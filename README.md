@@ -1,4 +1,5 @@
-# Dagger - A library for executing directed acyclic graphs (DAGs) with custom actions
+# Dagger
+## A library for executing directed acyclic graphs (DAGs) with custom actions
 
 Dagger is a Rust library that provides a way to define and execute directed acyclic graphs (DAGs) with custom actions. It supports loading graph definitions from YAML files, validating the graph structure, and executing custom actions associated with each node in the graph.
 
