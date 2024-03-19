@@ -1,0 +1,20 @@
+[package]
+name = "dagger"
+version = "0.0.1"
+edition = "2021"
+keywords = ["dag", "directed", "acyclic", "graph", "data-structure"]
+repository = "https://github.com/srv1n/dagger"
+rust-version = "1.74"
+
+[dependencies]
+serde = { version = "1.0.197", features = ["derive"] }
+serde_yaml = "0.9.32"
+petgraph = "0.6.4"
+tokio = { version = "1.36", features = ["rt", "sync", "rt-multi-thread", "time"] }
+anyhow = { version = "1.0" }
+tracing = "0.1.40"
+async-trait = "0.1.77"
+chrono = "0.4.35"
+
+[dev-dependencies]
+pretty_assertions = "1.2.1"
