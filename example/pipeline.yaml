@@ -1,3 +1,4 @@
+name: example
 nodes:
   - id: node1
     dependencies: []
@@ -15,10 +16,10 @@ nodes:
         type: Float
     action: function_to_call1
     failure: failure_function1
-    onfailure: continue
+    onfailure: false
     description: Description of node1
     timeout: 3600  # 1 hour in seconds
-    retry_count: 3
+    try_count: 3
 
   - id: node2
     dependencies: 
@@ -33,10 +34,10 @@ nodes:
         type: Float
     action: function_to_call2
     failure: failure_function2
-    onfailure: terminate
+    onfailure: true
     description: Description of node2
     timeout: 1800  # 30 minutes in seconds
-    retry_count: 2
+    try_count: 2
 
   - id: node3
     dependencies: 
@@ -53,7 +54,7 @@ nodes:
         type: String  
     action: function_to_call3
     failure: failure_function3
-    onfailure: continue
+    onfailure: false
     description: Description of node3
     timeout: 3600  # 1 hour in seconds
-    retry_count: 3
+    try_count: 3

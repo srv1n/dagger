@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
 use tracing::{debug, error, info, trace, warn, Level};
 
 /// Macro for registering an action with the `DagExecutor`.
@@ -69,10 +70,11 @@ macro_rules! register_action {
 pub struct Graph {
     /// The nodes in the graph.
     pub nodes: Vec<Node>,
+    pub name: String,
 }
 
 /// Represents a value that can be used as input or output in a node.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     /// A floating-point value.
     Float(f64),
@@ -209,6 +211,7 @@ pub struct IOField {
     pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
     pub reference: Option<String>,
+    pub default: Option<Value>,
 }
 
 /// The type of a variable.
@@ -270,6 +273,7 @@ pub struct Output {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Node {
     /// The unique identifier of the node.
+    ///
     pub id: String,
     /// The dependencies of the node (other nodes that must be executed before this node).
     pub dependencies: Vec<String>,
@@ -282,13 +286,13 @@ pub struct Node {
     /// The failure action to be executed if the node's action fails.
     pub failure: String,
     /// The on-failure behavior (continue or terminate).
-    pub onfailure: String,
+    pub onfailure: bool,
     /// The description of the node.
     pub description: String,
     /// The timeout for the node's action in seconds.
     pub timeout: u64,
     /// The number of times to retry the node's action if it fails.
-    pub retry_count: u8,
+    pub try_count: u8,
 }
 
 /// Type alias for a cache of input and output values.
@@ -310,8 +314,10 @@ pub trait NodeAction {
 pub struct DagExecutor {
     /// A registry of custom actions.
     function_registry: Mutex<HashMap<String, Arc<dyn NodeAction>>>,
-    /// The graph to be executed.
-    graph: Option<Graph>,
+    /// The graphs to be executed.
+    graphs: HashMap<String, Graph>,
+    /// The prebuilt DAGs.
+    prebuilt_dags: HashMap<String, (DiGraph<Node, ()>, HashMap<String, NodeIndex>)>,
 }
 
 impl DagExecutor {
@@ -319,7 +325,8 @@ impl DagExecutor {
     pub fn new() -> Self {
         DagExecutor {
             function_registry: Mutex::new(HashMap::new()),
-            graph: None,
+            graphs: HashMap::new(),
+            prebuilt_dags: HashMap::new(),
         }
     }
 
@@ -348,28 +355,33 @@ impl DagExecutor {
 
         let graph: Graph = serde_yaml::from_str(&yaml_content).context("Failed to parse YAML")?;
 
-        self.graph = Some(graph);
+        let (dag, node_indices) = self.build_dag_internal(&graph)?;
+        let name = graph.name.clone();
+        self.graphs.insert(name.clone(), graph);
+        self.prebuilt_dags.insert(name, (dag, node_indices));
         Ok(())
     }
 
     /// Builds a directed acyclic graph (DAG) from the loaded graph definition.
-    pub fn build_dag(&self) -> Result<(DiGraph<Node, ()>, HashMap<String, NodeIndex>), Error> {
-        let graph = self
-            .graph
-            .as_ref()
-            .ok_or_else(|| anyhow!("Graph not loaded"))?;
-        self.build_dag_internal(graph)
-    }
+    // pub fn build_dag(&mut self, name: &str) -> Result<(), Error> {
+    //     let graph = self
+    //         .graphs
+    //         .get(name)
+    //         .ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
+    //     let (dag, node_indices) = self.build_dag_internal(graph)?;
+    //     self.prebuilt_dags
+    //         .insert(name.to_string(), (dag, node_indices));
+    //     Ok(())
+    // }
 
     /// Executes the DAG with the given inputs and returns the outputs.
-    pub async fn execute_dag(
-        &self,
-        dag: &DiGraph<Node, ()>,
-        node_indices: &HashMap<String, NodeIndex>,
-        inputs: &Cache,
-    ) -> Result<Cache, Error> {
+    pub async fn execute_dag(&self, name: &str, inputs: &Cache) -> Result<Cache, Error> {
+        let (dag, node_indices) = self
+            .prebuilt_dags
+            .get(name)
+            .ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
         let mut updated_inputs = inputs.clone();
-        execute_dag_async(self, dag, node_indices, &inputs, &mut updated_inputs).await?;
+        execute_dag_async(self, &dag, &mut updated_inputs).await?;
         Ok(updated_inputs)
     }
 
@@ -403,41 +415,75 @@ impl DagExecutor {
 }
 
 /// Executes a single node asynchronously and returns its outputs.
+
 async fn execute_node_async(
     executor: &DagExecutor,
     node: &Node,
     inputs: &Cache,
-) -> Result<(String, Result<Cache>), Error> {
-    // Attempt to acquire the lock and retrieve the action object
+) -> Result<(String, Result<Cache>), anyhow::Error> {
+    println!("Executing node: {}", node.id);
     let action = {
-        let registry = match executor.function_registry.lock() {
-            Ok(registry) => registry,
-            Err(e) => {
-                error!("Failed to acquire lock: {}", e);
-                return Err(anyhow!(format!("Failed to acquire lock: {}", e)));
-            }
-        };
+        let registry = executor
+            .function_registry
+            .lock()
+            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
         registry
             .get(&node.action)
             .cloned()
             .ok_or_else(|| anyhow!("Unknown action {} for node {}", node.action, node.id))?
     };
 
-    info!("Executing node : {}", node.id);
+    info!("Executing action for node: {}", node.id);
 
-    // Execute the action asynchronously and await its result
-    let action_result = action.execute(node, inputs).await;
+    let timeout_duration = Duration::from_secs(node.timeout as u64);
+    let mut retries_left = node.try_count;
 
-    // Return the node ID along with the action's result
-    Ok((node.id.clone(), action_result))
+    while retries_left > 0 {
+        match timeout(timeout_duration, action.execute(node, inputs)).await {
+            Ok(Ok(result)) => return Ok((node.id.clone(), Ok(result))),
+            Ok(Err(e)) => {
+                error!("Node '{}' execution failed: {}", node.id, e);
+                if node.onfailure {
+                    warn!(
+                        "Retrying node '{}' ({} retries left)...",
+                        node.id, retries_left
+                    );
+                    sleep(Duration::from_secs(1)).await; // Wait for 1 second before retrying
+                    retries_left -= 1;
+                } else {
+                    return Err(anyhow!("Node '{}' execution failed: {}", node.id, e));
+                }
+            }
+            Err(_) => {
+                error!(
+                    "Node '{}' execution timed out after {} seconds",
+                    node.id, node.timeout
+                );
+                if node.onfailure {
+                    warn!(
+                        "Retrying node '{}' ({} retries left)...",
+                        node.id, retries_left
+                    );
+                    sleep(Duration::from_secs(1)).await; // Wait for 1 second before retrying
+                    retries_left -= 1;
+                } else {
+                    return Err(anyhow!("Node '{}' execution timed out", node.id));
+                }
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Node '{}' failed after {} retries",
+        node.id,
+        node.try_count
+    ))
 }
 
 /// Executes the DAG asynchronously and updates the inputs with each node's outputs.
 pub async fn execute_dag_async(
     executor: &DagExecutor,
     dag: &DiGraph<Node, ()>,
-    node_indices: &HashMap<String, NodeIndex>,
-    inputs: &Cache,
     updated_inputs: &mut Cache,
 ) -> Result<(), Error> {
     let mut topo = Topo::new(&dag);
@@ -446,9 +492,42 @@ pub async fn execute_dag_async(
         let (node_id, outputs) = match execute_node_async(executor, node, updated_inputs).await {
             Ok(result) => result,
             Err(err) => {
-                // Add error key to updated_inputs
-                updated_inputs.insert("error".to_string(), Value::Float(1.0)); // Placeholder value for error
-                return Err(err);
+                if !node.onfailure {
+                    // Return an error if onfailure is false
+                    let mut error_messages = match updated_inputs.get("error") {
+                        Some(Value::VecString(messages)) => messages.clone(),
+                        Some(_) => {
+                            warn!("Error key already exists with a different type. Overwriting with a new error message.");
+                            vec![]
+                        }
+                        None => vec![],
+                    };
+                    error_messages.push(format!("{}: {}", node.id, err));
+                    updated_inputs.insert("error".to_string(), Value::VecString(error_messages));
+                    warn!(
+                        "Node '{}' failed, but onfailure is set to true. Continuing...",
+                        node.id
+                    );
+                    break;
+                    // return Err(err);
+                } else {
+                    // Append error message to the 'error' key in updated_inputs
+                    let mut error_messages = match updated_inputs.get("error") {
+                        Some(Value::VecString(messages)) => messages.clone(),
+                        Some(_) => {
+                            warn!("Error key already exists with a different type. Overwriting with a new error message.");
+                            vec![]
+                        }
+                        None => vec![],
+                    };
+                    error_messages.push(format!("{}: {}", node.id, err));
+                    updated_inputs.insert("error".to_string(), Value::VecString(error_messages));
+                    warn!(
+                        "Node '{}' failed, but onfailure is set to true. Continuing...",
+                        node.id
+                    );
+                    continue;
+                }
             }
         };
 
