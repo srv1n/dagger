@@ -34,7 +34,7 @@ nodes:
         type: Float
     action: function_to_call2
     failure: failure_function2
-    onfailure: true
+    onfailure: false
     description: Description of node2
     timeout: 1800  # 30 minutes in seconds
     try_count: 2

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
 use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
 use tracing::{debug, error, info, trace, warn, Level};
@@ -71,6 +72,8 @@ pub struct Graph {
     /// The nodes in the graph.
     pub nodes: Vec<Node>,
     pub name: String,
+    pub description: String,
+    pub tags: Option<Vec<String>>,
 }
 
 /// Represents a value that can be used as input or output in a node.
@@ -257,6 +260,8 @@ pub struct Input {
     pub reference: String,
     /// An optional prompt for the input.
     pub prompt: Option<String>,
+
+    pub instruction: Option<String>,
 }
 
 /// An output of a node.
