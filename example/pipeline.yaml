@@ -1,4 +1,5 @@
 name: example
+description: Description of pipeline
 nodes:
   - id: node1
     dependencies: []
@@ -54,7 +55,7 @@ nodes:
         type: String  
     action: function_to_call3
     failure: failure_function3
-    onfailure: false
+    onfailure: true
     description: Description of node3
     timeout: 3600  # 1 hour in seconds
     try_count: 3

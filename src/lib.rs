@@ -15,11 +15,13 @@ use petgraph::visit::Topo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
+use std::hash::Hash;
 use std::io::Read;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
+// use tokio::sync::RwLock;
 use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
-use tracing::{debug, error, info, trace, warn, Level};
+use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using Tokio for async runtime
 
 /// Macro for registering an action with the `DagExecutor`.
 ///
@@ -38,7 +40,7 @@ use tracing::{debug, error, info, trace, warn, Level};
 ///         "my_action".to_string()
 ///     }
 ///
-///     async fn execute(&self, node: &Node, inputs: &Cache) -> Result<Cache> {
+///     async fn execute(&self, node: &Node, inputs: &HashMap<String, Value>) -> Result<HashMap<String, Value>> {
 ///         // Implementation of the action
 ///     }
 /// }
@@ -57,7 +59,11 @@ macro_rules! register_action {
                 $action_name.to_string()
             }
 
-            async fn execute(&self, node: &Node, inputs: &Cache) -> Result<Cache> {
+            async fn execute(
+                &self,
+                node: &Node,
+                inputs: &HashMap<String, Value>,
+            ) -> Result<HashMap<String, Value>> {
                 $action_func(node, inputs).await
             }
         }
@@ -301,7 +307,8 @@ pub struct Node {
 }
 
 /// Type alias for a cache of input and output values.
-pub type Cache = HashMap<String, Value>;
+pub type Cache = RwLock<HashMap<String, Value>>;
+pub type CachePass = HashMap<String, Value>;
 
 /// A trait for custom actions associated with nodes.
 #[async_trait]
@@ -312,7 +319,11 @@ pub trait NodeAction {
     }
 
     /// Executes the action with the given node and inputs, and returns the outputs.
-    async fn execute(&self, node: &Node, inputs: &Cache) -> Result<Cache>;
+    async fn execute(
+        &self,
+        node: &Node,
+        inputs: &HashMap<String, Value>,
+    ) -> Result<HashMap<String, Value>>;
 }
 
 /// The main executor for DAGs.
@@ -336,13 +347,14 @@ impl DagExecutor {
     }
 
     /// Registers a custom action with the `DagExecutor`.
-    pub fn register_action(&self, action: Arc<dyn NodeAction>) {
+    pub fn register_action(&self, action: Arc<dyn NodeAction>) -> Result<(), Error> {
         info!("Registered action: {:#?}", action.name());
         let action_name = action.name().clone(); // Get the name from the action itself
         self.function_registry
             .lock()
-            .unwrap()
+            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
             .insert(action_name, action);
+        Ok(())
     }
 
     /// Loads a graph definition from a YAML file.
@@ -380,14 +392,19 @@ impl DagExecutor {
     // }
 
     /// Executes the DAG with the given inputs and returns the outputs.
-    pub async fn execute_dag(&self, name: &str, inputs: &Cache) -> Result<Cache, Error> {
+    pub async fn execute_dag(
+        &self,
+        name: &str,
+        inputs: HashMap<String, Value>,
+    ) -> Result<HashMap<String, Value>, Error> {
         let (dag, node_indices) = self
             .prebuilt_dags
             .get(name)
             .ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
-        let mut updated_inputs = inputs.clone();
-        execute_dag_async(self, &dag, &mut updated_inputs).await?;
-        Ok(updated_inputs)
+        // let mut updated_inputs = inputs.clone();
+        let final_results = execute_dag_async(self, &dag, inputs).await?;
+
+        Ok(final_results)
     }
 
     fn build_dag_internal(
@@ -424,20 +441,25 @@ impl DagExecutor {
 async fn execute_node_async(
     executor: &DagExecutor,
     node: &Node,
-    inputs: &Cache,
-) -> Result<(String, Result<Cache>), anyhow::Error> {
+    inputs: &HashMap<String, Value>,
+) -> Result<(String, Result<HashMap<String, Value>>), anyhow::Error> {
     println!("Executing node: {}", node.id);
     let action = {
         let registry = executor
             .function_registry
             .lock()
             .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
+
+        // ...
         registry
             .get(&node.action)
             .cloned()
             .ok_or_else(|| anyhow!("Unknown action {} for node {}", node.action, node.id))?
     };
-
+    // let current_inputs = inputs
+    //     .read()
+    //     .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+    // let inputas = &*current_inputs;
     info!("Executing action for node: {}", node.id);
 
     let timeout_duration = Duration::from_secs(node.timeout as u64);
@@ -484,65 +506,64 @@ async fn execute_node_async(
         node.try_count
     ))
 }
-
 /// Executes the DAG asynchronously and updates the inputs with each node's outputs.
 pub async fn execute_dag_async(
     executor: &DagExecutor,
     dag: &DiGraph<Node, ()>,
-    updated_inputs: &mut Cache,
-) -> Result<(), Error> {
-    let mut topo = Topo::new(&dag);
-    while let Some(node_index) = topo.next(&dag) {
+    inputs: HashMap<String, Value>,
+) -> Result<HashMap<String, Value>, anyhow::Error> {
+    let mut topo = Topo::new(dag);
+    let updated_inputs = Cache::new(inputs);
+    while let Some(node_index) = topo.next(dag) {
         let node = &dag[node_index];
-        let (node_id, outputs) = match execute_node_async(executor, node, updated_inputs).await {
-            Ok(result) => result,
+        let current_inputs = updated_inputs
+            .read()
+            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
+            .clone();
+        // println!("current_inputs: {:?}", current_inputs);
+        match execute_node_async(executor, node, &current_inputs).await {
+            Ok((node_id, outputs)) => {
+                let mut updated_inputs = updated_inputs
+                    .write()
+                    .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
+                for (name, value) in outputs.map_err(|e| {
+                    anyhow!(
+                        "Failed to get outputs to update node outputs: {} on node {}",
+                        e,
+                        node.id
+                    )
+                })? {
+                    updated_inputs.insert(format!("{}.{}", node_id, name), value);
+                }
+            }
             Err(err) => {
                 if !node.onfailure {
-                    // Return an error if onfailure is false
-                    let mut error_messages = match updated_inputs.get("error") {
-                        Some(Value::VecString(messages)) => messages.clone(),
-                        Some(_) => {
-                            warn!("Error key already exists with a different type. Overwriting with a new error message.");
-                            vec![]
-                        }
-                        None => vec![],
-                    };
-                    error_messages.push(format!("{}: {}", node.id, err));
-                    updated_inputs.insert("error".to_string(), Value::VecString(error_messages));
-                    warn!(
-                        "Node '{}' failed, but onfailure is set to true. Continuing...",
-                        node.id
-                    );
-                    break;
-                    // return Err(err);
+                    return Err(anyhow!("Node execution failed: {}", err));
                 } else {
-                    // Append error message to the 'error' key in updated_inputs
-                    let mut error_messages = match updated_inputs.get("error") {
-                        Some(Value::VecString(messages)) => messages.clone(),
-                        Some(_) => {
-                            warn!("Error key already exists with a different type. Overwriting with a new error message.");
-                            vec![]
+                    let mut updated_inputs = updated_inputs
+                        .write()
+                        .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
+                    let error_messages = match updated_inputs.get_mut("error") {
+                        Some(Value::VecString(messages)) => messages,
+                        _ => {
+                            updated_inputs.insert("error".to_string(), Value::VecString(vec![]));
+                            match updated_inputs.get_mut("error") {
+                                Some(Value::VecString(messages)) => messages,
+                                _ => unreachable!(),
+                            }
                         }
-                        None => vec![],
                     };
-                    error_messages.push(format!("{}: {}", node.id, err));
-                    updated_inputs.insert("error".to_string(), Value::VecString(error_messages));
-                    warn!(
-                        "Node '{}' failed, but onfailure is set to true. Continuing...",
-                        node.id
-                    );
+                    error_messages.push(format!("{}: {:?}", node.id, err));
                     continue;
                 }
             }
-        };
-
-        // Update inputs with outputs for next nodes
-        for (name, value) in outputs.unwrap() {
-            updated_inputs.insert(format!("{}.{}", node_id, name), value);
         }
-        info!("Node {}: {:?}", node.id, updated_inputs);
     }
-    Ok(())
+    let final_results = updated_inputs
+        .read()
+        .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
+        .clone();
+    Ok(final_results)
 }
 
 /// Validates the structure of the DAG.
