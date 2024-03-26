@@ -40,7 +40,7 @@ use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using 
 ///         "my_action".to_string()
 ///     }
 ///
-///     async fn execute(&self, node: &Node, inputs: &HashMap<String, Value>) -> Result<HashMap<String, Value>> {
+///     async fn execute(&self, node: &Node, inputs: &HashMap<String, DataValue>) -> Result<HashMap<String, DataValue>> {
 ///         // Implementation of the action
 ///     }
 /// }
@@ -62,8 +62,8 @@ macro_rules! register_action {
             async fn execute(
                 &self,
                 node: &Node,
-                inputs: &HashMap<String, Value>,
-            ) -> Result<HashMap<String, Value>> {
+                inputs: &HashMap<String, DataValue>,
+            ) -> Result<HashMap<String, DataValue>> {
                 $action_func(node, inputs).await
             }
         }
@@ -82,55 +82,55 @@ pub struct Graph {
     pub tags: Option<Vec<String>>,
 }
 
-/// Represents a value that can be used as input or output in a node.
+/// Represents a DataValue that can be used as input or output in a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Value {
-    /// A floating-point value.
+pub enum DataValue {
+    /// A floating-point DataValue.
     Float(f64),
-    /// An integer value.
+    /// An integer DataValue.
     Integer(i64),
-    /// A string value.
+    /// A string DataValue.
     String(String),
 
     /// A vector of strings.
     VecString(Vec<String>),
     /// A vector of integers.
     VecInt(Vec<i64>),
-    /// A vector of floating-point values.
+    /// A vector of floating-point DataValues.
     VecFloat(Vec<f64>),
 
-    /// A boolean value.
+    /// A boolean DataValue.
     Bool(bool),
 
-    /// An object with string keys and values.
-    Object(HashMap<String, Value>),
+    /// An object with string keys and DataValues.
+    Object(HashMap<String, DataValue>),
 
-    /// A null value.
+    /// A null DataValue.
     Null,
 
-    /// A datetime value in UTC.
+    /// A datetime DataValue in UTC.
     DateTime(chrono::DateTime<chrono::Utc>),
     // Add more variants as needed
 }
 
-/// A trait for converting values between Rust types and `Value` enum.
+/// A trait for converting DataValues between Rust types and `DataValue` enum.
 pub trait Convertible {
-    /// Converts a Rust type to a `Value` enum.
-    fn to_value(&self) -> Value;
+    /// Converts a Rust type to a `DataValue` enum.
+    fn to_DataValue(&self) -> DataValue;
 
-    /// Converts a `Value` enum to a Rust type.
-    fn from_value(value: &Value) -> Option<Self>
+    /// Converts a `DataValue` enum to a Rust type.
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self>
     where
         Self: Sized;
 }
 
 impl Convertible for f64 {
-    fn to_value(&self) -> Value {
-        Value::Float(*self)
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::Float(*self)
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::Float(f) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::Float(f) = DataValue {
             Some(*f)
         } else {
             None
@@ -139,12 +139,12 @@ impl Convertible for f64 {
 }
 
 impl Convertible for i64 {
-    fn to_value(&self) -> Value {
-        Value::Integer(*self)
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::Integer(*self)
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::Integer(i) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::Integer(i) = DataValue {
             Some(*i)
         } else {
             None
@@ -153,12 +153,12 @@ impl Convertible for i64 {
 }
 
 impl Convertible for String {
-    fn to_value(&self) -> Value {
-        Value::String(self.clone())
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::String(self.clone())
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::String(s) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::String(s) = DataValue {
             Some(s.clone())
         } else {
             None
@@ -167,12 +167,12 @@ impl Convertible for String {
 }
 
 impl Convertible for bool {
-    fn to_value(&self) -> Value {
-        Value::Bool(*self)
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::Bool(*self)
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::Bool(b) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::Bool(b) = DataValue {
             Some(*b)
         } else {
             None
@@ -180,13 +180,13 @@ impl Convertible for bool {
     }
 }
 
-impl Convertible for HashMap<String, Value> {
-    fn to_value(&self) -> Value {
-        Value::Object(self.clone())
+impl Convertible for HashMap<String, DataValue> {
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::Object(self.clone())
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::Object(obj) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::Object(obj) = DataValue {
             Some(obj.clone())
         } else {
             None
@@ -195,12 +195,12 @@ impl Convertible for HashMap<String, Value> {
 }
 
 impl Convertible for chrono::DateTime<Utc> {
-    fn to_value(&self) -> Value {
-        Value::DateTime(*self)
+    fn to_DataValue(&self) -> DataValue {
+        DataValue::DateTime(*self)
     }
 
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Value::DateTime(dt) = value {
+    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
+        if let DataValue::DateTime(dt) = DataValue {
             Some(*dt)
         } else {
             None
@@ -220,7 +220,7 @@ pub struct IOField {
     pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
     pub reference: Option<String>,
-    pub default: Option<Value>,
+    pub default: Option<DataValue>,
 }
 
 /// The type of a variable.
@@ -236,19 +236,19 @@ pub enum VariableType {
     VecString,
     /// A vector of integers.
     VecInt,
-    /// A vector of floating-point values.
+    /// A vector of floating-point DataValues.
     VecFloat,
 
-    /// A boolean value.
+    /// A boolean DataValue.
     Bool,
 
-    /// An object with string keys and values.
+    /// An object with string keys and DataValues.
     Object,
 
-    /// A null value.
+    /// A null DataValue.
     Null,
 
-    /// A datetime value in UTC.
+    /// A datetime DataValue in UTC.
     DateTime,
 }
 
@@ -306,9 +306,9 @@ pub struct Node {
     pub try_count: u8,
 }
 
-/// Type alias for a cache of input and output values.
-pub type Cache = RwLock<HashMap<String, Value>>;
-pub type CachePass = HashMap<String, Value>;
+/// Type alias for a cache of input and output DataValues.
+pub type Cache = RwLock<HashMap<String, DataValue>>;
+pub type CachePass = HashMap<String, DataValue>;
 
 /// A trait for custom actions associated with nodes.
 #[async_trait]
@@ -322,8 +322,8 @@ pub trait NodeAction: Send + Sync {
     async fn execute(
         &self,
         node: &Node,
-        inputs: &HashMap<String, Value>,
-    ) -> Result<HashMap<String, Value>>;
+        inputs: &HashMap<String, DataValue>,
+    ) -> Result<HashMap<String, DataValue>>;
 }
 
 /// The main executor for DAGs.
@@ -395,8 +395,8 @@ impl DagExecutor {
     pub async fn execute_dag(
         &self,
         name: &str,
-        inputs: HashMap<String, Value>,
-    ) -> Result<HashMap<String, Value>, Error> {
+        inputs: HashMap<String, DataValue>,
+    ) -> Result<HashMap<String, DataValue>, Error> {
         let (dag, node_indices) = self
             .prebuilt_dags
             .get(name)
@@ -441,8 +441,8 @@ impl DagExecutor {
 async fn execute_node_async(
     executor: &DagExecutor,
     node: &Node,
-    inputs: &HashMap<String, Value>,
-) -> Result<(String, Result<HashMap<String, Value>>), anyhow::Error> {
+    inputs: &HashMap<String, DataValue>,
+) -> Result<(String, Result<HashMap<String, DataValue>>), anyhow::Error> {
     println!("Executing node: {}", node.id);
     let action = {
         // let registry = executor
@@ -511,8 +511,8 @@ async fn execute_node_async(
 pub async fn execute_dag_async(
     executor: &DagExecutor,
     dag: &DiGraph<Node, ()>,
-    inputs: HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, anyhow::Error> {
+    inputs: HashMap<String, DataValue>,
+) -> Result<HashMap<String, DataValue>, anyhow::Error> {
     let mut topo = Topo::new(dag);
     let updated_inputs = Cache::new(inputs);
     while let Some(node_index) = topo.next(dag) {
@@ -527,14 +527,14 @@ pub async fn execute_dag_async(
                 let mut updated_inputs = updated_inputs
                     .write()
                     .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
-                for (name, value) in outputs.map_err(|e| {
+                for (name, DataValue) in outputs.map_err(|e| {
                     anyhow!(
                         "Failed to get outputs to update node outputs: {} on node {}",
                         e,
                         node.id
                     )
                 })? {
-                    updated_inputs.insert(format!("{}.{}", node_id, name), value);
+                    updated_inputs.insert(format!("{}.{}", node_id, name), DataValue);
                 }
             }
             Err(err) => {
@@ -545,11 +545,12 @@ pub async fn execute_dag_async(
                         .write()
                         .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
                     let error_messages = match updated_inputs.get_mut("error") {
-                        Some(Value::VecString(messages)) => messages,
+                        Some(DataValue::VecString(messages)) => messages,
                         _ => {
-                            updated_inputs.insert("error".to_string(), Value::VecString(vec![]));
+                            updated_inputs
+                                .insert("error".to_string(), DataValue::VecString(vec![]));
                             match updated_inputs.get_mut("error") {
-                                Some(Value::VecString(messages)) => messages,
+                                Some(DataValue::VecString(messages)) => messages,
                                 _ => unreachable!(),
                             }
                         }
