@@ -312,7 +312,7 @@ pub type CachePass = HashMap<String, Value>;
 
 /// A trait for custom actions associated with nodes.
 #[async_trait]
-pub trait NodeAction {
+pub trait NodeAction: Send + Sync {
     /// Returns the name of the action.
     fn name(&self) -> String {
         type_name::<Self>().to_string()
@@ -329,7 +329,7 @@ pub trait NodeAction {
 /// The main executor for DAGs.
 pub struct DagExecutor {
     /// A registry of custom actions.
-    function_registry: Mutex<HashMap<String, Arc<dyn NodeAction>>>,
+    function_registry: HashMap<String, Arc<dyn NodeAction>>,
     /// The graphs to be executed.
     graphs: HashMap<String, Graph>,
     /// The prebuilt DAGs.
@@ -340,19 +340,19 @@ impl DagExecutor {
     /// Creates a new `DagExecutor`.
     pub fn new() -> Self {
         DagExecutor {
-            function_registry: Mutex::new(HashMap::new()),
+            function_registry: HashMap::new(),
             graphs: HashMap::new(),
             prebuilt_dags: HashMap::new(),
         }
     }
 
     /// Registers a custom action with the `DagExecutor`.
-    pub fn register_action(&self, action: Arc<dyn NodeAction>) -> Result<(), Error> {
+    pub fn register_action(&mut self, action: Arc<dyn NodeAction>) -> Result<(), Error> {
         info!("Registered action: {:#?}", action.name());
         let action_name = action.name().clone(); // Get the name from the action itself
         self.function_registry
-            .lock()
-            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
+            // .lock()
+            // .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
             .insert(action_name, action);
         Ok(())
     }
@@ -445,13 +445,14 @@ async fn execute_node_async(
 ) -> Result<(String, Result<HashMap<String, Value>>), anyhow::Error> {
     println!("Executing node: {}", node.id);
     let action = {
-        let registry = executor
-            .function_registry
-            .lock()
-            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
+        // let registry = executor
+        //     .function_registry
+        //     .lock()
+        //     .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
 
         // ...
-        registry
+        executor
+            .function_registry
             .get(&node.action)
             .cloned()
             .ok_or_else(|| anyhow!("Unknown action {} for node {}", node.action, node.id))?
@@ -594,13 +595,14 @@ pub fn validate_node_dependencies(
 
 /// Validates the actions of the nodes.
 pub fn validate_node_actions(executor: &DagExecutor, nodes: &[Node]) -> Result<(), Error> {
-    let registry = match executor.function_registry.lock() {
-        Ok(registry) => registry,
-        Err(e) => {
-            error!("Failed to acquire lock: {}", e);
-            return Err(anyhow!(format!("Failed to acquire lock: {}", e)));
-        }
-    };
+    // let registry = match executor.function_registry.lock() {
+    //     Ok(registry) => registry,
+    //     Err(e) => {
+    //         error!("Failed to acquire lock: {}", e);
+    //         return Err(anyhow!(format!("Failed to acquire lock: {}", e)));
+    //     }
+    // };
+    let registry = executor.function_registry.clone();
     for node in nodes {
         if !registry.contains_key(&node.action) {
             return Err(anyhow!(format!(
