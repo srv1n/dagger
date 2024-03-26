@@ -82,55 +82,55 @@ pub struct Graph {
     pub tags: Option<Vec<String>>,
 }
 
-/// Represents a DataValue that can be used as input or output in a node.
+/// Represents a value that can be used as input or output in a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DataValue {
-    /// A floating-point DataValue.
+    /// A floating-point value.
     Float(f64),
-    /// An integer DataValue.
+    /// An integer value.
     Integer(i64),
-    /// A string DataValue.
+    /// A string value.
     String(String),
 
     /// A vector of strings.
     VecString(Vec<String>),
     /// A vector of integers.
     VecInt(Vec<i64>),
-    /// A vector of floating-point DataValues.
+    /// A vector of floating-point values.
     VecFloat(Vec<f64>),
 
-    /// A boolean DataValue.
+    /// A boolean value.
     Bool(bool),
 
-    /// An object with string keys and DataValues.
+    /// An object with string keys and values.
     Object(HashMap<String, DataValue>),
 
-    /// A null DataValue.
+    /// A null value.
     Null,
 
-    /// A datetime DataValue in UTC.
+    /// A datetime value in UTC.
     DateTime(chrono::DateTime<chrono::Utc>),
     // Add more variants as needed
 }
 
-/// A trait for converting DataValues between Rust types and `DataValue` enum.
+/// A trait for converting values between Rust types and `DataValue` enum.
 pub trait Convertible {
     /// Converts a Rust type to a `DataValue` enum.
-    fn to_DataValue(&self) -> DataValue;
+    fn to_value(&self) -> DataValue;
 
     /// Converts a `DataValue` enum to a Rust type.
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self>
+    fn from_value(value: &DataValue) -> Option<Self>
     where
         Self: Sized;
 }
 
 impl Convertible for f64 {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::Float(*self)
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::Float(f) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::Float(f) = value {
             Some(*f)
         } else {
             None
@@ -139,12 +139,12 @@ impl Convertible for f64 {
 }
 
 impl Convertible for i64 {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::Integer(*self)
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::Integer(i) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::Integer(i) = value {
             Some(*i)
         } else {
             None
@@ -153,12 +153,12 @@ impl Convertible for i64 {
 }
 
 impl Convertible for String {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::String(self.clone())
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::String(s) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::String(s) = value {
             Some(s.clone())
         } else {
             None
@@ -167,12 +167,12 @@ impl Convertible for String {
 }
 
 impl Convertible for bool {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::Bool(*self)
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::Bool(b) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::Bool(b) = value {
             Some(*b)
         } else {
             None
@@ -181,12 +181,12 @@ impl Convertible for bool {
 }
 
 impl Convertible for HashMap<String, DataValue> {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::Object(self.clone())
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::Object(obj) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::Object(obj) = value {
             Some(obj.clone())
         } else {
             None
@@ -195,12 +195,12 @@ impl Convertible for HashMap<String, DataValue> {
 }
 
 impl Convertible for chrono::DateTime<Utc> {
-    fn to_DataValue(&self) -> DataValue {
+    fn to_value(&self) -> DataValue {
         DataValue::DateTime(*self)
     }
 
-    fn from_DataValue(DataValue: &DataValue) -> Option<Self> {
-        if let DataValue::DateTime(dt) = DataValue {
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::DateTime(dt) = value {
             Some(*dt)
         } else {
             None
@@ -236,19 +236,19 @@ pub enum VariableType {
     VecString,
     /// A vector of integers.
     VecInt,
-    /// A vector of floating-point DataValues.
+    /// A vector of floating-point values.
     VecFloat,
 
-    /// A boolean DataValue.
+    /// A boolean value.
     Bool,
 
-    /// An object with string keys and DataValues.
+    /// An object with string keys and values.
     Object,
 
-    /// A null DataValue.
+    /// A null value.
     Null,
 
-    /// A datetime DataValue in UTC.
+    /// A datetime value in UTC.
     DateTime,
 }
 
@@ -306,7 +306,7 @@ pub struct Node {
     pub try_count: u8,
 }
 
-/// Type alias for a cache of input and output DataValues.
+/// Type alias for a cache of input and output values.
 pub type Cache = RwLock<HashMap<String, DataValue>>;
 pub type CachePass = HashMap<String, DataValue>;
 
@@ -527,14 +527,14 @@ pub async fn execute_dag_async(
                 let mut updated_inputs = updated_inputs
                     .write()
                     .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
-                for (name, DataValue) in outputs.map_err(|e| {
+                for (name, value) in outputs.map_err(|e| {
                     anyhow!(
                         "Failed to get outputs to update node outputs: {} on node {}",
                         e,
                         node.id
                     )
                 })? {
-                    updated_inputs.insert(format!("{}.{}", node_id, name), DataValue);
+                    updated_inputs.insert(format!("{}.{}", node_id, name), value);
                 }
             }
             Err(err) => {
