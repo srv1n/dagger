@@ -49,7 +49,7 @@ nodes:
       - name: result
         description: Description of result (referencing squared_result of node2)
         type: Float
-        reference: node2.squared_result2
+        reference: node2.squared_result
     outputs:
       - name: doubled_result
         type: Float
