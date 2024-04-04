@@ -7,14 +7,15 @@ nodes:
       - name: num1
         description: Description of num1
         type: Float
-        reference: num1
+        reference: inputs.num1
       - name: num2
         description: Description of num2
         type: Float
-        reference: num2
+        reference: inputs.num2
     outputs:
       - name: sum
         type: Float
+        reference: node1.sum
     action: function_to_call1
     failure: failure_function1
     onfailure: false
@@ -33,6 +34,7 @@ nodes:
     outputs:
       - name: squared_result
         type: Float
+        reference: node2.squared_result
     action: function_to_call2
     failure: failure_function2
     onfailure: false
@@ -47,12 +49,14 @@ nodes:
       - name: result
         description: Description of result (referencing squared_result of node2)
         type: Float
-        reference: node2.squared_result
+        reference: node2.squared_result2
     outputs:
       - name: doubled_result
         type: Float
+        reference: node3.doubled_result
       - name: puta
         type: String  
+        reference: node3.puta
     action: function_to_call3
     failure: failure_function3
     onfailure: true

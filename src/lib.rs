@@ -219,7 +219,7 @@ pub struct IOField {
     #[serde(rename = "type")]
     pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
-    pub reference: Option<String>,
+    pub reference: String,
     pub default: Option<DataValue>,
 }
 
@@ -307,8 +307,7 @@ pub struct Node {
 }
 
 /// Type alias for a cache of input and output values.
-pub type Cache = RwLock<HashMap<String, DataValue>>;
-pub type CachePass = HashMap<String, DataValue>;
+pub type Cache = RwLock<HashMap<String, HashMap<String, DataValue>>>;
 
 /// A trait for custom actions associated with nodes.
 #[async_trait]
@@ -395,8 +394,8 @@ impl DagExecutor {
     pub async fn execute_dag(
         &self,
         name: &str,
-        inputs: HashMap<String, DataValue>,
-    ) -> Result<HashMap<String, DataValue>, Error> {
+        inputs: HashMap<String, HashMap<String, DataValue>>,
+    ) -> Result<HashMap<String, HashMap<String, DataValue>>, Error> {
         let (dag, node_indices) = self
             .prebuilt_dags
             .get(name)
@@ -441,7 +440,7 @@ impl DagExecutor {
 async fn execute_node_async(
     executor: &DagExecutor,
     node: &Node,
-    inputs: &HashMap<String, DataValue>,
+    inputs: &HashMap<String, HashMap<String, DataValue>>,
 ) -> Result<(String, Result<HashMap<String, DataValue>>), anyhow::Error> {
     println!("Executing node: {}", node.id);
     let action = {
@@ -465,9 +464,9 @@ async fn execute_node_async(
 
     let timeout_duration = Duration::from_secs(node.timeout as u64);
     let mut retries_left = node.try_count;
-
+    let inputs_to_function = get_input_values(inputs, &node.inputs)?;
     while retries_left > 0 {
-        match timeout(timeout_duration, action.execute(node, inputs)).await {
+        match timeout(timeout_duration, action.execute(node, &inputs_to_function)).await {
             Ok(Ok(result)) => return Ok((node.id.clone(), Ok(result))),
             Ok(Err(e)) => {
                 error!("Node '{}' execution failed: {}", node.id, e);
@@ -511,9 +510,10 @@ async fn execute_node_async(
 pub async fn execute_dag_async(
     executor: &DagExecutor,
     dag: &DiGraph<Node, ()>,
-    inputs: HashMap<String, DataValue>,
-) -> Result<HashMap<String, DataValue>, anyhow::Error> {
+    inputs: HashMap<String, HashMap<String, DataValue>>,
+) -> Result<HashMap<String, HashMap<String, DataValue>>, anyhow::Error> {
     let mut topo = Topo::new(dag);
+
     let updated_inputs = Cache::new(inputs);
     while let Some(node_index) = topo.next(dag) {
         let node = &dag[node_index];
@@ -534,7 +534,13 @@ pub async fn execute_dag_async(
                         node.id
                     )
                 })? {
-                    updated_inputs.insert(format!("{}.{}", node_id, name), value);
+                    let mut first: HashMap<String, DataValue> = HashMap::new();
+                    let mut temp: HashMap<String, HashMap<String, DataValue>> = HashMap::new();
+                    first.insert(name, value);
+                    temp.insert(node_id.clone(), first);
+
+                    updated_inputs.extend(temp);
+                    // updated_inputs.insert(format!("{}.{}", node_id, name), value);
                 }
             }
             Err(err) => {
@@ -544,18 +550,27 @@ pub async fn execute_dag_async(
                     let mut updated_inputs = updated_inputs
                         .write()
                         .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
-                    let error_messages = match updated_inputs.get_mut("error") {
-                        Some(DataValue::VecString(messages)) => messages,
-                        _ => {
-                            updated_inputs
-                                .insert("error".to_string(), DataValue::VecString(vec![]));
-                            match updated_inputs.get_mut("error") {
-                                Some(DataValue::VecString(messages)) => messages,
-                                _ => unreachable!(),
-                            }
+                    let mut first: HashMap<String, DataValue> = HashMap::new();
+                    let mut temp: HashMap<String, HashMap<String, DataValue>> = HashMap::new();
+                    first.insert("error".to_owned(), DataValue::String(err.to_string()));
+                    temp.insert(node.id.clone(), first);
+
+                    updated_inputs.extend(temp);
+
+                    match updated_inputs.get_mut("error") {
+                        Some(val) => {
+                            val.insert(node.id.to_owned(), DataValue::String(err.to_string()));
                         }
-                    };
-                    error_messages.push(format!("{}: {:?}", node.id, err));
+                        None => {
+                            let mut first: HashMap<String, DataValue> = HashMap::new();
+                            let mut temp: HashMap<String, HashMap<String, DataValue>> =
+                                HashMap::new();
+                            first.insert(node.id.clone(), DataValue::String(err.to_string()));
+                            temp.insert("error".to_owned(), first);
+
+                            updated_inputs.extend(temp);
+                        }
+                    }
                     continue;
                 }
             }
@@ -637,4 +652,36 @@ pub fn validate_io_data_types(nodes: &[Node]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+fn get_input_values(
+    inputs: &HashMap<String, HashMap<String, DataValue>>,
+    node_inputs: &Vec<IOField>,
+) -> Result<HashMap<String, DataValue>, anyhow::Error> {
+    let mut input_values = HashMap::new();
+
+    for input in node_inputs {
+        let reference = input.reference.clone();
+        let parts: Vec<&str> = reference.split('.').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid reference format"));
+        }
+        let node_id = parts[0];
+        let output_name = parts[1];
+
+        if let Some(node_outputs) = inputs.get(node_id) {
+            if let Some(value) = node_outputs.get(output_name) {
+                input_values.insert(input.name.clone(), value.clone());
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Failed to get input value for {}",
+                    output_name
+                ));
+            }
+        } else {
+            return Err(anyhow::anyhow!("Failed to get inputs for node {}", node_id));
+        }
+    }
+
+    Ok(input_values)
 }

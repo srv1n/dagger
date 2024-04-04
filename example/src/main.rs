@@ -2,7 +2,7 @@ use anyhow::{anyhow, Error, Result};
 
 use dagger::register_action;
 use dagger::DagExecutor;
-use dagger::{Convertible, Node, NodeAction, Value};
+use dagger::{Convertible, DataValue, Node, NodeAction};
 use std::collections::HashMap;
 
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use std::sync::Arc;
 //
 async fn function_to_call1(
     node: &Node,
-    inputs: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, Error> {
+    inputs: &HashMap<String, DataValue>,
+) -> Result<HashMap<String, DataValue>, Error> {
     let mut outputs = HashMap::new();
     let num1: f64 = Convertible::from_value(
         inputs
@@ -32,7 +32,7 @@ async fn function_to_call1(
     let new = num1 + num2;
 
     // Insert the result into the outputs
-    outputs.insert(node.outputs[0].clone().name, Value::Float(new));
+    outputs.insert(node.outputs[0].clone().name, DataValue::Float(new));
 
     Ok(outputs)
 }
@@ -40,13 +40,13 @@ use anyhow::Context;
 
 async fn function_to_call2(
     node: &Node,
-    inputs: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, anyhow::Error> {
+    inputs: &HashMap<String, DataValue>,
+) -> Result<HashMap<String, DataValue>, anyhow::Error> {
     let mut outputs = HashMap::new();
     // Example operation: square the input
 
-    if let Some(Value::Float(num)) = inputs.get(node.inputs[0].reference.as_ref().unwrap()) {
-        outputs.insert("squared_result".to_string(), Value::Float(num * num));
+    if let Some(DataValue::Float(num)) = inputs.get(&node.inputs[0].name) {
+        outputs.insert("squared_result".to_string(), DataValue::Float(num * num));
         Ok(outputs)
     } else {
         Err(anyhow::anyhow!("Failed to get input for squaring"))
@@ -55,26 +55,24 @@ async fn function_to_call2(
 
 async fn function_to_call3(
     node: &Node,
-    inputs: &HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, anyhow::Error> {
+    inputs: &HashMap<String, DataValue>,
+) -> Result<HashMap<String, DataValue>, anyhow::Error> {
     let mut outputs = HashMap::new();
     // Example operation: double the input
 
-    if let Some(input_key) = node.inputs.get(0).and_then(|input| input.reference.clone()) {
-        if let Some(result) = inputs.get(&input_key) {
-            let shata: f64 = Convertible::from_value(result).context(format!(
-                "Failed to convert input '{}' to f64.",
-                node.inputs[0].name
-            ))?;
-            // println!("shata: {}", shata);
-            outputs.insert("tripled_result".to_string(), Value::Float(shata * 3.0));
-            Ok(outputs)
-        } else {
-            Err(anyhow::anyhow!("Failed to get input for doubling"))
-        }
-    } else {
-        Err(anyhow::anyhow!("Failed to get input reference"))
-    }
+    let result: f64 = Convertible::from_value(
+        inputs
+            .get("result")
+            .ok_or_else(|| anyhow::anyhow!("Failed to get input for doubling"))?,
+    )
+    .context(format!(
+        "Failed to convert input '{}' to f64.",
+        node.inputs[0].name
+    ))?;
+
+    outputs.insert("tripled_result".to_string(), DataValue::Float(result * 3.0));
+
+    Ok(outputs)
 }
 
 #[tokio::main]
@@ -86,13 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_action!(executor, "function_to_call3", function_to_call3);
     executor.load_yaml_file("pipeline.yaml")?;
 
-    let mut inputs = HashMap::new();
-    inputs.insert("num1".to_string(), Value::Float(10.0));
-    inputs.insert("num2".to_string(), Value::Float(20.0));
+    let mut temp = HashMap::new();
+    temp.insert("num1".to_string(), DataValue::Float(10.0));
+    temp.insert("num2".to_string(), DataValue::Float(20.0));
 
+    let mut inputs = HashMap::new();
+    inputs.insert("inputs".to_string(), temp);
     let result = run_dag(executor, "example", inputs).await?;
 
-    println!("{:?}", result);
+    println!("{:#?}", result);
 
     Ok(())
 }
@@ -100,8 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_dag(
     executor: DagExecutor,
     name: &str,
-    inputs: HashMap<String, Value>,
-) -> Result<HashMap<String, Value>, Error> {
+    inputs: HashMap<String, HashMap<String, DataValue>>,
+) -> Result<HashMap<String, HashMap<String, DataValue>>, Error> {
     let updated_inputs = executor.execute_dag(name, inputs).await?;
     Ok(updated_inputs)
 }
