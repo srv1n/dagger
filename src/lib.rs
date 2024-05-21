@@ -442,7 +442,7 @@ async fn execute_node_async(
     node: &Node,
     inputs: &HashMap<String, HashMap<String, DataValue>>,
 ) -> Result<(String, Result<HashMap<String, DataValue>>), anyhow::Error> {
-    println!("Executing node: {}", node.id);
+    // println!("Executing node: {}", node.id);
     let action = {
         // let registry = executor
         //     .function_registry
@@ -466,8 +466,15 @@ async fn execute_node_async(
     let mut retries_left = node.try_count;
     let inputs_to_function = get_input_values(inputs, &node.inputs)?;
     while retries_left > 0 {
+        info!(
+            "Trying to execute node: {} ({} retries left)...",
+            node.id, retries_left
+        );
         match timeout(timeout_duration, action.execute(node, &inputs_to_function)).await {
-            Ok(Ok(result)) => return Ok((node.id.clone(), Ok(result))),
+            Ok(Ok(result)) => {
+                info!("Node '{}' execution succeeded", node.id);
+                return Ok((node.id.clone(), Ok(result)));
+            }
             Ok(Err(e)) => {
                 error!("Node '{}' execution failed: {}", node.id, e);
                 if node.onfailure {
