@@ -666,11 +666,12 @@ fn get_input_values(
     node_inputs: &Vec<IOField>,
 ) -> Result<HashMap<String, DataValue>, anyhow::Error> {
     let mut input_values = HashMap::new();
-
+    info!("node_inputs: {:#?}", node_inputs);
     for input in node_inputs {
         let reference = input.reference.clone();
         let parts: Vec<&str> = reference.split('.').collect();
         if parts.len() != 2 {
+            error!("Invalid reference format: {}", reference);
             return Err(anyhow::anyhow!("Invalid reference format"));
         }
         let node_id = parts[0];
@@ -680,15 +681,17 @@ fn get_input_values(
             if let Some(value) = node_outputs.get(output_name) {
                 input_values.insert(input.name.clone(), value.clone());
             } else {
+                error!("Failed to get input value for {}", output_name);
                 return Err(anyhow::anyhow!(
                     "Failed to get input value for {}",
                     output_name
                 ));
             }
         } else {
+            error!("Failed to get inputs for node {}", node_id);
             return Err(anyhow::anyhow!("Failed to get inputs for node {}", node_id));
         }
     }
-
+    info!("input_values: {:#?}", input_values);
     Ok(input_values)
 }
