@@ -19,6 +19,7 @@ use std::hash::Hash;
 use std::io::Read;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
+use tauri::Window;
 // use tokio::sync::RwLock;
 use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
 use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using Tokio for async runtime
@@ -99,6 +100,8 @@ pub enum DataValue {
     /// A vector of floating-point values.
     VecFloat(Vec<f64>),
     HashMap(HashMap<String, DataValue>),
+    #[serde(skip)]
+    TauriWindow(Window),
 
     VecHashMap(Vec<HashMap<String, DataValue>>),
     /// A boolean value.
@@ -124,6 +127,20 @@ pub trait Convertible {
     fn from_value(value: &DataValue) -> Option<Self>
     where
         Self: Sized;
+}
+
+impl Convertible for Window {
+    fn to_value(&self) -> DataValue {
+        DataValue::TauriWindow(self.clone())
+    }
+
+    fn from_value(value: &DataValue) -> Option<Self> {
+        if let DataValue::TauriWindow(w) = value {
+            Some(w.clone())
+        } else {
+            None
+        }
+    }
 }
 
 impl Convertible for f64 {
