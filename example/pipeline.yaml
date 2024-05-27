@@ -6,19 +6,19 @@ nodes:
     inputs:
       - name: num1
         description: Description of num1
-        type: Float
+        data_type: Float
         reference: inputs.num1
       - name: num2
         description: Description of num2
-        type: Float
+        data_type: Float
         reference: inputs.num2
     outputs:
       - name: sum
-        type: Float
+        data_type: Float
         reference: node1.sum
     action: function_to_call1
     failure: failure_function1
-    onfailure: false
+    onfailure: true
     description: Description of node1
     timeout: 3600  # 1 hour in seconds
     try_count: 3
@@ -29,12 +29,12 @@ nodes:
     inputs:
       - name: result
         description: Description of result (referencing sum of node1)
-        type: Float
+        data_type: Float
         reference: node1.sum
     outputs:
       - name: squared_result
-        type: Float
-        reference: node2.squared_result
+        data_type: Float
+        reference: node2.squared_result2
     action: function_to_call2
     failure: failure_function2
     onfailure: false
@@ -48,15 +48,15 @@ nodes:
     inputs:
       - name: result
         description: Description of result (referencing squared_result of node2)
-        type: Float
+        data_type: Float
         reference: node2.squared_result
     outputs:
       - name: doubled_result
-        type: Float
+        data_type: Float
         reference: node3.doubled_result
-      - name: puta
-        type: String  
-        reference: node3.puta
+      - name: test_string
+        data_type: String  
+        reference: node3.tester
     action: function_to_call3
     failure: failure_function3
     onfailure: true
