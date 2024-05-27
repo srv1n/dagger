@@ -98,7 +98,9 @@ pub enum DataValue {
     VecInt(Vec<i64>),
     /// A vector of floating-point values.
     VecFloat(Vec<f64>),
+    HashMap(HashMap<String, DataValue>),
 
+    VecHashMap(Vec<HashMap<String, DataValue>>),
     /// A boolean value.
     Bool(bool),
 
