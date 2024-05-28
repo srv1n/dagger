@@ -9,7 +9,7 @@ use dagger::parse_input;
 use dagger::register_action;
 use dagger::Cache;
 use dagger::DagExecutor;
-use dagger::{Convertible, DataValue, Node, NodeAction};
+use dagger::{Convertible, Node, NodeAction};
 use std::collections::HashMap;
 use tracing::Level;
 use tracing::{debug, error, info, trace, warn};

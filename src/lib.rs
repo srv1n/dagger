@@ -59,40 +59,43 @@ pub struct Graph {
     pub description: String,
     pub instructions: Vec<String>,
     pub tags: Vec<String>,
+    pub author: String,
+    pub version: String,
+    pub signature: String,
 }
 
 /// Represents a value that can be used as input or output in a node.
-#[derive(Clone)]
-pub enum DataValue {
-    /// A floating-point value.
-    Float(f64),
-    /// An integer value.
-    Integer(i64),
-    /// A string value.
-    String(String),
+// #[derive(Clone)]
+// pub enum DataValue {
+//     /// A floating-point value.
+//     Float(f64),
+//     /// An integer value.
+//     Integer(i64),
+//     /// A string value.
+//     String(String),
 
-    /// A vector of strings.
-    VecString(Vec<String>),
-    /// A vector of integers.
-    VecInt(Vec<i64>),
-    /// A vector of floating-point values.
-    VecFloat(Vec<f64>),
-    HashMap(HashMap<String, DynAny>),
+//     /// A vector of strings.
+//     VecString(Vec<String>),
+//     /// A vector of integers.
+//     VecInt(Vec<i64>),
+//     /// A vector of floating-point values.
+//     VecFloat(Vec<f64>),
+//     HashMap(HashMap<String, DynAny>),
 
-    VecHashMap(Vec<HashMap<String, DynAny>>),
-    /// A boolean value.
-    Bool(bool),
+//     VecHashMap(Vec<HashMap<String, DynAny>>),
+//     /// A boolean value.
+//     Bool(bool),
 
-    /// An object with string keys and values.
-    Object(HashMap<String, DynAny>),
+//     /// An object with string keys and values.
+//     Object(HashMap<String, DynAny>),
 
-    /// A null value.
-    Null,
+//     /// A null value.
+//     Null,
 
-    /// A datetime value in UTC.
-    DateTime(chrono::DateTime<chrono::Utc>),
-    // Add more variants as needed
-}
+//     /// A datetime value in UTC.
+//     DateTime(chrono::DateTime<chrono::Utc>),
+//     // Add more variants as needed
+// }
 
 /// A trait for converting values between Rust types and `DynAny` enum.
 pub trait Convertible {
@@ -205,75 +208,79 @@ pub trait Convertible {
 
 /// An input or output field of a node.
 #[derive(Debug, Clone, Deserialize)]
-pub struct IOField {
+pub struct IField {
     /// The name of the field.
     pub name: String,
     /// The description of the field.
     pub description: Option<String>,
     /// The data type of the field.
-    pub data_type: String, // Changed to String for simplicity in this example
+    // pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
     pub reference: String,
     // pub default: Option<DynAny>,
 }
 
-/// The type of a variable.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub enum VariableType {
-    /// A floating-point variable.
-    Float,
-    /// An integer variable.
-    Integer,
-    /// A string variable.
-    String,
-    /// A vector of strings.
-    VecString,
-    /// A vector of integers.
-    VecInt,
-    /// A vector of floating-point values.
-    VecFloat,
-
-    /// A boolean value.
-    Bool,
-
-    /// An object with string keys and values.
-    Object,
-
-    /// A null value.
-    Null,
-
-    Any,
-    /// A datetime value in UTC.
-    DateTime,
+/// An input or output field of a node.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OField {
+    /// The name of the field.
+    pub name: String,
+    /// The description of the field.
+    pub description: Option<String>,
 }
+
+/// The type of a variable.
+// #[derive(Debug, Deserialize, Serialize, Clone)]
+// pub enum VariableType {
+//     /// A floating-point variable.
+//     Float,
+//     /// An integer variable.
+//     Integer,
+//     /// A string variable.
+//     String,
+//     /// A vector of strings.
+//     VecString,
+//     /// A vector of integers.
+//     VecInt,
+//     /// A vector of floating-point values.
+//     VecFloat,
+
+//     /// A boolean value.
+//     Bool,
+
+//     /// An object with string keys and values.
+//     Object,
+
+//     /// A null value.
+//     Null,
+
+//     Any,
+//     /// A datetime value in UTC.
+//     DateTime,
+// }
 
 /// An input to a node.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Input {
-    /// The name of the input.
-    pub name: String,
-    /// The description of the input.
-    pub description: String,
-    /// The input type.
-    #[serde(rename = "type")]
-    pub input_type: VariableType,
-    /// The reference to another node's output.
-    pub reference: String,
-    /// An optional prompt for the input.
-    pub prompt: Option<String>,
+// #[derive(Debug, Deserialize, Serialize, Clone)]
+// pub struct Input {
+//     /// The name of the input.
+//     pub name: String,
+//     /// The description of the input.
+//     pub description: String,
+//     /// The input type
+//     /// The reference to another node's output.
+//     pub reference: String,
+//     /// An optional prompt for the input.
+//     pub prompt: Option<String>,
 
-    pub instruction: Option<String>,
-}
+//     pub instruction: Option<String>,
+// }
 
-/// An output of a node.
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct Output {
-    /// The name of the output.
-    pub name: String,
-    /// The output type.
-    #[serde(rename = "type")]
-    pub output_type: VariableType,
-}
+// /// An output of a node.
+// #[derive(Debug, Deserialize, Serialize, Clone)]
+// pub struct Output {
+//     /// The name of the output.
+//     pub name: String,
+// }
 
 /// A node in the graph.
 #[derive(Debug, Clone, Deserialize)]
@@ -284,9 +291,9 @@ pub struct Node {
     /// The dependencies of the node (other nodes that must be executed before this node).
     pub dependencies: Vec<String>,
     /// The inputs of the node.
-    pub inputs: Vec<IOField>,
+    pub inputs: Vec<IField>,
     /// The outputs of the node.
-    pub outputs: Vec<IOField>,
+    pub outputs: Vec<OField>,
     /// The action to be executed by the node.
     pub action: String,
     /// The failure action to be executed if the node's action fails.
@@ -321,7 +328,7 @@ pub fn get_value<T: 'static>(cache: &Cache, category: &str, key: &str) -> Option
     }
     None
 }
-pub fn parse_input<T: 'static>(cache: &Cache, input: IOField) -> Result<T> {
+pub fn parse_input<T: 'static>(cache: &Cache, input: IField) -> Result<T> {
     let parts: Vec<&str> = input.reference.split('.').collect();
     if parts.len() != 2 {
         error!("Invalid reference format: {}", input.reference);
@@ -456,7 +463,7 @@ impl DagExecutor {
         validate_dag_structure(&dag)?;
         validate_node_dependencies(&graph.nodes, &node_indices)?;
         validate_node_actions(self, &graph.nodes)?;
-        validate_io_data_types(&graph.nodes)?;
+        // validate_io_data_types(&graph.nodes)?;
 
         for node in &graph.nodes {
             let dependent_node_index = node_indices[&node.id];
@@ -671,32 +678,32 @@ pub fn validate_node_actions(executor: &DagExecutor, nodes: &[Node]) -> Result<(
 }
 
 /// Validates the data types of the inputs and outputs of the nodes.
-pub fn validate_io_data_types(nodes: &[Node]) -> Result<(), Error> {
-    let valid_types = vec!["Float", "Integer", "String"]; // Extend this list as needed
-    for node in nodes {
-        for input in &node.inputs {
-            if !valid_types.contains(&input.data_type.as_str()) {
-                return Err(anyhow!(format!(
-                    "Unsupported data type '{}' in inputs for node '{}'.",
-                    input.data_type, node.id
-                )));
-            }
-        }
-        for output in &node.outputs {
-            if !valid_types.contains(&output.data_type.as_str()) {
-                return Err(anyhow!(format!(
-                    "Unsupported data type '{}' in outputs for node '{}'.",
-                    output.data_type, node.id
-                )));
-            }
-        }
-    }
-    Ok(())
-}
+// pub fn validate_io_data_types(nodes: &[Node]) -> Result<(), Error> {
+//     let valid_types = vec!["Float", "Integer", "String"]; // Extend this list as needed
+//     for node in nodes {
+//         for input in &node.inputs {
+//             if !valid_types.contains(&input.data_type.as_str()) {
+//                 return Err(anyhow!(format!(
+//                     "Unsupported data type '{}' in inputs for node '{}'.",
+//                     input.data_type, node.id
+//                 )));
+//             }
+//         }
+//         for output in &node.outputs {
+//             if !valid_types.contains(&output.data_type.as_str()) {
+//                 return Err(anyhow!(format!(
+//                     "Unsupported data type '{}' in outputs for node '{}'.",
+//                     output.data_type, node.id
+//                 )));
+//             }
+//         }
+//     }
+//     Ok(())
+// }
 
 pub fn get_input_values(
     cache: &Cache,
-    node_inputs: &Vec<IOField>,
+    node_inputs: &Vec<IField>,
 ) -> Result<HashMap<String, DynAny>, anyhow::Error> {
     let mut input_values = HashMap::new();
     println!("node_inputs: {:#?}", node_inputs);
