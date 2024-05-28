@@ -4,8 +4,12 @@
 //! loading graph definitions from YAML files, validating the graph structure, and executing
 //! custom actions associated with each node in the graph.
 
+use any::{downcast, DynAny, IntoAny};
 use anyhow::anyhow;
 use anyhow::{Context, Error, Result};
+use dyn_clone::DynClone;
+pub mod any;
+pub use any::*;
 use async_trait::async_trait;
 use chrono::Utc;
 use core::any::type_name;
@@ -13,42 +17,19 @@ use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::Topo;
 use serde::{Deserialize, Serialize};
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::fmt::format;
 use std::fs::File;
 use std::hash::Hash;
 use std::io::Read;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
-use tauri::Window;
+
 // use tokio::sync::RwLock;
 use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
 use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using Tokio for async runtime
 
-/// Macro for registering an action with the `DagExecutor`.
-///
-/// # Examples
-///
-/// ```
-/// use dagger::register_action;
-/// use dagger::DagExecutor;
-/// use dagger::NodeAction;
-///
-/// struct MyAction;
-///
-/// #[async_trait::async_trait]
-/// impl NodeAction for MyAction {
-///     fn name(&self) -> String {
-///         "my_action".to_string()
-///     }
-///
-///     async fn execute(&self, node: &Node, inputs: &HashMap<String, DataValue>) -> Result<HashMap<String, DataValue>> {
-///         // Implementation of the action
-///     }
-/// }
-///
-/// let executor = DagExecutor::new();
-/// register_action!(executor, "My Action", MyAction);
-/// ```
 #[macro_export]
 macro_rules! register_action {
     ($executor:expr, $action_name:expr, $action_func:path) => {{
@@ -60,12 +41,8 @@ macro_rules! register_action {
                 $action_name.to_string()
             }
 
-            async fn execute(
-                &self,
-                node: &Node,
-                inputs: &HashMap<String, DataValue>,
-            ) -> Result<HashMap<String, DataValue>> {
-                $action_func(node, inputs).await
+            async fn execute(&self, node: &Node, cache: &Cache) -> Result<()> {
+                $action_func(node, cache).await
             }
         }
 
@@ -80,11 +57,12 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub name: String,
     pub description: String,
-    pub tags: Option<Vec<String>>,
+    pub instructions: Vec<String>,
+    pub tags: Vec<String>,
 }
 
 /// Represents a value that can be used as input or output in a node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub enum DataValue {
     /// A floating-point value.
     Float(f64),
@@ -99,16 +77,14 @@ pub enum DataValue {
     VecInt(Vec<i64>),
     /// A vector of floating-point values.
     VecFloat(Vec<f64>),
-    HashMap(HashMap<String, DataValue>),
-    #[serde(skip)]
-    TauriWindow(Window),
+    HashMap(HashMap<String, DynAny>),
 
-    VecHashMap(Vec<HashMap<String, DataValue>>),
+    VecHashMap(Vec<HashMap<String, DynAny>>),
     /// A boolean value.
     Bool(bool),
 
     /// An object with string keys and values.
-    Object(HashMap<String, DataValue>),
+    Object(HashMap<String, DynAny>),
 
     /// A null value.
     Null,
@@ -118,128 +94,127 @@ pub enum DataValue {
     // Add more variants as needed
 }
 
-/// A trait for converting values between Rust types and `DataValue` enum.
+/// A trait for converting values between Rust types and `DynAny` enum.
 pub trait Convertible {
-    /// Converts a Rust type to a `DataValue` enum.
-    fn to_value(&self) -> DataValue;
+    /// Converts a Rust type to a `DynAny` enum.
+    fn to_value(&self) -> DynAny;
 
-    /// Converts a `DataValue` enum to a Rust type.
-    fn from_value(value: &DataValue) -> Option<Self>
+    /// Converts a `DynAny` enum to a Rust type.
+    fn from_value(value: &DynAny) -> Option<Self>
     where
         Self: Sized;
 }
 
-impl Convertible for Window {
-    fn to_value(&self) -> DataValue {
-        DataValue::TauriWindow(self.clone())
-    }
+// impl Convertible for Window {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::TauriWindow(self.clone())
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::TauriWindow(w) = value {
-            Some(w.clone())
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::TauriWindow(w) = value {
+//             Some(w.clone())
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for f64 {
-    fn to_value(&self) -> DataValue {
-        DataValue::Float(*self)
-    }
+// impl Convertible for f64 {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::Float(*self)
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::Float(f) = value {
-            Some(*f)
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::Float(f) = value {
+//             Some(*f)
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for i64 {
-    fn to_value(&self) -> DataValue {
-        DataValue::Integer(*self)
-    }
+// impl Convertible for i64 {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::Integer(*self)
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::Integer(i) = value {
-            Some(*i)
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::Integer(i) = value {
+//             Some(*i)
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for String {
-    fn to_value(&self) -> DataValue {
-        DataValue::String(self.clone())
-    }
+// impl Convertible for String {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::String(self.clone())
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::String(s) = value {
-            Some(s.clone())
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::String(s) = value {
+//             Some(s.clone())
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for bool {
-    fn to_value(&self) -> DataValue {
-        DataValue::Bool(*self)
-    }
+// impl Convertible for bool {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::Bool(*self)
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::Bool(b) = value {
-            Some(*b)
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::Bool(b) = value {
+//             Some(*b)
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for HashMap<String, DataValue> {
-    fn to_value(&self) -> DataValue {
-        DataValue::Object(self.clone())
-    }
+// impl Convertible for HashMap<String, DynAny> {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::Object(self.clone())
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::Object(obj) = value {
-            Some(obj.clone())
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::Object(obj) = value {
+//             Some(obj.clone())
+//         } else {
+//             None
+//         }
+//     }
+// }
 
-impl Convertible for chrono::DateTime<Utc> {
-    fn to_value(&self) -> DataValue {
-        DataValue::DateTime(*self)
-    }
+// impl Convertible for chrono::DateTime<Utc> {
+//     fn to_value(&self) -> DynAny {
+//         DynAny::DateTime(*self)
+//     }
 
-    fn from_value(value: &DataValue) -> Option<Self> {
-        if let DataValue::DateTime(dt) = value {
-            Some(*dt)
-        } else {
-            None
-        }
-    }
-}
+//     fn from_value(value: &DynAny) -> Option<Self> {
+//         if let DynAny::DateTime(dt) = value {
+//             Some(*dt)
+//         } else {
+//             None
+//         }
+//     }
+// }
 
 /// An input or output field of a node.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct IOField {
     /// The name of the field.
     pub name: String,
     /// The description of the field.
     pub description: Option<String>,
     /// The data type of the field.
-    #[serde(rename = "type")]
     pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
     pub reference: String,
-    pub default: Option<DataValue>,
+    // pub default: Option<DynAny>,
 }
 
 /// The type of a variable.
@@ -267,6 +242,7 @@ pub enum VariableType {
     /// A null value.
     Null,
 
+    Any,
     /// A datetime value in UTC.
     DateTime,
 }
@@ -300,7 +276,7 @@ pub struct Output {
 }
 
 /// A node in the graph.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Node {
     /// The unique identifier of the node.
     ///
@@ -326,7 +302,50 @@ pub struct Node {
 }
 
 /// Type alias for a cache of input and output values.
-pub type Cache = RwLock<HashMap<String, HashMap<String, DataValue>>>;
+pub type Cache = RwLock<HashMap<String, HashMap<String, DynAny>>>;
+
+pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
+    let mut cache_write = cache.write().unwrap();
+    let category_map = cache_write.entry(category).or_insert_with(HashMap::new);
+    category_map.insert(key, Box::new(value));
+}
+
+pub fn get_value<T: 'static>(cache: &Cache, category: &str, key: &str) -> Option<T> {
+    let cache_read = cache.read().unwrap();
+    if let Some(category_map) = cache_read.get(category) {
+        if let Some(value) = category_map.get(key) {
+            if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                return Some(downcasted_value);
+            }
+        }
+    }
+    None
+}
+pub fn parse_input<T: 'static>(cache: &Cache, input: IOField) -> Result<T> {
+    let parts: Vec<&str> = input.reference.split('.').collect();
+    if parts.len() != 2 {
+        error!("Invalid reference format: {}", input.reference);
+        return Err(anyhow::anyhow!(format!(
+            "Invalid reference format. needs to be node.reference on field: {}",
+            input.reference
+        )));
+    }
+
+    let node_id = parts[0];
+    let output_name = parts[1];
+    let cache_read = cache.read().unwrap();
+    if let Some(category_map) = cache_read.get(node_id) {
+        if let Some(value) = category_map.get(output_name) {
+            if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                return Ok(downcasted_value);
+            }
+        }
+    }
+    Err(anyhow::anyhow!(format!(
+        "Value not found {}",
+        input.reference
+    )))
+}
 
 /// A trait for custom actions associated with nodes.
 #[async_trait]
@@ -337,11 +356,7 @@ pub trait NodeAction: Send + Sync {
     }
 
     /// Executes the action with the given node and inputs, and returns the outputs.
-    async fn execute(
-        &self,
-        node: &Node,
-        inputs: &HashMap<String, DataValue>,
-    ) -> Result<HashMap<String, DataValue>>;
+    async fn execute(&self, node: &Node, cache: &Cache) -> Result<()>;
 }
 
 /// The main executor for DAGs.
@@ -413,16 +428,16 @@ impl DagExecutor {
     pub async fn execute_dag(
         &self,
         name: &str,
-        inputs: HashMap<String, HashMap<String, DataValue>>,
-    ) -> Result<HashMap<String, HashMap<String, DataValue>>, Error> {
+        cache: &Cache, // : HashMap<String, HashMap<String, DynAny>>,
+    ) -> Result<(), Error> {
         let (dag, node_indices) = self
             .prebuilt_dags
             .get(name)
             .ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
         // let mut updated_inputs = inputs.clone();
-        let final_results = execute_dag_async(self, &dag, inputs).await?;
+        let final_results = execute_dag_async(self, &dag, cache).await?;
 
-        Ok(final_results)
+        Ok(())
     }
 
     fn build_dag_internal(
@@ -456,11 +471,7 @@ impl DagExecutor {
 
 /// Executes a single node asynchronously and returns its outputs.
 
-async fn execute_node_async(
-    executor: &DagExecutor,
-    node: &Node,
-    inputs: &HashMap<String, HashMap<String, DataValue>>,
-) -> Result<(String, Result<HashMap<String, DataValue>>), anyhow::Error> {
+async fn execute_node_async(executor: &DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
     // println!("Executing node: {}", node.id);
     let action = {
         // let registry = executor
@@ -483,19 +494,26 @@ async fn execute_node_async(
 
     let timeout_duration = Duration::from_secs(node.timeout as u64);
     let mut retries_left = node.try_count;
-    let inputs_to_function = get_input_values(inputs, &node.inputs)?;
+    // let inputs_to_function = get_input_values(inputs, &node.inputs)?;
     while retries_left > 0 {
         info!(
             "Trying to execute node: {} ({} retries left)...",
             node.id, retries_left
         );
-        match timeout(timeout_duration, action.execute(node, &inputs_to_function)).await {
+        match timeout(timeout_duration, action.execute(node, &cache)).await {
             Ok(Ok(result)) => {
                 info!("Node '{}' execution succeeded", node.id);
-                return Ok((node.id.clone(), Ok(result)));
+                return Ok(());
             }
             Ok(Err(e)) => {
                 error!("Node '{}' execution failed: {}", node.id, e);
+                insert_value(
+                    cache,
+                    node.id.clone(),
+                    format!("error_retry{}", retries_left),
+                    e.to_string(),
+                );
+                // let current_error = get_value(cache, node.id, "error")
                 if node.onfailure {
                     warn!(
                         "Retrying node '{}' ({} retries left)...",
@@ -507,10 +525,18 @@ async fn execute_node_async(
                     return Err(anyhow!("Node '{}' execution failed: {}", node.id, e));
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 error!(
-                    "Node '{}' execution timed out after {} seconds",
-                    node.id, node.timeout
+                    "Node '{}' execution timed out after {} seconds due to {}",
+                    node.id,
+                    node.timeout,
+                    e.to_string()
+                );
+                insert_value(
+                    cache,
+                    node.id.clone(),
+                    format!("error_retry_{}_timeout", retries_left),
+                    e.to_string(),
                 );
                 if node.onfailure {
                     warn!(
@@ -519,13 +545,30 @@ async fn execute_node_async(
                     );
                     sleep(Duration::from_secs(1)).await; // Wait for 1 second before retrying
                     retries_left -= 1;
+                    insert_value(
+                        cache,
+                        node.id.clone(),
+                        format!("error_retry_{}_timeout", retries_left),
+                        e.to_string(),
+                    );
                 } else {
+                    insert_value(
+                        cache,
+                        node.id.clone(),
+                        format!("error_retry_{}_timeout", retries_left),
+                        e.to_string(),
+                    );
                     return Err(anyhow!("Node '{}' execution timed out", node.id));
                 }
             }
         }
     }
-
+    insert_value(
+        cache,
+        node.id.clone(),
+        format!("error_retry_{}_final", retries_left),
+        "Done with all retries",
+    );
     Err(anyhow!(
         "Node '{}' failed after {} retries",
         node.id,
@@ -536,77 +579,47 @@ async fn execute_node_async(
 pub async fn execute_dag_async(
     executor: &DagExecutor,
     dag: &DiGraph<Node, ()>,
-    inputs: HashMap<String, HashMap<String, DataValue>>,
-) -> Result<HashMap<String, HashMap<String, DataValue>>, anyhow::Error> {
+    cache: &Cache,
+) -> Result<(), anyhow::Error> {
     let mut topo = Topo::new(dag);
 
-    let updated_inputs = Cache::new(inputs);
+    // let updated_inputs = Cache::new(inputs);
     while let Some(node_index) = topo.next(dag) {
         let node = &dag[node_index];
-        let current_inputs = updated_inputs
-            .read()
-            .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
-            .clone();
-        // println!("current_inputs: {:?}", current_inputs);
-        match execute_node_async(executor, node, &current_inputs).await {
-            Ok((node_id, outputs)) => {
-                let mut updated_inputs = updated_inputs
-                    .write()
-                    .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
-                for (name, value) in outputs.map_err(|e| {
-                    anyhow!(
-                        "Failed to get outputs to update node outputs: {} on node {}",
-                        e,
-                        node.id
-                    )
-                })? {
-                    let mut first: HashMap<String, DataValue> = HashMap::new();
-                    let mut temp: HashMap<String, HashMap<String, DataValue>> = HashMap::new();
-                    first.insert(name, value);
-                    temp.insert(node_id.clone(), first);
+        // let current_inputs = updated_inputs
+        //     .read()
+        //     .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
+        //     .clone();
 
-                    updated_inputs.extend(temp);
-                    // updated_inputs.insert(format!("{}.{}", node_id, name), value);
-                }
-            }
+        match execute_node_async(executor, node, cache).await {
+            Ok(()) => {}
             Err(err) => {
                 if !node.onfailure {
                     return Err(anyhow!("Node execution failed: {}", err));
                 } else {
-                    let mut updated_inputs = updated_inputs
-                        .write()
-                        .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
-                    let mut first: HashMap<String, DataValue> = HashMap::new();
-                    let mut temp: HashMap<String, HashMap<String, DataValue>> = HashMap::new();
-                    first.insert("error".to_owned(), DataValue::String(err.to_string()));
-                    temp.insert(node.id.clone(), first);
+                    info!("Node '{}' execution failed: {}", node.id, err);
+                    insert_value(cache, node.id.clone(), "error".to_string(), err.to_string());
+                    // let mut updated_inputs = updated_inputs
+                    //     .write()
+                    //     .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?;
+                    // let category_map = updated_inputs
+                    //     .entry(node.id.clone())
+                    //     .or_insert_with(HashMap::new);
+                    // category_map.insert("error".to_owned(), Box::new(err.to_string()) as DynAny);
 
-                    updated_inputs.extend(temp);
-
-                    match updated_inputs.get_mut("error") {
-                        Some(val) => {
-                            val.insert(node.id.to_owned(), DataValue::String(err.to_string()));
-                        }
-                        None => {
-                            let mut first: HashMap<String, DataValue> = HashMap::new();
-                            let mut temp: HashMap<String, HashMap<String, DataValue>> =
-                                HashMap::new();
-                            first.insert(node.id.clone(), DataValue::String(err.to_string()));
-                            temp.insert("error".to_owned(), first);
-
-                            updated_inputs.extend(temp);
-                        }
-                    }
-                    continue;
+                    // let error_map = updated_inputs
+                    //     .entry("error".to_owned())
+                    //     .or_insert_with(HashMap::new);
+                    // error_map.insert(node.id.clone(), Box::new(err.to_string()) as DynAny);
                 }
             }
         }
     }
-    let final_results = updated_inputs
+    let final_results = cache
         .read()
         .map_err(|e| anyhow!("Failed to acquire lock: {}", e))?
         .clone();
-    Ok(final_results)
+    Ok(())
 }
 
 /// Validates the structure of the DAG.
@@ -680,12 +693,12 @@ pub fn validate_io_data_types(nodes: &[Node]) -> Result<(), Error> {
     Ok(())
 }
 
-fn get_input_values(
-    inputs: &HashMap<String, HashMap<String, DataValue>>,
+pub fn get_input_values(
+    cache: &Cache,
     node_inputs: &Vec<IOField>,
-) -> Result<HashMap<String, DataValue>, anyhow::Error> {
+) -> Result<HashMap<String, DynAny>, anyhow::Error> {
     let mut input_values = HashMap::new();
-    info!("node_inputs: {:#?}", node_inputs);
+    println!("node_inputs: {:#?}", node_inputs);
     for input in node_inputs {
         let reference = input.reference.clone();
         let parts: Vec<&str> = reference.split('.').collect();
@@ -695,22 +708,14 @@ fn get_input_values(
         }
         let node_id = parts[0];
         let output_name = parts[1];
+        println!("node_id: {}, output_name: {}", node_id, output_name);
+        let val: DynAny = get_value(cache, "inputs", "num1").unwrap();
+        println!("val: {:#?}", val);
 
-        if let Some(node_outputs) = inputs.get(node_id) {
-            if let Some(value) = node_outputs.get(output_name) {
-                input_values.insert(input.name.clone(), value.clone());
-            } else {
-                error!("Failed to get input value for {}", output_name);
-                return Err(anyhow::anyhow!(
-                    "Failed to get input value for {}",
-                    output_name
-                ));
-            }
-        } else {
-            error!("Failed to get inputs for node {}", node_id);
-            return Err(anyhow::anyhow!("Failed to get inputs for node {}", node_id));
-        }
+        get_value(cache, node_id, output_name)
+            .map(|value| input_values.insert(input.name.clone(), value))
+            .unwrap();
     }
-    info!("input_values: {:#?}", input_values);
+    println!("input_values: {:#?}", input_values);
     Ok(input_values)
 }
