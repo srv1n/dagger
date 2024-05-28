@@ -420,6 +420,24 @@ impl DagExecutor {
         Ok(())
     }
 
+    // extend above to load all yaml files in a directory
+
+    pub fn load_yaml_dir(&mut self, dir_path: &str) -> Result<(), Error> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                files.push(entry.path());
+            }
+        }
+        for file in files {
+            self.load_yaml_file(file.to_str().unwrap()).map_err(|e| {
+                anyhow!("Failed to load YAML file {}: {}", file.to_str().unwrap(), e)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Builds a directed acyclic graph (DAG) from the loaded graph definition.
     // pub fn build_dag(&mut self, name: &str) -> Result<(), Error> {
     //     let graph = self

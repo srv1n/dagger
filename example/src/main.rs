@@ -91,10 +91,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_action!(executor, "function_to_call2", function_to_call2);
     register_action!(executor, "function_to_call3", function_to_call3);
     executor.load_yaml_file("pipeline.yaml")?;
+    executor.load_yaml_dir("./dags")?;
 
     let names = executor.list_dags();
     println!("Loaded DAGs: {:#?}", names);
-    let filter_tags = executor.list_dag_filtered_tag("maths");
+    let filter_tags = executor.list_dag_filtered_tag("math");
     println!("Filtered DAGs: {:#?}", filter_tags);
     // let mut temp = HashMap::new();
     // temp.insert("num1".to_string(), DataValue::Float(10.0));
@@ -106,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     insert_value(&cache, "inputs".to_string(), "num1".to_string(), 10.0);
 
     insert_value(&cache, "inputs".to_string(), "num2".to_string(), 20.0);
-    let _ = run_dag(executor, "example", &cache).await?;
+    let _ = run_dag(executor, "infolder", &cache).await?;
     let result = cache.read().unwrap();
     println!("{:#?}", result);
     let test: f64 = get_value::<f64>(&cache, "node3", "doubled_result").unwrap();
