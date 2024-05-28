@@ -401,9 +401,10 @@ impl DagExecutor {
         };
         let mut yaml_content = String::new();
         file.read_to_string(&mut yaml_content)
-            .context("Failed to read file")?;
+            .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
 
-        let graph: Graph = serde_yaml::from_str(&yaml_content).context("Failed to parse YAML")?;
+        let graph: Graph = serde_yaml::from_str(&yaml_content)
+            .map_err(|e| anyhow!("Failed to parse YAML file: {}", e))?;
 
         let (dag, node_indices) = self.build_dag_internal(&graph)?;
         let name = graph.name.clone();

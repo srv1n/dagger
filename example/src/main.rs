@@ -29,20 +29,6 @@ async fn function_to_call1(node: &Node, cache: &Cache) -> Result<()> {
     let num2 = get_value::<f64>(cache, "inputs", &node.inputs[1].name)
         .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[1].name))?;
 
-    // let num1: f64 = Convertible::from_value(
-    //     inputs
-    //         .get(&node.inputs[0].name)
-    //         .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[0].name))?,
-    // )
-    // .ok_or_else(|| anyhow!("Failed to convert input '{}' to f64.", node.inputs[0].name))?;
-
-    // let num2: f64 = Convertible::from_value(
-    //     inputs
-    //         .get(&node.inputs[1].name)
-    //         .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[1].name))?,
-    // )
-    // .ok_or_else(|| anyhow!("Failed to convert input '{}' to f64.", node.inputs[1].name))?;
-
     // Perform the operation with the retrieved and converted inputs
     let new = num1 + num2;
 
@@ -55,13 +41,8 @@ async fn function_to_call1(node: &Node, cache: &Cache) -> Result<()> {
 }
 
 async fn function_to_call2(node: &Node, cache: &Cache) -> Result<()> {
-    // let mut outputs = HashMap::new();
-    // Example operation: square the input
-    // println!("Cache: {:#?}", cache);
-
     let result: f64 = parse_input(cache, node.inputs[0].clone())?;
 
-    // let numa: f64 = downcast::<f64>(Box::new(inputs.get("result").unwrap()));
     // Perform the operation
     insert_value(
         cache,
@@ -72,18 +53,8 @@ async fn function_to_call2(node: &Node, cache: &Cache) -> Result<()> {
     // outputs.insert("squared_result".to_string(), num * num);
     Ok(())
 }
-//     if let Some(DataValue::Float(num)) = inputs.get(&node.inputs[0].name) {
-//         outputs.insert("squared_result".to_string(), DataValue::Float(num * num));
-//         Ok(outputs)
-//     } else {
-//         Err(anyhow::anyhow!("Failed to get input for squaring"))
-//     }
-// }
 
 async fn function_to_call3(node: &Node, cache: &Cache) -> Result<(), Error> {
-    // let mut outputs = HashMap::new();
-    // Example operation: double the input
-
     let num: f64 = parse_input(cache, node.inputs[0].clone())?;
 
     insert_value(
@@ -97,20 +68,8 @@ async fn function_to_call3(node: &Node, cache: &Cache) -> Result<(), Error> {
         cache,
         node.id.clone(),
         node.outputs[1].name.clone(),
-        "Shaata".to_string(),
+        "Testo".to_string(),
     );
-
-    // let result: f64 = Convertible::from_value(
-    //     inputs
-    //         .get("result")
-    //         .ok_or_else(|| anyhow::anyhow!("Failed to get input for doubling"))?,
-    // )
-    // .context(format!(
-    //     "Failed to convert input '{}' to f64.",
-    //     node.inputs[0].name
-    // ))?;
-
-    // outputs.insert("tripled_result".to_string(), DataValue::Float(result * 3.0));
 
     Ok(())
 }
