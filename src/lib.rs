@@ -475,6 +475,60 @@ impl DagExecutor {
 
         Ok((dag, node_indices))
     }
+
+    pub fn list_dags(&self) -> Vec<(String, String)> {
+        // return name and description of all graphs
+        let response = self
+            .graphs
+            .iter()
+            .map(|(name, graph)| (name.clone(), graph.description.clone()))
+            .collect();
+        response
+    }
+
+    pub fn list_dag_filtered_tag(&self, filter: &str) -> Vec<(String, String)> {
+        // return name and description of all graphs that match a substring within any of the tags (tags is a vec<String>)
+        let response = self
+            .graphs
+            .iter()
+            .filter(|(name, graph)| graph.tags.iter().any(|tag| tag.contains(filter)))
+            .map(|(name, graph)| (name.clone(), graph.description.clone()))
+            .collect();
+        response
+    }
+    // given a dag name return a list of instructions
+    pub fn list_dag_instructions(&self, name: &str) -> Vec<String> {
+        // return name and description of all graphs
+        let response = self
+            .graphs
+            .get(name)
+            .ok_or_else(|| anyhow!("Graph '{}' not found", name))
+            .unwrap()
+            .instructions
+            .iter()
+            .map(|instruction| instruction.clone())
+            .collect();
+        response
+    }
+
+    // list all metadata of avaialble dags name, description, signature, author, version
+    pub fn list_dags_metadata(&self) -> Vec<(String, String, String, String, String)> {
+        // return name and description of all graphs
+        let response = self
+            .graphs
+            .iter()
+            .map(|(name, graph)| {
+                (
+                    name.clone(),
+                    graph.description.clone(),
+                    graph.author.clone(),
+                    graph.version.clone(),
+                    graph.signature.clone(),
+                )
+            })
+            .collect();
+        response
+    }
 }
 
 /// Executes a single node asynchronously and returns its outputs.

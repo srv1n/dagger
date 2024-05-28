@@ -92,6 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_action!(executor, "function_to_call3", function_to_call3);
     executor.load_yaml_file("pipeline.yaml")?;
 
+    let names = executor.list_dags();
+    println!("Loaded DAGs: {:#?}", names);
+    let filter_tags = executor.list_dag_filtered_tag("maths");
+    println!("Filtered DAGs: {:#?}", filter_tags);
     // let mut temp = HashMap::new();
     // temp.insert("num1".to_string(), DataValue::Float(10.0));
     // temp.insert("num2".to_string(), DataValue::Float(20.0));
