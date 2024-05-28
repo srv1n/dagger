@@ -213,6 +213,7 @@ pub struct IField {
     pub name: String,
     /// The description of the field.
     pub description: Option<String>,
+    pub instructions: Option<Vec<String>>,
     /// The data type of the field.
     // pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.

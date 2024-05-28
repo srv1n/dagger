@@ -15,9 +15,12 @@ nodes:
       - name: num1
         description: Description of num1
         reference: inputs.num1
+        instructions:
+            - Any arbit text that can be used to do things like string templating {} 
       - name: num2
         description: Description of num2
         reference: inputs.num2
+        instructions:
     outputs:
       - name: sum
     action: function_to_call1
