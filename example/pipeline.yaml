@@ -6,8 +6,6 @@ signature: example
 tags:
  - example
  - math
-instructions:
- - "Template to print {{}}" 
 nodes:
   - id: node1
     dependencies: []

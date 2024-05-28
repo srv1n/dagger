@@ -57,7 +57,7 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     pub name: String,
     pub description: String,
-    pub instructions: Vec<String>,
+    pub instructions: Option<Vec<String>>,
     pub tags: Vec<String>,
     pub author: String,
     pub version: String,
@@ -512,20 +512,6 @@ impl DagExecutor {
             .iter()
             .filter(|(name, graph)| graph.tags.iter().any(|tag| tag.contains(filter)))
             .map(|(name, graph)| (name.clone(), graph.description.clone()))
-            .collect();
-        response
-    }
-    // given a dag name return a list of instructions
-    pub fn list_dag_instructions(&self, name: &str) -> Vec<String> {
-        // return name and description of all graphs
-        let response = self
-            .graphs
-            .get(name)
-            .ok_or_else(|| anyhow!("Graph '{}' not found", name))
-            .unwrap()
-            .instructions
-            .iter()
-            .map(|instruction| instruction.clone())
             .collect();
         response
     }

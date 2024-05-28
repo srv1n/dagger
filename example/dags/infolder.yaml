@@ -6,8 +6,6 @@ signature: example
 tags:
  - infolder
  - physics
-instructions:
- - "Template to print {{}}" 
 nodes:
   - id: node1
     dependencies: []
