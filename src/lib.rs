@@ -213,7 +213,7 @@ pub struct IField {
     pub name: String,
     /// The description of the field.
     pub description: Option<String>,
-    pub instructions: Option<Vec<String>>,
+
     /// The data type of the field.
     // pub data_type: String, // Changed to String for simplicity in this example
     /// The reference to another node's output.
@@ -307,6 +307,7 @@ pub struct Node {
     pub timeout: u64,
     /// The number of times to retry the node's action if it fails.
     pub try_count: u8,
+    pub instructions: Option<Vec<String>>,
 }
 
 /// Type alias for a cache of input and output values.
