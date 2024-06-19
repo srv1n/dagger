@@ -97,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loaded DAGs: {:#?}", names);
     let filter_tags = executor.list_dag_filtered_tag("math");
     println!("Filtered DAGs: {:#?}", filter_tags);
+    let multiple_filter_tags = executor.list_dag_multiple_tags(vec!["math".to_string()]);
+    println!("Multiple Filtered DAGs: {:#?}", multiple_filter_tags);
     // let mut temp = HashMap::new();
     // temp.insert("num1".to_string(), DataValue::Float(10.0));
     // temp.insert("num2".to_string(), DataValue::Float(20.0));

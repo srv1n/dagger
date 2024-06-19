@@ -517,6 +517,17 @@ impl DagExecutor {
         response
     }
 
+    pub fn list_dag_multiple_tags(&self, tags: Vec<String>) -> Vec<(String, String)> {
+        // return name and description of all graphs that match all tags
+        let response = self
+            .graphs
+            .iter()
+            .filter(|(name, graph)| tags.iter().all(|tag| graph.tags.contains(tag)))
+            .map(|(name, graph)| (name.clone(), graph.description.clone()))
+            .collect();
+        response
+    }
+
     // list all metadata of avaialble dags name, description, signature, author, version
     pub fn list_dags_metadata(&self) -> Vec<(String, String, String, String, String)> {
         // return name and description of all graphs
