@@ -2,6 +2,7 @@ use chrono::NaiveDateTime;
 use dyn_clone::DynClone;
 use std::{
     any::{type_name, Any, TypeId},
+    collections::HashMap,
     fmt::{self, Debug},
     hash::Hash,
 };
@@ -45,6 +46,36 @@ impl Debug for dyn IntoAny + Send + Sync {
             return write!(f, "{:?}", downcasted_value);
         } else if let Some(downcasted_value) = self.as_any().downcast_ref::<String>() {
             return write!(f, "{:?}", downcasted_value);
+        } else if let Some(downcasted_value) =
+            self.as_any().downcast_ref::<HashMap<String, String>>()
+        {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<HashMap<i32, String>>()
+        {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<HashMap<i64, String>>()
+        {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<HashMap<i32, i32>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<HashMap<i64, i64>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) =
+            self.as_any().downcast_ref::<HashMap<String, String>>()
+        {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<String>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<&str>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<i32>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<i64>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<u16>>() {
+            return write!(f, "{:#?}", downcasted_value);
+        } else if let Some(downcasted_value) = self.as_any().downcast_ref::<Vec<u32>>() {
+            return write!(f, "{:#?}", downcasted_value);
         }
 
         write!(f, "dyn IntoAny")

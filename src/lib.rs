@@ -356,6 +356,37 @@ pub fn parse_input<T: 'static>(cache: &Cache, input: IField) -> Result<T> {
     )))
 }
 
+// write another function that takes in cache and the node name and returns the value of the node
+pub fn parse_input_from_name<T: 'static>(
+    cache: &Cache,
+    input_name: String,
+    inputs: &Vec<IField>,
+) -> Result<T> {
+    // let cache_read = cache.read().unwrap();
+    if let Some(input) = inputs.iter().find(|input| input.name == input_name) {
+        let parts: Vec<&str> = input.reference.split('.').collect();
+        if parts.len() != 2 {
+            error!("Invalid reference format: {}", input.reference);
+            return Err(anyhow::anyhow!(format!(
+                "Invalid reference format. needs to be node.reference on field: {}",
+                input.reference
+            )));
+        }
+
+        let node_id = parts[0];
+        let output_name = parts[1];
+        let cache_read = cache.read().unwrap();
+        if let Some(category_map) = cache_read.get(node_id) {
+            if let Some(value) = category_map.get(output_name) {
+                if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                    return Ok(downcasted_value);
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(format!("Value not found {}", input_name)))
+}
+
 /// A trait for custom actions associated with nodes.
 #[async_trait]
 pub trait NodeAction: Send + Sync {

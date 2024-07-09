@@ -6,6 +6,7 @@ use dagger::get_input_values;
 use dagger::get_value;
 use dagger::insert_value;
 use dagger::parse_input;
+use dagger::parse_input_from_name;
 use dagger::register_action;
 use dagger::Cache;
 use dagger::DagExecutor;
@@ -34,6 +35,15 @@ async fn function_to_call1(node: &Node, cache: &Cache) -> Result<()> {
 
     insert_value(cache, node.id.clone(), node.outputs[0].clone().name, new);
 
+    insert_value(
+        cache,
+        node.id.clone(),
+        "Gaandu".to_owned(),
+        vec!["Resident", "Alien"],
+    );
+
+    insert_value(cache, node.id.clone(), "bandu".to_owned(), vec![1, 2, 3, 4]);
+
     // Insert the result into the outputs
     // outputs.insert(node.outputs[0].clone().name, new);
 
@@ -56,6 +66,10 @@ async fn function_to_call2(node: &Node, cache: &Cache) -> Result<()> {
 
 async fn function_to_call3(node: &Node, cache: &Cache) -> Result<(), Error> {
     let num: f64 = parse_input(cache, node.inputs[0].clone())?;
+    println!("num from parse_input: {:#?}", num);
+
+    let numm: f64 = parse_input_from_name(cache, "result".to_string(), &node.inputs)?;
+    println!("num from parse_input_from_name: {:#?}", numm);
 
     insert_value(
         cache,
