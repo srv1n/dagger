@@ -431,44 +431,73 @@ impl DagExecutor {
     }
 
     /// Loads a graph definition from a YAML file.
-    pub fn load_yaml_file(&mut self, file_path: &str) -> Result<(), Error> {
-        let mut file = match File::open(file_path) {
-            Ok(file) => file,
-            Err(e) => {
-                error!("Failed to open file: {}", e);
-                return Err(e.into());
+    pub fn load_yaml_file(&mut self, file_path: &str) {
+        match File::open(file_path) {
+            Ok(mut file) => {
+                let mut yaml_content = String::new();
+                if let Err(e) = file.read_to_string(&mut yaml_content) {
+                    error!("Failed to read file {}: {}", file_path, e);
+                    return;
+                }
+
+                match serde_yaml::from_str::<Graph>(&yaml_content) {
+                    Ok(graph) => match self.build_dag_internal(&graph) {
+                        Ok((dag, node_indices)) => {
+                            let name = graph.name.clone();
+                            self.graphs.insert(name.clone(), graph);
+                            self.prebuilt_dags.insert(name, (dag, node_indices));
+                        }
+                        Err(e) => {
+                            error!("Failed to build DAG for file {}: {}", file_path, e);
+                        }
+                    },
+                    Err(e) => {
+                        error!("Failed to parse YAML file {}: {}", file_path, e);
+                    }
+                }
             }
-        };
-        let mut yaml_content = String::new();
-        file.read_to_string(&mut yaml_content)
-            .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
-
-        let graph: Graph = serde_yaml::from_str(&yaml_content)
-            .map_err(|e| anyhow!("Failed to parse YAML file: {}", e))?;
-
-        let (dag, node_indices) = self.build_dag_internal(&graph)?;
-        let name = graph.name.clone();
-        self.graphs.insert(name.clone(), graph);
-        self.prebuilt_dags.insert(name, (dag, node_indices));
-        Ok(())
+            Err(e) => {
+                error!("Failed to open file {}: {}", file_path, e);
+            }
+        }
     }
 
     // extend above to load all yaml files in a directory
 
-    pub fn load_yaml_dir(&mut self, dir_path: &str) -> Result<(), Error> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(dir_path)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                files.push(entry.path());
+    pub fn load_yaml_dir(&mut self, dir_path: &str) {
+        match std::fs::read_dir(dir_path) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            if let Ok(file_type) = entry.file_type() {
+                                if file_type.is_file() {
+                                    if let Some(file_path) = entry.path().to_str() {
+                                        self.load_yaml_file(file_path);
+                                    } else {
+                                        error!(
+                                            "Failed to convert file path to string: {:?}",
+                                            entry.path()
+                                        );
+                                    }
+                                }
+                            } else {
+                                error!(
+                                    "Failed to determine file type for entry: {:?}",
+                                    entry.path()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Error reading directory entry: {}", e);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read directory {}: {}", dir_path, e);
             }
         }
-        for file in files {
-            self.load_yaml_file(file.to_str().unwrap()).map_err(|e| {
-                anyhow!("Failed to load YAML file {}: {}", file.to_str().unwrap(), e)
-            })?;
-        }
-        Ok(())
     }
 
     /// Builds a directed acyclic graph (DAG) from the loaded graph definition.

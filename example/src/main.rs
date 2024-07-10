@@ -104,8 +104,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     register_action!(executor, "function_to_call1", function_to_call1);
     register_action!(executor, "function_to_call2", function_to_call2);
     register_action!(executor, "function_to_call3", function_to_call3);
-    executor.load_yaml_file("pipeline.yaml")?;
-    executor.load_yaml_dir("./dags")?;
+    executor.load_yaml_file("pipeline.yaml");
+    executor.load_yaml_dir("./dags");
 
     let names = executor.list_dags();
     println!("Loaded DAGs: {:#?}", names);
