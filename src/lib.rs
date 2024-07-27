@@ -25,6 +25,7 @@ use std::hash::Hash;
 use std::io::Read;
 use std::sync::RwLock;
 use std::sync::{Arc, Mutex};
+use tokio::sync::oneshot;
 
 // use tokio::sync::RwLock;
 use tokio::time::{error as TimeoutError, sleep, timeout, Duration};
@@ -516,15 +517,25 @@ impl DagExecutor {
     pub async fn execute_dag(
         &self,
         name: &str,
-        cache: &Cache, // : HashMap<String, HashMap<String, DynAny>>,
+        cache: &Cache,
+        cancel_rx: oneshot::Receiver<()>,
     ) -> Result<(), Error> {
         let (dag, node_indices) = self
             .prebuilt_dags
             .get(name)
             .ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
-        // let mut updated_inputs = inputs.clone();
-        let final_results = execute_dag_async(self, &dag, cache).await?;
 
+        tokio::select! {
+            res = execute_dag_async(self, dag, cache) => {
+                res?
+            }
+            _ = cancel_rx => {
+                // Handle cancellation logic here
+                return Err(anyhow!("DAG execution was cancelled."));
+            }
+        };
+
+        // Handle the result here if needed
         Ok(())
     }
 

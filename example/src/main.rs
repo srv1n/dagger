@@ -12,12 +12,12 @@ use dagger::Cache;
 use dagger::DagExecutor;
 use dagger::{Convertible, Node, NodeAction};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::oneshot;
 use tracing::Level;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::fmt;
 use tracing_subscriber::FmtSubscriber;
-
-use std::sync::Arc;
 
 // Example NodeAction Implementation
 //
@@ -123,7 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     insert_value(&cache, "inputs".to_string(), "num1".to_string(), 10.0);
 
     insert_value(&cache, "inputs".to_string(), "num2".to_string(), 20.0);
-    let _ = run_dag(executor, "infolder", &cache).await?;
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let _ = run_dag(executor, "infolder", &cache, cancel_rx).await?;
     let result = cache.read().unwrap();
     println!("{:#?}", result);
     let test: f64 = get_value::<f64>(&cache, "node3", "doubled_result").unwrap();
@@ -132,7 +133,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_dag(executor: DagExecutor, name: &str, cache: &Cache) -> Result<(), Error> {
-    let updated_inputs = executor.execute_dag(name, &cache).await?;
+async fn run_dag(
+    executor: DagExecutor,
+    name: &str,
+    cache: &Cache,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    let updated_inputs = executor.execute_dag(name, &cache, cancel_rx).await?;
     Ok(())
 }
