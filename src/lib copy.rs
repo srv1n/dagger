@@ -128,140 +128,80 @@ pub struct Node {
 }
 
 /// Type alias for a cache of input and output values.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct SerializableData {
-    pub value: String, // Use String or a custom serializable type
-}
+pub type Cache = RwLock<HashMap<String, HashMap<String, DynAny>>>;
 
-// Update your cache to use the new SerializableData
-pub type Cache = RwLock<HashMap<String, HashMap<String, SerializableData>>>;
-
-pub fn serialize_cache_to_json(cache: &Cache) -> Result<String> {
-    let cache_read = cache.read().unwrap();
-    let serialized_cache: HashMap<String, HashMap<String, String>> = cache_read
-        .iter()
-        .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, String> = category_map
-                .iter()
-                .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
-                .collect();
-            (node_id.clone(), serialized_category)
-        })
-        .collect();
-
-    // Convert to JSON string
-    serde_json::to_string(&serialized_cache)
-        .map_err(|e| anyhow::anyhow!(format!("Serialization error: {}", e)))
-}
-
-pub fn serialize_cache_to_prettyjson(cache: &Cache) -> Result<String> {
-    let cache_read = cache.read().unwrap();
-    let serialized_cache: HashMap<String, HashMap<String, String>> = cache_read
-        .iter()
-        .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, String> = category_map
-                .iter()
-                .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
-                .collect();
-            (node_id.clone(), serialized_category)
-        })
-        .collect();
-
-    // Convert to JSON string
-    serde_json::to_string_pretty(&serialized_cache)
-        .map_err(|e| anyhow::anyhow!(format!("Serialization error: {}", e)))
-}
-
-/// Function to load the cache from JSON
-/// Function to load the cache from JSON
-pub fn load_cache_from_json(json_data: &str) -> Result<Cache> {
-    // Create a new cache instance
-    let cache = Cache::new(HashMap::new());
-
-    // Deserialize the JSON string into a HashMap
-    let parsed_cache: HashMap<String, HashMap<String, String>> = serde_json::from_str(json_data)
-        .map_err(|e| anyhow::anyhow!(format!("Deserialization error: {}", e)))?;
-
-    // Lock the cache for writing
-    {
-        let mut cache_write = cache.write().unwrap();
-
-        // Populate the cache with the deserialized values
-        for (node_id, category_map) in parsed_cache {
-            let serialized_category: HashMap<String, SerializableData> = category_map
-                .into_iter()
-                .map(|(output_name, value)| (output_name, SerializableData { value }))
-                .collect();
-            cache_write.insert(node_id, serialized_category);
-        }
-    } // The write lock is released here
-
-    Ok(cache) // Return the cache without any borrow issues
-}
-// pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
-//     let mut cache_write = cache.write().unwrap();
-//     let category_map = cache_write.entry(category).or_insert_with(HashMap::new);
-//     category_map.insert(key, Box::new(value));
-// }
-
-pub fn insert_value<T: Serialize>(
-    cache: &Cache,
-    node_id: &str,
-    output_name: &str,
-    value: T,
-) -> Result<()> {
+pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
     let mut cache_write = cache.write().unwrap();
-
-    // Serialize the value to a JSON string
-    let serialized_value = serde_json::to_string(&value)
-        .map_err(|e| anyhow::anyhow!(format!("Serialization error: {}", e)))?;
-
-    // Store the serialized value in the cache
-    cache_write
-        .entry(node_id.to_string())
-        .or_insert_with(HashMap::new)
-        .insert(
-            output_name.to_string(),
-            SerializableData {
-                value: serialized_value,
-            },
-        );
-
-    Ok(())
+    let category_map = cache_write.entry(category).or_insert_with(HashMap::new);
+    category_map.insert(key, Box::new(value));
 }
 
-pub fn parse_input_from_name<T: for<'de> Deserialize<'de>>(
-    cache: &Cache,
-    input_name: String,
-    inputs: &[IField],
-) -> Result<T> {
-    let input = inputs
-        .iter()
-        .find(|input| input.name == input_name)
-        .ok_or_else(|| anyhow::anyhow!("Input not found: {}", input_name))?;
-
+pub fn get_value<T: 'static>(cache: &Cache, category: &str, key: &str) -> Option<T> {
+    let cache_read = cache.read().unwrap();
+    if let Some(category_map) = cache_read.get(category) {
+        if let Some(value) = category_map.get(key) {
+            if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                return Some(downcasted_value);
+            }
+        }
+    }
+    None
+}
+pub fn parse_input<T: 'static>(cache: &Cache, input: IField) -> Result<T> {
     let parts: Vec<&str> = input.reference.split('.').collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "Invalid reference format: {}",
+        error!("Invalid reference format: {}", input.reference);
+        return Err(anyhow::anyhow!(format!(
+            "Invalid reference format. needs to be node.reference on field: {}",
             input.reference
-        ));
+        )));
     }
 
     let node_id = parts[0];
     let output_name = parts[1];
-
     let cache_read = cache.read().unwrap();
-    let category_map = cache_read
-        .get(node_id)
-        .ok_or_else(|| anyhow::anyhow!("Node not found: {}", node_id))?;
+    if let Some(category_map) = cache_read.get(node_id) {
+        if let Some(value) = category_map.get(output_name) {
+            if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                return Ok(downcasted_value);
+            }
+        }
+    }
+    Err(anyhow::anyhow!(format!(
+        "Value not found {}",
+        input.reference
+    )))
+}
 
-    let serialized_value = category_map
-        .get(output_name)
-        .ok_or_else(|| anyhow::anyhow!("Output not found: {}", output_name))?;
+// write another function that takes in cache and the node name and returns the value of the node
+pub fn parse_input_from_name<T: 'static>(
+    cache: &Cache,
+    input_name: String,
+    inputs: &Vec<IField>,
+) -> Result<T> {
+    // let cache_read = cache.read().unwrap();
+    if let Some(input) = inputs.iter().find(|input| input.name == input_name) {
+        let parts: Vec<&str> = input.reference.split('.').collect();
+        if parts.len() != 2 {
+            error!("Invalid reference format: {}", input.reference);
+            return Err(anyhow::anyhow!(format!(
+                "Invalid reference format. needs to be node.reference on field: {}",
+                input.reference
+            )));
+        }
 
-    serde_json::from_str(&serialized_value.value)
-        .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
+        let node_id = parts[0];
+        let output_name = parts[1];
+        let cache_read = cache.read().unwrap();
+        if let Some(category_map) = cache_read.get(node_id) {
+            if let Some(value) = category_map.get(output_name) {
+                if let Ok(downcasted_value) = downcast::<T>(value.clone()) {
+                    return Ok(downcasted_value);
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(format!("Value not found {}", input_name)))
 }
 
 /// A trait for custom actions associated with nodes.
@@ -513,10 +453,10 @@ async fn execute_node_async(executor: &DagExecutor, node: &Node, cache: &Cache) 
             }
             Ok(Err(e)) => {
                 error!("Node '{}' execution failed: {}", node.id, e);
-                let _ = insert_value(
+                insert_value(
                     cache,
-                    &node.id.clone(),
-                    &format!("error_retry{}", retries_left),
+                    node.id.clone(),
+                    format!("error_retry{}", retries_left),
                     e.to_string(),
                 );
                 // let current_error = get_value(cache, node.id, "error")
@@ -538,10 +478,10 @@ async fn execute_node_async(executor: &DagExecutor, node: &Node, cache: &Cache) 
                     node.timeout,
                     e.to_string()
                 );
-                let _ = insert_value(
+                insert_value(
                     cache,
-                    &node.id.clone(),
-                    &format!("error_retry_{}_timeout", retries_left),
+                    node.id.clone(),
+                    format!("error_retry_{}_timeout", retries_left),
                     e.to_string(),
                 );
                 if node.onfailure {
@@ -551,17 +491,17 @@ async fn execute_node_async(executor: &DagExecutor, node: &Node, cache: &Cache) 
                     );
                     sleep(Duration::from_secs(1)).await; // Wait for 1 second before retrying
                     retries_left -= 1;
-                    let _ = insert_value(
+                    insert_value(
                         cache,
-                        &node.id.clone(),
-                        &format!("error_retry_{}_timeout", retries_left),
+                        node.id.clone(),
+                        format!("error_retry_{}_timeout", retries_left),
                         e.to_string(),
                     );
                 } else {
-                    let _ = insert_value(
+                    insert_value(
                         cache,
-                        &node.id.clone(),
-                        &format!("error_retry_{}_timeout", retries_left),
+                        node.id.clone(),
+                        format!("error_retry_{}_timeout", retries_left),
                         e.to_string(),
                     );
                     return Err(anyhow!("Node '{}' execution timed out", node.id));
@@ -569,10 +509,10 @@ async fn execute_node_async(executor: &DagExecutor, node: &Node, cache: &Cache) 
             }
         }
     }
-    let _ = insert_value(
+    insert_value(
         cache,
-        &node.id.clone(),
-        &format!("error_retry_{}_final", retries_left),
+        node.id.clone(),
+        format!("error_retry_{}_final", retries_left),
         "Done with all retries",
     );
     Err(anyhow!(
@@ -600,7 +540,7 @@ pub async fn execute_dag_async(
                     return Err(anyhow!("Node execution failed: {}", err));
                 } else {
                     info!("Node '{}' execution failed: {}", node.id, err);
-                    let _ = insert_value(cache, &node.id.clone(), "error", err.to_string());
+                    insert_value(cache, node.id.clone(), "error".to_string(), err.to_string());
                 }
             }
         }
@@ -649,29 +589,29 @@ pub fn validate_node_actions(executor: &DagExecutor, nodes: &[Node]) -> Result<(
     Ok(())
 }
 
-// pub fn get_input_values(
-//     cache: &Cache,
-//     node_inputs: &Vec<IField>,
-// ) -> Result<HashMap<String, DynAny>, anyhow::Error> {
-//     let mut input_values = HashMap::new();
-//     println!("node_inputs: {:#?}", node_inputs);
-//     for input in node_inputs {
-//         let reference = input.reference.clone();
-//         let parts: Vec<&str> = reference.split('.').collect();
-//         if parts.len() != 2 {
-//             error!("Invalid reference format: {}", reference);
-//             return Err(anyhow::anyhow!("Invalid reference format"));
-//         }
-//         let node_id = parts[0];
-//         let output_name = parts[1];
-//         println!("node_id: {}, output_name: {}", node_id, output_name);
-//         let val: DynAny = get_value(cache, "inputs", "num1").unwrap();
-//         println!("val: {:#?}", val);
+pub fn get_input_values(
+    cache: &Cache,
+    node_inputs: &Vec<IField>,
+) -> Result<HashMap<String, DynAny>, anyhow::Error> {
+    let mut input_values = HashMap::new();
+    println!("node_inputs: {:#?}", node_inputs);
+    for input in node_inputs {
+        let reference = input.reference.clone();
+        let parts: Vec<&str> = reference.split('.').collect();
+        if parts.len() != 2 {
+            error!("Invalid reference format: {}", reference);
+            return Err(anyhow::anyhow!("Invalid reference format"));
+        }
+        let node_id = parts[0];
+        let output_name = parts[1];
+        println!("node_id: {}, output_name: {}", node_id, output_name);
+        let val: DynAny = get_value(cache, "inputs", "num1").unwrap();
+        println!("val: {:#?}", val);
 
-//         get_value(cache, node_id, output_name)
-//             .map(|value| input_values.insert(input.name.clone(), value))
-//             .unwrap();
-//     }
-//     println!("input_values: {:#?}", input_values);
-//     Ok(input_values)
-// }
+        get_value(cache, node_id, output_name)
+            .map(|value| input_values.insert(input.name.clone(), value))
+            .unwrap();
+    }
+    println!("input_values: {:#?}", input_values);
+    Ok(input_values)
+}
