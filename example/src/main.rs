@@ -2,14 +2,17 @@ use anyhow::{anyhow, Error, Result};
 
 use dagger::any::downcast;
 use dagger::any::DynAny;
-use dagger::get_input_values;
-use dagger::get_value;
+
 use dagger::insert_value;
-use dagger::parse_input;
+
 use dagger::parse_input_from_name;
 use dagger::register_action;
+use dagger::serialize_cache_to_json;
+use dagger::serialize_cache_to_prettyjson;
 use dagger::Cache;
+use dagger::DagExecutionReport;
 use dagger::DagExecutor;
+
 use dagger::{Convertible, Node, NodeAction};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,25 +27,18 @@ use tracing_subscriber::FmtSubscriber;
 async fn function_to_call1(node: &Node, cache: &Cache) -> Result<()> {
     // let mut outputs = HashMap::new();
     // println!("Cache: {:#?}", cache);
-    let num1 = get_value::<f64>(cache, "inputs", "num1")
-        .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[0].name))?;
+    let num1: f64 = parse_input_from_name(cache, "num1".to_string(), &node.inputs)?;
     // .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[0].name))?;
-    let num2 = get_value::<f64>(cache, "inputs", &node.inputs[1].name)
-        .ok_or_else(|| anyhow!("Input '{}' not found.", node.inputs[1].name))?;
+    let num2: f64 = parse_input_from_name(cache, "num2".to_string(), &node.inputs)?;
 
     // Perform the operation with the retrieved and converted inputs
     let new = num1 + num2;
 
-    insert_value(cache, node.id.clone(), node.outputs[0].clone().name, new);
+    insert_value(cache, &node.id, &node.outputs[0].name, new);
 
-    insert_value(
-        cache,
-        node.id.clone(),
-        "Gaandu".to_owned(),
-        vec!["Resident", "Alien"],
-    );
+    insert_value(cache, &node.id, "Gaandu", vec!["Resident", "Alien"]);
 
-    insert_value(cache, node.id.clone(), "bandu".to_owned(), vec![1, 2, 3, 4]);
+    insert_value(cache, &node.id, "bandu", vec![1, 2, 3, 4]);
 
     // Insert the result into the outputs
     // outputs.insert(node.outputs[0].clone().name, new);
@@ -51,39 +47,24 @@ async fn function_to_call1(node: &Node, cache: &Cache) -> Result<()> {
 }
 
 async fn function_to_call2(node: &Node, cache: &Cache) -> Result<()> {
-    let result: f64 = parse_input(cache, node.inputs[0].clone())?;
+    let result: f64 = parse_input_from_name(cache, "result".to_string(), &node.inputs)?;
 
     // Perform the operation
-    insert_value(
-        cache,
-        node.id.clone(),
-        node.outputs[0].clone().name,
-        result * result,
-    );
+    insert_value(cache, &node.id, &node.outputs[0].name, result * result);
     // outputs.insert("squared_result".to_string(), num * num);
     Ok(())
 }
 
 async fn function_to_call3(node: &Node, cache: &Cache) -> Result<(), Error> {
-    let num: f64 = parse_input(cache, node.inputs[0].clone())?;
+    let num: f64 = parse_input_from_name(cache, "result".to_string(), &node.inputs)?;
     println!("num from parse_input: {:#?}", num);
 
     let numm: f64 = parse_input_from_name(cache, "result".to_string(), &node.inputs)?;
     println!("num from parse_input_from_name: {:#?}", numm);
 
-    insert_value(
-        cache,
-        node.id.clone(),
-        node.outputs[0].name.clone(),
-        num * 3.0,
-    );
+    insert_value(cache, &node.id, &node.outputs[0].name, num * 3.0);
 
-    insert_value(
-        cache,
-        node.id.clone(),
-        node.outputs[1].name.clone(),
-        "Testo".to_string(),
-    );
+    insert_value(cache, &node.id, &node.outputs[1].name, "Testo".to_string());
 
     Ok(())
 }
@@ -120,15 +101,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let mut inputs = HashMap::new();
     // inputs.insert("inputs".to_string(), temp);
     let cache = Cache::new(HashMap::new());
-    insert_value(&cache, "inputs".to_string(), "num1".to_string(), 10.0);
+    insert_value(&cache, "inputs", "num1", 10.0);
 
-    insert_value(&cache, "inputs".to_string(), "num2".to_string(), 20.0);
+    // insert_value(&cache, "inputs", "num2", 20.0);
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    let _ = run_dag(executor, "infolder", &cache, cancel_rx).await?;
+    let dag_report = run_dag(executor, "infolder", &cache, cancel_rx).await?;
+
     let result = cache.read().unwrap();
-    println!("{:#?}", result);
-    let test: f64 = get_value::<f64>(&cache, "node3", "doubled_result").unwrap();
-    println!("{:#?}", test);
+    // println!("{:#?}", result);
+
+    let jsson = serialize_cache_to_prettyjson(&cache).map_err(|e| e.to_string())?;
+
+    println!("{}", jsson);
+    println!("DAG Report: {:#?}", dag_report);
+
+    // can you pretty print the json above?
+
+    // let pretty_json = serde_json::to_string_pretty(&jsson)?;
+
+    // println!("{:#?}", pretty_json);
+    // println!("{:#?}", jsson);
+    // let test: f64 = get_value::<f64>(&cache, "node3", "doubled_result").unwrap();
+    // println!("{:#?}", test);
+
+    // let serializable_cache = SerializableCache(cache);
+    // let shata = serializable_cache.to_json().map_err(|e| e.to_string());
+
+    // println!("{:#?}", shata);
 
     Ok(())
 }
@@ -138,7 +137,7 @@ async fn run_dag(
     name: &str,
     cache: &Cache,
     cancel_rx: oneshot::Receiver<()>,
-) -> Result<(), Error> {
+) -> Result<DagExecutionReport, Error> {
     let updated_inputs = executor.execute_dag(name, &cache, cancel_rx).await?;
-    Ok(())
+    Ok(updated_inputs)
 }
