@@ -1,0 +1,61 @@
+name: infolder
+description: A simple pipeline for mathematical operations
+author: Rzn,Inc
+version: 0.0.1
+signature: example
+tags:
+  - infolder
+  - physics
+nodes:
+  - id: node1
+    dependencies: []
+    inputs:
+      - name: num1
+        description: First number to add
+        reference: inputs.num1
+      - name: num2
+        description: Second number to add
+        reference: inputs.num2
+    outputs:
+      - name: sum
+        description: Sum of num1 and num2
+    action: add_numbers
+    failure: failure_function1
+    onfailure: true
+    description: Adds two numbers
+    timeout: 3600  # 1 hour in seconds
+    try_count: 3
+  - id: node2
+    dependencies:
+      - node1
+    inputs:
+      - name: input
+        description: Result from node1 to square
+        reference: node1.sum
+    outputs:
+      - name: squared_result
+        description: Squared result
+    action: square_number
+    failure: failure_function2
+    onfailure: false
+    description: Squares the sum from node1
+    timeout: 1800  # 30 minutes in seconds
+    try_count: 2
+  - id: node3
+    dependencies:
+      - node2
+    inputs:
+      - name: input
+        description: Result from node2 to triple
+        reference: node2.squared_result
+    outputs:
+      - name: tripled_result
+        description: Tripled result
+      - name: test_string
+        description: Example string output
+    action: triple_number_and_add_string
+    failure: failure_function3
+    onfailure: true
+    description: Triples the squared result and adds a string
+    timeout: 3600  # 1 hour in seconds
+    try_count: 3

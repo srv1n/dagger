@@ -1,0 +1,278 @@
+---
+description: Project
+globs: 
+---
+
+Below is the finalized Task and Design Requirement Document for extending Dagger v1 into a dual-mode DAG orchestration system supporting both static YAML workflows and dynamic agent-driven flows. This spec builds directly on the provided Dagger v1 code, incorporating all our discussions—dual execution modes, DagConfig integration, Sled-based state management with Zstd compression, human intervention with ad-hoc and planned updates via "pending_instructions", enhanced error handling, guardrails, and troubleshootability. It’s structured for step-by-step implementation by the team, with detailed tasks and effort estimates.
+
+Task and Design Requirement Document: Extending Dagger v1 for Dual-Mode DAG Orchestration
+Overview
+This document details modifications to the existing Dagger v1 library (provided code) to evolve it from a static, YAML-defined DAG executor into a robust system supporting both static workflows and dynamic, agent-driven flows. The design preserves Dagger v1’s core functionality (parsing YAML, executing DAGs) while adding features for agentic orchestration, troubleshootability, human intervention with ad-hoc and planned updates, error handling, guardrails, and state management. Dagger remains a library for integration into other programs (e.g., Tauri/React apps), with LLMs invoked externally via NodeActions. State persistence uses Sled with Zstd compression, replacing file-based storage and SQLite for simplicity. Changes are incremental, building on the current codebase, and detailed for team task assignment.
+
+Current Baseline (Dagger v1)
+Purpose: Executes static DAGs from YAML files.
+Key Structures (lib.rs):
+Graph: nodes: Vec<Node>, metadata (name, description, etc.).
+Node: id, dependencies, action, try_count, onfailure, etc.
+DagExecutor: function_registry, graphs, prebuilt_dags.
+Cache: RwLock<HashMap<String, HashMap<String, SerializableData>>>.
+NodeAction: Trait for custom actions.
+Execution:
+load_yaml_file: Parses YAML into Graph, builds DiGraph in prebuilt_dags.
+execute_dag(name: &str, cache: &Cache, cancel_rx): Runs a named DAG via execute_dag_async.
+Features: Retries (try_count), error continuation (onfailure), state serialization (serialize_cache_to_json).
+Example Use (main.rs):
+Loads "pipeline.yaml", registers actions (add_numbers), runs "infolder".
+
+Design Requirements and Tasks
+1. Execution Mode Specification (WorkflowSpec)
+Purpose: Enable execute_dag to handle both static YAML DAGs and agentic flows with a single API.
+Requirements:
+New enum: WorkflowSpec (add to lib.rs):
+Static { name: String }: Executes a preloaded DAG by name from prebuilt_dags.
+Agent { task: String }: Starts an agentic flow with a task, bootstrapping a supervisor node if the DAG doesn’t exist.
+Update DagExecutor::execute_dag:
+Replace name: &str with spec: WorkflowSpec.
+For Static: Lookup prebuilt_dags[name].
+For Agent: If task not in prebuilt_dags, create a Graph with "supervisor_start" node (action: "supervisor_step"), build DiGraph, and insert into graphs and prebuilt_dags.
+
+Tasks:
+Define WorkflowSpec:
+Add to lib.rs: enum WorkflowSpec { Static { name: String }, Agent { task: String } }.
+Implement Debug, Clone.
+Effort: 1-2 hours.
+Update execute_dag:
+Modify signature: pub async fn execute_dag(&self, spec: WorkflowSpec, cache: &Cache, cancel_rx: oneshot::Receiver<()>) -> Result<DagExecutionReport, Error>.
+Implement match logic:
+Static: Use existing lookup.
+Agent: Bootstrap if needed (pseudo-code below).
+Effort: 3-4 hours.
+
+Pseudo-Code:
+rust
+match spec {
+    WorkflowSpec::Static { name } => {
+        let (dag, _) = self.prebuilt_dags.get(&name).ok_or_else(|| anyhow!("Graph '{}' not found", name))?;
+        tokio::select! { report = execute_dag_async(self, dag, cache) => Ok(report), _ = cancel_rx => Err(anyhow!("Cancelled")) }
+    }
+    WorkflowSpec::Agent { task } => {
+        if !self.prebuilt_dags.contains_key(task) {
+            let graph = Graph {
+                name: task.clone(),
+                nodes: vec![Node { id: "supervisor_start".to_string(), action: "supervisor_step".to_string(), ..Default::default() }],
+                config: Some(self.config.clone()),
+                ..Default::default()
+            };
+            let (dag, indices) = self.build_dag_internal(&graph)?;
+            self.graphs.insert(task.clone(), graph);
+            self.prebuilt_dags.insert(task.clone(), (dag, indices));
+            self.sled_db.open_tree("active")?.insert(task, serde_json::to_vec(&DagMetadata { status: "Running", task: task.clone() })?)?;
+        }
+        let (dag, _) = self.prebuilt_dags.get(task).unwrap();
+        tokio::select! { report = execute_dag_async(self, dag, cache) => Ok(report), _ = cancel_rx => Err(anyhow!("Cancelled")) }
+    }
+}
+
+2. Initial Execution Parameters (DagConfig)
+Purpose: Provide configurable options for retries, error handling, and human intervention, usable in YAML or code.
+Requirements:
+New struct: DagConfig (add to lib.rs):
+max_attempts: u8 (default: 3) – Global retry limit, overridable by Node.try_count.
+on_failure: OnFailure – Enum: { Continue, Pause, Stop } (default: Pause) – Error policy.
+timeout_seconds: u64 (default: 3600) – Max DAG runtime.
+human_wait_minutes: Option<u32> (default: None) – Human input wait time.
+human_timeout_action: HumanTimeoutAction – Enum: { Autopilot, Pause } (default: Pause) – Timeout action.
+Update Graph:
+Add config: Option<DagConfig> (default: None), parsed from YAML (e.g., config: { max_attempts: 5 }).
+Modify DagExecutor:
+Update new() to new(config: Option<DagConfig>) -> Self, defaulting to DagConfig::default().
+Add config: DagConfig to struct.
+Merge logic: YAML Graph.config > DagExecutor.config > defaults.
+Update load_yaml_file: Parse Graph.config if present, merge with self.config.
+
+Tasks:
+Define DagConfig:
+Add to lib.rs: struct DagConfig, enums OnFailure, HumanTimeoutAction.
+Implement Serialize, Deserialize, Debug, Default.
+Effort: 2-3 hours.
+Update Graph:
+Add config: Option<DagConfig> to Graph, update Deserialize impl.
+Effort: 2 hours.
+Update DagExecutor:
+Modify new() to take config, add config field.
+Effort: 2 hours.
+Update load_yaml_file:
+Parse Graph.config, set self.config = graph.config.unwrap_or(self.config).
+Effort: 2-3 hours.
+
+3. Dynamic DAG Modification
+Purpose: Support runtime node addition for agentic flows.
+Requirements:
+Add to DagExecutor:
+add_node(name: &str, node_id: String, action: Arc<dyn NodeAction>, dependencies: Vec<String>) -> Result<()>.
+Updates prebuilt_dags[name].0 and .1.
+Calls validate_dag_structure.
+Update execute_dag_async:
+Replace one-pass Topo with loop: while !self.stopped && has_nodes().
+Add stopped: bool to DagExecutor (default: false).
+
+Tasks:
+Implement add_node:
+Add to DagExecutor: Modify DiGraph, validate.
+Effort: 4-5 hours.
+Update Execution Loop:
+Modify execute_dag_async: Loop with Topo::new, check stopped.
+Add stopped: bool to DagExecutor.
+Effort: 4-5 hours.
+
+4. State Management with Sled and Zstd
+Purpose: Persist Cache and DAG metadata in a single, efficient store.
+Requirements:
+Add Sled dependency (sled) and Zstd (zstd) to Cargo.toml.
+New struct: DagMetadata (add to lib.rs):
+status: String ("Running", "Paused", "Completed").
+task: String.
+Update DagExecutor:
+Add sled_db: sled::Db (init in new() with sled::open("dagger_db")).
+Replace file-based serialize_cache_to_json with Sled storage:
+save_cache(dag_id: &str, cache: &Cache) -> Result<()>: Compress with Zstd, store in cache tree.
+load_cache(dag_id: &str) -> Result<Cache>: Decompress and deserialize.
+Trees:
+cache: dag_id -> Zstd-compressed Cache JSON.
+pending: dag_id -> DagMetadata (paused jobs).
+active: dag_id -> DagMetadata (running jobs).
+completed: dag_id -> DagMetadata (finished jobs).
+
+Tasks:
+Add Dependencies:
+Update Cargo.toml: sled = "0.34", zstd = "0.13".
+Effort: 1 hour.
+Define DagMetadata:
+Add to lib.rs: struct DagMetadata { status: String, task: String }.
+Implement Serialize, Deserialize.
+Effort: 1-2 hours.
+Update DagExecutor:
+Add sled_db: sled::Db, init in new().
+Effort: 2 hours.
+Implement Cache Persistence:
+Add save_cache: zstd::encode_all(&serde_json::to_vec(cache)?, 3)?, store in sled_db.open_tree("cache").
+Add load_cache: Decompress with zstd::decode_all, deserialize.
+Effort: 4-5 hours.
+
+5. Troubleshootability: Execution Tree
+Purpose: Track and visualize execution history.
+Requirements:
+New struct: ExecutionTree (add to lib.rs):
+DiGraph<NodeSnapshot, ExecutionEdge>:
+NodeSnapshot: { node_id, outcome: NodeExecutionOutcome, cache_snapshot, timestamp }.
+ExecutionEdge: { parent, label }.
+Add tree: HashMap<String, ExecutionTree> to DagExecutor.
+Update execute_node_async: Append NodeSnapshot to tree[name].
+Add serialize_tree_to_json and serialize_tree_to_dot.
+
+Tasks:
+Define ExecutionTree:
+Add to lib.rs, implement Serialize.
+Effort: 4 hours.
+Integrate with Execution:
+Add tree to DagExecutor, update execute_node_async.
+Effort: 4-5 hours.
+Serialization:
+Implement JSON and DOT serialization.
+Effort: 4 hours.
+
+6. Human Intervention with Timeout
+Purpose: Enable planned and ad-hoc human input.
+Requirements:
+New NodeAction: HumanInterrupt:
+Waits per config.human_wait_minutes, then:
+Autopilot: Continues.
+Pause: Moves dag_id to Sled:pending, saves Cache, sets paused: true.
+Update DagExecutor:
+Add paused: bool.
+Add resume_from_state(dag_id: &str, user_input: Option<String>) -> Result<()>.
+Ad-Hoc Input:
+Add update_cache(dag_id: &str, key: String, value: SerializableData) -> Result<()>.
+Appends to "global.pending_instructions" in Cache.
+SupervisorStep: Checks "pending_instructions", processes, clears.
+
+Tasks:
+Implement HumanInterrupt:
+Add struct HumanInterrupt, implement NodeAction.
+Effort: 4 hours.
+Update DagExecutor:
+Add paused, implement resume_from_state.
+Effort: 4-5 hours.
+Implement update_cache:
+Add to DagExecutor, append to "global.pending_instructions".
+Effort: 3 hours.
+
+7. Error Handling Enhancements
+Purpose: Improve retries and error continuation.
+Requirements:
+Enhance execute_node_async: Use backoff (2^attempt seconds).
+Update execute_dag_async: Handle Node.onfailure or config.on_failure.
+
+Tasks:
+Enhance Retries:
+Update execute_node_async with backoff.
+Effort: 2 hours.
+Continue-on-Error:
+Modify execute_dag_async for on_failure logic.
+Effort: 3 hours.
+
+8. Guardrails
+Purpose: Prevent runaway execution.
+Requirements:
+Extend DagConfig: Add max_tokens: Option<u64>, max_iterations: Option<u32> (default: 50).
+Update execute_dag_async: Check limits, add "human_check" if exceeded.
+Add start_time: NaiveDateTime to DagExecutor.
+
+Tasks:
+Update DagConfig:
+Add fields, update Default.
+Effort: 1 hour.
+Guardrail Checks:
+Update execute_dag_async with limits, start_time.
+Effort: 3-4 hours.
+
+9. Supervisor and Sub-Agents
+Purpose: Drive agentic flows with sub-agents.
+Requirements:
+New NodeAction: SupervisorStep:
+Checks "pending_instructions", clears, adds nodes (e.g., "info_retrieval").
+Adds periodic "human_check" (e.g., every 5 iterations or LLM-driven).
+Sub-agents (e.g., InfoRetrievalAgent): Add tool nodes or run internally.
+
+Tasks:
+Implement SupervisorStep:
+Add struct SupervisorStep, implement NodeAction.
+Effort: 4-5 hours.
+
+Task Breakdown
+Core Team:
+Task 1: WorkflowSpec, execute_dag (4-6 hours).
+Task 2: DagConfig, Graph, DagExecutor (8-10 hours).
+Task 3: Dynamic DAG (8-10 hours).
+State Team:
+Task 4: Sled/Zstd persistence (8-10 hours).
+Task 5: ExecutionTree (12-13 hours).
+Human Team:
+Task 6: Human intervention, update_cache (11-12 hours).
+Error/Guardrail Team:
+Task 7: Error handling (5-6 hours).
+Task 8: Guardrails (4-5 hours).
+Agent Team:
+Task 9: SupervisorStep (4-5 hours).
+
+Milestones
+Week 1: Core, dynamic DAG, initial state.
+Week 2: Troubleshooting, human intervention.
+Week 3: Error, guardrails, agents, testing.
+
+Additional Notes
+Dependencies: Add sled, zstd to Cargo.toml.
+Testing: Unit tests for add_node, save_cache, resume_from_state.
+Docs: Update README.md with new APIs (execute_dag, update_cache).
+
+This spec builds on Dagger v1, integrating all refinements—Sled for state, "pending_instructions" for ad-hoc input, and a streamlined dual-mode execute_dag. Ready to proceed, or any last tweaks?

@@ -19,6 +19,10 @@ chrono = { version = "0.4.35", features = ["serde"] }
 dyn-clone = "1.0.17"
 lazy_static = "1.4.0"
 serde_json = "1.0.105"
+sled = "0.34"
+zstd = "0.13"
+cuid2 = "0.1.4"
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"
+
