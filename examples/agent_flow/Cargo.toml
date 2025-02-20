@@ -19,3 +19,4 @@ rzn_datasourcer = {path = "../../../rzn_datasourcer"}
 async-openai = "0.27.2"
 reqwest = { version = "0.12", features = ["json"] }  # Optional fallback, not used here
 serde_json = "1.0"
+chrono = "0.4"

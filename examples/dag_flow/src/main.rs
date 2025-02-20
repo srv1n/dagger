@@ -8,29 +8,38 @@ use tokio::sync::oneshot;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use dagger::NodeAction;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::time::{sleep, Duration};
 
 // Performs addition of two f64 numbers.
 async fn add_numbers(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    println!("node: {:#?}", node);
-    println!("cache: {:#?}", cache);
+   
     let num1: f64 = parse_input_from_name(cache, "num1".to_string(), &node.inputs)?;
     let num2: f64 = parse_input_from_name(cache, "num2".to_string(), &node.inputs)?;
+    
 
     let sum = num1 + num2;
-
+   
     insert_value(cache, &node.id, &node.outputs[0].name, sum)?;
+
+    // only need below to generate DOT graph
+    insert_value(cache, &node.id, "input_terms", format!("{} + {}", num1, num2))?;
+    insert_value(cache, &node.id, "output_sum", sum)?;
     Ok(())
 }
 
 // Squares a number.
 async fn square_number(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
     let input: f64 = parse_input_from_name(cache, "input".to_string(), &node.inputs)?;
+    
 
     let squared = input * input;
-
+    
     insert_value(cache, &node.id, &node.outputs[0].name, squared)?;
+
+    // only need below to generate DOT graph
+    insert_value(cache, &node.id, "input_terms", format!("{}", input))?;
+    insert_value(cache, &node.id, "output_squared", squared)?;
     Ok(())
 }
 
@@ -41,11 +50,16 @@ async fn triple_number_and_add_string(
     cache: &Cache,
 ) -> Result<()> {
     let input: f64 = parse_input_from_name(cache, "input".to_string(), &node.inputs)?;
-
+    
     let tripled = input * 3.0;
-
+    
+   
     insert_value(cache, &node.id, &node.outputs[0].name, tripled)?;
     insert_value(cache, &node.id, &node.outputs[1].name, "example_string".to_string())?;
+
+    // only need below to generate DOT graph
+    insert_value(cache, &node.id, "input_terms", format!("{}", input))?;
+    insert_value(cache, &node.id, "output_tripled", tripled)?;
     Ok(())
 }
 
@@ -58,7 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     // Initialize the DAG executor with default config
-    let mut executor = DagExecutor::new(None)?;
+    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let mut executor = DagExecutor::new(None, registry.clone(), "dagger_db")?;
 
     // Register the actions with the executor
     register_action!(executor, "add_numbers", add_numbers);
@@ -108,6 +123,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let json_output = serialize_cache_to_prettyjson(&cache)?;
     println!("Cache as JSON:\n{}", json_output);
     println!("DAG Execution Report: {:#?}", dag_report);
+
+    let json_output = serialize_cache_to_prettyjson(&cache)?;
+    println!("Cache as JSON:\n{}", json_output);
+
+    let dot_output = executor.serialize_tree_to_dot("infolder")?;
+    println!("Execution Tree (DOT):\n{}", dot_output);
 
     Ok(())
 }
