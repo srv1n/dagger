@@ -23,6 +23,7 @@ sled = "0.34"
 zstd = "0.13"
 cuid2 = "0.1.4"
 thiserror = "1.0"
+dagger-macros = { path = "../dagger-macros" }
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"

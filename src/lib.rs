@@ -39,13 +39,11 @@ use std::io::Error as IoError;
 macro_rules! register_action {
     ($executor:expr, $action_name:expr, $action_func:path) => {{
         struct Action;
-
         #[async_trait::async_trait]
         impl NodeAction for Action {
             fn name(&self) -> String {
                 $action_name.to_string()
             }
-
             async fn execute(
                 &self,
                 executor: &mut DagExecutor,
@@ -54,8 +52,15 @@ macro_rules! register_action {
             ) -> Result<()> {
                 $action_func(executor, node, cache).await
             }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "name": $action_name,
+                    "description": "Manually registered action",
+                    "parameters": { "type": "object", "properties": {} },
+                    "returns": { "type": "object" }
+                })
+            }
         }
-
         $executor.register_action(Arc::new(Action));
     }};
 }
@@ -540,6 +545,7 @@ pub trait NodeAction: Send + Sync {
 
     /// Executes the action with the given node and inputs, and returns the outputs.
     async fn execute(&self, executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()>;
+     fn schema(&self) -> Value;
 }
 
 // Add ExecutionTree type definition before DagExecutor
@@ -658,7 +664,10 @@ impl DagExecutor {
         registry.insert(action.name(), action);
         Ok(())
     }
-
+ pub fn get_tool_schemas(&self) -> Vec<Value> {
+        let registry = self.function_registry.read().unwrap();
+        registry.values().map(|action| action.schema()).collect()
+    }
     /// Loads a graph definition from a YAML file with proper config merging
     pub fn load_yaml_file(&mut self, file_path: &str) -> Result<(), Error> {
         let mut file = File::open(file_path)
@@ -2288,6 +2297,17 @@ impl NodeAction for HumanInterrupt {
         "human_interrupt".to_string()
     }
 
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "wait_minutes": { "type": "number" },
+                "timeout_action": { "type": "string", "enum": ["autopilot", "pause"] }
+            },
+            "required": ["wait_minutes", "timeout_action"]
+        })
+    }
+    
     async fn execute(&self, executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
         let dag_name = executor
             .graphs
@@ -2532,6 +2552,19 @@ impl NodeAction for SupervisorStep {
         "supervisor_step".to_string()
     }
 
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": { "type": "string" },
+                "params": { "type": "object" },
+                "priority": { "type": "number" },
+                "timestamp": { "type": "string" }
+            },
+            "required": ["action", "params", "priority", "timestamp"]
+        })
+    }
+    
     async fn execute(&self, executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
         let dag_name = executor
             .graphs
@@ -2585,53 +2618,6 @@ impl NodeAction for SupervisorStep {
     }
 }
 
-/// Agent for retrieving information based on instructions
-pub struct InfoRetrievalAgent;
-
-impl InfoRetrievalAgent {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl NodeAction for InfoRetrievalAgent {
-    fn name(&self) -> String {
-        "info_retrieval".to_string()
-    }
-
-    async fn execute(&self, executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-        info!("Starting info retrieval for node {}", node.id);
-
-        // Get parameters from cache
-        let params: Value =
-            parse_input_from_name(cache, "action_params".to_string(), &node.inputs)?;
-
-        // Simulate info retrieval (replace with actual implementation)
-        let retrieved_data = match params.get("query") {
-            Some(query) => format!("Retrieved data for query: {}", query),
-            None => "Retrieved default data".to_string(),
-        };
-
-        // Store results
-        insert_value(cache, &node.id, "retrieved_data", retrieved_data)?;
-        insert_value(
-            cache,
-            &node.id,
-            "retrieval_timestamp",
-            chrono::Utc::now().to_rfc3339(),
-        )?;
-
-        // // Optionally suggest next steps
-        // let should_review = rand::random::<f32>() < 0.3; // 30% chance of suggesting review
-        // if should_review {
-        //     insert_value(cache, &node.id, "needs_human_review", true)?;
-        //     info!("Suggesting human review of retrieved data");
-        // }
-
-        Ok(())
-    }
-}
 
 // When creating new nodes, initialize cache_ref with a unique identifier:
 pub fn generate_cache_ref(node_id: &str) -> String {

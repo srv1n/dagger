@@ -1,343 +1,207 @@
-use anyhow::{Error, Result};
-use async_openai::{
-    types::{
-        ChatCompletionFunctionsArgs, ChatCompletionRequestFunctionMessageArgs,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
-    },
-    Client,
-};
+use anyhow::{Result, anyhow};
 use dagger::{
-    append_global_value, generate_node_id, get_global_input, insert_global_value, insert_value,
-    parse_input_from_name, register_action, serialize_cache_to_prettyjson, Cache, DagConfig, DagExecutionReport,
-    DagExecutor, HumanInterrupt, InfoRetrievalAgent, Node, NodeAction, WorkflowSpec,
+    Cache, DagExecutor, Node, NodeAction, WorkflowSpec, 
+    register_action, insert_value, get_input, generate_node_id, 
+    serialize_cache_to_prettyjson
 };
-use reqwest;
+use async_openai::{Client, ChatCompletionBuilder}; // Hypothetical async OpenAI client
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, sync::RwLock};
+use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use tokio::time::{sleep, Duration};
-
-
-// Actual Google search implementation
-async fn google_search(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    info!("Running Google Search Node: {}", node.id);
-
-    // Get search query from cache
-    let query: String = get_global_input(cache, "research", "search_query")
-        .unwrap_or(  "AI trends".to_string())   ;
-    
-    // Store input for tracking
-    insert_value(cache, &node.id, "input_query", &query)?;
-
-    // Perform actual search using custom search API
-    let api_key = std::env::var("GOOGLE_API_KEY")?;
-    let cx = std::env::var("GOOGLE_SEARCH_CX")?;
-    let client = reqwest::Client::new();
-    
-    let response = client
-        .get("https://www.googleapis.com/customsearch/v1")
-        .query(&[
-            ("key", api_key),
-            ("cx", cx),
-            ("q", query.clone()),
-        ])
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-
-    // Extract and store results
-    let results = response["items"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .take(5)
-        .map(|item| {
-            format!(
-                "Title: {}\nSnippet: {}\nLink: {}", 
-                item["title"].as_str().unwrap_or(""),
-                item["snippet"].as_str().unwrap_or(""),
-                item["link"].as_str().unwrap_or("")
-            )
-        })
-        .collect::<Vec<String>>();
-
-    insert_value(cache, &node.id, "search_results", &results)?;
-    
-    Ok(())
-}
-
-// Intelligent supervisor using OpenAI with function calling
-async fn supervisor_step(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    info!("Running Supervisor Node: {}", node.id);
-
-    let client = Client::new();
-    let iteration: usize = get_global_input(cache, "research", "iteration").unwrap_or(0);
-    
-    // Get task and any previous results
-    let task: String = get_global_input(cache, "research", "task")
-        .unwrap_or("Research AI trends".to_string());
-    
-    let previous_results: Vec<String> = get_global_input(cache, "research", "all_results")
-        .unwrap_or_default();
-     
-
-    let model = "gpt-4o-mini";
-
-    let request = CreateChatCompletionRequestArgs::default()
-        .max_tokens(512u32)
-        .model(model)
-        .messages([ChatCompletionRequestUserMessageArgs::default()
-            .content("What's the weather like in Boston?")
-            .build()?
-            .into()])
-        .functions([ChatCompletionFunctionsArgs::default()
-            .name("get_current_weather")
-            .description("Get the current weather in a given location")
-            .parameters(json!({
-                "type": "object",
-                "properties": {
-                    "location": {
-                        "type": "string",
-                        "description": "The city and state, e.g. San Francisco, CA",
-                    },
-                    "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] },
-                },
-                "required": ["location"],
-            }))
-            .build()?])
-        .function_call("auto")
-        .build()?;
-
-    let response_message = client
-        .chat()
-        .create(request)
-        .await?
-        .choices
-        .first()
-        .unwrap()
-        .message
-        .clone();
-
-    if let Some(function_call) = response_message.function_call {
-        let mut available_functions: HashMap<&str, fn(&str, &str) -> serde_json::Value> =
-            HashMap::new();
-        available_functions.insert("get_current_weather", get_current_weather);
-        let function_name = function_call.name;
-        let function_args: serde_json::Value = function_call.arguments.parse().unwrap();
-
-        let location = function_args["location"].as_str().unwrap();
-        let unit = "fahrenheit";
-        let function = available_functions.get(function_name.as_str()).unwrap();
-        let function_response = function(location, unit);
-
-        let message = vec![
-            ChatCompletionRequestUserMessageArgs::default()
-                .content("What's the weather like in Boston?")
-                .build()?
-                .into(),
-            ChatCompletionRequestFunctionMessageArgs::default()
-                .content(function_response.to_string())
-                .name(function_name)
-                .build()?
-                .into(),
-        ];
-
-        println!("{}", serde_json::to_string(&message).unwrap());
-
-        let request = CreateChatCompletionRequestArgs::default()
-            .max_tokens(512u32)
-            .model(model)
-            .messages(message)
-            .build()?;
-
-        let response = client.chat().create(request).await?;
-
-        println!("\nResponse:\n");
-        for choice in response.choices {
-            println!(
-                "{}: Role: {}  Content: {:?}",
-                choice.index, choice.message.role, choice.message.content
-            );
-        }
-    }
-
-    
-    // Define available functions
-    let functions = vec![
-        ChatCompletionFunctionsArgs::default()
-            .name("perform_search")
-            .description("Perform a Google search with the specified query")
-            .parameters(json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query to execute",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Explanation of why this search is needed",
-                    }
-                },
-                "required": ["query", "reason"]
-            }))
-            .build()?,
-        ChatCompletionFunctionsArgs::default()
-            .name("finish_research")
-            .description("Complete the research task and summarize findings")
-            .parameters(json!({
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "Final summary of the research findings",
-                    }
-                },
-                "required": ["summary"]
-            }))
-            .build()?
-    ];
-
-    // Prepare context for OpenAI
-    let messages = vec![
-        ChatCompletionRequestMessage {
-            role: Role::System,
-            content: "You are a research supervisor agent. Plan and coordinate research steps using the available functions. Make decisions based on the task and previous results.".into(),
-            name: None,
-            function_call: None,
-        },
-        ChatCompletionRequestMessage {
-            role: Role::User,
-            content: format!(
-                "Task: {}\nIteration: {}\nPrevious results: {:?}\n\nWhat should be the next step?",
-                task, iteration, previous_results
-            ),
-            name: None,
-            function_call: None,
-        },
-    ];
-
-    // Get OpenAI's decision with function calling
-    let response = openai
-        .chat()
-        .create(CreateChatCompletionRequest {
-            model: "gpt-4".into(),
-            messages: messages.clone(),
-            functions: Some(functions),
-            function_call: Some(serde_json::json!("auto")),
-            temperature: Some(0.7),
-            max_tokens: Some(500),
-            ..Default::default()
-        })
-        .await?;
-
-    let message = &response.choices[0].message;
-    
-    // Handle function calls
-    if let Some(function_call) = &message.function_call {
-        let function_args: Value = serde_json::from_str(&function_call.arguments)?;
-        
-        match function_call.name.as_str() {
-            "perform_search" => {
-                let query = function_args["query"].as_str().unwrap();
-                let reason = function_args["reason"].as_str().unwrap();
-                
-                info!("Initiating search: {} (Reason: {})", query, reason);
-                
-                // Add search node
-                let search_id = generate_node_id("google_search");
-                insert_global_value(cache, "research", "search_query", query.to_string())?;
-                executor.add_node(
-                    "research",
-                    search_id.clone(),
-                    "google_search".to_string(),
-                    vec![node.id.clone()],
-                )?;
-
-                // Queue next supervisor step
-                let next_supervisor = generate_node_id("supervisor_step");
-                executor.add_node(
-                    "research",
-                    next_supervisor,
-                    "supervisor_step".to_string(),
-                    vec![search_id],
-                )?;
-            },
-            "finish_research" => {
-                let summary = function_args["summary"].as_str().unwrap();
-                info!("Research complete: {}", summary);
-                insert_value(cache, &node.id, "final_summary", summary)?;
-                executor.stopped = Arc::new(RwLock::new(true));
-            },
-            _ => {
-                info!("Unknown function call: {}", function_call.name);
-            }
-        }
-    }
-
-    // Update iteration count
-    insert_global_value(cache, "research", "iteration", iteration + 1)?;
-    
-    Ok(())
-}
-
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     // Setup tracing
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // Initialize executor with configuration
-    let config = DagConfig {
-        max_iterations: Some(10),
-        timeout_seconds: Some(300),
-        human_wait_minutes: Some(1),
-        human_timeout_action: dagger::HumanTimeoutAction::Autopilot,
-        review_frequency: Some(2),
-        ..Default::default()
-    };
-
-    let registry = Arc::new(RwLock::new(HashMap::new()));
-    let mut executor = DagExecutor::new(Some(config), registry.clone(), "dagger_db")?;
+    // Initialize Dagger executor
+    let registry = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let mut executor = DagExecutor::new(None, registry.clone(), "dagger_db")?;
 
     // Register actions
     register_action!(executor, "supervisor_step", supervisor_step);
-    register_action!(executor, "google_search", google_search);
+    register_action!(executor, "web_search", web_search);
+    register_action!(executor, "final_answer", final_answer);
 
-    // Initialize cache and set initial task
-    let cache = Cache::new(HashMap::new());
-    insert_global_value(
-        &cache,
-        "research",
-        "task",
-        "Research the latest developments in AI safety".to_string(),
-    )?;
+    // Initialize cache
+    let cache = Cache::new(std::collections::HashMap::new());
 
-    // Execute agent flow
+    // Set initial task
+    let task = "How many seconds would it take for a leopard at full speed to run through Pont des Arts?";
+    insert_value(&cache, "analyze", "task", task)?;
+
+    // Cancellation channel
     let (_cancel_tx, cancel_rx) = oneshot::channel();
+
+    // Execute agentic flow
     let report = executor
         .execute_dag(
             WorkflowSpec::Agent {
-                task: "research".to_string(),
+                task: "analyze".to_string(),
             },
             &cache,
             cancel_rx,
         )
         .await?;
 
-    // Output results
-    println!("Final Cache:\n{}", serialize_cache_to_prettyjson(&cache)?);
+    // Print results
+    let json_output = serialize_cache_to_prettyjson(&cache)?;
+    println!("Final Cache:\n{}", json_output);
     println!("Execution Report: {:#?}", report);
-    println!(
-        "Execution Tree (DOT):\n{}",
-        executor.serialize_tree_to_dot("research")?
-    );
 
+    let dot_output = executor.serialize_tree_to_dot("analyze")?;
+    println!("Execution Tree (DOT):\n{}", dot_output);
+
+    Ok(())
+}
+
+// Web Search Action (Simplified)
+async fn web_search(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    let query: String = get_input(cache, &node.id, "query")?;
+    info!("Performing web search for: {}", query);
+    
+    // Simulate search (replace with actual DuckDuckGo API call if available)
+    let results = format!("Search results for '{}': Leopard speed ~50mph, Pont des Arts length ~155m", query);
+    insert_value(cache, &node.id, "output_results", results)?;
+    Ok(())
+}
+
+// Final Answer Action
+async fn final_answer(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    let answer: String = get_input(cache, &node.id, "answer")?;
+    info!("Final answer: {}", answer);
+    insert_value(cache, "analyze", "final_result", answer)?;
+    Ok(())
+}
+
+// Supervisor Step with OpenAI LLM
+async fn supervisor_step(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    let dag_name = "analyze";
+    let task: String = get_input(cache, dag_name, "task")?;
+    let iteration: usize = get_input(cache, &node.id, "iteration").unwrap_or(0);
+    let next_iteration = iteration + 1;
+
+    // Initialize OpenAI client (replace with your API key)
+    let client = Client::new("your_openai_api_key");
+
+    // Define tools for function calling
+    let tools = vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Performs a web search for the given query",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "final_answer",
+                "description": "Provides the final answer to the task",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string", "description": "The final answer"}
+                    },
+                    "required": ["answer"]
+                }
+            }
+        }),
+    ];
+
+    // Prepare messages
+    let mut messages = vec![
+        json!({"role": "system", "content": "You are an expert assistant solving tasks using tools."}),
+        json!({"role": "user", "content": task}),
+    ];
+
+    // Add previous observations if any
+    if iteration > 0 {
+        let previous_results: String = get_input(cache, &node.id, "previous_results").unwrap_or("".to_string());
+        messages.push(json!({"role": "assistant", "content": previous_results}));
+    }
+
+    // Make LLM call with function calling
+    let response = ChatCompletionBuilder::new(&client)
+        .messages(messages)
+        .tools(tools)
+        .tool_choice("auto")
+        .build()?
+        .execute()
+        .await?;
+
+    let message = response.choices[0].message.clone();
+    if let Some(tool_calls) = message.tool_calls {
+        for tool_call in tool_calls {
+            let function = tool_call.function;
+            let args: Value = serde_json::from_str(&function.arguments)?;
+
+            match function.name.as_str() {
+                "web_search" => {
+                    let query = args["query"].as_str().ok_or(anyhow!("Missing query"))?.to_string();
+                    let search_id = generate_node_id("web_search");
+                    executor.add_node(
+                        dag_name,
+                        search_id.clone(),
+                        "web_search".to_string(),
+                        vec![node.id.clone()],
+                    )?;
+                    insert_value(cache, &search_id, "query", query)?;
+
+                    // Queue next supervisor step
+                    let next_supervisor = generate_node_id("supervisor_step");
+                    executor.add_node(
+                        dag_name,
+                        next_supervisor,
+                        "supervisor_step".to_string(),
+                        vec![search_id],
+                    )?;
+                }
+                "final_answer" => {
+                    let answer = args["answer"].as_str().ok_or(anyhow!("Missing answer"))?.to_string();
+                    let final_id = generate_node_id("final_answer");
+                    executor.add_node(
+                        dag_name,
+                        final_id.clone(),
+                        "final_answer".to_string(),
+                        vec![node.id.clone()],
+                    )?;
+                    insert_value(cache, &final_id, "answer", answer)?;
+                    executor.stopped = Arc::new(RwLock::new(true)); // Signal completion
+                }
+                _ => return Err(anyhow!("Unknown tool: {}", function.name)),
+            }
+        }
+    } else {
+        // Handle text response (e.g., intermediate reasoning)
+        let content = message.content.unwrap_or_default();
+        insert_value(cache, &node.id, "previous_results", content.clone())?;
+
+        // Queue next supervisor step if not finished
+        if iteration < 5 { // Arbitrary limit to prevent infinite loop
+            let next_supervisor = generate_node_id("supervisor_step");
+            executor.add_node(
+                dag_name,
+                next_supervisor,
+                "supervisor_step".to_string(),
+                vec![node.id.clone()],
+            )?;
+        }
+    }
+
+    // Update iteration
+    insert_value(cache, &node.id, "iteration", next_iteration)?;
     Ok(())
 }
