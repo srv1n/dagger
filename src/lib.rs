@@ -313,7 +313,7 @@ pub struct Node {
 /// Type alias for a cache of input and output values.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SerializableData {
-    pub value: String,
+    pub value: Value,
 }
 
 // Update your cache to use the new SerializableData
@@ -324,10 +324,10 @@ pub fn serialize_cache_to_json(cache: &Cache) -> Result<String> {
         .read()
         .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
 
-    let serialized_cache: HashMap<String, HashMap<String, String>> = cache_read
+    let serialized_cache: HashMap<String, HashMap<String, Value>> = cache_read
         .iter()
         .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, String> = category_map
+            let serialized_category: HashMap<String, Value> = category_map
                 .iter()
                 .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
                 .collect();
@@ -335,16 +335,18 @@ pub fn serialize_cache_to_json(cache: &Cache) -> Result<String> {
         })
         .collect();
 
-    serde_json::to_string(&serialized_cache)
-        .map_err(|e| anyhow!("Failed to serialize cache to JSON: {}", e))
+    serde_json::to_string(&serialized_cache).map_err(|e| e.into())
 }
 
 pub fn serialize_cache_to_prettyjson(cache: &Cache) -> Result<String> {
-    let cache_read = cache.read().unwrap();
-    let serialized_cache: HashMap<String, HashMap<String, String>> = cache_read
+    let cache_read = cache
+        .read()
+        .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
+
+    let serialized_cache: HashMap<String, HashMap<String, Value>> = cache_read
         .iter()
         .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, String> = category_map
+            let serialized_category: HashMap<String, Value> = category_map
                 .iter()
                 .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
                 .collect();
@@ -352,29 +354,34 @@ pub fn serialize_cache_to_prettyjson(cache: &Cache) -> Result<String> {
         })
         .collect();
 
-    // Convert to JSON string
-    serde_json::to_string_pretty(&serialized_cache)
-        .map_err(|e| anyhow::anyhow!(format!("Serialization error: {}", e)))
+    serde_json::to_string_pretty(&serialized_cache).map_err(|e| e.into())
 }
 
 /// Function to load the cache from JSON
 /// Function to load the cache from JSON
 pub fn load_cache_from_json(json_data: &str) -> Result<Cache> {
-    // Create a new cache instance
-    let cache = Cache::new(HashMap::new());
+    let deserialized_cache: HashMap<String, HashMap<String, Value>> =
+        serde_json::from_str(json_data)?;
 
-    // Deserialize the JSON string into a HashMap
-    let parsed_cache: HashMap<String, HashMap<String, SerializableData>> =
-        serde_json::from_str(json_data)
-            .map_err(|e| anyhow::anyhow!(format!("Deserialization error: {}", e)))?;
+    let cache = deserialized_cache
+        .into_iter()
+        .map(|(node_id, category_map)| {
+            let converted_category: HashMap<String, SerializableData> = category_map
+                .into_iter()
+                .map(|(output_name, value)| {
+                    (
+                        output_name,
+                        SerializableData {
+                            value, // Use Value directly
+                        },
+                    )
+                })
+                .collect();
+            (node_id, converted_category)
+        })
+        .collect();
 
-    // Lock the cache for writing
-    {
-        let mut cache_write = cache.write().unwrap();
-        *cache_write = parsed_cache;
-    }
-
-    Ok(cache)
+    Ok(RwLock::new(cache))
 }
 // pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
 //     let mut cache_write = cache.write().unwrap();
@@ -390,29 +397,17 @@ where
         .write()
         .map_err(|e| anyhow!("Failed to acquire cache write lock: {}", e))?;
 
-    // Try to convert the value to a string representation
-    let serialized_value = match serde_json::to_string(&value) {
-        Ok(json_str) => {
-            // For simple string values, remove the quotes
-            if json_str.starts_with('"') && json_str.ends_with('"') {
-                json_str[1..json_str.len() - 1].to_string()
-            } else {
-                json_str
-            }
-        }
-        Err(e) => return Err(anyhow!("Failed to serialize value: {}", e)),
-    };
+    let json_value = serde_json::to_value(value)?; // Serialize to serde_json::Value
 
-    // Store the serialized value in the cache
-    cache_write
-        .entry(node_id.to_string())
-        .or_insert_with(HashMap::new)
-        .insert(
-            output_name.to_string(),
-            SerializableData {
-                value: serialized_value,
-            },
-        );
+    let serializable_data = SerializableData { value: json_value }; // Use Value
+
+    if let Some(category_map) = cache_write.get_mut(node_id) {
+        category_map.insert(output_name.to_string(), serializable_data);
+    } else {
+        let mut new_category_map = HashMap::new();
+        new_category_map.insert(output_name.to_string(), serializable_data);
+        cache_write.insert(node_id.to_string(), new_category_map);
+    }
 
     Ok(())
 }
@@ -431,22 +426,16 @@ pub fn get_input<T: for<'de> Deserialize<'de>>(
         .read()
         .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
 
-    let node_map = cache_read
-        .get(node_id)
-        .ok_or_else(|| anyhow!("Node '{}' not found in cache", node_id))?;
-
-    let serialized_value = node_map
-        .get(key)
-        .ok_or_else(|| anyhow!("Key '{}' not found for node '{}'", key, node_id))?;
-
-    serde_json::from_str(&serialized_value.value).map_err(|e| {
-        anyhow!(
-            "Failed to deserialize value for node '{}', key '{}': {}",
-            node_id,
-            key,
-            e
-        )
-    })
+    if let Some(category_map) = cache_read.get(node_id) {
+        if let Some(serializable_data) = category_map.get(key) {
+            let value: T = serde_json::from_value(serializable_data.value.clone())?; // Deserialize from Value
+            Ok(value)
+        } else {
+            Err(anyhow!("Key '{}' not found in node '{}'", key, node_id).into())
+        }
+    } else {
+        Err(anyhow!("Node '{}' not found in cache", node_id).into())
+    }
 }
 
 pub fn parse_input_from_name<T: for<'de> Deserialize<'de>>(
@@ -454,49 +443,51 @@ pub fn parse_input_from_name<T: for<'de> Deserialize<'de>>(
     input_name: String,
     inputs: &[IField],
 ) -> Result<T> {
-    let input = inputs
+    // Find the input field that matches the given name
+    let input_field = inputs
         .iter()
         .find(|input| input.name == input_name)
-        .ok_or_else(|| anyhow::anyhow!("Input not found: {}", input_name))?;
+        .ok_or_else(|| anyhow!("Input field '{}' not found", input_name))?;
 
-    let parts: Vec<&str> = input.reference.split('.').collect();
+    // Extract the reference from the input field
+    let reference = &input_field.reference;
+
+    // Split the reference into node ID and output name
+    let parts: Vec<&str> = reference.split('.').collect();
     if parts.len() != 2 {
-        return Err(anyhow::anyhow!(
-            "Invalid reference format: {}",
-            input.reference
-        ));
+        return Err(anyhow!("Invalid reference format: '{}'", reference).into());
     }
-
     let node_id = parts[0];
     let output_name = parts[1];
-
-    let cache_read = cache.read().unwrap();
-    let category_map = cache_read
-        .get(node_id)
-        .ok_or_else(|| anyhow::anyhow!("Node not found: {}", node_id))?;
-
-    let serialized_value = category_map
-        .get(output_name)
-        .ok_or_else(|| anyhow::anyhow!("Output not found: {}", output_name))?;
-
-    serde_json::from_str(&serialized_value.value)
-        .map_err(|e| anyhow::anyhow!("Deserialization error: {}", e))
+    // Use get_input to retrieve the value from the cache
+    get_input(cache, node_id, output_name)
 }
 
 pub fn get_global_input<T: for<'de> Deserialize<'de>>(
     cache: &Cache,
     dag_name: &str,
     key: &str,
-) -> Result<T> {
-    let cache_read = cache.read().unwrap();
-    let dag_map = cache_read
-        .get(dag_name)
-        .ok_or_else(|| anyhow!("DAG '{}' not found", dag_name))?;
-    let serialized_value = dag_map
-        .get(key)
-        .ok_or_else(|| anyhow!("Key '{}' not found", key))?;
-    serde_json::from_str(&serialized_value.value)
-        .map_err(|e| anyhow!("Deserialization error: {}", e))
+) -> Result<T, DagError> {
+    let cache_read = cache.read().map_err(|e| DagError::LockError(e.to_string()))?;
+
+    let global_key = format!("global:{}", dag_name); // Consistent global key
+
+    if let Some(global_map) = cache_read.get(&global_key) {
+        if let Some(data) = global_map.get(key) {
+            let value: T = serde_json::from_value(data.value.clone())?; // Use Value
+            Ok(value)
+        } else {
+            Err(DagError::InvalidState(format!(
+                "Key '{}' not found in global inputs for DAG '{}'",
+                key, dag_name
+            )))
+        }
+    } else {
+        Err(DagError::InvalidState(format!(
+            "Global inputs not found for DAG '{}'",
+            dag_name
+        )))
+    }
 }
 
 pub fn insert_global_value<T: Serialize>(
@@ -505,16 +496,20 @@ pub fn insert_global_value<T: Serialize>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let mut cache_write = cache.write().unwrap();
-    let dag_map = cache_write
-        .entry(dag_name.to_string())
-        .or_insert_with(HashMap::new);
-    dag_map.insert(
-        key.to_string(),
-        SerializableData {
-            value: serde_json::to_string(&value)?,
-        },
-    );
+    let mut cache_write = cache.write().map_err(|e| DagError::LockError(e.to_string()))?;
+
+    let global_key = format!("global:{}", dag_name); // Consistent global key
+    let json_value = serde_json::to_value(value)?; // Serialize to Value
+    let serializable_data = SerializableData { value: json_value }; // Use Value
+
+    if let Some(global_map) = cache_write.get_mut(&global_key) {
+        global_map.insert(key.to_string(), serializable_data);
+    } else {
+        let mut new_global_map = HashMap::new();
+        new_global_map.insert(key.to_string(), serializable_data);
+        cache_write.insert(global_key, new_global_map);
+    }
+
     Ok(())
 }
 
@@ -524,22 +519,42 @@ pub fn append_global_value<T: Serialize + for<'de> Deserialize<'de>>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let mut cache_write = cache.write().unwrap();
-    let dag_map = cache_write
-        .entry(dag_name.to_string())
-        .or_insert_with(HashMap::new);
-    let existing: Vec<T> = dag_map
-        .get(key)
-        .map(|v| serde_json::from_str(&v.value).unwrap_or(vec![]))
-        .unwrap_or(vec![]);
-    let mut updated = existing;
-    updated.push(value);
-    dag_map.insert(
-        key.to_string(),
-        SerializableData {
-            value: serde_json::to_string(&updated)?,
-        },
-    );
+    let mut cache_write = cache.write().map_err(|e| DagError::LockError(e.to_string()))?;
+
+    let global_key = format!("global:{}", dag_name);
+    let json_value = serde_json::to_value(value)?;
+
+    if let Some(global_map) = cache_write.get_mut(&global_key) {
+        if let Some(existing_data) = global_map.get_mut(key) {
+            // Get mutable reference to existing Value
+            let existing_value = &mut existing_data.value;
+
+            if let Some(existing_vec) = existing_value.as_array_mut() {
+                existing_vec.push(json_value);
+            } else {
+                // Convert existing value to array and append
+                *existing_value = Value::Array(vec![existing_value.clone(), json_value]);
+            }
+        } else {
+            global_map.insert(
+                key.to_string(),
+                SerializableData {
+                    value: Value::Array(vec![json_value]),
+                },
+            );
+        }
+    } else {
+        // Create new global map with the value in an array
+        let mut new_global_map = HashMap::new();
+        new_global_map.insert(
+            key.to_string(),
+            SerializableData {
+                value: Value::Array(vec![json_value]),
+            },
+        );
+        cache_write.insert(global_key, new_global_map);
+    }
+
     Ok(())
 }
 /// A trait for custom actions associated with nodes.
@@ -1250,38 +1265,20 @@ impl DagExecutor {
         key: String,
         value: SerializableData,
     ) -> Result<(), DagError> {
-        let cache = self
-               .load_cache(dag_id)
-    .map_err(|e| DagError::ExecutionError(e.to_string()))?;
+        let mut cache = self.load_cache(dag_id).map_err(|e| DagError::ExecutionError(e.to_string()))?;
+        {
+            let mut write_cache = cache.write().map_err(|e| {
+                DagError::LockError(format!("Failed to acquire write lock: {}", e))
+            })?;
 
-            let mut cache_write = cache
-            .write()
-            .map_err(|e| DagError::LockError(e.to_string()))?;
-
-        let instructions = cache_write
-            .entry("global".to_string())
-            .or_insert_with(HashMap::new);
-
-        instructions.insert("pending_instructions".to_string(), value);
-        drop(cache_write);
-
-        // Signal any waiting HumanInterrupt actions
-        if let Some(graph) = self.graphs.read().unwrap().get(dag_id) {
-            for node in &graph.nodes {
-                if node.action == "human_interrupt" {
-                    if let Some(action) = self.function_registry.read().unwrap().get(&node.action) {
-                        if let Some(human_interrupt) =
-                            action.as_any().downcast_ref::<HumanInterrupt>()
-                        {
-                            if let Some(tx) = human_interrupt.input_tx.read().unwrap().as_ref() {
-                                let _ = tx.try_send(());
-                            }
-                        }
-                    }
-                }
+            if let Some(node_map) = write_cache.get_mut(dag_id) {
+                node_map.insert(key, value);
+            } else {
+                let mut new_map = HashMap::new();
+                new_map.insert(key, value);
+                write_cache.insert(dag_id.to_string(), new_map);
             }
         }
-
         self.save_cache(dag_id, &cache)?;
         Ok(())
     }
@@ -1312,7 +1309,7 @@ impl DagExecutor {
             self.update_cache(
                 dag_id,
                 "pending_instructions".to_string(),
-                SerializableData { value: input_value },
+                SerializableData { value: serde_json::to_value(&input_value).unwrap() },
             )?;
         }
 
@@ -1477,7 +1474,7 @@ impl DagExecutor {
                 let mut outputs = Vec::new();
 
                 for (key, data) in node_cache {
-                    let value_str = flatten_value(&data.value);
+                    let value_str = flatten_value(&data.value.to_string());
                     if key.starts_with("input_") || node_cache.len() == 1 {
                         inputs.push((key.clone(), value_str));
                     } else if key.starts_with("output_") || key == "retrieved_data" {
@@ -1801,7 +1798,7 @@ fn record_execution_snapshot(
             for (node_id, node_cache) in cache_read.iter() {
                 info!("  Node {}:", node_id);
                 for (key, value) in node_cache {
-                    info!("    {} = {}", key, value.value);
+                    info!("    {} = {}", key, value.value.to_string());
                 }
             }
             cache_read.clone()
@@ -2486,7 +2483,7 @@ impl SupervisorStep {
 
         let mut valid_instructions = Vec::new();
         for instruction_str in instructions {
-            match Self::validate_instruction(&instruction_str) {
+            match Self::validate_instruction(&instruction_str.to_string()) {
                 Ok(instruction) => valid_instructions.push(instruction),
                 Err(e) => {
                     warn!("Skipping invalid instruction: {}", e);

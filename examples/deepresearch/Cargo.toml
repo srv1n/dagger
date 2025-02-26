@@ -1,0 +1,16 @@
+[package]
+name = "deepresearch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+dagger = { git = "https://github.com/srv1n/dagger" }
+dagger-macros = { git = "https://github.com/srv1n/dagger-macros" }
+serde_json = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = "0.4"
+async-trait = "0.1.77"
+jsonschema = "0.16.1"

@@ -14,7 +14,7 @@ tracing = "0.1.40"
 tracing-subscriber = "0.3"
 futures = "0.3.31"
 async-trait = "0.1.77"
-dagger = {path = "../../"}
+dagger = { git = "https://github.com/srv1n/dagger" }
 rzn_datasourcer = {path = "../../../rzn_datasourcer"}
 async-openai = "0.27.2"
 reqwest = { version = "0.12", features = ["json"] }  # Optional fallback, not used here
