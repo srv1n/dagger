@@ -77,7 +77,11 @@ pub trait PubSubAgent: Send + Sync + 'static {
         let compiled_schema = jsonschema::validator_for(&schema)
             .map_err(|e| anyhow::anyhow!("Failed to compile input schema: {}", e))?;
         if let Err(errors) = compiled_schema.validate(message) {
-            warn!("Input validation failed for agent {}: {}", self.name(), errors);
+            warn!(
+                "Input validation failed for agent {}: {}",
+                self.name(),
+                errors
+            );
             return Err(anyhow::anyhow!("Invalid input: {}", errors));
         }
         Ok(())
@@ -88,7 +92,11 @@ pub trait PubSubAgent: Send + Sync + 'static {
         let compiled_schema = jsonschema::validator_for(&schema)
             .map_err(|e| anyhow::anyhow!("Failed to compile output schema: {}", e))?;
         if let Err(errors) = compiled_schema.validate(message) {
-            warn!("Output validation failed for agent {}: {}", self.name(), errors);
+            warn!(
+                "Output validation failed for agent {}: {}",
+                self.name(),
+                errors
+            );
             return Err(anyhow::anyhow!("Invalid output: {}", errors));
         }
         Ok(())
@@ -98,9 +106,10 @@ pub trait PubSubAgent: Send + Sync + 'static {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
     pub timestamp: NaiveDateTime,
-    pub source: String, // The node_id of the publishing agent or initial publish
-    pub channel: Option<String>, // Optional, set by publish
-    pub payload: Value, // The actual message content
+    pub source: String,          // Node ID of the publishing agent
+    pub channel: Option<String>, // Set by publish
+    pub task_id: Option<String>, // Links to a specific task
+    pub payload: Value,          // Task-specific data
 }
 
 impl Message {
@@ -109,9 +118,39 @@ impl Message {
             timestamp: chrono::Local::now().naive_local(),
             source,
             channel: None,
+            task_id: None, // Default to None; set explicitly when tied to a task
             payload,
         }
     }
+
+    pub fn with_task_id(source: String, task_id: String, payload: Value) -> Self {
+        Self {
+            timestamp: chrono::Local::now().naive_local(),
+            source,
+            channel: None,
+            task_id: Some(task_id),
+            payload,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Task {
+    pub task_id: String,           // Unique identifier
+    pub task_type: String,         // e.g., "search", "reason"
+    pub status: TaskStatus,        // Pending, InProgress, Completed, Failed
+    pub attempts: u32,             // Retry attempts
+    pub max_attempts: u32,         // From config
+    pub data: Value,               // Task-specific payload
+    pub created_at: NaiveDateTime, // For tracking and timeouts
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone)]
@@ -258,6 +297,7 @@ pub struct PubSubExecutor {
     pub agent_registry: Arc<RwLock<HashMap<String, AgentEntry>>>,
     pub agent_factories: Arc<RwLock<HashMap<String, AgentFactory>>>,
     pub channels: Arc<RwLock<HashMap<String, (Sender<Message>, Receiver<Message>)>>>,
+    pub task_manager: TaskManager,
     pub config: PubSubConfig,
     pub sled_db: Db,
     pub execution_tree: Arc<RwLock<ExecutionTree>>,
@@ -265,6 +305,7 @@ pub struct PubSubExecutor {
     pub stopped: Arc<RwLock<bool>>,
     pub start_time: NaiveDateTime,
     pub current_agent_id: Option<String>,
+    pub planned_tasks: Arc<RwLock<usize>>, // Track total planned tasks
 }
 
 impl PubSubExecutor {
@@ -292,6 +333,7 @@ impl PubSubExecutor {
             agent_registry: Arc::new(RwLock::new(HashMap::new())),
             agent_factories: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            task_manager: TaskManager::new(),
             config: config.clone(),
             sled_db,
             execution_tree: Arc::new(RwLock::new(DiGraph::new())),
@@ -299,9 +341,9 @@ impl PubSubExecutor {
             stopped: Arc::new(RwLock::new(false)),
             start_time: chrono::Local::now().naive_local(),
             current_agent_id: None,
+            planned_tasks: Arc::new(RwLock::new(0)),
         };
 
-        // Attempt to load persisted state
         if let Err(e) = executor.load_state(&cache).await {
             warn!("Failed to load persisted state: {}. Starting fresh.", e);
         }
@@ -311,7 +353,6 @@ impl PubSubExecutor {
             max_messages = ?config.max_messages,
             "Initialized PubSubExecutor"
         );
-
         Ok(executor)
     }
 
@@ -407,10 +448,8 @@ impl PubSubExecutor {
             ));
         }
 
-        let name = subscriptions[0].clone();
+        let name = agent.name();
         let publications = agent.publications();
-
-        // Ensure channels exist
         for channel in subscriptions.iter().chain(publications.iter()) {
             self.ensure_channel(channel)
                 .await
@@ -426,56 +465,30 @@ impl PubSubExecutor {
             registered_at: chrono::Local::now().to_rfc3339(),
         };
 
-        // Register in memory
-        {
-            let mut registry = self.agent_registry.write().await;
-            registry.insert(
-                name.clone(),
-                AgentEntry {
-                    agent: agent.clone(),
-                    metadata: metadata.clone(),
-                },
-            );
-        }
-
-        // Persist to storage
-        let agents_tree = self.sled_db.open_tree("pubsub_agents")?;
-        agents_tree.insert(name.as_bytes(), serde_json::to_vec(&metadata)?)?;
+        let mut registry = self.agent_registry.write().await;
+        registry.insert(
+            name.clone(),
+            AgentEntry {
+                agent: agent.clone(),
+                metadata,
+            },
+        );
 
         info!(agent_name = %name, "Registered Pub/Sub agent");
         Ok(())
     }
+
     pub async fn publish(
         &self,
         channel: &str,
         mut message: Message,
         cache: &Cache,
+        task: Option<(String, Value)>,
     ) -> Result<String, PubSubError> {
         if *self.stopped.read().await {
-            return Err(PubSubError::ExecutionError("Executor is stopped".to_string()));
-        }
-
-        let elapsed = chrono::Local::now().naive_local() - self.start_time;
-        if let Some(timeout) = self.config.timeout_seconds {
-            if elapsed.num_seconds() > timeout as i64 {
-                return Err(PubSubError::TimeoutExceeded);
-            }
-        }
-
-        // Validate payload against subscribing agents' schemas
-        let registry = self.agent_registry.read().await;
-        for (_, entry) in registry.iter() {
-            if entry.metadata.subscriptions.contains(&channel.to_string()) {
-                let schema = entry.metadata.input_schema.clone();
-                let compiled_schema = jsonschema::validator_for(&schema)
-                    .map_err(|e| PubSubError::ValidationError(e.to_string()))?;
-                if let Err(errors) = compiled_schema.validate(&message.payload) {
-                    return Err(PubSubError::ValidationError(format!(
-                        "Message payload validation failed: {}",
-                        errors
-                    )));
-                }
-            }
+            return Err(PubSubError::ExecutionError(
+                "Executor is stopped".to_string(),
+            ));
         }
 
         message.channel = Some(channel.to_string());
@@ -486,11 +499,19 @@ impl PubSubExecutor {
         let (sender, _) = channels
             .get(channel)
             .ok_or(PubSubError::ChannelNotFound(channel.to_string()))?;
-
-        let node_id = self.get_current_agent_id().unwrap_or("default_agent".to_string());
-      
-        let messages_tree = self.sled_db.open_tree("pubsub_messages")?;
+        let node_id = self
+            .get_current_agent_id()
+            .unwrap_or("default_agent".to_string());
         message.source = node_id.clone();
+
+          // Handle task creation or update
+        if let Some((task_type, data)) = task {
+            let task_id = message.task_id.clone().unwrap_or_else(|| format!("task_{}", chrono::Utc::now().timestamp_nanos()));
+            message.task_id = Some(task_id.clone());
+            self.task_manager.create_or_update_task(task_id, task_type, data, self.config.max_attempts).await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        }
+
+        let messages_tree = self.sled_db.open_tree("pubsub_messages")?;
         messages_tree.insert(node_id.as_bytes(), serde_json::to_vec(&message)?)?;
 
         if let Some(max_msgs) = self.config.max_messages {
@@ -498,79 +519,147 @@ impl PubSubExecutor {
                 warn!(
                     channel = channel,
                     capacity = max_msgs,
-                    current_len = sender.len(),
                     "Channel at capacity, dropping oldest message"
                 );
                 let mut rx = sender.new_receiver();
-                if let Err(_) = rx.try_recv() {}
+                let _ = rx.try_recv();
             }
         }
 
-         let max_attempts = self.config.max_attempts;
-        let mut attempts = max_attempts;
-
-        while attempts > 0 {
-            match sender.broadcast(message.clone()).await {
-                Ok(_) => {
-                    // crate::insert_value(&cache, channel, &msg_id, &message.payload)
-                    //     .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
-
-                    info!(
-                        channel = channel, 
-                        node_id = %node_id, 
-                        "Published message successfully"
-                    );
-                    return Ok(node_id);
-                }
-                Err(e) => {
-                    attempts -= 1;
-                    
-                    if attempts > 0 {
-                        let delay = match self.config.retry_strategy {
-                            RetryStrategy::Exponential {
-                                initial_delay_secs,
-                                max_delay_secs,
-                                multiplier,
-                            } => {
-                                let attempt = max_attempts - attempts;
-                                (initial_delay_secs as f64 * multiplier.powi(attempt as i32))
-                                    .min(max_delay_secs as f64)
-                                    as u64
-                            }
-                            RetryStrategy::Linear { delay_secs } => delay_secs,
-                            RetryStrategy::Immediate => 0,
-                        };
-                        
-                        warn!(
-                            channel = channel,
-                            attempt = max_attempts - attempts + 1,
-                            max_attempts = max_attempts,
-                            delay_secs = delay,
-                            error = %e,
-                            "Publish attempt failed, retrying"
-                        );
-                        
-                        if delay > 0 {
-                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                        }
-                    } else {
-                        error!(
-                            channel = channel,
-                            max_attempts = max_attempts,
-                            error = %e,
-                            "Failed to publish message after all retry attempts"
-                        );
-                        
-                        return Err(PubSubError::ExecutionError(format!(
-                            "Failed to broadcast after {} attempts: {}",
-                            max_attempts, e
-                        )));
-                    }
-                }
-            }
-        }
-        unreachable!()
+        sender
+            .broadcast(message.clone())
+            .await
+            .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        info!(channel = channel, node_id = %node_id, "Published message successfully");
+        Ok(node_id)
     }
+
+    // pub async fn publish(
+    //     &self,
+    //     channel: &str,
+    //     mut message: Message,
+    //     cache: &Cache,
+    // ) -> Result<String, PubSubError> {
+    //     if *self.stopped.read().await {
+    //         return Err(PubSubError::ExecutionError("Executor is stopped".to_string()));
+    //     }
+
+    //     let elapsed = chrono::Local::now().naive_local() - self.start_time;
+    //     if let Some(timeout) = self.config.timeout_seconds {
+    //         if elapsed.num_seconds() > timeout as i64 {
+    //             return Err(PubSubError::TimeoutExceeded);
+    //         }
+    //     }
+
+    //     // Validate payload against subscribing agents' schemas
+    //     let registry = self.agent_registry.read().await;
+    //     for (_, entry) in registry.iter() {
+    //         if entry.metadata.subscriptions.contains(&channel.to_string()) {
+    //             let schema = entry.metadata.input_schema.clone();
+    //             let compiled_schema = jsonschema::validator_for(&schema)
+    //                 .map_err(|e| PubSubError::ValidationError(e.to_string()))?;
+    //             if let Err(errors) = compiled_schema.validate(&message.payload) {
+    //                 return Err(PubSubError::ValidationError(format!(
+    //                     "Message payload validation failed: {}",
+    //                     errors
+    //                 )));
+    //             }
+    //         }
+    //     }
+
+    //     message.channel = Some(channel.to_string());
+    //     self.ensure_channel(channel)
+    //         .await
+    //         .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+    //     let channels = self.channels.read().await;
+    //     let (sender, _) = channels
+    //         .get(channel)
+    //         .ok_or(PubSubError::ChannelNotFound(channel.to_string()))?;
+
+    //     let node_id = self.get_current_agent_id().unwrap_or("default_agent".to_string());
+
+    //     let messages_tree = self.sled_db.open_tree("pubsub_messages")?;
+    //     message.source = node_id.clone();
+    //     messages_tree.insert(node_id.as_bytes(), serde_json::to_vec(&message)?)?;
+
+    //     if let Some(max_msgs) = self.config.max_messages {
+    //         if sender.len() >= max_msgs as usize {
+    //             warn!(
+    //                 channel = channel,
+    //                 capacity = max_msgs,
+    //                 current_len = sender.len(),
+    //                 "Channel at capacity, dropping oldest message"
+    //             );
+    //             let mut rx = sender.new_receiver();
+    //             if let Err(_) = rx.try_recv() {}
+    //         }
+    //     }
+
+    //      let max_attempts = self.config.max_attempts;
+    //     let mut attempts = max_attempts;
+
+    //     while attempts > 0 {
+    //         match sender.broadcast(message.clone()).await {
+    //             Ok(_) => {
+    //                 // crate::insert_value(&cache, channel, &msg_id, &message.payload)
+    //                 //     .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+
+    //                 info!(
+    //                     channel = channel,
+    //                     node_id = %node_id,
+    //                     "Published message successfully"
+    //                 );
+    //                 return Ok(node_id);
+    //             }
+    //             Err(e) => {
+    //                 attempts -= 1;
+
+    //                 if attempts > 0 {
+    //                     let delay = match self.config.retry_strategy {
+    //                         RetryStrategy::Exponential {
+    //                             initial_delay_secs,
+    //                             max_delay_secs,
+    //                             multiplier,
+    //                         } => {
+    //                             let attempt = max_attempts - attempts;
+    //                             (initial_delay_secs as f64 * multiplier.powi(attempt as i32))
+    //                                 .min(max_delay_secs as f64)
+    //                                 as u64
+    //                         }
+    //                         RetryStrategy::Linear { delay_secs } => delay_secs,
+    //                         RetryStrategy::Immediate => 0,
+    //                     };
+
+    //                     warn!(
+    //                         channel = channel,
+    //                         attempt = max_attempts - attempts + 1,
+    //                         max_attempts = max_attempts,
+    //                         delay_secs = delay,
+    //                         error = %e,
+    //                         "Publish attempt failed, retrying"
+    //                     );
+
+    //                     if delay > 0 {
+    //                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+    //                     }
+    //                 } else {
+    //                     error!(
+    //                         channel = channel,
+    //                         max_attempts = max_attempts,
+    //                         error = %e,
+    //                         "Failed to publish message after all retry attempts"
+    //                     );
+
+    //                     return Err(PubSubError::ExecutionError(format!(
+    //                         "Failed to broadcast after {} attempts: {}",
+    //                         max_attempts, e
+    //                     )));
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     unreachable!()
+    // }
     pub async fn get_agent_metadata(&self, name: &str) -> Option<AgentMetadata> {
         let registry = self.agent_registry.read().await;
         registry.get(name).map(|entry| entry.metadata.clone())
@@ -607,8 +696,9 @@ impl PubSubExecutor {
                     source: initial_node_id.clone(),
                     channel: Some(channel.clone()),
                     payload: initial_message.payload,
+                    task_id: None,
                 };
-                self.publish(&channel, initial_msg, &self.cache).await?;
+                self.publish(&channel, initial_msg, &self.cache, None).await?;
                 let (outcome_tx, mut outcome_rx) = mpsc::channel::<NodeExecutionOutcome>(100);
                 let processed_messages = Arc::new(RwLock::new(HashSet::new()));
                 let agents_clone = Arc::clone(&self.agent_registry);
@@ -750,6 +840,8 @@ impl PubSubExecutor {
             stopped: Arc::clone(&self.stopped),
             start_time: self.start_time,
             current_agent_id: self.current_agent_id.clone(),
+            task_manager: self.task_manager.clone(),
+            planned_tasks: Arc::clone(&self.planned_tasks),
         }
     }
 
@@ -795,17 +887,19 @@ impl PubSubExecutor {
         dot.push_str("    style=dashed;\n");
         dot.push_str("    color=blue;\n");
         dot.push_str("    node [style=filled, fillcolor=lightblue];\n\n");
-        
+
         // First pass: identify node types and create appropriate subgraphs
         let mut processed_nodes = HashSet::new();
         let mut agent_nodes = Vec::new();
         let mut publish_nodes = Vec::new();
-        
+
         for node_idx in tree.node_indices() {
             let node = &tree[node_idx];
-            if processed_nodes.contains(&node.node_id) { continue; }
+            if processed_nodes.contains(&node.node_id) {
+                continue;
+            }
             processed_nodes.insert(node.node_id.clone());
-            
+
             // Determine node type based on ID pattern
             if node.node_id.starts_with("publish_") {
                 publish_nodes.push(node_idx);
@@ -813,12 +907,12 @@ impl PubSubExecutor {
                 agent_nodes.push(node_idx);
             }
         }
-        
+
         // Add agent nodes to their subgraph
         for node_idx in &agent_nodes {
             let node = &tree[*node_idx];
             let agent_name = node.node_id.split('_').next().unwrap_or("unknown");
-            
+
             let label = format!(
                 "<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n\
                  <TR><TD BGCOLOR=\"#E8E8E8\"><B>Agent: {}</B></TD></TR>\n\
@@ -828,8 +922,16 @@ impl PubSubExecutor {
                  </TABLE>>",
                 agent_name,
                 node.channel.as_deref().unwrap_or("unknown"),
-                if node.outcome.success { "#E6FFE6" } else { "#FFE6E6" },
-                if node.outcome.success { "✓ Success" } else { "✗ Failed" },
+                if node.outcome.success {
+                    "#E6FFE6"
+                } else {
+                    "#FFE6E6"
+                },
+                if node.outcome.success {
+                    "✓ Success"
+                } else {
+                    "✗ Failed"
+                },
                 node.timestamp.format("%H:%M:%S")
             );
 
@@ -840,7 +942,7 @@ impl PubSubExecutor {
             ));
         }
         dot.push_str("  }\n\n");
-        
+
         // Add publish nodes to their own subgraph
         dot.push_str("  // Publish nodes\n");
         dot.push_str("  subgraph cluster_publish {\n");
@@ -848,11 +950,11 @@ impl PubSubExecutor {
         dot.push_str("    style=dashed;\n");
         dot.push_str("    color=orange;\n");
         dot.push_str("    node [style=filled, fillcolor=lightyellow, shape=ellipse];\n\n");
-        
+
         for node_idx in &publish_nodes {
             let node = &tree[*node_idx];
             let channel = node.channel.as_deref().unwrap_or("unknown");
-            
+
             let label = format!(
                 "<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n\
                  <TR><TD BGCOLOR=\"#FFF8E8\"><B>Publish: {}</B></TD></TR>\n\
@@ -862,8 +964,16 @@ impl PubSubExecutor {
                  </TABLE>>",
                 channel,
                 node.message_id.as_deref().unwrap_or("unknown"),
-                if node.outcome.success { "#E6FFE6" } else { "#FFE6E6" },
-                if node.outcome.success { "✓ Sent" } else { "✗ Failed" },
+                if node.outcome.success {
+                    "#E6FFE6"
+                } else {
+                    "#FFE6E6"
+                },
+                if node.outcome.success {
+                    "✓ Sent"
+                } else {
+                    "✗ Failed"
+                },
                 node.timestamp.format("%H:%M:%S")
             );
 
@@ -880,7 +990,7 @@ impl PubSubExecutor {
             let source = &tree[edge.source()].node_id;
             let target = &tree[edge.target()].node_id;
             let label = &edge.weight().label;
-            
+
             // Format edge labels to be more descriptive
             let formatted_label = if label.starts_with("via_") {
                 let channel = label.strip_prefix("via_").unwrap_or(label);
@@ -891,7 +1001,7 @@ impl PubSubExecutor {
             } else {
                 label.clone()
             };
-            
+
             dot.push_str(&format!(
                 "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
                 source, target, formatted_label
@@ -952,7 +1062,7 @@ impl PubSubExecutor {
 
             if !is_processed {
                 debug!(msg_id = %msg_id, channel = %channel, "Replaying unprocessed message");
-                self.publish(channel, message, cache).await?;
+                self.publish(channel, message, cache, None).await?;
                 replayed_count += 1;
             }
         }
@@ -1132,59 +1242,84 @@ impl PubSubExecutor {
         let channels = Arc::clone(&self.channels);
         let stopped = Arc::clone(&self.stopped);
         let cache = self.cache.clone();
+        let task_manager = self.task_manager.clone();
         let (outcome_tx, outcome_rx) = mpsc::channel::<NodeExecutionOutcome>(100);
 
         for (name, entry) in agents.iter() {
-            let agent = entry.agent.clone();
-            for sub in entry.metadata.subscriptions.iter() {
-                let mut rx = {
-                    let channels = channels.read().await;
-                    channels.get(sub).unwrap().1.clone()
-                };
-                let channel_name = sub.clone();
-                let name_clone = name.clone();
-                let executor_clone = self.clone();
-                let stopped_clone = Arc::clone(&stopped);
-                let agent_clone = agent.clone();
-                let cache_clone = cache.clone();
-                let outcome_tx_clone = outcome_tx.clone();
-                tokio::spawn(async move {
-                    while !*stopped_clone.read().await {
-                        if let Ok(message) = rx.recv().await {
-                            let mut executor = executor_clone.clone();
-                            let result = agent_clone
-                                .process_message(
-                                    &name_clone,
-                                    &channel_name,
-                                    message.clone(),
-                                    &mut executor,
-                                    cache_clone.clone(),
-                                )
-                                .await;
-                            let outcome = NodeExecutionOutcome {
-                                node_id: name_clone.clone(),
-                                success: result.is_ok(),
-                                retry_messages: result
-                                    .as_ref()
-                                    .err()
-                                    .map(|e| vec![e.to_string()])
-                                    .unwrap_or_default(),
-                                final_error: result.as_ref().err().map(|e| e.to_string()),
-                            };
-                            if outcome_tx_clone.send(outcome).await.is_err() {
-                                error!("Failed to send outcome for agent {}", name_clone);
-                                break;
-                            }
-                            if let Err(e) = result {
-                                error!(
-                                    "Agent {} failed on channel {}: {}",
-                                    name_clone, channel_name, e
-                                );
-                            }
+            let agent = entry.agent.clone(); // Arc<dyn PubSubAgent> is cheap to clone
+            let task_type = name.clone(); // String is owned
+            let channel_name = entry.metadata.subscriptions[0].clone(); // String is owned
+            let executor_clone = self.clone();
+            let stopped_clone = Arc::clone(&stopped);
+            let cache_clone = cache.clone();
+            let outcome_tx_clone = outcome_tx.clone();
+            let task_manager_clone = task_manager.clone();
+
+            tokio::spawn(async move {
+                while !*stopped_clone.read().await {
+                    if let Some(task) = task_manager_clone.claim_task(&task_type, &task_type).await {
+                        let mut executor = executor_clone.clone();
+                        let message = Message::with_task_id(
+                            task_type.clone(),
+                            task.task_id.clone(),
+                            task.data.clone(),
+                        );
+                        let result = agent
+                            .process_message(
+                                &task_type,
+                                &channel_name,
+                                message,
+                                &mut executor,
+                                cache_clone.clone(),
+                            )
+                            .await;
+                        let success = result.is_ok();
+                        task_manager_clone
+                            .complete_task(&task.task_id, success)
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to complete task {}: {}", task.task_id, e);
+                            });
+
+                        let outcome = NodeExecutionOutcome {
+                            node_id: task_type.clone(),
+                            success,
+                            retry_messages: result
+                                .as_ref()
+                                .err()
+                                .map(|e| vec![e.to_string()])
+                                .unwrap_or_default(),
+                            final_error: result.as_ref().err().map(|e| e.to_string()),
+                        };
+                        if outcome_tx_clone.send(outcome).await.is_err() {
+                            error!("Failed to send outcome for agent {}", task_type);
+                            break;
                         }
+                        if let Err(e) = result {
+                            error!("Agent {} failed on task {}: {}", task_type, task.task_id, e);
+                        }
+
+                        // let planned_tasks = *executor.planned_tasks.read().await;
+                        // if task_manager_clone.is_complete(planned_tasks).await {
+                        //     executor
+                        //         .publish(
+                        //             "report_request",
+                        //             Message::new(
+                        //                 task_type.clone(),
+                        //                 json!({"report_request": true}),
+                        //             ),
+                        //             &cache_clone,
+                        //         )
+                        //         .await
+                        //         .unwrap_or_else(|e| {
+                        //             error!("Failed to request report: {}", e.to_string());
+                        //             "Error occurred".to_string() // Return a String here
+                        //         });
+                        // }
                     }
-                });
-            }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+            });
         }
         info!("PubSubExecutor started all agent listeners");
         Ok(outcome_rx)
@@ -1458,14 +1593,136 @@ impl PubSubExecutor {
         // Store the current agent ID in thread-local storage or as a field
         self.current_agent_id = Some(id);
     }
-    
+
     /// Gets the current agent ID if available
     pub fn get_current_agent_id(&self) -> Option<String> {
         self.current_agent_id.clone()
     }
 
-     /// Clears the current agent ID
+    /// Clears the current agent ID
     pub fn clear_current_agent_id(&mut self) {
         self.current_agent_id = None;
     }
+}
+
+#[derive(Clone)]
+pub struct TaskManager {
+    tasks: Arc<RwLock<Vec<Task>>>,
+}
+
+impl TaskManager {
+    pub fn new() -> Self {
+        Self {
+            tasks: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    pub async fn add_task(&self, task_type: String, data: Value, max_attempts: u32) -> String {
+        let task_id = format!("task_{}", chrono::Utc::now().timestamp_nanos());
+        let task = Task {
+            task_id: task_id.clone(),
+            task_type,
+            status: TaskStatus::Pending,
+            attempts: 0,
+            max_attempts,
+            data,
+            created_at: chrono::Local::now().naive_local(),
+        };
+        let mut tasks = self.tasks.write().await;
+        tasks.push(task);
+        info!("Added task: {}", task_id);
+        task_id
+    }
+
+    pub async fn claim_task(&self, task_type: &str, agent_name: &str) -> Option<Task> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks
+            .iter_mut()
+            .find(|t| t.task_type == task_type && t.status == TaskStatus::Pending)
+        {
+            task.status = TaskStatus::InProgress;
+            task.attempts += 1;
+            info!("Task {} claimed by agent {}", task.task_id, agent_name);
+            Some(task.clone())
+        } else {
+            None
+        }
+    }
+
+    pub async fn complete_task(&self, task_id: &str, success: bool) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.status = if success {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            };
+            info!(
+                "Task {} marked as {}",
+                task_id,
+                if success { "completed" } else { "failed" }
+            );
+            Ok(())
+        } else {
+            Err(anyhow!("Task {} not found", task_id))
+        }
+
+        
+    }
+
+    pub async fn get_pending_tasks(&self) -> Vec<Task> {
+        let tasks = self.tasks.read().await;
+        tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn is_complete(&self, planned_tasks: usize) -> bool {
+        let tasks = self.tasks.read().await;
+        let completed = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Completed)
+            .count();
+        let pending = tasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .count();
+        pending == 0 && completed >= planned_tasks
+    }
+
+        pub async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.status = status.clone();
+            info!("Task {} updated to {:?}", task_id, status);
+            Ok(())
+        } else {
+            debug!("Task {} not found in queue", task_id);
+            Ok(()) // No error if task isn’t registered
+        }
+    }
+
+    pub async fn create_or_update_task(&self, task_id: String, task_type: String, data: Value, max_attempts: u32) -> Result<String> {
+        let mut tasks = self.tasks.write().await;
+        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+            task.data = data; // Update data if task exists
+            info!("Updated existing task: {}", task_id);
+        } else {
+            let task = Task {
+                task_id: task_id.clone(),
+                task_type,
+                status: TaskStatus::Pending,
+                attempts: 0,
+                max_attempts,
+                data,
+                created_at: chrono::Local::now().naive_local(),
+            };
+            tasks.push(task);
+            info!("Created new task: {}", task_id);
+        }
+        Ok(task_id)
+    }
+
 }

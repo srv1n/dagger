@@ -1,4 +1,3 @@
-
 use chrono::Utc;
 use dagger::{get_global_input, insert_global_value, append_global_value, Cache, Message};
 use dagger_macros::pubsub_agent;
@@ -7,6 +6,7 @@ use anyhow::Result;
 use dagger::PubSubExecutor;
 use tracing::info;
 use anyhow::anyhow;
+use tokio::time::{sleep, Duration};
 
 use crate::utils::search::read_page_content;
 
@@ -24,6 +24,7 @@ pub async fn reader_agent(
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
+    
     let search_results = message.payload["search_results"]
         .as_array()
         .ok_or(anyhow!("Missing search results"))?;
@@ -32,11 +33,14 @@ pub async fn reader_agent(
         let url = result["url"].as_str().ok_or(anyhow!("Missing URL"))?;
         let content = read_page_content(url).await?;
 
+        sleep(Duration::from_secs(2)).await;
+
         executor
             .publish(
                 "page_content",
                 Message::new(node_id.to_string(), json!({"page_content": content, "url": url})),
                 cache,
+                Some(("task_queue".to_string(),json!({"page_content": content, "url": url})))
             )
             .await?;
 
@@ -55,7 +59,7 @@ pub async fn reader_agent(
             cache,
             "global",
             "task_queue",
-            json!({"type": "reason", "question": "Content from URL", "relevant_urls": [url], "relevant_knowledge_ids": [knowledge_item["id"]]}),
+            json!({"type": "reason", "question": "Content from URL", "relevant_urls": [url], "relevant_knowledge_ids": [knowledge_item["id"]], "status": "pending"}),
         )?;
 
         executor
@@ -63,6 +67,7 @@ pub async fn reader_agent(
                 "knowledge",
                 Message::new(node_id.to_string(), json!({"knowledge": [knowledge_item]})),
                 cache,
+                Some(("task_queue".to_string(),json!({"knowledge": [knowledge_item]})))
             )
             .await?;
     }

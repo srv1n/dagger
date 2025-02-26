@@ -6,8 +6,8 @@ use anyhow::Result;
 use dagger::PubSubExecutor;
 use tracing::info;
 use anyhow::anyhow;
-
-use crate::utils::llm::llm_generate;
+use tokio::time::{sleep, Duration};
+use crate::utils::{llm::llm_generate, memory::update_global_task_queue};
 
 
 
@@ -25,8 +25,23 @@ pub async fn evaluation_agent(
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
+    // sleep(Duration::from_secs(2)).await;
     let question = message.payload["question"].as_str().ok_or(anyhow!("Missing question"))?;
     let answer = message.payload["intermediate_answer"].as_str().ok_or(anyhow!("Missing answer"))?;
+
+    // Mark the evaluate task as completed
+    let mut task_queue: Vec<serde_json::Value> = get_global_input(cache, "global", "task_queue")?;
+    if let Some(index) = task_queue.iter().position(|task| 
+        task["type"].as_str() == Some("evaluate") && 
+        task["question"].as_str() == Some(question) && 
+        task["status"].as_str() == Some("pending")
+    ) {
+        task_queue[index]["status"] = json!("completed");
+        update_global_task_queue(cache, task_queue)?;
+        info!("Marked evaluate task as completed for question: {}", question);
+    } else {
+        info!("No matching pending evaluate task found for question: {}", question);
+    }
 
     let question_eval_prompt = format!("Determine evaluation types for: {}", question);
     let question_eval_response = llm_generate(&question_eval_prompt, "evaluator_question").await?;
@@ -59,6 +74,8 @@ pub async fn evaluation_agent(
             "evaluation_results",
             Message::new(node_id.to_string(), json!({"evaluation_results": evaluation_results_json, "question": question})),
             cache,
+            Some(("task_queue".to_string(),json!({"evaluation_results": evaluation_results_json, "question": question}))
+        )
         )
         .await?;
 
@@ -78,7 +95,7 @@ pub async fn evaluation_agent(
                     cache,
                     "global",
                     "task_queue",
-                    json!({"type": "search", "query": query, "source": "gap", "attempt_count": 0}),
+                    json!({"type": "search", "query": query, "source": "gap", "attempt_count": 0, "status": "pending"}),
                 )?;
             }
             executor
@@ -86,20 +103,27 @@ pub async fn evaluation_agent(
                     "gap_questions",
                     Message::new(node_id.to_string(), json!({"gap_questions": gap_queries, "query": question})),
                     cache,
+                    Some(("task_queue".to_string(),json!({"gap_questions": gap_queries, "query": question}))
+                )
                 )
                 .await?;
         }
     }
 
-    // Notify Supervisor of task completion
+    // Increment completed tasks
+    let completed_tasks: usize = get_global_input(cache, "global", "completed_tasks").unwrap_or(0);
+    insert_global_value(cache, "global", "completed_tasks", completed_tasks + 1)?;
+    info!("Incremented completed_tasks to: {}", completed_tasks + 1);
+
     executor
         .publish(
             "task_completed",
             Message::new(node_id.to_string(), json!({"question": question})),
             cache,
+            Some(("task_queue".to_string(),json!({"question": question}))
+        )
         )
         .await?;
 
     Ok(())
-
 }

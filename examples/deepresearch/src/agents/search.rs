@@ -6,7 +6,7 @@ use anyhow::Result;
 use dagger::PubSubExecutor;
 use tracing::info;
 use anyhow::anyhow;
-
+use tokio::time::{sleep, Duration};
 use crate::utils::search::perform_search;
 
 #[pubsub_agent(
@@ -23,6 +23,7 @@ pub async fn search_agent(
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
+    sleep(Duration::from_secs(2)).await;
     let search_queries: Vec<String> = message.payload["search_queries"]
         .as_array()
         .ok_or(anyhow!("Missing search_queries"))?
@@ -40,7 +41,7 @@ pub async fn search_agent(
                 cache,
                 "global",
                 "task_queue",
-                json!({"type": "read", "url": url, "source_query": query}),
+                json!({"type": "read", "url": url, "source_query": query, "status": "pending"}),
             )?;
         }
     }
@@ -50,6 +51,7 @@ pub async fn search_agent(
             "search_results",
             Message::new(node_id.to_string(), json!({"search_results": all_results})),
             cache,
+            Some("search_results")
         )
         .await?;
 

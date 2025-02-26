@@ -6,9 +6,8 @@ use anyhow::Result;
 use dagger::PubSubExecutor;
 use tracing::info;
 use anyhow::anyhow;
-
+use tokio::time::{sleep, Duration};
 use crate::utils::llm::llm_generate;
-
 #[pubsub_agent(
     name = "PlanningAgent",
     subscribe = "initial_query, gap_questions, evaluation_results",
@@ -25,6 +24,7 @@ pub async fn planning_agent(
 ) -> Result<()> {
     match channel {
         "initial_query" | "gap_questions" => {
+             sleep(Duration::from_secs(2)).await;
             let query = message.payload["query"].as_str().ok_or(anyhow!("Missing query"))?;
             let rewriter_prompt = format!("Rewrite this query for better search results:\n\n{}", query);
             let rewriter_response = llm_generate(&rewriter_prompt, "query_rewriter").await?;
@@ -40,10 +40,9 @@ pub async fn planning_agent(
                     cache,
                     "global",
                     "task_queue",
-                    json!({"type": "search", "query": expanded_query, "source": "initial", "attempt_count": 0}),
+                    json!({"type": "search", "query": expanded_query, "source": "initial", "attempt_count": 0, "status": "pending"}),
                 )?;
             }
-            // Update planned tasks count
             let current_planned: usize = get_global_input(cache, "global", "planned_tasks")?;
             insert_global_value(cache, "global", "planned_tasks", current_planned + expanded_queries.len())?;
 
@@ -52,6 +51,7 @@ pub async fn planning_agent(
                     "search_queries",
                     Message::new(node_id.to_string(), json!({"search_queries": expanded_queries})),
                     cache,
+                    Some(("task_queue".to_string(),json!({"search_queries": expanded_queries})))
                 )
                 .await?;
         }
@@ -80,7 +80,7 @@ pub async fn planning_agent(
                                 cache,
                                 "global",
                                 "task_queue",
-                                json!({"type": "search", "query": new_query, "source": "rephrased", "attempt_count": 0}),
+                                json!({"type": "search", "query": new_query, "source": "rephrased", "attempt_count": 0, "status": "pending"}),
                             )?;
                         }
                         let current_planned: usize = get_global_input(cache, "global", "planned_tasks")?;
@@ -91,6 +91,7 @@ pub async fn planning_agent(
                                 "search_queries",
                                 Message::new(node_id.to_string(), json!({"search_queries": new_queries})),
                                 cache,
+                                Some(("task_queue".to_string(),json!({"search_queries": new_queries})))
                             )
                             .await?;
                     }
