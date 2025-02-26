@@ -23,7 +23,9 @@ sled = "0.34"
 zstd = "0.13"
 cuid2 = "0.1.4"
 thiserror = "1.0"
-dagger-macros = { path = "../dagger-macros" }
+
+async-broadcast = "0.7.2"
+jsonschema = "0.29.0"
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"

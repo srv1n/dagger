@@ -1,3 +1,8 @@
+We are trying to extend the dagger library attached below to also have a third way of executing flows. The first is essentially running a DAG through a static workflow. The second is a dynamic DAG where agents can add or nodes can add other nodes to the DAG execution. The last is a completely autonomous pub/sub based system. I am attaching the code to the DAG library along with where we stand with the current pub/sub agent implementation and also we have. One second. Also we have. Also  The below is attached the design document. 
+
+
+Dagger Lib
+```
 //! Dagger - A library for executing directed acyclic graphs (DAGs) with custom actions.
 //!
 //! This library provides a way to define and execute DAGs with custom actions. It supports
@@ -16,18 +21,16 @@ use petgraph::algo::is_cyclic_directed;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::visit::Topo;
-use pubsubagent::{PubSubExecutionReport, GLOBAL_REGISTRY};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-pub mod pubsubagent;
+
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::oneshot;
-pub use pubsubagent::*;
-
+mod pubsubagent;
 // use tokio::sync::RwLock;
 use serde_json::error::Error as JsonError;
 use tokio::time::{sleep, timeout, Duration};
@@ -36,9 +39,6 @@ use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using 
 // Add these imports at the top with other imports
 use serde::de::Error as SerdeError;
 use std::io::Error as IoError;
-
-// Add near the top with other type definitions
-pub use crate::pubsubagent::{PubSubAgent, PubSubConfig, PubSubError, PubSubExecutor, PubSubWorkflowSpec};
 
 #[macro_export]
 macro_rules! register_action {
@@ -562,8 +562,6 @@ pub struct NodeSnapshot {
     pub outcome: NodeExecutionOutcome,
     pub cache_ref: String,
     pub timestamp: NaiveDateTime,
-    pub channel: Option<String>, // New field for tracking message channel
-    pub message_id: Option<String>, // New field for tracking message ID
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1762,8 +1760,6 @@ fn record_execution_snapshot(
             outcome: outcome.clone(),
             cache_ref: generate_cache_ref(&node.id),
             timestamp: chrono::Local::now().naive_local(),
-            channel: None, // New field for tracking message channel
-            message_id: None, // New field for tracking message ID
         };
 
         // Update in-memory execution tree
@@ -2453,7 +2449,7 @@ impl SupervisorStep {
 
         Ok(SupervisorInstruction {
             action,
-            params: instruction_value.get("params").map(|v| v.clone()),
+            params: instruction_value.get("params").cloned(),
             priority: instruction_value
                 .get("priority")
                 .and_then(|v| v.as_u64())
@@ -2692,3 +2688,1161 @@ impl SerializableExecutionTree {
 }
 
 
+```
+
+Design Spec
+```
+
+Enhanced Design Specification for Pub/Sub Extension in Dagger
+Table of Contents
+Introduction (#introduction)
+Current State of the Dagger Library (#current-state-of-the-dagger-library)
+Capabilities (#capabilities)
+Limitations (#limitations)
+Motivation for Pub/Sub Extension (#motivation-for-pubsub-extension)
+Technical Decisions (#technical-decisions)
+Detailed Design (#detailed-design)
+PubSubAgent Trait (#pubsubagent-trait)
+#[pubsub_agent] Macro (#pubsub_agent-macro)
+PubSubExecutor (#pubsubexecutor)
+Agent Registry (#agent-registry)
+Channel Management (#channel-management)
+Configuration (PubSubConfig) (#configuration-pubsubconfig)
+Message Validation (#message-validation)
+Traceability and DOT Graph Generation (#traceability-and-dot-graph-generation)
+Logging (#logging)
+Human Intervention (#human-intervention)
+Thread Safety (#thread-safety)
+Integration with Existing Infrastructure (#integration-with-existing-infrastructure)
+Sample Schemas and Usage (#sample-schemas-and-usage)
+Implementation Tasks (#implementation-tasks)
+Conclusion (#conclusion)
+Introduction
+This document outlines the extension of the dagger library to support a Publish/Subscribe (Pub/Sub) execution model, complementing the existing DAG-based workflows. The Pub/Sub system will enable autonomous, event-driven agents that operate in parallel, react to messages in real-time, and scale efficiently. Key requirements include:
+DOT Graph Generation: Reconstruct execution flows as DOT graphs for visualization, similar to DagExecutor.
+Robust Logging: Use error propagation instead of unwraps, leveraging the tracing crate.
+Configuration: Include starter config options (e.g., max tokens, max time) akin to DagConfig.
+Thread Safety: Ensure all components are Send + Sync for concurrent execution.
+Human Intervention: Support pausing for human input, mirroring HumanInterrupt in DAGs.
+The design introduces a PubSubAgent trait, a #[pubsub_agent] macro, and a PubSubExecutor struct, integrating seamlessly with existing components like the cache and Sled database.
+Current State of the Dagger Library
+Capabilities
+DAG Execution: DagExecutor executes static and dynamic DAGs with custom actions.
+Dynamic Node Addition: Agents can extend DAGs via add_node.
+Traceability: Execution trees are stored and visualized as DOT graphs.
+Configuration: DagConfig manages retries, timeouts, and failure behavior.
+Shared State: A thread-safe Cache persists data across nodes.
+Limitations
+Sequential Execution: Nodes execute one at a time, limiting parallelism.
+Centralized Control: Dynamic DAGs rely on a supervisor, creating bottlenecks.
+No Event-Driven Model: Lacks native support for real-time, decoupled workflows.
+Motivation for Pub/Sub Extension
+The Pub/Sub extension addresses these limitations by:
+Enabling parallel, autonomous agents that react to events without a central orchestrator.
+Supporting real-time reactivity via message-driven execution.
+Enhancing scalability through concurrent task processing.
+Maintaining compatibility with DAG workflows, offering a dual-mode framework.
+This is critical for use cases like legal research or content generation, where agents need to respond to events (e.g., new data availability) dynamically.
+Technical Decisions
+New Struct (PubSubExecutor): A dedicated executor for Pub/Sub workflows, distinct from DagExecutor, to manage message routing and agent execution.
+Trait-Based Agents: PubSubAgent defines the agent interface, ensuring modularity.
+Macro Support: #[pubsub_agent] simplifies agent creation, mirroring #[action].
+Thread Safety: Use Arc<RwLock<>> and async_broadcast for concurrent access.
+DOT Graphs: Extend the execution tree model to Pub/Sub, storing in Sled.
+Logging: Leverage tracing for structured, error-propagating logs.
+Detailed Design
+PubSubAgent Trait
+rust
+use async_trait::async_trait;
+use serde_json::Value;
+use anyhow::Result;
+
+#[async_trait]
+pub trait PubSubAgent: Send + Sync + 'static {
+    fn subscriptions(&self) -> Vec<String>;
+    fn publications(&self) -> Vec<String>;
+    fn input_schema(&self) -> Value;
+    fn output_schema(&self) -> Value;
+    async fn process_message(&self, channel: &str, message: Value, executor: &mut PubSubExecutor) -> Result<()>;
+}
+subscriptions/publications: Define channels for message flow.
+input_schema/output_schema: Enforce message structure.
+process_message: Handles incoming messages, with access to the executor for publishing.
+#[pubsub_agent] Macro
+Syntax
+rust
+#[pubsub_agent(
+    subscribe = "new_tasks",
+    publish = "results",
+    input_schema = r#"{"type": "object", "properties": {"task": {"type": "string"}}}"#,
+    output_schema = r#"{"type": "object", "properties": {"result": {"type": "string"}}}"#
+)]
+async fn task_processor(executor: &mut PubSubExecutor, message: Value) -> Result<()> {
+    let task = message["task"].as_str().ok_or(anyhow!("Missing task"))?;
+    executor.publish("results", json!({"result": format!("Processed: {}", task)}))?;
+    Ok(())
+}
+Generated Code
+Implements PubSubAgent.
+Validates input/output against schemas using jsonschema.
+Wraps the function call with error handling.
+PubSubExecutor
+rust
+use async_broadcast::{Sender, Receiver};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use anyhow::Result;
+use sled::Db;
+use tracing::{info, error};
+use serde_json::Value;
+
+pub struct PubSubExecutor {
+    agents: Arc<RwLock<HashMap<String, Arc<dyn PubSubAgent>>>>,
+    channels: Arc<RwLock<HashMap<String, (Sender<Value>, Receiver<Value>)>>>,
+    config: PubSubConfig,
+    sled_db: Db,
+    execution_tree: Arc<RwLock<ExecutionTree>>,
+    stopped: Arc<RwLock<bool>>,
+    start_time: NaiveDateTime,
+}
+
+impl PubSubExecutor {
+    pub fn new(config: Option<PubSubConfig>, sled_path: &str) -> Result<Self> {
+        let sled_db = sled::open(sled_path)?;
+        Ok(Self {
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            config: config.unwrap_or_default(),
+            sled_db,
+            execution_tree: Arc::new(RwLock::new(DiGraph::new())),
+            stopped: Arc::new(RwLock::new(false)),
+            start_time: chrono::Local::now().naive_local(),
+        })
+    }
+
+    pub async fn register_agent(&mut self, agent: Arc<dyn PubSubAgent>) -> Result<()> {
+        let name = agent.subscriptions().first().ok_or(anyhow!("No subscriptions"))?.clone();
+        self.agents.write().await.insert(name, agent);
+        Ok(())
+    }
+
+    pub async fn publish(&self, channel: &str, message: Value) -> Result<()> {
+        let channels = self.channels.read().await;
+        let sender = channels.get(channel)
+            .ok_or(anyhow!("Channel {} not found", channel))?
+            .0.clone();
+        sender.broadcast(message).await?;
+        info!("Published to {}: {:?}", channel, message);
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        let agents = self.agents.read().await;
+        let channels = self.channels.read().await;
+
+        for (name, agent) in agents.iter() {
+            for sub in agent.subscriptions() {
+                if let Some((_, rx)) = channels.get(&sub) {
+                    let agent_clone = agent.clone();
+                    let mut rx_clone = rx.clone();
+                    let executor_clone = self.clone();
+
+                    tokio::spawn(async move {
+                        while let Ok(msg) = rx_clone.recv().await {
+                            if let Err(e) = agent_clone.process_message(&sub, msg, &mut executor_clone).await {
+                                error!("Agent {} failed: {:?}", name, e);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn serialize_tree_to_dot(&self, workflow_id: &str) -> Result<String> {
+        // Similar to DagExecutor's implementation, adapted for message flows
+        let tree = self.execution_tree.read()?;
+        // Generate DOT graph from execution tree
+        Ok(String::new()) // Placeholder
+    }
+}
+
+impl Clone for PubSubExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            agents: self.agents.clone(),
+            channels: self.channels.clone(),
+            config: self.config.clone(),
+            sled_db: self.sled_db.clone(),
+            execution_tree: self.execution_tree.clone(),
+            stopped: self.stopped.clone(),
+            start_time: self.start_time,
+        }
+    }
+}
+Components:
+agents: Thread-safe registry of Pub/Sub agents.
+channels: MPMC channels for message passing.
+config: Execution parameters (see below).
+sled_db: Persistent storage for logs and trees.
+execution_tree: Tracks message flow for DOT generation.
+stopped: Flag to halt execution.
+Agent Registry
+rust
+struct AgentMetadata {
+    subscriptions: Vec<String>,
+    publications: Vec<String>,
+    input_schema: Value,
+    output_schema: Value,
+}
+
+pub struct AgentRegistry {
+    agents: Arc<RwLock<HashMap<String, AgentMetadata>>>,
+}
+Stores metadata for validation and schema compatibility checks.
+Channel Management
+Implementation: Uses async_broadcast for MPMC channels.
+Dynamic Creation: Channels are created on demand based on agent subscriptions/publications.
+Configuration (PubSubConfig)
+rust
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PubSubConfig {
+    pub max_messages: Option<u64>,
+    pub timeout_seconds: Option<u64>,
+    pub human_wait_minutes: Option<u32>,
+    pub human_timeout_action: HumanTimeoutAction,
+    pub max_tokens: Option<u64>,
+    pub retry_strategy: RetryStrategy,
+}
+
+impl Default for PubSubConfig {
+    fn default() -> Self {
+        Self {
+            max_messages: Some(1000),
+            timeout_seconds: Some(3600),
+            human_wait_minutes: None,
+            human_timeout_action: HumanTimeoutAction::Pause,
+            max_tokens: None,
+            retry_strategy: RetryStrategy::default(),
+        }
+    }
+}
+Mirrors DagConfig with Pub/Sub-specific tweaks (e.g., max_messages).
+Message Validation
+Input: Validated in process_message using jsonschema.
+Output: Checked against downstream agent’s input_schema before publishing.
+Traceability and DOT Graph Generation
+Execution Tree: Records message sends/receives as nodes and edges.
+Storage: Persisted in Sled, retrievable via serialize_tree_to_dot.
+Format: Similar to DagExecutor, showing agent interactions.
+Logging
+Approach: Uses tracing macros (e.g., info!, error!) with structured JSON output.
+Error Handling: Propagates Result instead of unwrapping.
+Human Intervention
+Mechanism: A built-in HumanInterruptAgent pauses execution:
+rust
+pub struct HumanInterruptAgent {
+    input_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<()>>>>,
+}
+
+#[async_trait]
+impl PubSubAgent for HumanInterruptAgent {
+    async fn process_message(&self, _channel: &str, _message: Value, executor: &mut PubSubExecutor) -> Result<()> {
+        executor.paused().await?;
+        Ok(())
+    }
+}
+Integrated via subscription to a "human_review" channel.
+Thread Safety
+Locks: Arc<RwLock<>> for shared state.
+Channels: async_broadcast ensures thread-safe message passing.
+Integration with Existing Infrastructure
+Cache: Reused for state persistence.
+Sled: Stores logs and execution trees.
+Tracing: Unified logging across DAG and Pub/Sub modes.
+Sample Schemas and Usage
+rust
+#[pubsub_agent(
+    subscribe = "tasks",
+    publish = "results",
+    input_schema = r#"{"type": "object", "properties": {"task": {"type": "string"}}}"#,
+    output_schema = r#"{"type": "object", "properties": {"result": {"type": "string"}}}"#
+)]
+async fn worker(executor: &mut PubSubExecutor, message: Value) -> Result<()> {
+    let task = message["task"].as_str().ok_or(anyhow!("Missing task"))?;
+    executor.publish("results", json!({"result": format!("Done: {}", task)}))?;
+    Ok(())
+}
+Implementation Tasks
+Define PubSubAgent Trait:
+Add methods as specified.
+Ensure Send + Sync + 'static.
+Implement #[pubsub_agent] Macro:
+Generate trait impl with schema validation.
+Handle executor parameter injection.
+Develop PubSubExecutor:
+Initialize with config and sled_db.
+Implement register_agent, publish, and run.
+Build Agent Registry:
+Store metadata for validation.
+Set Up Channel Management:
+Use async_broadcast for MPMC channels.
+Add Traceability:
+Extend ExecutionTree for Pub/Sub flows.
+Implement serialize_tree_to_dot.
+Enhance Logging:
+Use tracing with structured output.
+Implement Human Intervention:
+Create HumanInterruptAgent and integrate with config.
+Test End-to-End:
+Build a sample workflow with multiple agents.
+```
+
+
+and current state of the src/pubsubagents.rs
+```
+use crate::NodeExecutionOutcome;
+use crate::{async_trait, Cache, ExecutionTree, HumanTimeoutAction, NodeSnapshot, RetryStrategy};
+use anyhow::anyhow;
+use anyhow::Result;
+use async_broadcast::{Receiver, Sender};
+use chrono::NaiveDateTime;
+use petgraph::graph::DiGraph;
+use petgraph::visit::EdgeRef;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use serde_json::Value;
+use sled::Db;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
+/// Trait defining the behavior of a Pub/Sub agent in the dagger library.
+///
+/// Agents implementing this trait can subscribe to channels, publish to channels,
+/// and process incoming messages asynchronously. The trait ensures thread safety
+/// and provides schema validation capabilities.
+///
+/// # Requirements
+/// - Must be `Send + Sync + 'static` for safe concurrent execution across threads.
+/// - Methods should minimize cloning and avoid unnecessary allocations for performance.
+#[async_trait]
+pub trait PubSubAgent: Send + Sync + 'static {
+    /// Returns the list of channels this agent subscribes to.
+    ///
+    /// # Returns
+    /// A `Vec<String>` containing channel names (e.g., `"new_tasks"`).
+    fn subscriptions(&self) -> Vec<String>;
+
+    /// Returns the list of channels this agent publishes to.
+    ///
+    /// # Returns
+    /// A `Vec<String>` containing channel names (e.g., `"results"`).
+    fn publications(&self) -> Vec<String>;
+
+    /// Returns the JSON schema for validating incoming messages.
+    ///
+    /// # Returns
+    /// A `serde_json::Value` representing the schema (e.g., `{"type": "object", "properties": {...}}`).
+    fn input_schema(&self) -> Value;
+
+    /// Returns the JSON schema for validating outgoing messages.
+    ///
+    /// # Returns
+    /// A `serde_json::Value` representing the schema.
+    fn output_schema(&self) -> Value;
+
+    /// Processes an incoming message from a subscribed channel.
+    ///
+    /// # Arguments
+    /// - `channel`: The name of the channel the message was received from.
+    /// - `message`: The incoming message as a `serde_json::Value`.
+    /// - `executor`: A mutable reference to the `PubSubExecutor` for publishing or state management.
+    ///
+    /// # Returns
+    /// A `Result<()>` indicating success or failure of message processing.
+    ///
+    /// # Tracing
+    /// Logs entry and exit points with message details for traceability.
+    async fn process_message(
+        &self,
+        channel: &str,
+        message: Value,
+        executor: &mut PubSubExecutor,
+    ) -> Result<()>;
+
+    /// Validates an incoming message against the agent's input schema.
+    ///
+    /// # Arguments
+    /// - `message`: The message to validate.
+    ///
+    /// # Returns
+    /// A `Result<()>` indicating if the message matches the schema.
+    ///
+    /// # Default Implementation
+    /// Uses `jsonschema` for validation, with tracing for errors.
+    fn validate_input(&self, message: &Value) -> Result<()> {
+        let schema = self.input_schema();
+        let compiled_schema = jsonschema::validator_for(&schema)
+            .map_err(|e| anyhow::anyhow!("Failed to compile input schema: {}", e))?;
+
+        if let Err(errors) = compiled_schema.validate(message) {
+            warn!(
+                "Input validation failed for agent with subscriptions {:?}: {}",
+                self.subscriptions(),
+                errors
+            );
+            return Err(anyhow::anyhow!("Invalid input: {}", errors));
+        }
+        Ok(())
+    }
+
+    /// Validates an outgoing message against the agent's output schema.
+    ///
+    /// # Arguments
+    /// - `message`: The message to validate.
+    ///
+    /// # Returns
+    /// A `Result<()>` indicating if the message matches the schema.
+    fn validate_output(&self, message: &Value) -> Result<()> {
+        let schema = self.output_schema();
+        let compiled_schema = jsonschema::validator_for(&schema)
+            .map_err(|e| anyhow::anyhow!("Failed to compile output schema: {}", e))?;
+
+        if let Err(errors) = compiled_schema.validate(message) {
+            warn!(
+                "Output validation failed for agent with publications {:?}: {}",
+                self.publications(),
+                errors
+            );
+            return Err(anyhow::anyhow!("Invalid output: {}", errors));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PubSubConfig {
+    pub max_messages: Option<u64>,
+    pub timeout_seconds: Option<u64>,
+    pub human_wait_minutes: Option<u32>,
+    pub human_timeout_action: HumanTimeoutAction,
+    pub max_tokens: Option<u64>,
+    pub retry_strategy: RetryStrategy,
+}
+
+impl Default for PubSubConfig {
+    fn default() -> Self {
+        Self {
+            max_messages: Some(1000),
+            timeout_seconds: Some(3600),
+            human_wait_minutes: None,
+            human_timeout_action: HumanTimeoutAction::Pause,
+            max_tokens: None,
+            retry_strategy: RetryStrategy::default(),
+        }
+    }
+}
+
+impl PubSubConfig {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(timeout) = self.timeout_seconds {
+            if timeout == 0 {
+                return Err(anyhow!("timeout_seconds must be greater than 0"));
+            }
+            if timeout > 86400 {
+                return Err(anyhow!("timeout_seconds cannot exceed 24 hours"));
+            }
+        }
+        if let Some(max_msgs) = self.max_messages {
+            if max_msgs == 0 {
+                return Err(anyhow!("max_messages must be greater than 0"));
+            }
+        }
+        Ok(())
+    }
+}
+
+// Standardized Error System for PubSubExecutor
+#[derive(Debug, thiserror::Error)]
+pub enum PubSubError {
+    #[error("Lock error: {0}")]
+    LockError(String),
+
+    #[error("Agent not found: {0}")]
+    AgentNotFound(String),
+
+    #[error("Channel not found: {0}")]
+    ChannelNotFound(String),
+
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] sled::Error),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Execution error: {0}")]
+    ExecutionError(String),
+
+    #[error("Cancelled")]
+    Cancelled,
+
+    #[error("Timeout exceeded")]
+    TimeoutExceeded,
+
+    #[error("No agents registered")]
+    NoAgentsRegistered,
+}
+
+// Execution Report for PubSubExecutor
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PubSubExecutionReport {
+    pub agent_outcomes: Vec<NodeExecutionOutcome>, // Outcomes per agent processing attempt
+    pub overall_success: bool,                     // True if no critical failures
+    pub error: Option<String>,                     // Consolidated error message if failed
+}
+
+impl PubSubExecutionReport {
+    fn new(outcomes: Vec<NodeExecutionOutcome>, success: bool, error: Option<String>) -> Self {
+        Self {
+            agent_outcomes: outcomes,
+            overall_success: success,
+            error,
+        }
+    }
+}
+
+// Workflow specification for PubSubExecutor (similar to DagExecutor's WorkflowSpec)
+#[derive(Debug, Clone)]
+pub enum PubSubWorkflowSpec {
+    /// Start a Pub/Sub workflow with an initial message
+    EventDriven {
+        channel: String,
+        initial_message: Value,
+    },
+}
+
+/// Executor for managing Pub/Sub workflows in the dagger library.
+///
+/// This struct orchestrates the execution of `PubSubAgent`s, routing messages between
+/// subscribed and published channels, and maintains an execution tree for traceability.
+///
+/// # Fields
+/// - `agents`: Thread-safe registry of registered agents.
+/// - `channels`: Thread-safe map of channel names to MPMC sender/receiver pairs.
+/// - `config`: Configuration for execution limits and behavior.
+/// - `sled_db`: Persistent storage for execution trees and logs.
+/// - `execution_tree`: Graph tracking message flows for DOT visualization.
+/// - `stopped`: Flag to halt execution.
+/// - `start_time`: Timestamp of executor initialization.
+
+// PubSubExecutor struct (updated with execute method)
+pub struct PubSubExecutor {
+    agents: Arc<RwLock<HashMap<String, Arc<dyn PubSubAgent>>>>,
+    channels: Arc<RwLock<HashMap<String, (Sender<Value>, Receiver<Value>)>>>,
+    config: PubSubConfig,
+    sled_db: Db,
+    execution_tree: Arc<RwLock<ExecutionTree>>,
+    cache: Cache,
+    stopped: Arc<RwLock<bool>>,
+    start_time: NaiveDateTime,
+}
+
+impl PubSubExecutor {
+    pub fn new(config: Option<PubSubConfig>, sled_path: &str, cache: Cache) -> Result<Self> {
+        let sled_db = sled::open(sled_path)?;
+        let config = config.unwrap_or_default();
+        config
+            .validate()
+            .map_err(|e| PubSubError::ValidationError(e.to_string()))?;
+
+        info!(
+            sled_path = sled_path,
+            max_messages = ?config.max_messages,
+            "Initialized PubSubExecutor"
+        );
+
+        Ok(Self {
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            sled_db,
+            execution_tree: Arc::new(RwLock::new(DiGraph::new())),
+            cache,
+            stopped: Arc::new(RwLock::new(false)),
+            start_time: chrono::Local::now().naive_local(),
+        })
+    }
+
+    /// Ensures a channel exists, creating it if necessary.
+    async fn ensure_channel(&self, channel: &str) -> Result<()> {
+        let mut channels = self.channels.write().await;
+        if !channels.contains_key(channel) {
+            let capacity = self.config.max_messages.unwrap_or(1000) as usize;
+            let (tx, rx) = async_broadcast::broadcast(capacity);
+            channels.insert(channel.to_string(), (tx, rx));
+            info!(channel = channel, capacity = capacity, "Created new channel");
+
+            // Persist channel metadata
+            let metadata = json!({
+                "channel": channel,
+                "capacity": capacity,
+                "created_at": chrono::Local::now().to_rfc3339(),
+            });
+            let channels_tree = self.sled_db.open_tree("pubsub_channels")?;
+            channels_tree.insert(channel.as_bytes(), serde_json::to_vec(&metadata)?)?;
+        }
+        Ok(())
+    }
+
+    /// Cleans up channels with no active subscribers.
+    async fn cleanup_channels(&self) -> Result<()> {
+        let agents = self.agents.read().await;
+        let mut channels = self.channels.write().await;
+        let channels_tree = self.sled_db.open_tree("pubsub_channels")?;
+
+        let mut active_channels = HashSet::new();
+        for (_, agent) in agents.iter() {
+            for sub in agent.subscriptions() {
+                active_channels.insert(sub);
+            }
+            for publ in agent.publications() {
+                active_channels.insert(publ);
+            }
+        }
+
+        let mut removed = Vec::new();
+        channels.retain(|channel, (tx, _)| {
+            let is_active = active_channels.contains(channel);
+            if !is_active && tx.receiver_count() == 0 {
+                removed.push(channel.clone());
+                false // Remove the channel
+            } else {
+                true // Keep the channel
+            }
+        });
+
+        for channel in removed {
+            channels_tree.remove(channel.as_bytes())?;
+            info!(channel = %channel, "Cleaned up unused channel");
+        }
+
+        Ok(())
+    }
+
+    pub async fn register_agent(&mut self, agent: Arc<dyn PubSubAgent>) -> Result<()> {
+        let subscriptions = agent.subscriptions();
+        if subscriptions.is_empty() {
+            return Err(anyhow!("Agent must have at least one subscription"));
+        }
+
+        let name = subscriptions[0].clone();
+        let publications = agent.publications();
+
+        // Ensure channels exist for subscriptions and publications
+        for sub in &subscriptions {
+            self.ensure_channel(sub).await?;
+        }
+        for publ in &publications {
+            self.ensure_channel(publ).await?;
+        }
+
+        {
+            let mut agents = self.agents.write().await;
+            agents.insert(name.clone(), agent.clone());
+        }
+
+        let metadata = json!({
+            "name": name,
+            "subscriptions": subscriptions,
+            "publications": publications,
+            "registered_at": chrono::Local::now().to_rfc3339(),
+        });
+        let agents_tree = self.sled_db.open_tree("pubsub_agents")?;
+        agents_tree.insert(name.as_bytes(), serde_json::to_vec(&metadata)?)?;
+
+        info!(agent_name = %name, "Registered Pub/Sub agent");
+        Ok(())
+    }
+
+    pub async fn publish(&self, channel: &str, message: Value) -> Result<(), PubSubError> {
+        if *self.stopped.read().await {
+            return Err(PubSubError::ExecutionError("Executor is stopped".to_string()));
+        }
+
+        let elapsed = chrono::Local::now().naive_local() - self.start_time;
+        if let Some(timeout) = self.config.timeout_seconds {
+            if elapsed.num_seconds() > timeout as i64 {
+                return Err(PubSubError::TimeoutExceeded);
+            }
+        }
+
+        self.ensure_channel(channel).await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        let channels = self.channels.read().await;
+        let (sender, receiver) = channels.get(channel)
+            .ok_or(PubSubError::ChannelNotFound(channel.to_string()))?;
+
+        // Check capacity and drop oldest message if needed
+        if let Some(max_msgs) = self.config.max_messages {
+            if sender.len() >= max_msgs as usize {
+                warn!(channel = channel, capacity = max_msgs, current_len = sender.len(), "Channel at capacity, dropping oldest message");
+                // Clone the receiver to get a mutable instance we can use
+                let mut rx = receiver.clone();
+                // Try to receive and drop the oldest message
+                if let Err(e) = rx.try_recv() {
+                    debug!(channel = channel, error = %e, "Failed to drop oldest message");
+                }
+            }
+        }
+
+        // Validate message against agent schemas
+        let agents = self.agents.read().await;
+        for (_, agent) in agents.iter() {
+            if agent.subscriptions().contains(&channel.to_string()) {
+                if let Err(e) = agent.validate_input(&message) {
+                    return Err(PubSubError::ValidationError(e.to_string()));
+                }
+            }
+        }
+
+        sender
+            .broadcast(message.clone())
+            .await
+            .map_err(|e| PubSubError::ExecutionError(format!("Broadcast failed: {}", e)))?;
+
+        let mut tree = self.execution_tree.write().await;
+        let snapshot = NodeSnapshot {
+            node_id: format!("publish_{}_{}", channel, chrono::Utc::now().timestamp_millis()),
+            outcome: NodeExecutionOutcome {
+                node_id: channel.to_string(),
+                success: true,
+                retry_messages: Vec::new(),
+                final_error: None,
+            },
+            cache_ref: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+            timestamp: chrono::Local::now().naive_local(),
+        };
+        tree.add_node(snapshot);
+
+        crate::insert_value(&self.cache, channel, "last_message", &message)
+            .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        info!(channel = channel, "Published message");
+        Ok(())
+    }
+
+    /// Executes a Pub/Sub workflow based on a specification.
+    ///
+    /// # Arguments
+    /// - `spec`: The workflow specification (e.g., initial message to kickstart execution).
+    /// - `cache`: Shared cache for state persistence.
+    /// - `cancel_rx`: Receiver for cancellation signal.
+    ///
+    /// # Returns
+    /// A `Result` containing a `PubSubExecutionReport` or a `PubSubError`.
+
+    pub async fn execute(
+        &mut self,
+        spec: PubSubWorkflowSpec,
+        cache: &Cache,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<PubSubExecutionReport, PubSubError> {
+        match spec {
+            PubSubWorkflowSpec::EventDriven {
+                channel,
+                initial_message,
+            } => {
+                let agents = self.agents.read().await;
+                if agents.is_empty() {
+                    return Err(PubSubError::NoAgentsRegistered);
+                }
+
+                // Initialize with the initial message
+                self.publish(&channel, initial_message).await?;
+
+                // Channel to collect outcomes from all tasks
+                let (outcome_tx, mut outcome_rx) = mpsc::channel::<NodeExecutionOutcome>(100);
+                let processed_messages = Arc::new(RwLock::new(HashSet::new()));
+
+                let agents_clone = Arc::clone(&self.agents);
+                let channels_clone = Arc::clone(&self.channels);
+                let stopped_clone = Arc::clone(&self.stopped);
+                let timeout = self.config.timeout_seconds;
+
+                let agent_configs: Vec<(String, Arc<dyn PubSubAgent>, Vec<String>)> = {
+                    agents
+                        .iter()
+                        .map(|(name, agent)| (name.clone(), agent.clone(), agent.subscriptions()))
+                        .collect()
+                };
+
+                tokio::select! {
+                    result = async {
+                        let mut handles = Vec::new();
+                        for (name, agent, subscriptions) in agent_configs {
+                            for sub in subscriptions {
+                                let rx = {
+                                    let channels_guard = channels_clone.read().await;
+                                    channels_guard.get(&sub).map(|(_, rx)| rx.clone())
+                                };
+
+                                if let Some(mut rx_clone) = rx {
+                                    let agent_clone = agent.clone();
+                                    let executor_clone = self.clone();
+                                    let channel_name = sub.clone();
+                                    let name_clone = name.clone();
+                                    let processed_messages_clone = Arc::clone(&processed_messages);
+                                    let outcome_tx_clone = outcome_tx.clone();
+
+                                    let handle = tokio::spawn(async move {
+                                        while !*executor_clone.stopped.read().await {
+                                            match rx_clone.recv().await {
+                                                Ok(message) => {
+                                                    let msg_id = format!("{}_{}", channel_name, chrono::Utc::now().timestamp_millis());
+                                                    {
+                                                        let mut processed = processed_messages_clone.write().await;
+                                                        if processed.contains(&msg_id) {
+                                                            continue; // Skip duplicates
+                                                        }
+                                                        processed.insert(msg_id.clone());
+                                                    }
+
+                                                    debug!(agent = %name_clone, channel = %channel_name, "Processing message");
+
+                                                    let mut executor = executor_clone.clone();
+                                                    let result = agent_clone.process_message(&channel_name, message.clone(), &mut executor).await;
+
+                                                    let outcome = NodeExecutionOutcome {
+                                                        node_id: name_clone.clone(),
+                                                        success: result.is_ok(),
+                                                        retry_messages: match &result {
+                                                            Err(e) => vec![e.to_string()],
+                                                            Ok(_) => Vec::new(),
+                                                        },
+                                                        final_error: match &result {
+                                                            Err(e) => Some(e.to_string()),
+                                                            Ok(_) => None,
+                                                        },
+                                                    };
+
+                                                    let mut tree = executor.execution_tree.write().await;
+                                                    let snapshot = NodeSnapshot {
+                                                        node_id: msg_id,
+                                                        outcome: outcome.clone(),
+                                                        cache_ref: format!("msg_{}", chrono::Utc::now().timestamp_millis()),
+                                                        timestamp: chrono::Local::now().naive_local(),
+                                                    };
+                                                    let node_idx = tree.add_node(snapshot);
+
+                                                    if let Some(last_publish_idx) = tree.node_indices()
+                                                        .filter(|idx| tree[*idx].node_id.starts_with(&format!("publish_{}", channel_name)))
+                                                        .max_by_key(|idx| tree[*idx].timestamp) {
+                                                        // Get the parent node ID first
+                                                        let parent_id = tree[last_publish_idx].node_id.clone();
+                                                        // Then create the edge with the stored parent ID
+                                                        tree.add_edge(last_publish_idx, node_idx, crate::ExecutionEdge {
+                                                            parent: parent_id,
+                                                            label: "processed_by".to_string(),
+                                                        });
+                                                    }
+
+                                                    // Send outcome to the collector
+                                                    if outcome_tx_clone.send(outcome).await.is_err() {
+                                                        error!(agent = %name_clone, "Failed to send outcome; collector closed");
+                                                        break;
+                                                    }
+
+                                                    if let Err(e) = result {
+                                                        error!(agent = %name_clone, channel = %channel_name, "Processing failed: {}", e);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!(agent = %name_clone, channel = %channel_name, "Receive failed: {}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    });
+                                    handles.push(handle);
+                                }
+                            }
+                        }
+
+                        // Collect outcomes asynchronously
+                        let mut final_outcomes = Vec::new();
+                        while let Some(outcome) = outcome_rx.recv().await {
+                            final_outcomes.push(outcome);
+                        }
+
+                        // Wait for all tasks to complete
+                        for handle in handles {
+                            if let Err(e) = handle.await {
+                                error!("Task failed: {}", e);
+                            }
+                        }
+
+                        self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+                        Result::<_, PubSubError>::Ok(PubSubExecutionReport::new(
+                            final_outcomes.clone(),
+                            final_outcomes.iter().all(|o| o.success),
+                            None,
+                        ))
+                    } => match result {
+                        Ok(report) => Ok(report),
+                        Err(e) => {
+                            self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+                            Err(PubSubError::ExecutionError(e.to_string()))
+                        }
+                    },
+                    _ = cancel_rx => {
+                        self.stop().await?;
+                        // Collect any pending outcomes before returning
+                        let mut final_outcomes = Vec::new();
+                        while let Ok(outcome) = outcome_rx.try_recv() {
+                            final_outcomes.push(outcome);
+                        }
+                        Ok(PubSubExecutionReport::new(
+                            final_outcomes,
+                            false,
+                            Some("Execution cancelled".to_string()),
+                        ))
+                    },
+                }
+            }
+        }
+    }
+
+    fn clone(&self) -> Self {
+        Self {
+            agents: self.agents.clone(),
+            channels: self.channels.clone(),
+            config: self.config.clone(),
+            sled_db: self.sled_db.clone(),
+            execution_tree: self.execution_tree.clone(),
+            cache: self.cache.read().unwrap().clone().into(),
+            stopped: self.stopped.clone(),
+            start_time: self.start_time,
+        }
+    }
+
+    async fn save_state(&self) -> Result<()> {
+        let tree = self.execution_tree.read().await;
+        let serializable_tree = crate::SerializableExecutionTree::from_execution_tree(&tree);
+        let serialized = serde_json::to_vec(&serializable_tree)?;
+        let compressed = zstd::encode_all(&*serialized, 3)?;
+        let tree_store = self.sled_db.open_tree("pubsub_execution_trees")?;
+        tree_store.insert(b"latest", compressed)?;
+
+        let cache_str = crate::serialize_cache_to_json(&self.cache)?;
+        let cache_tree = self.sled_db.open_tree("pubsub_cache")?;
+        cache_tree.insert(b"latest", cache_str.as_bytes())?;
+
+        info!("Saved PubSubExecutor state");
+        Ok(())
+    }
+
+    pub async fn stop(&self) -> Result<(), PubSubError> {
+        let mut stopped = self.stopped.write().await;
+        *stopped = true;
+        self.cleanup_channels().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        info!("PubSubExecutor stopped");
+        Ok(())
+    }
+
+     pub async fn serialize_tree_to_dot(&self, workflow_id: &str) -> Result<String, PubSubError> {
+        let tree = self.execution_tree.read().await;
+        let mut dot = String::from("digraph PubSubFlow {\n");
+        dot.push_str("  graph [rankdir=LR, nodesep=0.5, ranksep=1.0];\n");
+        dot.push_str("  node [shape=box, style=rounded, fontname=\"Helvetica\", width=1.5];\n");
+        dot.push_str("  edge [fontsize=10];\n\n");
+
+        let mut processed_nodes = HashSet::new();
+
+        // Generate nodes
+        for node_idx in tree.node_indices() {
+            let node = &tree[node_idx];
+            if processed_nodes.contains(&node.node_id) {
+                continue;
+            }
+            processed_nodes.insert(node.node_id.clone());
+
+            let is_publish = node.node_id.starts_with("publish_");
+            let label = if is_publish {
+                format!(
+                    "<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n\
+                     <TR><TD BGCOLOR=\"#E8E8E8\"><B>Publish: {}</B></TD></TR>\n\
+                     <TR><TD>Time: {}</TD></TR>\n\
+                     </TABLE>>",
+                    node.node_id.split('_').nth(1).unwrap_or(&node.node_id),
+                    node.timestamp.format("%H:%M:%S")
+                )
+            } else {
+                let cache_read = self.cache.read().map_err(|e| PubSubError::LockError(e.to_string()))?;
+                let message = cache_read
+                    .get(&node.node_id)
+                    .and_then(|m| m.get("last_message"))
+                    .map(|data| {
+                        let value = data.value.as_str();
+                        if value.len() > 50 { format!("{}...", &value[..47]) } else { value.to_string() }
+                    })
+                    .unwrap_or("N/A".to_string());
+
+                format!(
+                    "<<TABLE BORDER=\"0\" CELLBORDER=\"1\" CELLSPACING=\"0\">\n\
+                     <TR><TD BGCOLOR=\"#E8E8E8\"><B>Agent: {}</B></TD></TR>\n\
+                     <TR><TD>Message: {}</TD></TR>\n\
+                     <TR><TD BGCOLOR=\"{}\">{}</TD></TR>\n\
+                     <TR><TD>Time: {}</TD></TR>\n\
+                     </TABLE>>",
+                    node.node_id,
+                    message,
+                    if node.outcome.success { "#E6FFE6" } else { "#FFE6E6" },
+                    if node.outcome.success { "✓ Success" } else { "✗ Failed" },
+                    node.timestamp.format("%H:%M:%S")
+                )
+            };
+
+            let color = if node.outcome.success { "green" } else { "red" };
+            dot.push_str(&format!(
+                "  \"{}\" [label={}, color={}, fontcolor=black];\n",
+                node.node_id, label, color
+            ));
+        }
+
+        // Generate edges
+        dot.push_str("\n  // Edges\n");
+        for edge in tree.edge_references() {
+            let source = &tree[edge.source()].node_id;
+            let target = &tree[edge.target()].node_id;
+            dot.push_str(&format!(
+                "  \"{}\" -> \"{}\" [label=\"{}\"];\n",
+                source, target, edge.weight().label
+            ));
+        }
+
+        dot.push_str("}\n");
+        info!("Generated DOT graph for workflow '{}'", workflow_id);
+        Ok(dot)
+    }
+}
+
+
+
+/// HumanInterruptAgent pauses execution for human input
+pub struct HumanInterruptAgent {
+    input_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+    cancel_tx: Arc<RwLock<Option<mpsc::Sender<()>>>>,
+}
+
+impl HumanInterruptAgent {
+    pub fn new() -> Self {
+        Self {
+            input_tx: Arc::new(RwLock::new(None)),
+            cancel_tx: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    pub async fn cancel(&self) {
+        // Get read lock on cancel_tx
+        let cancel_guard = self.cancel_tx.read().await;
+        // If there's a sender in the Option, try to send cancellation
+        if let Some(tx) = &*cancel_guard {
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+#[async_trait]
+impl PubSubAgent for HumanInterruptAgent {
+    fn subscriptions(&self) -> Vec<String> {
+        vec!["human_review".to_string()]
+    }
+
+    fn publications(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({"type": "object", "properties": {"review": {"type": "string"}}})
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({"type": "null"})
+    }
+
+    async fn process_message(
+        &self,
+        channel: &str,
+        message: Value,
+        executor: &mut PubSubExecutor,
+    ) -> Result<()> {
+        let wait_minutes = executor.config.human_wait_minutes.unwrap_or(5);
+        info!(
+            "HumanInterruptAgent pausing on channel {} for {} minutes",
+            channel, wait_minutes
+        );
+
+        let wait_duration = tokio::time::Duration::from_secs(wait_minutes as u64 * 60);
+        let (input_tx, mut input_rx) = mpsc::channel(1);
+        let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
+
+        {
+            // Await the write locks
+            let mut tx_write = self.input_tx.write().await;
+            let mut cancel_write = self.cancel_tx.write().await;
+            *tx_write = Some(input_tx);
+            *cancel_write = Some(cancel_tx);
+        }
+
+        struct ChannelCleanup<'a>(&'a HumanInterruptAgent);
+        impl<'a> Drop for ChannelCleanup<'a> {
+            fn drop(&mut self) {
+                // Since this is in Drop, we can't use async/await directly
+                // We'll use block_on for simplicity, but this should ideally be handled differently
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let mut tx_write = self.0.input_tx.write().await;
+                    let mut cancel_write = self.0.cancel_tx.write().await;
+                    *tx_write = None;
+                    *cancel_write = None;
+                });
+            }
+        }
+        let _cleanup = ChannelCleanup(self);
+
+        tokio::select! {
+            _ = tokio::time::sleep(wait_duration) => {
+                match executor.config.human_timeout_action {
+                    HumanTimeoutAction::Autopilot => {
+                        info!("No human input received, proceeding in autopilot");
+                        Ok(())
+                    }
+                    HumanTimeoutAction::Pause => {
+                        info!("No human input received, pausing execution");
+                        let mut stopped = executor.stopped.write().await;
+                        *stopped = true;  // Dereference instead of replace
+                        executor.save_state().await?;
+                        Err(anyhow!("Paused for human input"))
+                    }
+                }
+            }
+            _ = input_rx.recv() => {
+                info!("Received human input, continuing execution");
+                Ok(())
+            }
+            _ = cancel_rx.recv() => {
+                info!("Human interrupt cancelled");
+                Err(anyhow!("Human interrupt cancelled"))
+            }
+        }
+    }
+}
+```
+
+Please start implementing the next missing items . Please note the macros are already implemented in another file not attached here. 
