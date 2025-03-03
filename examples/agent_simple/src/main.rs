@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
     let _ = executor.register_action(Arc::new(TWITTER_SEARCH.clone()));
     let _ = executor.register_action(Arc::new(REVIEW.clone()));
 
-    let cache = Cache::new(HashMap::new());
+    let cache = Cache::new();
     let (_cancel_tx, cancel_rx) = oneshot::channel();
     let report = executor
         .execute_dag(WorkflowSpec::Agent { task: "analyze".to_string() }, &cache, cancel_rx)

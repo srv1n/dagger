@@ -6,6 +6,7 @@
 
 use anyhow::anyhow;
 use anyhow::{Error, Result};
+use dashmap::DashMap;
 use petgraph::visit::IntoNodeReferences;
 pub mod any;
 pub use any::*;
@@ -316,72 +317,126 @@ pub struct SerializableData {
     pub value: Value,
 }
 
-// Update your cache to use the new SerializableData
-pub type Cache = RwLock<HashMap<String, HashMap<String, SerializableData>>>;
+#[derive(Debug, Default)]
+pub struct Cache {
+   pub data: Arc<DashMap<String, DashMap<String, SerializableData>>>,
+}
+
+impl Cache {
+    pub fn new() -> Self {
+        Cache {
+            data: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn append_global_value<T: Serialize + for<'de> Deserialize<'de>>(
+        &self,
+        dag_name: &str,
+        key: &str,
+        value: T,
+    ) -> Result<()> {
+        let global_key = format!("global:{}", dag_name);
+        let json_value = serde_json::to_value(value)?;
+
+        // Get or insert the inner DashMap for the global key.
+        let inner_map = self.data.entry(global_key).or_insert_with(|| DashMap::new());
+
+        // Use `entry` API for efficient updates.
+        inner_map.entry(key.to_string())
+            .and_modify(|existing_data| {
+                if let Some(existing_vec) = existing_data.value.as_array_mut() {
+                    existing_vec.push(json_value.clone()); // Clone for the modify closure.
+                } else {
+                    existing_data.value = Value::Array(vec![existing_data.value.clone(), json_value.clone()]);
+                }
+            })
+            .or_insert(SerializableData { value: Value::Array(vec![json_value]) }); // No clone needed here
+
+        Ok(())
+    }
+
+    pub fn get_global_value<T: for<'de> Deserialize<'de>>(
+        &self,
+        dag_name: &str,
+        key: &str,
+    ) -> Result<Option<T>> {
+        let global_key = format!("global:{}", dag_name);
+
+        if let Some(inner_map) = self.data.get(&global_key) {
+            if let Some(serializable_data) = inner_map.get(key) {
+                let value: T = serde_json::from_value(serializable_data.value.clone())?;
+                Ok(Some(value))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+     pub fn insert_value<T: Serialize>(
+        &self,
+        node_id: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        let value = serde_json::to_value(value)?;
+        let map = self.data.entry(node_id.to_string()).or_insert_with(|| DashMap::new());
+        map.insert(key.to_string(), SerializableData{value});
+        Ok(())
+    }
+}
+
+// Clone is already handled correctly by Arc<DashMap>.
+impl Clone for Cache {
+    fn clone(&self) -> Self {
+        Cache {
+            data: self.data.clone(),
+        }
+    }
+}
 
 pub fn serialize_cache_to_json(cache: &Cache) -> Result<String> {
-    let cache_read = cache
-        .read()
-        .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
+    // Create a serializable representation of the cache.
+    let serializable_cache: HashMap<String, HashMap<String, SerializableData>> =
+        cache.data.iter().map(|m| (m.key().clone(), m.value().clone().into_iter().collect())).collect();
 
-    let serialized_cache: HashMap<String, HashMap<String, Value>> = cache_read
-        .iter()
-        .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, Value> = category_map
-                .iter()
-                .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
-                .collect();
-            (node_id.clone(), serialized_category)
-        })
-        .collect();
-
-    serde_json::to_string(&serialized_cache).map_err(|e| e.into())
+    serde_json::to_string(&serializable_cache).map_err(|e| e.into())
 }
 
 pub fn serialize_cache_to_prettyjson(cache: &Cache) -> Result<String> {
-    let cache_read = cache
-        .read()
-        .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
+    // Create a serializable representation of the cache.
+    let serializable_cache: HashMap<String, HashMap<String, SerializableData>> =
+        cache.data.iter().map(|m| (m.key().clone(), m.value().clone().into_iter().collect())).collect();
 
-    let serialized_cache: HashMap<String, HashMap<String, Value>> = cache_read
-        .iter()
-        .map(|(node_id, category_map)| {
-            let serialized_category: HashMap<String, Value> = category_map
-                .iter()
-                .map(|(output_name, data)| (output_name.clone(), data.value.clone()))
-                .collect();
-            (node_id.clone(), serialized_category)
-        })
-        .collect();
-
-    serde_json::to_string_pretty(&serialized_cache).map_err(|e| e.into())
+    serde_json::to_string_pretty(&serializable_cache).map_err(|e| e.into())
 }
 
 /// Function to load the cache from JSON
 /// Function to load the cache from JSON
 pub fn load_cache_from_json(json_data: &str) -> Result<Cache> {
-    let deserialized_cache: HashMap<String, HashMap<String, Value>> =
+    let deserialized_cache: HashMap<String, DashMap<String, SerializableData>> =
         serde_json::from_str(json_data)?;
 
-    let cache = deserialized_cache
+    let cache: HashMap<String, DashMap<String, SerializableData>> = deserialized_cache
         .into_iter()
         .map(|(node_id, category_map)| {
-            let converted_category: HashMap<String, SerializableData> = category_map
+            let converted_category: DashMap<String, SerializableData> = category_map
                 .into_iter()
                 .map(|(output_name, value)| {
                     (
                         output_name,
-                        SerializableData {
-                            value, // Use Value directly
-                        },
+                       value,
                     )
                 })
                 .collect();
             (node_id, converted_category)
         })
-        .collect();
+        .collect(); // This collect needs the type hint
 
-    Ok(RwLock::new(cache))
+     Ok(Cache {
+      data: Arc::new(DashMap::from_iter(cache)),
+     })
 }
 // pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
 //     let mut cache_write = cache.write().unwrap();
@@ -393,21 +448,15 @@ pub fn insert_value<T>(cache: &Cache, node_id: &str, output_name: &str, value: T
 where
     T: Serialize + std::fmt::Debug,
 {
-    let mut cache_write = cache
-        .write()
-        .map_err(|e| anyhow!("Failed to acquire cache write lock: {}", e))?;
+    let cache_data = &cache.data; // Get a reference to the DashMap
 
     let json_value = serde_json::to_value(value)?; // Serialize to serde_json::Value
 
     let serializable_data = SerializableData { value: json_value }; // Use Value
 
-    if let Some(category_map) = cache_write.get_mut(node_id) {
-        category_map.insert(output_name.to_string(), serializable_data);
-    } else {
-        let mut new_category_map = HashMap::new();
-        new_category_map.insert(output_name.to_string(), serializable_data);
-        cache_write.insert(node_id.to_string(), new_category_map);
-    }
+    // Use entry API for efficient insertion/modification.
+    let inner_map = cache_data.entry(node_id.to_string()).or_insert_with(|| DashMap::new());
+    inner_map.insert(output_name.to_string(), serializable_data);
 
     Ok(())
 }
@@ -422,9 +471,8 @@ pub fn get_input<T: for<'de> Deserialize<'de>>(
     node_id: &str,
     key: &str,
 ) -> Result<T> {
-    let cache_read = cache
-        .read()
-        .map_err(|e| anyhow!("Failed to acquire cache read lock: {}", e))?;
+        let cache_read = &cache
+            .data;
 
     if let Some(category_map) = cache_read.get(node_id) {
         if let Some(serializable_data) = category_map.get(key) {
@@ -468,7 +516,8 @@ pub fn get_global_input<T: for<'de> Deserialize<'de>>(
     dag_name: &str,
     key: &str,
 ) -> Result<T, DagError> {
-    let cache_read = cache.read().map_err(|e| DagError::LockError(e.to_string()))?;
+    let cache_read = &cache
+        .data;
 
     let global_key = format!("global:{}", dag_name); // Consistent global key
 
@@ -496,7 +545,8 @@ pub fn insert_global_value<T: Serialize>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let mut cache_write = cache.write().map_err(|e| DagError::LockError(e.to_string()))?;
+    let mut cache_write = &cache
+        .data;
 
     let global_key = format!("global:{}", dag_name); // Consistent global key
     let json_value = serde_json::to_value(value)?; // Serialize to Value
@@ -505,7 +555,7 @@ pub fn insert_global_value<T: Serialize>(
     if let Some(global_map) = cache_write.get_mut(&global_key) {
         global_map.insert(key.to_string(), serializable_data);
     } else {
-        let mut new_global_map = HashMap::new();
+        let mut new_global_map = DashMap::new();
         new_global_map.insert(key.to_string(), serializable_data);
         cache_write.insert(global_key, new_global_map);
     }
@@ -519,41 +569,22 @@ pub fn append_global_value<T: Serialize + for<'de> Deserialize<'de>>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let mut cache_write = cache.write().map_err(|e| DagError::LockError(e.to_string()))?;
-
     let global_key = format!("global:{}", dag_name);
     let json_value = serde_json::to_value(value)?;
 
-    if let Some(global_map) = cache_write.get_mut(&global_key) {
-        if let Some(existing_data) = global_map.get_mut(key) {
-            // Get mutable reference to existing Value
-            let existing_value = &mut existing_data.value;
+    // Get or insert the inner DashMap for the global key.
+    let inner_map = cache.data.entry(global_key).or_insert_with(|| DashMap::new());
 
-            if let Some(existing_vec) = existing_value.as_array_mut() {
-                existing_vec.push(json_value);
+    // Use `entry` API for efficient updates.
+    inner_map.entry(key.to_string())
+        .and_modify(|existing_data| {
+            if let Some(existing_vec) = existing_data.value.as_array_mut() {
+                existing_vec.push(json_value.clone()); // Clone for the modify closure.
             } else {
-                // Convert existing value to array and append
-                *existing_value = Value::Array(vec![existing_value.clone(), json_value]);
+                existing_data.value = Value::Array(vec![existing_data.value.clone(), json_value.clone()]);
             }
-        } else {
-            global_map.insert(
-                key.to_string(),
-                SerializableData {
-                    value: Value::Array(vec![json_value]),
-                },
-            );
-        }
-    } else {
-        // Create new global map with the value in an array
-        let mut new_global_map = HashMap::new();
-        new_global_map.insert(
-            key.to_string(),
-            SerializableData {
-                value: Value::Array(vec![json_value]),
-            },
-        );
-        cache_write.insert(global_key, new_global_map);
-    }
+        })
+        .or_insert(SerializableData { value: Value::Array(vec![json_value]) }); // No clone needed here
 
     Ok(())
 }
@@ -1005,14 +1036,13 @@ impl DagExecutor {
     /// Saves only changed cache entries since last save
     pub fn save_cache(&self, dag_id: &str, cache: &Cache) -> Result<(), DagError> {
         let start = std::time::Instant::now();
-        let cache_read = cache.read().map_err(|e| {
-            DagError::LockError(format!("Failed to acquire cache read lock: {}", e))
-        })?;
+        let cache_read = &cache
+            .data;
 
         // Get last saved state from Sled
         let cache_tree = self.sled_db.open_tree("cache")?;
 
-        let previous_state: HashMap<String, HashMap<String, SerializableData>> =
+        let previous_state: HashMap<String, DashMap<String, SerializableData>> =
             match cache_tree.get(dag_id.as_bytes())? {
                 Some(compressed) => zstd::decode_all(&compressed[..])
                     .map_err(|e| {
@@ -1027,12 +1057,16 @@ impl DagExecutor {
 
         // Calculate delta by comparing with previous state
         let mut delta = HashMap::new();
-        for (node_id, current_values) in cache_read.iter() {
+        for dashmap_ref in cache_read.iter() { // Changed: No tuple destructuring
+            let node_id = dashmap_ref.key(); // Use .key()
+            let current_values = dashmap_ref.value(); // Use .value()
             match previous_state.get(node_id) {
                 Some(prev_values) => {
                     let mut node_delta = HashMap::new();
-                    for (key, value) in current_values {
-                        if !prev_values.contains_key(key) || prev_values[key] != *value {
+                    for inner_ref in current_values.iter() { // Iterate over inner DashMap
+                        let key = inner_ref.key();
+                        let value = inner_ref.value();
+                        if !prev_values.contains_key(key) || prev_values.get(key).map_or(true, |prev_value| prev_value.value != value.value) {
                             node_delta.insert(key.clone(), value.clone());
                         }
                     }
@@ -1041,7 +1075,10 @@ impl DagExecutor {
                     }
                 }
                 None => {
-                    delta.insert(node_id.clone(), current_values.clone());
+                    // If no previous state, the entire inner map is a delta.
+                    let node_delta: HashMap<String, SerializableData> =
+                        current_values.iter().map(|inner_ref| (inner_ref.key().clone(), inner_ref.value().clone())).collect();
+                    delta.insert(node_id.clone(), node_delta);
                 }
             }
         }
@@ -1267,14 +1304,12 @@ impl DagExecutor {
     ) -> Result<(), DagError> {
         let mut cache = self.load_cache(dag_id).map_err(|e| DagError::ExecutionError(e.to_string()))?;
         {
-            let mut write_cache = cache.write().map_err(|e| {
-                DagError::LockError(format!("Failed to acquire write lock: {}", e))
-            })?;
+            let mut write_cache = &cache.data;
 
             if let Some(node_map) = write_cache.get_mut(dag_id) {
                 node_map.insert(key, value);
             } else {
-                let mut new_map = HashMap::new();
+                let mut new_map = DashMap::new();
                 new_map.insert(key, value);
                 write_cache.insert(dag_id.to_string(), new_map);
             }
@@ -1425,7 +1460,7 @@ impl DagExecutor {
         };
 
         let cache = self.load_cache(&normalized_id)?;
-        let cache_read = cache.read().unwrap();
+        let cache_read = &cache.data;
         info!("Loaded cache with {} entries", cache_read.len());
 
         let mut dot = String::from("digraph ExecutionFlow {\n");
@@ -1473,7 +1508,10 @@ impl DagExecutor {
                 let mut inputs = Vec::new();
                 let mut outputs = Vec::new();
 
-                for (key, data) in node_cache {
+                // Get the *inner* DashMap and iterate over *it*.
+                for inner_ref in node_cache.value().iter() { // Changed: .value().iter()
+                    let key = inner_ref.key(); // Use .key()
+                    let data = inner_ref.value(); // Use .value()
                     let value_str = flatten_value(&data.value.to_string());
                     if key.starts_with("input_") || node_cache.len() == 1 {
                         inputs.push((key.clone(), value_str));
@@ -1570,7 +1608,7 @@ impl DagExecutor {
             let json_str = String::from_utf8(bytes)?;
             info!("Loaded cache JSON: {}", json_str);
             let cache = load_cache_from_json(&json_str)?;
-            info!("Loaded {} entries from cache", cache.read().unwrap().len());
+            info!("Loaded {} entries from cache", cache.data.len());
             return Ok(cache);
         }
 
@@ -1582,7 +1620,7 @@ impl DagExecutor {
             let cache = load_cache_from_json(&json_str)?;
             info!(
                 "Loaded {} entries from snapshots",
-                cache.read().unwrap().len()
+                cache.data.len()
             );
             return Ok(cache);
         }
@@ -1591,7 +1629,7 @@ impl DagExecutor {
             "No cache found in cache or snapshots trees for DAG {}",
             normalized_id
         );
-        Ok(Cache::new(HashMap::new()))
+        Ok(Cache::new())
     }
 
     /// Helper method to check if execution is stopped
@@ -1793,18 +1831,26 @@ fn record_execution_snapshot(
 
         // Store full cache state in Sled "snapshots" tree
         let full_cache = {
-            let cache_read = cache.read().unwrap();
+            let cache_read = &cache.data;
             info!("Cache contents for node {}:", node.id);
-            for (node_id, node_cache) in cache_read.iter() {
+            for dashmap_ref in cache_read.iter() { // Changed: No tuple destructuring
+                let node_id = dashmap_ref.key(); // Use .key()
+                let node_cache = dashmap_ref.value(); // Use .value()
                 info!("  Node {}:", node_id);
-                for (key, value) in node_cache {
+                for inner_ref in node_cache.iter() { // Iterate over inner DashMap
+                    let key = inner_ref.key(); // Use .key()
+                    let value = inner_ref.value(); // Use .value()
                     info!("    {} = {}", key, value.value.to_string());
                 }
             }
             cache_read.clone()
         };
 
-        match serde_json::to_vec(&full_cache) {
+        // Create a serializable representation of the cache.
+        let serializable_cache: HashMap<String, HashMap<String, SerializableData>> =
+            full_cache.iter().map(|m| (m.key().clone(), m.value().clone().into_iter().collect())).collect();
+
+        match serde_json::to_vec(&serializable_cache) {
             Ok(serialized) => {
                 info!(
                     "Serialized cache for '{}': {} bytes",
@@ -2358,11 +2404,13 @@ impl NodeAction for HumanInterrupt {
 
             let result = tokio::select! {
                 _ = sleep(wait_duration) => {
-                    let cache_read = cache.read().unwrap();
-                    let has_input = cache_read
-                        .get("global")
-                        .and_then(|m| m.get("pending_instructions"))
-                        .is_some();
+                    let cache_read = &cache.data;
+                    let global_map = cache_read.get("global");
+                    let has_input = if let Some(global_map) = global_map {
+                        global_map.get("pending_instructions").is_some()
+                    } else {
+                        return Err(anyhow!("Missing 'global' in cache"));
+                    };
 
                     if !has_input {
                         match executor.config.human_timeout_action {
@@ -2469,12 +2517,12 @@ impl SupervisorStep {
     ) -> Result<()> {
         // Get and sort instructions by priority
         let instructions = {
-            let cache_read = cache.read().unwrap();
+            let cache_read = &cache.data;
             if let Some(global) = cache_read.get("global") {
                 global
                     .iter()
-                    .filter(|(k, _)| k.starts_with("instruction_"))
-                    .map(|(_, v)| v.value.clone())
+                    .filter(|ref_multi| ref_multi.key().starts_with("instruction_")) // Use .key()
+                    .map(|ref_multi| ref_multi.value().value.clone()) // Use .value()
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
@@ -2542,7 +2590,7 @@ impl SupervisorStep {
 
         // Clear processed instructions
         {
-            let mut cache_write = cache.write().unwrap();
+            let mut cache_write = &cache.data;
             if let Some(global) = cache_write.get_mut("global") {
                 global.retain(|k, _| !k.starts_with("instruction_"));
             }

@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dag_names = executor.list_dags()?;
     println!("Loaded DAGs: {:#?}", dag_names);
 
-    let cache = Cache::new(HashMap::new());
+    let cache = Cache::new();
     insert_value(&cache, "inputs", "num1", 10.0)?;
     insert_value(&cache, "inputs", "num2", 20.0)?;
 

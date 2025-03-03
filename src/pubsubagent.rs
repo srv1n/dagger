@@ -3,7 +3,7 @@ use crate::{NodeExecutionOutcome, SerializableData};
 use anyhow::anyhow;
 use anyhow::Result;
 use async_broadcast::{Receiver, Sender};
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use petgraph::graph::DiGraph;
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
+use futures::future::join_all;
+use dashmap::DashMap;
+use tokio::time::{sleep, Duration};
 /// Trait defining the behavior of a Pub/Sub agent in the dagger library.
 ///
 /// Agents implementing this trait can subscribe to channels, publish to channels,
@@ -67,7 +70,7 @@ pub trait PubSubAgent: Send + Sync + 'static {
         &self,
         node_id: &str, // New parameter: the agent's assigned node_id
         channel: &str,
-        message: Message,
+        message: &Message,
         executor: &mut PubSubExecutor,
         cache: Arc<Cache>,
     ) -> Result<()>;
@@ -110,47 +113,68 @@ pub struct Message {
     pub channel: Option<String>, // Set by publish
     pub task_id: Option<String>, // Links to a specific task
     pub payload: Value,          // Task-specific data
+    pub message_id: String, // Unique identifier for the message
 }
-
 impl Message {
     pub fn new(source: String, payload: Value) -> Self {
+        let message_id =  format!("message_{}", chrono::Utc::now().timestamp_nanos());
         Self {
             timestamp: chrono::Local::now().naive_local(),
             source,
             channel: None,
             task_id: None, // Default to None; set explicitly when tied to a task
+            message_id,
             payload,
         }
     }
 
     pub fn with_task_id(source: String, task_id: String, payload: Value) -> Self {
+       let message_id =  format!("message_{}", chrono::Utc::now().timestamp_nanos());
         Self {
             timestamp: chrono::Local::now().naive_local(),
             source,
             channel: None,
             task_id: Some(task_id),
+            message_id,
             payload,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Task {
-    pub task_id: String,           // Unique identifier
-    pub task_type: String,         // e.g., "search", "reason"
-    pub status: TaskStatus,        // Pending, InProgress, Completed, Failed
-    pub attempts: u32,             // Retry attempts
-    pub max_attempts: u32,         // From config
-    pub data: Value,               // Task-specific payload
-    pub created_at: NaiveDateTime, // For tracking and timeouts
+pub struct TaskOutput {
+    pub success: bool,
+    pub data: Option<Value>, // Raw data (if success)
+    pub error: Option<String>, // Error message (if !success)
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Task {
+    pub job_id: String,
+    pub task_id: String,
+    pub parent_task_id: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub description: String,
+    pub status: TaskStatus,
+    pub status_reason: Option<String>, 
+    pub agent: String,
+    pub dependencies: Vec<String>,
+    pub dependents: Vec<String>,
+    pub input: Value,
+    pub output: TaskOutput,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaskStatus {
     Pending,
     InProgress,
     Completed,
     Failed,
+    Blocked,
+    Accepted,
+    Rejected,
 }
 
 #[derive(Clone)]
@@ -162,6 +186,7 @@ struct AgentEntry {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AgentMetadata {
     pub name: String,
+    pub description: String,
     pub subscriptions: Vec<String>,
     pub publications: Vec<String>,
     pub input_schema: Value,
@@ -344,7 +369,7 @@ impl PubSubExecutor {
             planned_tasks: Arc::new(RwLock::new(0)),
         };
 
-        if let Err(e) = executor.load_state(&cache).await {
+        if let Err(e) = executor.load_state(&executor.cache).await {
             warn!("Failed to load persisted state: {}. Starting fresh.", e);
         }
 
@@ -364,7 +389,7 @@ impl PubSubExecutor {
             let (mut tx, rx) = async_broadcast::broadcast(capacity);
             tx.set_overflow(true); // Drop oldest messages when full
             channels.insert(channel.to_string(), (tx, rx));
-            info!(channel = %channel, capacity = capacity, "Created new channel dynamically");
+            // info!(channel = %channel, capacity = capacity, "Created new channel dynamically");
 
             let metadata = json!({
                 "channel": channel,
@@ -380,7 +405,7 @@ impl PubSubExecutor {
                 let mut metadata: Value = serde_json::from_slice(&existing)?;
                 let active_subscribers = channels.get(channel).unwrap().0.receiver_count() as u64;
                 metadata["active_subscribers"] = json!(active_subscribers);
-                info!(channel = %channel, active_subscribers = active_subscribers, "Channel metadata updated");
+                // info!(channel = %channel, active_subscribers = active_subscribers, "Channel metadata updated");
                 channels_tree.insert(channel.as_bytes(), serde_json::to_vec(&metadata)?)?;
             }
         }
@@ -458,6 +483,7 @@ impl PubSubExecutor {
 
         let metadata = AgentMetadata {
             name: name.clone(),
+            description: agent.description(),
             subscriptions: subscriptions.clone(),
             publications: publications.clone(),
             input_schema: agent.input_schema(),
@@ -482,8 +508,7 @@ impl PubSubExecutor {
         &self,
         channel: &str,
         mut message: Message,
-        cache: &Cache,
-        task: Option<(String, Value)>,
+       
     ) -> Result<String, PubSubError> {
         if *self.stopped.read().await {
             return Err(PubSubError::ExecutionError(
@@ -504,12 +529,18 @@ impl PubSubExecutor {
             .unwrap_or("default_agent".to_string());
         message.source = node_id.clone();
 
-          // Handle task creation or update
-        if let Some((task_type, data)) = task {
-            let task_id = message.task_id.clone().unwrap_or_else(|| format!("task_{}", chrono::Utc::now().timestamp_nanos()));
-            message.task_id = Some(task_id.clone());
-            self.task_manager.create_or_update_task(task_id, task_type, data, self.config.max_attempts).await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
-        }
+        // // Handle task creation or update
+        // if let Some((task_type, data)) = task {
+        //     let task_id = message
+        //         .task_id
+        //         .clone()
+        //         .unwrap_or_else(|| format!("task_{}", chrono::Utc::now().timestamp_nanos()));
+        //     message.task_id = Some(task_id.clone());
+        //     self.task_manager
+        //         .create_or_update_task(task_id, task_type, data, self.config.max_attempts)
+        //         .await
+        //         .map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+        // }
 
         let messages_tree = self.sled_db.open_tree("pubsub_messages")?;
         messages_tree.insert(node_id.as_bytes(), serde_json::to_vec(&message)?)?;
@@ -674,161 +705,151 @@ impl PubSubExecutor {
     ///
     /// # Returns
     /// A `Result` containing a `PubSubExecutionReport` or a `PubSubError`.
+pub async fn execute(
+    &mut self,
+    spec: PubSubWorkflowSpec,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<(PubSubExecutionReport, mpsc::Receiver<NodeExecutionOutcome>), PubSubError> {
+    match spec {
+        PubSubWorkflowSpec::EventDriven { channel, initial_message } => {
+            let agents = self.agent_registry.read().await;
+            if agents.is_empty() { return Err(PubSubError::NoAgentsRegistered); }
 
-    pub async fn execute(
-        &mut self,
-        spec: PubSubWorkflowSpec,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> Result<(PubSubExecutionReport, mpsc::Receiver<NodeExecutionOutcome>), PubSubError> {
-        match spec {
-            PubSubWorkflowSpec::EventDriven {
-                channel,
-                initial_message,
-            } => {
-                let agents = self.agent_registry.read().await;
-                if agents.is_empty() {
-                    return Err(PubSubError::NoAgentsRegistered);
+            info!("Agents registered: {:?}", agents.keys().collect::<Vec<_>>());
+            for (_, entry) in agents.iter() {
+                for sub in &entry.metadata.subscriptions {
+                    self.ensure_channel(sub).await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+                    info!("Ensured channel: {}", sub);
                 }
+            }
 
-                let initial_node_id = format!("initial_{}", chrono::Utc::now().timestamp_millis());
-                let initial_msg = Message {
-                    timestamp: chrono::Local::now().naive_local(),
-                    source: initial_node_id.clone(),
-                    channel: Some(channel.clone()),
-                    payload: initial_message.payload,
-                    task_id: None,
-                };
-                self.publish(&channel, initial_msg, &self.cache, None).await?;
-                let (outcome_tx, mut outcome_rx) = mpsc::channel::<NodeExecutionOutcome>(100);
-                let processed_messages = Arc::new(RwLock::new(HashSet::new()));
-                let agents_clone = Arc::clone(&self.agent_registry);
-                let channels_clone = Arc::clone(&self.channels);
-                let stopped_clone = Arc::clone(&self.stopped);
-                let cache = self.cache.clone();
-                let agent_configs: Vec<(String, Arc<dyn PubSubAgent>, Vec<String>)> = {
-                    agents
-                        .iter()
-                        .map(|(name, entry)| {
-                            (
-                                name.clone(),
-                                entry.agent.clone(),
-                                entry.metadata.subscriptions.clone(),
-                            )
-                        })
-                        .collect()
-                };
+            let (outcome_tx, outcome_rx) = mpsc::channel(100);
+            let processed_messages = Arc::new(RwLock::new(HashSet::new()));
+            let (final_tx, mut final_rx) = mpsc::channel(100);
 
-                let result = tokio::select! {
-                    result = async {
-                        let mut handles = Vec::new();
-                        for (name, agent, subscriptions) in agent_configs {
-                            let agent_node_id = format!("{}_instance", name); // Stable ID per agent
-                            for sub in subscriptions {
-                                let rx = {
-                                    let channels_guard = channels_clone.read().await;
-                                    channels_guard.get(&sub).map(|(_, rx)| rx.clone())
-                                };
-                                if let Some(mut rx_clone) = rx {
-                                    let agent_clone = agent.clone();
-                                    let executor_clone = self.clone();
-                                    let channel_name = sub.clone();
-                                    let name_clone = name.clone();
-                                    let processed_messages_clone = Arc::clone(&processed_messages);
-                                    let outcome_tx_clone = outcome_tx.clone();
-                                    let cache = cache.clone();
-                                    let agent_node_id = agent_node_id.clone();
-                                    let handle = tokio::spawn(async move {
-                                        while !*executor_clone.stopped.read().await {
-                                            match rx_clone.recv().await {
-                                                Ok(message) => {
-                                                    let msg_id = format!("msg_{}_{}", channel_name, chrono::Utc::now().timestamp_millis());
-                                                    {
-                                                        let mut processed = processed_messages_clone.write().await;
-                                                        if processed.contains(&msg_id) { continue; }
-                                                        processed.insert(msg_id.clone());
-                                                    }
+            let agent_configs: Vec<(String, Arc<dyn PubSubAgent>, Vec<String>)> = {
+                agents.iter().map(|(n, e)| (n.clone(), e.agent.clone(), e.metadata.subscriptions.clone())).collect()
+            };
 
-                                                    let mut executor = executor_clone.clone();
-                                                    let result = agent_clone
-                                                        .process_message(
-                                                            &agent_node_id,
-                                                            &channel_name,
-                                                            message.clone(),
-                                                            &mut executor,
-                                                            cache.clone(),
-                                                        )
-                                                        .await;
-                                                    let outcome = NodeExecutionOutcome {
-                                                        node_id: name_clone.clone(),
-                                                        success: result.is_ok(),
-                                                        retry_messages: match &result {
-                                                            Err(e) => vec![e.to_string()],
-                                                            Ok(_) => Vec::new(),
-                                                        },
-                                                        final_error: match &result {
-                                                            Err(e) => Some(e.to_string()),
-                                                            Ok(_) => None,
-                                                        },
-                                                    };
+            info!("Starting {} agent listeners", agent_configs.len());
+            let mut handles = Vec::new();
+            for (name, agent, subscriptions) in agent_configs {
+                let agent_node_id = format!("{}_instance", name);
+                for sub in subscriptions {
+                    let rx = {
+                        let channels_guard = self.channels.read().await;
+                        channels_guard.get(&sub).map(|(_, rx)| rx.clone()).ok_or_else(|| {
+                            PubSubError::ChannelNotFound(sub.clone())
+                        })?
+                    };
+                    let agent_clone = agent.clone();
+                    let executor_clone = self.clone();
+                    let channel_name = sub.clone();
+                    let name_clone = name.clone();
+                    let processed_messages_clone = processed_messages.clone();
+                    let outcome_tx_clone = outcome_tx.clone();
+                    let final_tx_clone = final_tx.clone();
+                    let cache = self.cache.clone();
+                    let mut rx = rx.clone();
+                    let agent_node_id = agent_node_id.clone();
 
-                                                    if outcome_tx_clone.send(outcome).await.is_err() {
-                                                        error!(agent = %name_clone, "Failed to send outcome");
-                                                        break;
-                                                    }
-                                                    if let Err(e) = result {
-                                                        error!(agent = %name_clone, channel = %channel_name, "Processing failed: {}", e);
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!(agent = %name_clone, channel = %channel_name, "Receive failed: {}", e);
-                                                    break;
-                                                }
-                                            }
+                    let handle = tokio::spawn(async move {
+                        info!(agent = %name_clone, channel = %channel_name, "Listener started");
+                        loop {
+                            if *executor_clone.stopped.read().await {
+                                info!(agent = %name_clone, "Stopping listener");
+                                break;
+                            }
+                            match rx.recv().await {
+                                Ok(message) => {
+                                    let msg_id = message.message_id.clone();
+                                    {
+                                        let mut processed = processed_messages_clone.write().await;
+                                        if processed.contains(&msg_id) {
+                                            debug!(agent = %name_clone, "Skipping duplicate: {}", msg_id);
+                                            continue;
                                         }
-                                    });
-                                    handles.push(handle);
+                                        processed.insert(msg_id.clone());
+                                    }
+                                    info!(agent = %name_clone, channel = %channel_name, "Processing message: {}", msg_id);
+                                    let mut executor = executor_clone.clone();
+                                    let result = agent_clone.process_message(
+                                        &agent_node_id,
+                                        &channel_name,
+                                        &message,
+                                        &mut executor,
+                                        cache.clone(),
+                                    ).await;
+
+                                    let outcome = NodeExecutionOutcome {
+                                        node_id: name_clone.clone(),
+                                        success: result.is_ok(),
+                                        retry_messages: result.as_ref().err().map(|e| vec![e.to_string()]).unwrap_or_default(),
+                                        final_error: result.as_ref().err().map(|e| e.to_string()),
+                                    };
+                                    info!(agent = %name_clone, "Outcome: {:?}", outcome);
+
+                                    if outcome_tx_clone.send(outcome.clone()).await.is_err() {
+                                        error!(agent = %name_clone, "Failed to send to outcome_tx");
+                                        break;
+                                    }
+                                    if final_tx_clone.send(outcome.clone()).await.is_err() {
+                                        error!(agent = %name_clone, "Failed to send to final_tx");
+                                        break;
+                                    }
+                                }
+                                Err(async_broadcast::RecvError::Closed) => {
+                                    info!(agent = %name_clone, channel = %channel_name, "Channel closed");
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(agent = %name_clone, channel = %channel_name, "Receive error: {}, retrying", e);
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
                                 }
                             }
                         }
+                    });
+                    handles.push(handle);
+                }
+            }
 
-                        let mut final_outcomes = Vec::new();
-                        while let Some(outcome) = outcome_rx.recv().await {
-                            final_outcomes.push(outcome);
-                        }
-                        for handle in handles {
-                            if let Err(e) = handle.await {
-                                error!("Task failed: {}", e);
-                            }
-                        }
-                        // self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
-                        Result::<_, PubSubError>::Ok(PubSubExecutionReport::new(
-                            final_outcomes.clone(),
-                            final_outcomes.iter().all(|o| o.success),
-                            None,
-                        ))
-                    } => match result {
-                        Ok(report) => Ok((report, outcome_rx)),
-                        Err(e) => {
-                            self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
-                            Err(PubSubError::ExecutionError(e.to_string()))
-                        }
-                    },
-                    _ = cancel_rx => {
-                        self.stop().await?;
-                        let mut final_outcomes = Vec::new();
-                        while let Ok(outcome) = outcome_rx.try_recv() {
-                            final_outcomes.push(outcome);
-                        }
-                        Ok((PubSubExecutionReport::new(final_outcomes, false, Some("Execution cancelled".to_string())), outcome_rx))
-                    },
-                };
-                result
+            info!("Publishing initial message to channel: {}", channel);
+            self.publish(&channel, initial_message).await?;
+
+            tokio::select! {
+                result = async {
+                    info!("Collecting outcomes...");
+                    let mut final_outcomes = Vec::new();
+                    while let Some(outcome) = tokio::time::timeout(Duration::from_secs(1), final_rx.recv()).await.unwrap_or(None) {
+                        final_outcomes.push(outcome.clone());
+                        info!("Collected outcome: {:?}", outcome);
+                    }
+                    info!("Waiting for {} handles to complete", handles.len());
+                    join_all(handles).await;
+                    self.save_state().await.map_err(|e| PubSubError::ExecutionError(e.to_string()))?;
+                    info!("Execution completed with {} outcomes", final_outcomes.len());
+                    Ok(PubSubExecutionReport::new(
+                        final_outcomes.clone(),
+                        !final_outcomes.iter().any(|o| !o.success),
+                        None,
+                    ))
+                } => result.map(|report| (report, outcome_rx)),
+                _ = cancel_rx => {
+                    info!("Cancellation received");
+                    self.stop().await?;
+                    let mut final_outcomes = Vec::new();
+                    while let Ok(outcome) = final_rx.try_recv() {
+                        final_outcomes.push(outcome);
+                    }
+                    Ok((PubSubExecutionReport::new(final_outcomes, false, Some("Execution cancelled".to_string())), outcome_rx))
+                }
             }
         }
     }
+}
 
     /// Creates a lightweight clone of the executor, reusing thread-safe components.
-    fn clone(&self) -> Self {
+   pub fn clone(&self) -> Self {
         Self {
             agent_registry: Arc::clone(&self.agent_registry),
             agent_factories: Arc::clone(&self.agent_factories),
@@ -1013,7 +1034,7 @@ impl PubSubExecutor {
         Ok(dot)
     }
 
-    pub async fn load_state(&self, cache: &Cache) -> Result<()> {
+    pub async fn load_state(&self, cache: &Arc<Cache>) -> Result<()> {
         // Load execution tree from compressed storage
         let tree_store = self.sled_db.open_tree("pubsub_execution_trees")?;
         if let Some(compressed) = tree_store.get(b"latest")? {
@@ -1030,14 +1051,16 @@ impl PubSubExecutor {
         if let Some(cache_bytes) = cache_tree.get(b"latest")? {
             let cache_str = String::from_utf8(cache_bytes.to_vec())?;
             let loaded_cache = crate::load_cache_from_json(&cache_str)?;
-            let mut current_cache = cache
-                .write()
-                .map_err(|e| anyhow!("Cache lock error: {}", e))?;
-            *current_cache = loaded_cache
-                .read()
-                .map_err(|e| anyhow!("Cache read error: {}", e))?
-                .clone();
-            info!("Loaded cache with {} entries", current_cache.len());
+
+            // Replace the contents of the DashMap instead of the Arc itself
+            cache.data.clear(); // Clear existing data
+            for item in loaded_cache.data.iter() {
+                let key = item.key().clone();
+                let value = item.value().clone();
+                cache.data.insert(key, value);
+            }
+
+            info!("Loaded cache with {} entries", cache.data.len());
         }
 
         // Replay unprocessed messages
@@ -1050,19 +1073,15 @@ impl PubSubExecutor {
             let channel = msg_id.split('_').nth(1).unwrap_or("unknown");
 
             // Check if this message has already been processed
-            let is_processed = {
-                let cache_read = cache
-                    .read()
-                    .map_err(|e| anyhow!("Cache lock error: {}", e))?;
-                cache_read
-                    .get(channel)
-                    .and_then(|m| m.get(&msg_id))
-                    .is_some()
-            };
+            let is_processed = cache
+                .data
+                .get(channel)
+                .map(|m| m.contains_key(&msg_id))
+                .unwrap_or(false);
 
             if !is_processed {
                 debug!(msg_id = %msg_id, channel = %channel, "Replaying unprocessed message");
-                self.publish(channel, message, cache, None).await?;
+                self.publish(channel, message).await?;
                 replayed_count += 1;
             }
         }
@@ -1257,18 +1276,19 @@ impl PubSubExecutor {
 
             tokio::spawn(async move {
                 while !*stopped_clone.read().await {
-                    if let Some(task) = task_manager_clone.claim_task(&task_type, &task_type).await {
+                    if let Some(task) = task_manager_clone.claim_task(&task_type, &task_type).await
+                    {
                         let mut executor = executor_clone.clone();
                         let message = Message::with_task_id(
                             task_type.clone(),
                             task.task_id.clone(),
-                            task.data.clone(),
+                            task.input.clone(),
                         );
                         let result = agent
                             .process_message(
                                 &task_type,
                                 &channel_name,
-                                message,
+                                &message,
                                 &mut executor,
                                 cache_clone.clone(),
                             )
@@ -1298,24 +1318,6 @@ impl PubSubExecutor {
                         if let Err(e) = result {
                             error!("Agent {} failed on task {}: {}", task_type, task.task_id, e);
                         }
-
-                        // let planned_tasks = *executor.planned_tasks.read().await;
-                        // if task_manager_clone.is_complete(planned_tasks).await {
-                        //     executor
-                        //         .publish(
-                        //             "report_request",
-                        //             Message::new(
-                        //                 task_type.clone(),
-                        //                 json!({"report_request": true}),
-                        //             ),
-                        //             &cache_clone,
-                        //         )
-                        //         .await
-                        //         .unwrap_or_else(|e| {
-                        //             error!("Failed to request report: {}", e.to_string());
-                        //             "Error occurred".to_string() // Return a String here
-                        //         });
-                        // }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
@@ -1457,7 +1459,7 @@ impl PubSubAgent for HumanInterruptAgent {
         &self,
         node_id: &str,
         channel: &str,
-        message: Message,
+        message: &Message,
         executor: &mut PubSubExecutor,
         cache: Arc<Cache>,
     ) -> Result<()> {
@@ -1607,56 +1609,193 @@ impl PubSubExecutor {
 
 #[derive(Clone)]
 pub struct TaskManager {
-    tasks: Arc<RwLock<Vec<Task>>>,
+  
+    tasks_by_assignee: Arc<DashMap<String, Vec<String>>>,
+    tasks_by_status: Arc<DashMap<TaskStatus, Vec<String>>>,
+    tasks_by_parent: Arc<DashMap<String, Vec<String>>>, // Parent -> Child mapping
+    tasks_by_id: Arc<DashMap<String, Task>>,
 }
-
 impl TaskManager {
     pub fn new() -> Self {
         Self {
-            tasks: Arc::new(RwLock::new(Vec::new())),
+         
+            tasks_by_assignee: Arc::new(DashMap::new()),
+            tasks_by_status: Arc::new(DashMap::new()),
+            tasks_by_parent: Arc::new(DashMap::new()),
+            tasks_by_id: Arc::new(DashMap::new()),
         }
     }
 
-    pub async fn add_task(&self, task_type: String, data: Value, max_attempts: u32) -> String {
-        let task_id = format!("task_{}", chrono::Utc::now().timestamp_nanos());
+    pub async fn add_task(
+        &self,
+        job_id: String,
+        task_id: String, // Now takes the ID as an argument
+        parent_task_id: Option<String>,
+        acceptance_criteria: Option<String>,
+        description: String,
+        agent: String,
+        dependencies: Vec<String>,
+        dependents: Vec<String>, // New argument
+        input: Value,
+    ) -> Result<String> {
+        // --- Start of changes
+        if task_id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Task ID cannot be empty or only whitespace"
+            ));
+        }
+        if job_id.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Job ID cannot be empty or only whitespace"
+            ));
+        }
+
+        
+        if dependencies.contains(&task_id) {
+            return Err(anyhow::anyhow!("Task cannot depend on itself: {}", task_id));
+        }
+
+        if dependents.contains(&task_id) {
+            return Err(anyhow::anyhow!("Task cannot depend on itself: {}", task_id));
+        }
+
+        // Check if task ID already exists
+        let task_id_exists = self.tasks_by_id.read().await.contains_key(&task_id);
+        if task_id_exists {
+            return Err(anyhow::anyhow!("Task with ID '{}' already exists", task_id));
+        }
+        //--- End of changes.
+
         let task = Task {
+            job_id: job_id.clone(),
             task_id: task_id.clone(),
-            task_type,
+            parent_task_id,
+            acceptance_criteria,
+            description,
             status: TaskStatus::Pending,
-            attempts: 0,
-            max_attempts,
-            data,
-            created_at: chrono::Local::now().naive_local(),
+            status_reason: None,
+            agent: agent.clone(), // Clone the agent string
+            dependencies,
+            dependents: dependents.clone(), // Clone the subtasks vector
+            input: input.clone(),
+            output: TaskOutput {
+                success: false,
+                data: None,
+                error: None,
+            },
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
         };
+
+        // --- Start of changes
+        // Update indexes *before* adding to the main task list
+        self.tasks_by_id
+            .write()
+            .await
+            .insert(task_id.clone(), task.clone());
+
+        self.tasks_by_assignee
+            .write()
+            .await
+            .entry(agent.clone()) // Use the cloned agent string
+            .or_insert_with(Vec::new)
+            .push(task_id.clone());
+
+        self.tasks_by_status
+            .write()
+            .await
+            .entry(TaskStatus::Pending)
+            .or_insert_with(Vec::new)
+            .push(task_id.clone());
+
+        // --- End of changes
+
         let mut tasks = self.tasks.write().await;
         tasks.push(task);
-        info!("Added task: {}", task_id);
-        task_id
-    }
 
+        // --- Start of changes
+
+        // *No* implicit dependency management.  The caller is responsible for
+        // providing the complete list of dependencies.
+        // --- end of changes
+
+        Ok(task_id)
+    }
     pub async fn claim_task(&self, task_type: &str, agent_name: &str) -> Option<Task> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks
-            .iter_mut()
-            .find(|t| t.task_type == task_type && t.status == TaskStatus::Pending)
-        {
-            task.status = TaskStatus::InProgress;
-            task.attempts += 1;
-            info!("Task {} claimed by agent {}", task.task_id, agent_name);
-            Some(task.clone())
-        } else {
-            None
+        let mut tasks_by_id = self.tasks_by_id.write().await;
+        let mut tasks_by_status = self.tasks_by_status.write().await;
+        let mut tasks = self.tasks.write().await; //we need write lock
+
+        if let Some(task_ids) = tasks_by_status.get_mut(&TaskStatus::Pending) {
+            if let Some(index) = task_ids.iter().position(|task_id| {
+                tasks_by_id
+                    .get(task_id)
+                    .map_or(false, |task| task.agent == task_type)
+            }) {
+                let task_id = task_ids.remove(index);
+                if let Some(mut task) = tasks_by_id.get_mut(&task_id).cloned() {
+                    task.status = TaskStatus::InProgress; // Update
+
+                    // Update tasks_by_id
+                    tasks_by_id.insert(task_id.clone(), task.clone());
+
+                    // Update tasks (main list)
+                    if let Some(index_in_tasks) = tasks.iter().position(|t| t.task_id == task_id) {
+                        tasks[index_in_tasks] = task.clone();
+                    }
+
+                    // Update the status index: Remove from pending, add to in progress
+                    tasks_by_status
+                        .entry(TaskStatus::InProgress)
+                        .or_insert_with(Vec::new)
+                        .push(task_id);
+
+                    info!("Task {} claimed by agent {}", task.task_id, agent_name);
+                    return Some(task);
+                }
+            }
         }
+        None
     }
 
     pub async fn complete_task(&self, task_id: &str, success: bool) -> Result<()> {
         let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
-            task.status = if success {
+        let mut tasks_by_id = self.tasks_by_id.write().await;
+        let mut tasks_by_status = self.tasks_by_status.write().await;
+
+        // Find task in by_id index, update the main task list
+        if let Some(mut task) = tasks_by_id.get_mut(task_id).cloned() {
+            let new_status = if success {
                 TaskStatus::Completed
             } else {
                 TaskStatus::Failed
             };
+            task.status = new_status.clone();
+            tasks_by_id.insert(task_id.to_string(), task.clone());
+
+            //Update the main task
+            if let Some(index) = tasks.iter().position(|t| t.task_id == task_id.to_string()) {
+                tasks[index] = task.clone(); // Replace with updated
+            }
+
+            // Remove the old status
+            let old_status = if success {
+                TaskStatus::InProgress
+            } else {
+                TaskStatus::Pending
+            };
+
+            if let Some(task_ids) = tasks_by_status.get_mut(&old_status) {
+                if let Some(index) = task_ids.iter().position(|id| id == task_id) {
+                    task_ids.remove(index);
+                }
+            }
+            // Add to new status
+            tasks_by_status
+                .entry(new_status.clone())
+                .or_insert_with(Vec::new)
+                .push(task_id.to_string());
+
             info!(
                 "Task {} marked as {}",
                 task_id,
@@ -1666,63 +1805,136 @@ impl TaskManager {
         } else {
             Err(anyhow!("Task {} not found", task_id))
         }
-
-        
+    }
+    pub async fn get_task_by_id(&self, task_id: &str) -> Option<Task> {
+        self.tasks_by_id.read().await.get(task_id).cloned()
     }
 
-    pub async fn get_pending_tasks(&self) -> Vec<Task> {
+    pub async fn get_tasks_by_type(&self, task_type: &str) -> Vec<Task> {
+        //We don't have index by task type
+        // so use tasks
         let tasks = self.tasks.read().await;
         tasks
             .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
+            .filter(|t| t.agent == task_type)
             .cloned()
             .collect()
     }
 
-    pub async fn is_complete(&self, planned_tasks: usize) -> bool {
-        let tasks = self.tasks.read().await;
-        let completed = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Completed)
-            .count();
-        let pending = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Pending)
-            .count();
-        pending == 0 && completed >= planned_tasks
+    pub async fn get_tasks_by_status(&self, status: TaskStatus) -> Vec<Task> {
+        let tasks_by_status = self.tasks_by_status.read().await;
+        let tasks_by_id = self.tasks_by_id.read().await;
+
+        if let Some(ids) = tasks_by_status.get(&status) {
+            let futures = ids.iter().map(|id| {
+                let tasks_by_id_clone = tasks_by_id.clone(); // Clone the Arc for each future
+                async move {
+                    tasks_by_id_clone.get(id).cloned()
+                }
+            });
+
+            join_all(futures).await.into_iter().filter_map(|x| x).collect()
+        } else {
+            Vec::new()
+        }
     }
 
-        pub async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+    // Added get_subtasks
+    pub async fn get_subtasks(&self, task_id: &str) -> Vec<Task> {
+        if let Some(task) = self.get_task_by_id(task_id).await {
+            let tasks_by_id = self.tasks_by_id.read().await;
+            task.dependents
+                .iter()
+                .filter_map(|subtask_id| tasks_by_id.get(subtask_id).cloned())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    // Added update task, we update task and indexes
+    pub async fn update_task(&self, task_id: &str, updated_task: Task) -> Result<()> {
         let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
+        let mut tasks_by_id = self.tasks_by_id.write().await;
+        let mut tasks_by_assignee = self.tasks_by_assignee.write().await;
+        let mut tasks_by_status = self.tasks_by_status.write().await;
+
+        // Check if the task exists
+        if !tasks_by_id.contains_key(task_id) {
+            return Err(anyhow!("Task {} not found", task_id));
+        }
+
+        // Update the main task list
+        if let Some(index) = tasks.iter().position(|t| t.task_id == task_id) {
+            tasks[index] = updated_task.clone();
+        }
+
+        // Get the old task for comparison (before updating indexes)
+        let old_task = tasks_by_id.get(task_id).unwrap().clone();
+
+        // Update indexes
+
+        // 1. tasks_by_id (always updated, as it is get)
+        tasks_by_id.insert(task_id.to_string(), updated_task.clone());
+
+        // 2. tasks_by_assignee (check if assignee changed)
+        if old_task.agent != updated_task.agent {
+            // Remove from old assignee's list
+            if let Some(task_ids) = tasks_by_assignee.get_mut(&old_task.agent) {
+                if let Some(index) = task_ids.iter().position(|id| id == task_id) {
+                    task_ids.remove(index);
+                }
+            }
+
+            // Add to new assignee's list
+            tasks_by_assignee
+                .entry(updated_task.agent.clone())
+                .or_insert_with(Vec::new)
+                .push(task_id.to_string());
+        }
+
+        // 3. tasks_by_status (check if status changed)
+        if old_task.status != updated_task.status {
+            // Remove the task from the old status
+            if let Some(task_ids) = tasks_by_status.get_mut(&old_task.status) {
+                if let Some(index) = task_ids.iter().position(|id| id == task_id) {
+                    task_ids.remove(index);
+                }
+            }
+
+            // Add to new status's list
+            tasks_by_status
+                .entry(updated_task.status.clone())
+                .or_insert_with(Vec::new)
+                .push(task_id.to_string());
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_all_tasks(&self) -> Vec<Task> {
+        self.tasks.read().await.clone()
+    }
+
+    pub async fn get_task_count(&self) -> usize {
+        self.tasks.read().await.len()
+    }
+
+    pub async fn get_task_count_by_status(&self, status: TaskStatus) -> usize {
+        self.tasks_by_status.read().await.get(&status).unwrap_or(&Vec::new()).len()
+    }
+
+    pub async fn update_task_status(&self, task_id: &str, status: TaskStatus) -> Result<()> {
+        let mut tasks = self.tasks.write().await;
+        let mut tasks_by_id = self.tasks_by_id.write().await;
+        let mut tasks_by_status = self.tasks_by_status.write().await;
+
+        if let Some(task) = tasks_by_id.get_mut(task_id) {
             task.status = status.clone();
-            info!("Task {} updated to {:?}", task_id, status);
+            tasks_by_status.entry(status).or_insert_with(Vec::new).push(task_id.to_string());
             Ok(())
         } else {
-            debug!("Task {} not found in queue", task_id);
-            Ok(()) // No error if task isn’t registered
+            Err(anyhow!("Task {} not found", task_id))
         }
     }
-
-    pub async fn create_or_update_task(&self, task_id: String, task_type: String, data: Value, max_attempts: u32) -> Result<String> {
-        let mut tasks = self.tasks.write().await;
-        if let Some(task) = tasks.iter_mut().find(|t| t.task_id == task_id) {
-            task.data = data; // Update data if task exists
-            info!("Updated existing task: {}", task_id);
-        } else {
-            let task = Task {
-                task_id: task_id.clone(),
-                task_type,
-                status: TaskStatus::Pending,
-                attempts: 0,
-                max_attempts,
-                data,
-                created_at: chrono::Local::now().naive_local(),
-            };
-            tasks.push(task);
-            info!("Created new task: {}", task_id);
-        }
-        Ok(task_id)
-    }
-
 }

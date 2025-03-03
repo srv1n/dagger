@@ -1,32 +1,39 @@
-
-use dagger::{get_global_input, insert_global_value, append_global_value, Cache, Message};
+// src/agents/planning.rs (Corrected)
+use anyhow::anyhow;
+use anyhow::Result;
+use dagger::TaskStatus;
+use dagger::{Cache, Message, PubSubExecutor};
 use dagger_macros::pubsub_agent;
 use serde_json::json;
-use anyhow::Result;
-use dagger::PubSubExecutor;
 use tracing::info;
-use anyhow::anyhow;
-use tokio::time::{sleep, Duration};
+
 use crate::utils::llm::llm_generate;
+
 #[pubsub_agent(
     name = "PlanningAgent",
-    subscribe = "initial_query, gap_questions, evaluation_results",
-    publish = "search_queries, gap_questions",
-    input_schema = r#"{"type": "object", "properties": {"query": {"type": "string"}, "gap_questions": {"type": "array"}}}"#,
-    output_schema = r#"{"type": "object", "properties": {"search_queries": {"type": "array"}, "gap_questions": {"type": "array"}}}"#
+    subscribe = "initial_query, gap_questions",
+    publish = "search_queries",
+    input_schema = r#"{"type": "object", "properties": {"query": {"type": "string"}}}"#,
+    output_schema = r#"{"type": "object", "properties": {"search_queries": {"type": "array"}}}"#
 )]
 pub async fn planning_agent(
     node_id: &str,
-    channel: &str,
-    message: Message,
+    channel: &str,     // Use the channel
+    message: &Message, // Corrected: &Message
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
     match channel {
         "initial_query" | "gap_questions" => {
-             sleep(Duration::from_secs(2)).await;
-            let query = message.payload["query"].as_str().ok_or(anyhow!("Missing query"))?;
-            let rewriter_prompt = format!("Rewrite this query for better search results:\n\n{}", query);
+            let query = message.payload["query"]
+                .as_str()
+                .ok_or(anyhow!("Missing query"))?
+                .to_string();
+
+            let task_id = message.task_id.clone().ok_or(anyhow!("Missing task_id"))?;
+
+            let rewriter_prompt =
+                format!("Rewrite this query for better search results:\n\n{}", query);
             let rewriter_response = llm_generate(&rewriter_prompt, "query_rewriter").await?;
             let expanded_queries: Vec<String> = rewriter_response["queries"]
                 .as_array()
@@ -35,68 +42,46 @@ pub async fn planning_agent(
                 .map(|v| v.as_str().unwrap().to_string())
                 .collect();
 
+            let mut subtask_ids = Vec::new();
             for expanded_query in &expanded_queries {
-                append_global_value(
-                    cache,
-                    "global",
-                    "task_queue",
-                    json!({"type": "search", "query": expanded_query, "source": "initial", "attempt_count": 0, "status": "pending"}),
-                )?;
+                let subtask_id = format!("search_{}", chrono::Utc::now().timestamp_nanos());
+                executor
+                    .task_manager
+                    .add_task(
+                        subtask_id.clone(),
+                        "Perform web search".to_string(),
+                        "SearchAgent".to_string(),
+                        vec![task_id.clone()],
+                        vec![],
+                        json!({ "query": expanded_query }),
+                    )
+                    .await?;
+                subtask_ids.push(subtask_id.clone());
+
+                executor
+                    .publish(
+                        "search_queries", // Correct channel
+                        Message {
+                            timestamp: chrono::Local::now().naive_local(),
+                            source: node_id.to_string(),
+                            channel: Some("search_queries".to_string()),
+                            task_id: Some(task_id.clone()), // Use original task_id
+                            message_id: subtask_id.clone(),
+                            payload: json!({ "query": expanded_query }),
+                        },
+                    )
+                    .await?;
             }
-            let current_planned: usize = get_global_input(cache, "global", "planned_tasks")?;
-            insert_global_value(cache, "global", "planned_tasks", current_planned + expanded_queries.len())?;
+
+            if let Some(mut task) = executor.task_manager.get_task_by_id(&task_id).await {
+                task.subtasks.extend(subtask_ids.clone());
+                executor.task_manager.update_task(&task_id, task).await?;
+            }
 
             executor
-                .publish(
-                    "search_queries",
-                    Message::new(node_id.to_string(), json!({"search_queries": expanded_queries})),
-                    cache,
-                    Some(("task_queue".to_string(),json!({"search_queries": expanded_queries})))
-                )
+                .task_manager
+                .update_task_status(&task_id, TaskStatus::Completed)
                 .await?;
-        }
-        "evaluation_results" => {
-            let evaluation_results = message.payload["evaluation_results"]
-                .as_array()
-                .ok_or(anyhow!("Missing evaluation_results"))?;
-            for result in evaluation_results {
-                if let (Some(false), Some(reason)) = (result["pass"].as_bool(), result["reason"].as_str()) {
-                    if reason.contains("definitive") {
-                        let original_question = message.payload["question"].as_str().unwrap_or_default();
-                        let rewriter_prompt = format!(
-                            "Rephrase this query for better search results, given it failed definitiveness:\n\n{}",
-                            original_question
-                        );
-                        let rewriter_response = llm_generate(&rewriter_prompt, "query_rewriter").await?;
-                        let new_queries: Vec<String> = rewriter_response["queries"]
-                            .as_array()
-                            .ok_or(anyhow!("Invalid query rewriter response"))?
-                            .iter()
-                            .map(|v| v.as_str().unwrap().to_string())
-                            .collect();
-
-                        for new_query in &new_queries {
-                            append_global_value(
-                                cache,
-                                "global",
-                                "task_queue",
-                                json!({"type": "search", "query": new_query, "source": "rephrased", "attempt_count": 0, "status": "pending"}),
-                            )?;
-                        }
-                        let current_planned: usize = get_global_input(cache, "global", "planned_tasks")?;
-                        insert_global_value(cache, "global", "planned_tasks", current_planned + new_queries.len())?;
-
-                        executor
-                            .publish(
-                                "search_queries",
-                                Message::new(node_id.to_string(), json!({"search_queries": new_queries})),
-                                cache,
-                                Some(("task_queue".to_string(),json!({"search_queries": new_queries})))
-                            )
-                            .await?;
-                    }
-                }
-            }
         }
         _ => {}
     }

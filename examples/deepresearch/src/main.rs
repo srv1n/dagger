@@ -1,45 +1,79 @@
+// src/main.rs
 use anyhow::Result;
-use dagger::{Cache, Message, PubSubExecutor};
-
+use dagger::{Cache, Message, NodeExecutionOutcome, PubSubExecutor, PubSubWorkflowSpec};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::time::{sleep, Duration, timeout};
+use tokio::sync::oneshot;
+use tokio::time::{sleep, Duration};
 use tracing::info;
 use tracing_subscriber;
 use deepresearch::agents::get_all_agents;
 
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    let cache = Arc::new(Cache::new(std::collections::HashMap::new()));
-    let mut executor = PubSubExecutor::new(None, "pubsub_db", cache.clone()).await?;
+    let cache = Arc::new(Cache::new());
+    let mut executor = PubSubExecutor::new(None, "./sled_db", cache.clone()).await?;
 
     executor.register_agents(get_all_agents()).await?;
+    println!("Registered Agents: {:?}", executor.list_agents().await);
+    println!("Channels: {:?}", executor.list_channels().await);
 
-    let mut outcome_rx = executor.start().await?;
     let initial_query = "Research the best electric vehicles (EVs) for families in 2024, considering price, range, safety, and cargo space.";
-    let initial_message = Message::new("initial_input".to_string(), json!({"query": initial_query}));
-    executor.publish("start", initial_message, &cache, None).await?;
+    let initial_message = Message::new("initial_input".to_string(), json!({ "query": initial_query }));
 
-    // Wait for workflow completion with a reasonable timeout
-    let duration = Duration::from_secs(120); // Increased to allow more processing time
-    let result = timeout(duration, async {
-        while let Some(outcome) = outcome_rx.recv().await {
-            info!("Outcome: {:?}", outcome);
-            if outcome.node_id == "SupervisorAgent" && !outcome.success {
-                info!("Workflow completed or failed, shutting down");
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let spec = PubSubWorkflowSpec::EventDriven {
+        channel: "start".to_string(),
+        initial_message,
+    };
+
+    let executor_handle = {
+        let mut executor = executor.clone();
+        tokio::spawn(async move {
+            let (report, outcome_rx) = executor.execute(spec, cancel_rx).await?;
+            Ok::<_, anyhow::Error>((report, outcome_rx))
+        })
+    };
+
+    let (report, mut outcome_rx) = executor_handle.await??;
+    let mut last_outcome_time = std::time::Instant::now();
+    let timeout = Duration::from_secs(10);
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), outcome_rx.recv()).await {
+            Ok(Some(outcome)) => {
+                println!("Outcome: {:?}", outcome);
+                last_outcome_time = std::time::Instant::now();
+                if !outcome.success {
+                    println!("Task failed for {}: {:?}", outcome.node_id, outcome.final_error);
+                }
+            }
+            Ok(None) => {
+                println!("Outcome channel closed");
                 break;
             }
+            Err(_) => {
+                let elapsed = last_outcome_time.elapsed();
+                if elapsed > timeout {
+                    println!("No outcomes for {} seconds, investigating...", elapsed.as_secs());
+                    println!("Cache contents:");
+                    for entry in cache.data.iter() {
+                        println!("  Key: {:?}, Value: {:?}", entry.key(), entry.value());
+                    }
+                    let dot = executor.serialize_tree_to_dot("workflow_1", &cache).await?;
+                    println!("DOT Diagram:\n{}", dot);
+                    let _ = cancel_tx.send(());
+                    break;
+                } else {
+                    info!("Waiting, elapsed: {}s", elapsed.as_secs());
+                }
+            }
         }
-    }).await;
-
-    if result.is_err() {
-        info!("Timeout reached, shutting down");
     }
 
-    executor.stop().await?;
-    let dot = executor.serialize_tree_to_dot("workflow1", &cache).await.unwrap();
-    println!("DOT Graph:\n{}", dot);
-    println!("Final Cache: {:#?}", cache.read().unwrap());
+    println!("Final Report: {:?}", report);
     Ok(())
 }

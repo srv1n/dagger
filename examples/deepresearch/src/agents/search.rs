@@ -1,12 +1,13 @@
-
-use dagger::{get_global_input, insert_global_value, append_global_value, Cache, Message};
+// src/agents/search.rs (Corrected)
+use anyhow::anyhow;
+use anyhow::Result;
+use dagger::TaskStatus;
+use dagger::{Cache, Message, PubSubExecutor};
 use dagger_macros::pubsub_agent;
 use serde_json::json;
-use anyhow::Result;
-use dagger::PubSubExecutor;
+use serde_json::Value;
 use tracing::info;
-use anyhow::anyhow;
-use tokio::time::{sleep, Duration};
+
 use crate::utils::search::perform_search;
 
 #[pubsub_agent(
@@ -18,42 +19,42 @@ use crate::utils::search::perform_search;
 )]
 pub async fn search_agent(
     node_id: &str,
-    channel: &str,
-    message: Message,
+    channel: &str, // Use the channel!
+    message: &Message, // Correct: &Message
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
-    sleep(Duration::from_secs(2)).await;
-    let search_queries: Vec<String> = message.payload["search_queries"]
-        .as_array()
-        .ok_or(anyhow!("Missing search_queries"))?
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
+    let query: String = message.payload["query"]
+        .as_str()
+        .ok_or(anyhow!("Missing query"))?
+        .to_string();
 
-    let mut all_results = Vec::new();
-    for query in search_queries {
-        let search_results = perform_search(&query).await?;
-        all_results.extend(search_results.clone());
-        for result in search_results {
-            let url = result["url"].as_str().unwrap().to_string();
-            append_global_value(
-                cache,
-                "global",
-                "task_queue",
-                json!({"type": "read", "url": url, "source_query": query, "status": "pending"}),
-            )?;
-        }
-    }
+    let task_id = message
+        .task_id
+        .clone()
+        .ok_or(anyhow!("Message is missing task_id"))?;
+
+    // let mut all_results = Vec::new();
+
+    let results: Vec<Value> = perform_search(&query).await?;
+    // let all_results = results.iter().map(|v| v.to_string()).collect();
+
+    // all_results.extend(results);
 
     executor
         .publish(
-            "search_results",
-            Message::new(node_id.to_string(), json!({"search_results": all_results})),
-            cache,
-            Some("search_results")
+            "search_results", // Use correct channel
+            Message {
+                timestamp: chrono::Local::now().naive_local(),
+                source: node_id.to_string(),
+                channel: Some("search_results".to_string()),
+                task_id: Some(task_id.clone()), // Keep task_id
+                message_id: format!("message_{}", chrono::Utc::now().timestamp_nanos()),
+                payload: json!({ "search_results": results }),
+            },
         )
         .await?;
-
+    executor.task_manager.update_task_status(&task_id, TaskStatus::Completed).await?;
+    info!("Search agent completed");
     Ok(())
 }

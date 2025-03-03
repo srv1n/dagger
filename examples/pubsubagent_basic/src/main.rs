@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 async fn supervisor_agent(
     node_id: &str,
     channel: &str,
-    message: Message,
+    message: &Message,
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
@@ -30,7 +30,7 @@ async fn supervisor_agent(
         let payload = json!({"plan_request": query, "iteration": i});
         let msg = Message::new(node_id.to_string(), payload);
         info!("Supervisor publishing plan request iteration {}", i);
-        executor.publish("plan_requests", msg, cache).await?;
+        executor.publish("plan_requests", msg, &cache,None).await?;
     }
     Ok(())
 }
@@ -46,7 +46,7 @@ async fn supervisor_agent(
 async fn planning_agent(
     node_id: &str, // Now receives node_id
     channel: &str,
-    message: Message,
+    message: &Message,
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
@@ -60,7 +60,7 @@ async fn planning_agent(
             let payload = json!({"search_question": format!("{} - part {}", question, idx + 1), "iteration": iteration});
             let msg = Message::new(node_id.to_string(), payload);
             info!("Planning agent publishing search question: {} (iteration {})", question, iteration);
-            executor.publish("search_requests", msg, &cache).await?;
+            executor.publish("search_requests", msg, &cache,None).await?;
         }
         Ok(())
 }
@@ -75,7 +75,7 @@ async fn planning_agent(
 async fn retrieval_agent(
     node_id: &str, // Now receives node_id
     channel: &str,
-    message: Message,
+    message: &Message,
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
@@ -89,7 +89,7 @@ async fn retrieval_agent(
         ];
         let payload = json!({"search_question": search_question, "results": results, "iteration": iteration});
         let msg = Message::new(node_id.to_string(), payload);
-        executor.publish("search_results", msg, &cache).await?;
+        executor.publish("search_results", msg, &cache,None).await?;
         Ok(())
 }
 
@@ -104,7 +104,7 @@ async fn retrieval_agent(
 async fn review_agent(
     node_id: &str, // Now receives node_id
     channel: &str,
-    message: Message,
+    message: &Message,
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
@@ -116,12 +116,12 @@ async fn review_agent(
         let reviewed_results = results.clone();
         let payload = json!({"search_question": search_question, "reviewed_results": reviewed_results, "iteration": iteration});
         let msg = Message::new(node_id.to_string(), payload);
-        executor.publish("reviewed_results", msg, &cache).await?;
+        executor.publish("reviewed_results", msg, &cache,None).await?;
         tokio::time::sleep(Duration::from_secs(1)).await;
         let refined_results = reviewed_results.iter().map(|r| json!(format!("Refined: {}", r.as_str().unwrap()))).collect::<Vec<_>>();
         let refined_payload = json!({"search_question": search_question, "reviewed_results": refined_results, "iteration": iteration});
         let msg = Message::new(node_id.to_string(), refined_payload);
-        executor.publish("reviewed_results", msg, &cache).await?;
+        executor.publish("reviewed_results", msg, &cache,None).await?;
         Ok(())
 }
 
@@ -136,7 +136,7 @@ async fn review_agent(
 async fn drafting_agent(
     node_id: &str, // Now receives node_id
     channel: &str,
-    message: Message,
+    message: &Message,
     executor: &mut PubSubExecutor,
     cache: &Cache,
 ) -> Result<()> {
@@ -153,7 +153,7 @@ async fn drafting_agent(
         );
         let payload = json!({"draft": draft, "iteration": iteration});
         let msg = Message::new(node_id.to_string(), payload);
-        executor.publish("final_draft", msg, &cache).await?;
+        executor.publish("final_draft", msg, &cache,None).await?;
         Ok(())
 }
 
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
     let node_id = "SupervisorAgent".to_string();
     let msg = Message::new(node_id, initial_message);
     println!("Publishing initial message: {:#?}", msg);
-    executor.publish("start", msg, &cache).await?;
+    executor.publish("start", msg, &cache,None).await?;
 
     // Monitor outcomes for 30 seconds to capture multiple iterations
     tokio::time::sleep(Duration::from_secs(30)).await;
