@@ -9,6 +9,7 @@ Dagger is a lightweight, flexible Rust library designed for executing directed a
 - [Usage](#usage)
   - [Option 1: YAML-Based DAG Execution](#option-1-yaml-based-dag-execution)
   - [Option 2: Agent-Driven Flow Execution](#option-2-agent-driven-flow-execution)
+  - [Option 3: Task Agent System](#option-3-task-agent-system)
 - [Dagger Macros (Optional)](#dagger-macros-optional)
 - [Key Concepts](#key-concepts)
 - [Examples](#examples)
@@ -57,7 +58,7 @@ dagger-macros = { path = "path/to/dagger-macros" } # Replace with version or pat
 Ensure your Rust version is 1.70 or higher for compatibility with the latest features used.
 
 ## Usage
-Dagger supports two primary execution modes: YAML-based static DAGs and agent-driven dynamic flows. Both methods rely on registering actions with a DagExecutor, but they differ in how the DAG is defined and executed.
+Dagger supports multiple execution modes: YAML-based static DAGs, agent-driven dynamic flows, and a task agent system for more complex orchestration. All methods rely on registering actions with a DagExecutor, but they differ in how the workflow is defined and executed.
 
 ### Option 1: YAML-Based DAG Execution
 Overview: Define a DAG in a YAML file with nodes, dependencies, inputs, and outputs, then execute it using WorkflowSpec::Static. This approach is ideal for predefined, repeatable workflows.
@@ -470,25 +471,380 @@ async fn main() -> Result<()> {
 The supervisor dynamically adds nodes using add_node, building the DAG at runtime.
 WorkflowSpec::Agent starts with an initial task ("analyze"), and the supervisor dictates the flow.
 
+### Option 3: Task Agent System
+Overview: The Task Agent System provides a more sophisticated approach to task orchestration with features like job persistence, task dependencies, and agent-specific task execution. This system is ideal for complex workflows where tasks need to be claimed, executed, and tracked by specific agents.
+
+#### Steps
+1. Define Task Agents: Create structs that implement the required methods for task execution
+2. Use the `task_agent` macro: Apply the macro to your implementation to generate the TaskAgent trait
+3. Create Tasks: Use the `task_builder` macro to generate builder patterns for task creation
+4. Execute: Run tasks through the TaskManager, which handles dependencies and state management
+
+#### Task Agent Implementation
+```rust
+use dagger::taskagent::{TaskManager, Task};
+use dagger_macros::task_agent;
+use serde_json::Value;
+
+struct MyTaskAgent;
+
+impl MyTaskAgent {
+    // Required methods that will be checked by the macro
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "data": {"type": "string"}
+            }
+        })
+    }
+    
+    fn output_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "result": {"type": "string"}
+            }
+        })
+    }
+    
+    async fn execute(&self, input: serde_json::Value, task_id: &str, job_id: &str) -> Result<serde_json::Value, String> {
+        // Process the task
+        let data = input["data"].as_str().unwrap_or("default");
+        let result = format!("Processed: {}", data);
+        
+        Ok(serde_json::json!({
+            "result": result
+        }))
+    }
+}
+
+// Apply the task_agent macro to generate the TaskAgent trait implementation
+#[task_agent(name = "my_task_agent", description = "A simple task agent")]
+impl MyTaskAgent {
+    // The implementation block where the required methods are defined
+}
+```
+
+#### Task Builder Implementation
+```rust
+use dagger::taskagent::TaskManager;
+use dagger_macros::task_builder;
+
+struct MyTaskBuilder;
+
+// Apply the task_builder macro to generate the TaskBuilder struct and methods
+#[task_builder(agent = "my_task_agent")]
+impl MyTaskBuilder {
+    // The implementation can be empty as the macro generates all needed methods
+}
+
+// Usage example
+fn create_task(task_manager: &TaskManager, job_id: &str) -> String {
+    let builder = MyTaskBuilder{};
+    
+    // Create and configure a task
+    builder.create_task(job_id)
+        .with_description("Process some data")
+        .with_input(serde_json::json!({"data": "sample input"}))
+        .with_timeout(60) // 60 seconds timeout
+        .with_max_retries(3)
+        .build(task_manager)
+}
+```
+
+#### TaskManager Usage
+```rust
+use dagger::taskagent::{TaskManager, TaskAgentRegistry};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a registry and register your agents
+    let registry = TaskAgentRegistry::new();
+    registry.register(Arc::new(MyTaskAgent{}));
+    
+    // Create a task manager with the registry
+    let task_manager = TaskManager::new(registry, "task_db")?;
+    
+    // Create a new job
+    let job_id = task_manager.create_job()?;
+    
+    // Create tasks for the job
+    let task_id = create_task(&task_manager, &job_id);
+    
+    // Start the job
+    task_manager.start_job(&job_id)?;
+    
+    // Process tasks (in a real application, this would be done by agent workers)
+    loop {
+        // Get tasks that are ready for the agent
+        let agent = MyTaskAgent{};
+        let ready_tasks = agent.get_ready_tasks(&task_manager);
+        
+        for task in ready_tasks {
+            // Claim the task
+            if agent.claim_task(&task_manager, &task.id) {
+                // Execute the task
+                let result = agent.execute(task.input.clone(), &task.id, &task.job_id).await;
+                
+                // Complete the task
+                agent.complete_task(&task_manager, &task.id, result);
+            }
+        }
+        
+        // Check if job is complete
+        if task_manager.is_job_complete(&job_id)? {
+            break;
+        }
+        
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    
+    // Get the job results
+    let results = task_manager.get_job_results(&job_id)?;
+    println!("Job results: {:?}", results);
+    
+    // Generate a DOT graph of the task execution
+    let dot_graph = task_manager.get_dot_graph(Some(&job_id))?;
+    println!("Task execution graph:\n{}", dot_graph);
+    
+    Ok(())
+}
+```
+
+#### Key Features of the Task Agent System
+- **Persistence**: Job and task states are persisted using sled database
+- **Task Dependencies**: Tasks can depend on other tasks, creating a DAG
+- **Agent-Specific Tasks**: Tasks are assigned to specific agent types
+- **Task Claiming**: Agents claim tasks to prevent duplicate execution
+- **Retry Mechanism**: Failed tasks can be retried automatically
+- **Timeout Handling**: Tasks can have timeouts to prevent hanging
+- **Visualization**: Generate DOT graphs of task execution for analysis
+- **Caching**: Store intermediate results in a thread-safe cache
+
+#### Advanced Usage: Job Resumption
+The Task Agent System supports resuming jobs that were interrupted:
+
+```rust
+// Resume a previously started job
+let job_id = "previous_job_id";
+task_manager.resume_job(job_id)?;
+
+// Continue processing tasks as before
+```
+
+This is particularly useful for long-running workflows that need to survive process restarts or for implementing checkpointing in distributed systems.
+
 ## Dagger Macros (Optional)
-The dagger-macros crate provides an optional #[action] macro to simplify action definition:
+The dagger-macros crate provides several macros to simplify working with Dagger:
 
-### Purpose
-Automatically generates NodeAction implementations with JSON schemas.
+### Available Macros
 
-### Usage
-Annotate async functions with #[action(description = "...")], register with Arc::new(UPPERCASE_NAME.clone()).
+#### 1. `#[action]` - Define DAG Actions
+The `#[action]` macro simplifies the creation of actions for YAML-based and agent-driven flows.
 
-### Benefits
-- Adds metadata (e.g., schema) for introspection or LLM integration
-- Reduces boilerplate
+```rust
+use dagger_macros::action;
 
-### Trade-off
-Slightly more complex registration syntax (UPPERCASE_NAME.clone() vs. register_action!)
+#[action(description = "Adds two numbers", retry_count = 3, timeout = 60)]
+async fn add_numbers(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    // Implementation
+    Ok(())
+}
 
-### When to Use
-- Use #[action] for agent-driven flows where schema metadata is valuable
-- Skip it for YAML flows if schema isn't needed
+// Registration
+executor.register_action(Arc::new(ADD_NUMBERS.clone()));
+```
+
+**Parameters:**
+- `description`: String describing the action (required)
+- `retry_count`: Number of retry attempts (optional)
+- `timeout`: Timeout in seconds (optional)
+
+**Generated:**
+- A static `ADD_NUMBERS` constant implementing `NodeAction`
+- JSON schema generation based on function signature
+- Metadata for introspection
+
+#### 2. `#[task_agent]` - Define Task Agents
+The `#[task_agent]` macro generates a `TaskAgent` trait implementation for a struct.
+
+```rust
+use dagger_macros::task_agent;
+
+struct MyAgent;
+
+impl MyAgent {
+    fn input_schema(&self) -> serde_json::Value {
+        // Schema definition
+        serde_json::json!({})
+    }
+    
+    fn output_schema(&self) -> serde_json::Value {
+        // Schema definition
+        serde_json::json!({})
+    }
+    
+    async fn execute(&self, input: serde_json::Value, task_id: &str, job_id: &str) 
+        -> Result<serde_json::Value, String> {
+        // Implementation
+        Ok(serde_json::json!({}))
+    }
+}
+
+#[task_agent(name = "my_agent", description = "Performs a specific task")]
+impl MyAgent {
+    // Implementation block with required methods
+}
+```
+
+**Parameters:**
+- `name`: String identifier for the agent (required)
+- `description`: String describing the agent (optional)
+
+**Requirements:**
+The struct must implement:
+- `input_schema()` - Returns JSON schema for inputs
+- `output_schema()` - Returns JSON schema for outputs
+- `execute()` - Async function that performs the task
+
+**Generated:**
+- `TaskAgent` trait implementation with helper methods
+- Integration with TaskManager for task claiming and completion
+
+#### 3. `#[task_builder]` - Create Task Builder
+The `#[task_builder]` macro generates a builder pattern for creating tasks for a specific agent.
+
+```rust
+use dagger_macros::task_builder;
+
+struct MyTaskBuilder;
+
+#[task_builder(agent = "my_agent")]
+impl MyTaskBuilder {
+    // Empty implementation block
+}
+
+// Usage
+let builder = MyTaskBuilder{};
+let task_id = builder.create_task("job_123")
+    .with_description("Process data")
+    .with_input(serde_json::json!({"key": "value"}))
+    .with_timeout(60)
+    .build(&task_manager);
+```
+
+**Parameters:**
+- `agent`: String name of the agent that will execute tasks (required)
+
+**Generated:**
+- `TaskBuilder` struct with fluent builder methods
+- `create_task()` method on the original struct
+- Methods for configuring task properties
+
+#### 4. `#[task_workflow]` - Define Task Workflows
+The `#[task_workflow]` macro helps define reusable task workflow templates.
+
+```rust
+use dagger_macros::task_workflow;
+
+#[task_workflow(name = "data_processing", description = "Process and analyze data")]
+struct DataProcessingWorkflow {
+    input_path: String,
+    output_path: String,
+}
+
+impl DataProcessingWorkflow {
+    // Methods to create and configure the workflow
+    pub fn create_tasks(&self, task_manager: &TaskManager, job_id: &str) -> Result<(), String> {
+        // Create and connect tasks
+        // Return the entry point task ID
+        Ok(())
+    }
+}
+```
+
+**Parameters:**
+- `name`: String identifier for the workflow (required)
+- `description`: String describing the workflow (optional)
+
+**Generated:**
+- Metadata for the workflow
+- Helper methods for workflow creation and management
+
+### Helper Functions
+
+#### Cache Manipulation
+
+```rust
+// Insert a value into the cache
+insert_value(cache, &node.id, "output_key", value)?;
+
+// Parse input from a named reference
+let input: f64 = parse_input_from_name(cache, "input_name", &node.inputs)?;
+
+// Get a global input value
+let terms: Vec<String> = get_global_input(cache, "dag_name", "input_key").unwrap_or_default();
+
+// Insert a global value
+insert_global_value(cache, "dag_name", "output_key", value)?;
+
+// Append to a global value (for arrays)
+append_global_value(cache, "dag_name", "array_key", new_item)?;
+
+// Serialize cache to JSON
+let json = serialize_cache_to_prettyjson(&cache)?;
+```
+
+#### Node Management
+
+```rust
+// Generate a unique node ID with a prefix
+let node_id = generate_node_id("prefix");
+
+// Add a node to a DAG dynamically
+executor.add_node(
+    "dag_name",
+    node_id.clone(),
+    "action_name",
+    vec!["dependency1", "dependency2"]
+)?;
+```
+
+#### Visualization
+
+```rust
+// Generate DOT graph for a DAG
+let dot = executor.serialize_tree_to_dot("dag_name")?;
+
+// Generate detailed DOT graph with task execution data
+let detailed_dot = task_manager.get_dot_graph(Some("job_id"))?;
+```
+
+### When to Use Each Macro
+
+- **#[action]**: Use for defining actions in YAML-based or agent-driven flows when you want schema generation and metadata.
+- **register_action!**: Use for simpler action registration without schema generation.
+- **#[task_agent]**: Use when implementing agents for the Task Agent System.
+- **#[task_builder]**: Use to create builder patterns for task creation.
+- **#[task_workflow]**: Use to define reusable workflow templates.
+
+### Benefits of Using Macros
+
+1. **Reduced Boilerplate**: Eliminates repetitive code for trait implementations
+2. **Schema Generation**: Automatic JSON schema creation for inputs and outputs
+3. **Type Safety**: Compile-time checks for required methods and parameters
+4. **Consistency**: Enforces consistent patterns across your codebase
+5. **Introspection**: Adds metadata for debugging and visualization
+
+### Trade-offs
+
+1. **Complexity**: Macros can make code harder to understand for newcomers
+2. **Debugging**: Macro-generated code can be harder to debug
+3. **Flexibility**: Less control over implementation details
+
+Choose the approach that best fits your project's needs and your team's familiarity with Rust macros.
 
 ## Key Concepts
 - DagExecutor: The core engine managing action registration, DAG loading, and execution
@@ -511,3 +867,77 @@ Issues can be reported on the GitHub issue tracker.
 
 ## License
 Dagger is licensed under the MIT License. See LICENSE for details.
+
+## Simplified Usage
+
+Dagger now provides a simplified API through `TaskSystemBuilder` that makes it much easier to get started:
+
+```rust
+use dagger::taskagent::TaskSystemBuilder;
+use serde_json::json;
+
+// Create a task system with one line
+let mut task_system = TaskSystemBuilder::new()
+    .register_agent("my_agent")?
+    .build()?;
+
+// Run a simple objective
+let result = task_system.run_objective(
+    "My task description",
+    "my_agent",
+    json!({"key": "value"}),
+).await?;
+
+println!("Task completed with result: {}", result);
+```
+
+### Defining Agents
+
+Agents are defined using the `task_agent` macro:
+
+```rust
+use dagger::task_agent;
+use serde_json::{json, Value};
+
+#[task_agent(
+    name = "my_agent", 
+    description = "Performs a specific task",
+    input_schema = r#"{"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}"#,
+    output_schema = r#"{"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]}"#
+)]
+async fn my_agent(input: Value, task_id: &str, job_id: &str) -> Result<Value, String> {
+    // Extract input
+    let value = input["key"].as_str().unwrap_or("default");
+    
+    // Process and return
+    Ok(json!({"result": format!("Processed: {}", value)}))
+}
+```
+
+### Multi-Agent Workflows
+
+You can also create multi-agent workflows with dependencies:
+
+```rust
+// Create system with multiple agents
+let mut task_system = TaskSystemBuilder::new()
+    .register_agents(&["agent1", "agent2", "agent3"])?
+    .build()?;
+
+// Create tasks with dependencies
+let task1_id = task_system.add_task(
+    "First task".to_string(),
+    "agent1".to_string(),
+    vec![], // No dependencies
+    json!({"input": "value"}),
+)?;
+
+let task2_id = task_system.add_task(
+    "Second task".to_string(),
+    "agent2".to_string(),
+    vec![task1_id.clone()], // Depends on task1
+    json!({"from_task1": "Will be populated automatically"}),
+)?;
+```
+
+See the examples directory for complete working examples.
