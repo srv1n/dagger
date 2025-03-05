@@ -35,9 +35,11 @@ use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using 
 use serde::de::Error as SerdeError;
 use std::io::Error as IoError;
 
+use super::any::{DynAny, IntoAny};
+
 // Add near the top with other type definitions
 
-use crate::{DynAny, IntoAny};
+
 
 #[macro_export]
 macro_rules! register_action {

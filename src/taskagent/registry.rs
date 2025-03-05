@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
-
+use std::any::{Any, TypeId};
 use super::taskagent::TaskAgent;
 
 #[derive(Clone)]
@@ -41,4 +41,31 @@ impl GlobalAgentRegistry {
 
 lazy_static::lazy_static! {
     pub static ref GLOBAL_REGISTRY: GlobalAgentRegistry = GlobalAgentRegistry::new();
+}
+
+
+#[derive(Default)]
+pub struct TypeRegistry {
+    types: RwLock<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
+}
+
+impl TypeRegistry {
+    pub fn new() -> Self {
+        Self {
+            types: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub async fn register<T: 'static + Send + Sync>(&self, instance: T) -> Result<()> {
+        let mut types = self.types.write().await;
+        types.insert(TypeId::of::<T>(), Box::new(instance));
+        Ok(())
+    }
+
+    pub async fn get<T: 'static + Clone + Send + Sync>(&self) -> Option<T> {
+        let types = self.types.read().await;
+        types.get(&TypeId::of::<T>())
+            .and_then(|boxed| boxed.downcast_ref::<T>())
+            .cloned()
+    }
 }
