@@ -30,12 +30,14 @@ The development of Dagger was driven by a series of design discussions and itera
 
 * **Persistence:**  Dagger leverages `sled`, a lightweight embedded database, to persist the state of jobs. This enables resuming jobs after interruptions, ensures durability, and provides a mechanism for long-running workflows.
 
+* **Dynamic Dependency Creation:** Agents can request more information during execution by creating new tasks that become dependencies for the current task. This allows for adaptive workflows where agents can dynamically expand the task graph based on discovered needs, pausing their execution until the new dependencies are resolved.
+
 ## Key Components (overview)
 
 ### TaskManager
 The TaskManager is the heart of the system, responsible for:
 - Task tracking: Maintains a map of tasks by ID, job, assignee, status, and parent.
-- Dependency resolution: Checks if a task’s dependencies are complete before marking it as ready.
+- Dependency resolution: Checks if a task's dependencies are complete before marking it as ready.
 - State management: Updates task statuses (e.g., Pending, InProgress, Completed) and handles heartbeats to detect stalls.
 - Persistence: Optionally saves state to Sled for recovery.
 
@@ -53,7 +55,7 @@ It integrates with the TaskManager and GlobalAgentRegistry to fetch agents and e
 The TaskAgent trait defines the interface for agents:
 - Name and description: Identifies the agent and its purpose.
 - Schemas: Specifies input/output JSON schemas for validation.
-- Execution: Implements the agent’s logic, interacting with the TaskManager and Cache.
+- Execution: Implements the agent's logic, interacting with the TaskManager and Cache.
 - Agents are registered globally via the GlobalAgentRegistry and can be invoked dynamically.
 
 ### Cache
@@ -114,6 +116,99 @@ pub trait TaskAgent: Send + Sync + 'static  {
 *   **JSON Schema:**  Using JSON Schema for input/output definition provides a standard, well-defined way to specify data structures, enabling validation and automatic documentation generation.
 *   **`TaskManager` Access:**  Passing a reference to the `TaskManager` allows agents to interact with the task hierarchy, access the cache, and potentially create new tasks (though careful design is needed to avoid uncontrolled task creation).
 
+**Dynamic Dependency Creation:**
+
+Agents can now request more information during execution by creating new tasks and adding them as dependencies. Here's how an agent implementation might handle this:
+
+```rust
+#[task_agent(name = "ExampleAgent", 
+    input_schema = r#"{"type": "object"}"#,
+    output_schema = r#"{"type": "object"}"#)]
+async fn example_agent(
+    input: serde_json::Value,
+    task_id: &str,
+    job_id: &str,
+    task_manager: &TaskManager,
+) -> Result<serde_json::Value, String> {
+    // Check if this is a retry after dependencies were added
+    let task = task_manager.get_task_by_id(task_id)
+        .ok_or_else(|| "Task not found".to_string())?;
+    
+    if !task.dependencies.is_empty() {
+        // This is a retry after dependencies were resolved
+        match task_manager.get_dependency_outputs(task_id) {
+            Ok(outputs) => {
+                // Use the dependency outputs to complete the task
+                let combined_data = process_dependency_outputs(input, outputs);
+                return Ok(combined_data);
+            },
+            Err(e) => return Err(format!("Failed to get dependency outputs: {}", e)),
+        }
+    }
+    
+    // First execution - check if we need more information
+    if input.get("required_data").is_none() {
+        // Create a new task to gather the required data
+        let new_task_id = match task_manager.add_task_with_type(
+            job_id.to_string(),
+            "Gather additional data".to_string(),
+            "DataGatherer".to_string(),
+            vec![],
+            serde_json::json!({"context": "needed for task"}),
+            Some(task_id.to_string()),
+            None,
+            TaskType::Task,
+            None,
+            0,
+            None,
+            0,
+        ) {
+            Ok(id) => id,
+            Err(e) => return Err(format!("Failed to create dependency task: {}", e)),
+        };
+        
+        // Add the new task as a dependency
+        if let Err(e) = task_manager.add_dependency(task_id, &new_task_id) {
+            return Err(format!("Failed to add dependency: {}", e));
+        }
+        
+        // Set the current task to Blocked
+        if let Err(e) = task_manager.update_task_status(task_id, TaskStatus::Blocked) {
+            return Err(format!("Failed to update task status: {}", e));
+        }
+        
+        // Return a special error to indicate we need more information
+        return Err("needs_more_info".to_string());
+    }
+    
+    // Normal execution path with all required information
+    Ok(serde_json::json!({"result": "Task completed successfully"}))
+}
+
+fn process_dependency_outputs(input: Value, outputs: Vec<Value>) -> Value {
+    // Combine the original input with the dependency outputs
+    // This is just an example - actual implementation would depend on your needs
+    let mut result = input.as_object().unwrap().clone();
+    for (i, output) in outputs.iter().enumerate() {
+        result.insert(format!("dependency_{}", i), output.clone());
+    }
+    serde_json::Value::Object(result)
+}
+```
+
+In this example:
+1. The agent first checks if it's being executed after dependencies were added
+2. If dependencies exist, it retrieves their outputs and uses them to complete the task
+3. If this is the first execution and required data is missing, it:
+   - Creates a new task to gather the needed information
+   - Adds that task as a dependency
+   - Sets its own status to Blocked
+   - Returns a special error indicating it needs more information
+4. The TaskExecutor will respect the Blocked status and not mark the task as Failed
+5. When the dependency completes, the task will be set back to Pending and executed again
+
+This pattern allows for adaptive workflows where agents can dynamically expand the task graph based on discovered needs during execution.
+
 ### 2. `TaskManager`
 
 The central coordinator of the entire system.  It manages tasks, their statuses, dependencies, and relationships.
@@ -146,12 +241,47 @@ pub struct TaskManager {
 *   **`sled_db_path`:**  An optional path to a `sled` database for persistence.
 *  **`jobs`**: Stores job handles for cancelling and monitoring.
 
+**Key Methods for Dynamic Dependencies:**
+
+```rust
+impl TaskManager {
+    // Add a new dependency to an existing task
+    pub fn add_dependency(&self, task_id: &str, new_dep_id: &str) -> Result<()> {
+        if let Some(mut task) = self.tasks_by_id.get_mut(task_id) {
+            if !task.dependencies.contains(&new_dep_id.to_string()) {
+                task.dependencies.push(new_dep_id.to_string());
+            }
+            Ok(())
+        } else {
+            Err(anyhow!("Task not found: {}", task_id))
+        }
+    }
+
+    // Retrieve outputs from all dependencies of a task
+    pub fn get_dependency_outputs(&self, task_id: &str) -> Result<Vec<Value>> {
+        let task = self.tasks_by_id.get(task_id)
+            .ok_or_else(|| anyhow!("Task not found: {}", task_id))?;
+        let outputs = task.dependencies.iter().map(|dep_id| {
+            let dep_task = self.tasks_by_id.get(dep_id)
+                .ok_or_else(|| anyhow!("Dependency task not found: {}", dep_id))?;
+            if dep_task.status != TaskStatus::Completed {
+                Err(anyhow!("Dependency task {} not completed", dep_id))
+            } else {
+                Ok(dep_task.output.data.clone().unwrap_or_default())
+            }
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(outputs)
+    }
+}
+```
+
 **Key Design Choices:**
 
 *   **DashMap:**  The use of `DashMap` is critical for performance and concurrency. It allows multiple agents and the `TaskManager` itself to access and modify task data without blocking.
 *   **Multiple Indexes:** Indexing tasks by ID, job, assignee, status, and parent allows for efficient queries needed for different operations (e.g., finding all tasks for a specific job, finding all tasks assigned to a particular agent, etc.).
 *   **Stall Handling:**  The `heartbeat_interval` and `stall_action` provide a configurable way to deal with jobs that become unresponsive.  The `StallAction` enum allows for different strategies (notify a planning agent, terminate the job, or execute a custom function).
 * **Sled Integration:**  The use of sled allows for storing tasks and persist them on disk.
+* **Dynamic Dependencies:** The ability to add dependencies to a task during execution enables adaptive workflows where agents can request more information as needed.
 
 ### 3. `Cache`
 
@@ -208,7 +338,65 @@ pub struct TaskExecutor {
 **Key Design Choices:**
 *   **Job-Specific:**  A `TaskExecutor` is created for each job, ensuring isolation.
 *   **Configuration:** The `TaskConfiguration` struct allows for setting parameters like maximum execution time, retry strategy, and human timeout behavior.
-* **`allowed_agents`**: This field gives you the opportunity to filter and run only specific types of agents.
+*   **`allowed_agents`**: This field gives you the opportunity to filter and run only specific types of agents.
+
+**Handling Dynamic Dependencies:**
+
+The TaskExecutor has been updated to properly handle tasks that create dynamic dependencies during execution. Here's the modified execution logic:
+
+```rust
+async fn execute_single_task(&self, task: Task) -> TaskOutcome {
+    let task_id = task.task_id.clone();
+
+    if let Err(e) = self.task_manager.claim_task(&task_id, task.agent.clone()) {
+        return TaskOutcome {
+            task_id,
+            success: false,
+            error: Some(e.to_string()),
+        };
+    }
+
+    let agent = match self.agent_registry.get_agent(&task.agent) {
+        Some(agent) => agent,
+        None => {
+            self.task_manager.update_task_status(&task_id, TaskStatus::Failed)?;
+            return TaskOutcome {
+                task_id,
+                success: false,
+                error: Some(format!("Agent {} not found", task.agent)),
+            };
+        }
+    };
+
+    match agent.execute(&task_id, task.input.clone(), &self.task_manager).await {
+        Ok(output) => {
+            // Check the task's current status rather than overriding it
+            // This allows agents to set tasks to Blocked status
+            let status = self.task_manager.get_task_by_id(&task_id)
+                .map(|t| t.status)
+                .unwrap_or(TaskStatus::Failed);
+            
+            TaskOutcome {
+                task_id,
+                success: matches!(status, TaskStatus::Completed),
+                error: output.error,
+            }
+        },
+        Err(e) => {
+            self.task_manager.update_task_status(&task_id, TaskStatus::Failed)?;
+            TaskOutcome {
+                task_id,
+                success: false,
+                error: Some(e.to_string()),
+            }
+        }
+    }
+}
+```
+
+The key change is that the executor now respects the task status set by the agent rather than automatically setting it based on the `TaskOutput.success` field. This allows agents to set a task to `Blocked` status when they need more information, and the executor won't override it.
+
+When a task's dependencies are completed, the `TaskManager`'s `check_dependencies` method will automatically transition the task from `Blocked` to `Pending`, making it eligible for execution again. The executor will then pick it up for another execution attempt, and the agent can retrieve the outputs from its dependencies to complete the task.
 
 ### 5. `Task`, `TaskStatus`, `TaskOutput`
 
@@ -466,6 +654,103 @@ These macros simplify the process of defining agents and workflows.
         Ok(())
     }
     ```
+
+5.  **Creating an Agent with Dynamic Dependencies:**
+
+    ```rust
+    use dagger::taskagent::{TaskAgent, TaskManager, TaskOutput, TaskStatus, TaskType};
+    use serde_json::Value;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    
+    #[dagger::task_agent(
+        name = "AnalysisAgent",
+        description = "Analyzes data and requests more information if needed",
+        input_schema = r#"{"type": "object", "properties": {"data": {"type": "string"}}}"#,
+        output_schema = r#"{"type": "object", "properties": {"analysis": {"type": "string"}}}"#
+    )]
+    async fn analysis_agent(
+        input: Value,
+        task_id: &str,
+        job_id: &str,
+        task_manager: &TaskManager,
+    ) -> Result<Value, String> {
+        // Check if this is a retry after dependencies were added
+        let task = task_manager.get_task_by_id(task_id)
+            .ok_or("Task not found")?;
+        
+        if !task.dependencies.is_empty() {
+            // This is a retry after dependencies were resolved
+            let dependency_outputs = task_manager.get_dependency_outputs(task_id)
+                .map_err(|e| format!("Failed to get dependency outputs: {}", e))?;
+            
+            // Process the dependency outputs
+            let mut additional_data = Vec::new();
+            for output in dependency_outputs {
+                if let Some(data) = output.get("content") {
+                    additional_data.push(data.as_str().unwrap_or_default());
+                }
+            }
+            
+            // Complete the analysis with the additional data
+            let analysis = format!(
+                "Analysis of {} with additional data: {}",
+                input.get("data").and_then(|v| v.as_str()).unwrap_or("unknown"),
+                additional_data.join(", ")
+            );
+            
+            return Ok(serde_json::json!({ "analysis": analysis }));
+        }
+        
+        // First execution - check if we need more information
+        if !input.get("data").and_then(|v| v.as_str()).unwrap_or_default().contains("complete") {
+            // Create a new task to gather additional data
+            let new_task_id = task_manager.add_task_with_type(
+                job_id.to_string(),
+                "Gather additional data".to_string(),
+                "WebScraper".to_string(),
+                vec![],
+                serde_json::json!({ "url": "https://example.org/additional-data" }),
+                Some(task_id.to_string()),
+                None,
+                TaskType::Task,
+                None,
+                0,
+                None,
+                0,
+            ).map_err(|e| format!("Failed to create dependency task: {}", e))?;
+            
+            // Add the new task as a dependency
+            task_manager.add_dependency(task_id, &new_task_id)
+                .map_err(|e| format!("Failed to add dependency: {}", e))?;
+            
+            // Set the current task to Blocked
+            task_manager.update_task_status(task_id, TaskStatus::Blocked)
+                .map_err(|e| format!("Failed to update task status: {}", e))?;
+            
+            // Return a special error to indicate we need more information
+            return Err("needs_more_info".to_string());
+        }
+        
+        // Normal execution path with all required information
+        let analysis = format!(
+            "Analysis of {}",
+            input.get("data").and_then(|v| v.as_str()).unwrap_or("unknown")
+        );
+        
+        Ok(serde_json::json!({ "analysis": analysis }))
+    }
+    ```
+
+    In this example:
+    
+    1. The `AnalysisAgent` checks if the input data is "complete"
+    2. If not, it creates a new `WebScraper` task to gather additional data
+    3. It adds this task as a dependency and sets itself to `Blocked`
+    4. When the dependency completes, the agent is re-executed
+    5. It retrieves the outputs from its dependencies and uses them to complete the analysis
+
+    This demonstrates how agents can dynamically expand the task graph based on their needs during execution.
 
 ## Error Handling
 

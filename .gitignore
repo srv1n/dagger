@@ -20,3 +20,8 @@ Cargo.lock
 .DS_Store
 .cursorignore
 .cursor/
+# Ignore all database files
+*.db
+**/*.db
+**/*.db/*
+**/example_state.db/

@@ -421,32 +421,15 @@ impl TaskExecutor {
             .await
         {
             Ok(output) => {
-                // Log execution result
-                if output.success {
-                    info!("TaskExecutor: Task {} executed successfully", task_id);
-                } else {
-                    warn!(
-                        "TaskExecutor: Task {} execution failed: {:?}",
-                        task_id, output.error
-                    );
-                }
-
-                // Update task status in task manager
-                if let Err(e) = self.task_manager.update_task_status(
-                    &task_id,
-                    if output.success {
-                        TaskStatus::Completed
-                    } else {
-                        TaskStatus::Failed
-                    },
-                ) {
-                    error!("Failed to update task status: {}", e);
-                }
-
-                // Return outcome
+                // Check the task's current status rather than overriding it
+                let status = self
+                    .task_manager
+                    .get_task_by_id(&task_id)
+                    .map(|t| t.status)
+                    .unwrap_or(TaskStatus::Failed);
                 TaskOutcome {
                     task_id,
-                    success: output.success,
+                    success: matches!(status, TaskStatus::Completed),
                     error: output.error,
                 }
             }
@@ -1069,7 +1052,7 @@ impl TaskManager {
 
         let new_status;
         let job_id;
-        
+
         // Use a block to limit the scope of the mutable reference
         {
             let mut task = match self.tasks_by_id.get_mut(task_id) {
@@ -1093,7 +1076,12 @@ impl TaskManager {
         Ok(())
     }
 
-    fn update_task_status_map(&self, task_id: &str, old_status: TaskStatus, new_status: TaskStatus) {
+    fn update_task_status_map(
+        &self,
+        task_id: &str,
+        old_status: TaskStatus,
+        new_status: TaskStatus,
+    ) {
         tracing::info!(
             "update_task_status_map: Updating task status map for task {} from {:?} to {:?}",
             task_id,
@@ -1112,9 +1100,46 @@ impl TaskManager {
         }
 
         // Add to new status set using entry API
-        self.tasks_by_status.entry(new_status).or_insert_with(DashSet::new).insert(task_id.to_string());
-        
+        self.tasks_by_status
+            .entry(new_status)
+            .or_insert_with(DashSet::new)
+            .insert(task_id.to_string());
+
         tracing::info!("update_task_status_map: Task status map updated");
+    }
+
+    pub fn add_dependency(&self, task_id: &str, new_dep_id: &str) -> Result<()> {
+        if let Some(mut task) = self.tasks_by_id.get_mut(task_id) {
+            if !task.dependencies.contains(&new_dep_id.to_string()) {
+                task.dependencies.push(new_dep_id.to_string());
+            }
+            Ok(())
+        } else {
+            Err(anyhow!("Task not found: {}", task_id))
+        }
+    }
+
+    pub fn get_dependency_outputs(&self, task_id: &str) -> Result<Vec<Value>> {
+        let task = self
+            .tasks_by_id
+            .get(task_id)
+            .ok_or_else(|| anyhow!("Task not found: {}", task_id))?;
+        let outputs = task
+            .dependencies
+            .iter()
+            .map(|dep_id| {
+                let dep_task = self
+                    .tasks_by_id
+                    .get(dep_id)
+                    .ok_or_else(|| anyhow!("Dependency task not found: {}", dep_id))?;
+                if dep_task.status != TaskStatus::Completed {
+                    Err(anyhow!("Dependency task {} not completed", dep_id))
+                } else {
+                    Ok(dep_task.output.data.clone().unwrap_or_default())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(outputs)
     }
 
     pub fn check_dependencies(&self, job_id: &str, completed_task_id: &str) {
@@ -1147,7 +1172,11 @@ impl TaskManager {
                             task_id
                         );
                         task.status = TaskStatus::Pending;
-                        self.update_task_status_map(task_id, TaskStatus::Pending, TaskStatus::Pending);
+                        self.update_task_status_map(
+                            task_id,
+                            TaskStatus::Pending,
+                            TaskStatus::Pending,
+                        );
                     }
                 }
             }
@@ -1181,7 +1210,11 @@ impl TaskManager {
                                         task.status = TaskStatus::Failed;
                                         task.status_reason =
                                             Some("Job terminated due to inactivity".to_string());
-                                        self.update_task_status_map(task_id, TaskStatus::Failed, TaskStatus::Failed);
+                                        self.update_task_status_map(
+                                            task_id,
+                                            TaskStatus::Failed,
+                                            TaskStatus::Failed,
+                                        );
                                     }
                                 }
                             }
@@ -1837,16 +1870,16 @@ impl TaskManager {
                 old_status,
                 new_status
             );
-            
+
             task.status = new_status;
             task.updated_at = Utc::now().naive_utc();
-            
+
             (old_status, job_id)
         }; // Release lock here
 
         // Update the status maps
         self.update_task_status_map(task_id, old_status, new_status);
-        
+
         // Update last activity
         self.last_activity.insert(job_id.clone(), Instant::now());
 
@@ -1864,7 +1897,7 @@ impl TaskManager {
             task_id,
             new_status
         );
-        
+
         Ok(())
     }
 
