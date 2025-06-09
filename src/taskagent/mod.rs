@@ -1,11 +1,12 @@
 pub mod taskagent;
+// pub mod enhanced_taskagent;
 pub mod registry;
 pub mod errors;
-  
-// Remove orchestrator module
-// pub mod orchestrator;
+pub mod taskagent_builder;
 
 // Re-export all the key structs and functions
 pub use taskagent::*;
-// Remove orchestrator re-export
-// pub use orchestrator::*;
+pub use taskagent_builder::*;
+// pub use enhanced_taskagent::{
+//     EnhancedTaskAgent, EnhancedTaskManager, ExampleEnhancedAgent
+// };

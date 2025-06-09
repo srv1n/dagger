@@ -1,17 +1,26 @@
-pub mod dag_flow;
+// Core infrastructure modules
+pub mod core {
+    pub mod errors;
+    pub mod memory;
+    pub mod limits;
+}
+
+// Three main execution paradigms
+pub mod dag_flow;    // DAG-based workflow execution
+pub mod taskagent;   // Task-based agent execution
+pub mod pubsub;      // Pub/Sub messaging execution
+
+// Re-exports for convenience
+pub use core::errors::{DaggerError, Result};
+// Export the original Cache for backward compatibility
+pub use dag_flow::{Cache, insert_value};
+// Export the enhanced cache with a different name  
+pub use core::memory::Cache as EnhancedCache;
+pub use core::limits::{ResourceLimits, ResourceTracker};
+
+// Re-export existing modules for backward compatibility
 pub use dag_flow::*;
-
-// pub mod pubsubagent;
-// pub use pubsubagent::*;
-
-
-
-pub mod taskagent;
 pub use taskagent::*;
-
-// Expose the registry module
-pub mod registry;
-pub use registry::GLOBAL_REGISTRY;
 
 #[cfg(test)]
 mod tests {

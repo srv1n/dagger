@@ -1,8 +1,9 @@
 use anyhow::{Error, Result};
 use dagger::{
-    insert_value, parse_input_from_name, register_action, serialize_cache_to_prettyjson, Cache,
+    insert_value, parse_input_from_name, register_action, serialize_cache_to_prettyjson, 
     DagExecutionReport, DagExecutor, Node, WorkflowSpec, NodeAction,
 };
+use dagger::dag_flow::Cache;
 use std::collections::HashMap;
 use tokio::sync::oneshot;
 use tracing::Level;

@@ -23,6 +23,7 @@ exclude = [
 [dependencies]
 serde = { version = "1.0.197", features = ["derive"] }
 serde_yaml = "0.9.32"
+serde_json = "1.0.105"
 petgraph = "0.6.4"
 tokio = { version = "1.36", features = ["rt", "sync", "rt-multi-thread", "time", "macros"] }
 anyhow = { version = "1.0" }
@@ -31,7 +32,6 @@ async-trait = "0.1.86"
 chrono = { version = "0.4.35", features = ["serde"] }
 dyn-clone = "1.0.17"
 lazy_static = "1.4.0"
-serde_json = "1.0.105"
 sled = "0.34"
 zstd = "0.13"
 cuid2 = "0.1.4"
@@ -43,6 +43,9 @@ dashmap = { version = "6.1.0", features = ["serde"] }
 futures = "0.3.31"
 bincode = "1.3.3"
 linkme = "0.3"
+uuid = { version = "1.0", features = ["v4"] }
+tracing-subscriber = "0.3"
+fastrand = "2.0"
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"
