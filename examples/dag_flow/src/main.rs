@@ -80,15 +80,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Cancellation signal sent");
     });
 
-    let dag_report = run_dag(
-        &mut executor,
-        WorkflowSpec::Static {
-            name: "infolder".to_string(),
-        },
-        &cache,
-        cancel_rx,
-    )
-    .await?;
+    // OLD WAY (still works but deprecated):
+    // let dag_report = executor.execute_dag(
+    //     WorkflowSpec::Static { name: "infolder".to_string() }, 
+    //     &cache, 
+    //     cancel_rx
+    // ).await?;
+
+    // NEW SIMPLIFIED WAY:
+    let dag_report = executor.execute_static_dag("infolder", &cache, cancel_rx).await?;
 
     let json_output = serialize_cache_to_prettyjson(&cache)?;
     println!("Cache as JSON:\n{}", json_output);
@@ -100,12 +100,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_dag(
-    executor: &mut DagExecutor,
-    spec: WorkflowSpec,
-    cache: &Cache,
-    cancel_rx: oneshot::Receiver<()>,
-) -> Result<DagExecutionReport, Error> {
-    let report = executor.execute_dag(spec, cache, cancel_rx).await?;
-    Ok(report)
-}
+// This helper function is no longer needed with the simplified API
+// async fn run_dag(
+//     executor: &mut DagExecutor,
+//     spec: WorkflowSpec,
+//     cache: &Cache,
+//     cancel_rx: oneshot::Receiver<()>,
+// ) -> Result<DagExecutionReport, Error> {
+//     let report = executor.execute_dag(spec, cache, cancel_rx).await?;
+//     Ok(report)
+// }

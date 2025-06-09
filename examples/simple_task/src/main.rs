@@ -1,49 +1,62 @@
 use anyhow::Result;
-use dagger::taskagent::{TaskSystemBuilder};
-use dagger::task_agent;
-use serde_json::{json, Value};
+use dagger::{
+    Cache, DagExecutor, ExecutionMode, WorkflowSpec,
+    insert_value, register_action,
+    Node, NodeAction,
+};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+use tokio::sync::oneshot;
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
 
-/// Define a simple task agent
-#[task_agent(
-    name = "simple_agent", 
-    description = "A simple agent that processes input text",
-    input_schema = r#"{"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}"#,
-    output_schema = r#"{"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]}"#
-)]
-async fn simple_agent(input: Value, task_id: &str, job_id: &str) -> Result<Value, String> {
-    // Extract input text
-    let text = input["text"].as_str().unwrap_or("No text provided");
-    println!("Processing text: {}", text);
-    
-    // Simple processing - convert to uppercase
-    let processed = text.to_uppercase();
-    
-    // Return the result
-    Ok(json!({"result": processed}))
+// Simple action for demonstration
+async fn hello_world(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    let message = "Hello from Dagger!";
+    insert_value(cache, &node.id, "output", message)?;
+    println!("Executed: {}", message);
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Set up logging
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
+    // Setup logging
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::INFO)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set default tracing subscriber");
-    
-    // Create a task system with one line using the builder
-    let mut task_system = TaskSystemBuilder::new()
-        .register_agent("simple_agent")?
-        .build()?;
-    
-    // Run a simple objective
-    let result = task_system.run_objective(
-        "Process some text",
-        "simple_agent",
-        json!({"text": "Hello, world!"}),
-    ).await?;
-    
-    println!("Task completed with result: {}", result);
-    
+    tracing::subscriber::set_global_default(subscriber)?;
+
+    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let mut executor = DagExecutor::new(None, registry.clone(), "simple_db")?;
+
+    // Register action
+    register_action!(executor, "hello_world", hello_world);
+
+    let cache = Cache::new();
+    let (_cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
+    println!("=== Demonstrating New Simplified API ===\n");
+
+    // Method 1: New simplified methods (RECOMMENDED)
+    println!("1. Using simplified methods:");
+    println!("   executor.execute_static_dag(\"my_workflow\", &cache, cancel_rx)");
+    println!("   executor.execute_agent_dag(\"analyze_task\", &cache, cancel_rx)\n");
+
+    // Method 2: Using ExecutionMode enum
+    println!("2. Using ExecutionMode:");
+    println!("   executor.execute_dag_with_mode(ExecutionMode::Static, \"my_workflow\", &cache, cancel_rx)");
+    println!("   executor.execute_dag_with_mode(ExecutionMode::Agent, \"analyze_task\", &cache, cancel_rx)\n");
+
+    // Method 3: Old enum style (DEPRECATED but still supported)
+    println!("3. Old enum style (deprecated):");
+    println!("   executor.execute_dag(WorkflowSpec::Static {{ name: \"my_workflow\".to_string() }}, &cache, cancel_rx)");
+    println!("   executor.execute_dag(WorkflowSpec::Agent {{ task: \"analyze_task\".to_string() }}, &cache, cancel_rx)\n");
+
+    println!("=== Benefits of Simplification ===");
+    println!("✅ Less verbose: Just pass strings instead of enum variants");
+    println!("✅ Cleaner API: Purpose-specific methods");
+    println!("✅ Backward compatible: Old WorkflowSpec still works");
+    println!("✅ Type safety: ExecutionMode prevents confusion");
+
     Ok(())
 } 

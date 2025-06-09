@@ -71,13 +71,23 @@ macro_rules! register_action {
     }};
 }
 
-/// Specifies how to execute a workflow
+/// Specifies how to execute a workflow (DEPRECATED - use ExecutionMode)
 #[derive(Debug, Clone)]
 pub enum WorkflowSpec {
     /// Execute a static, pre-loaded DAG by name
     Static { name: String },
     /// Start an agent-driven flow with a given task
     Agent { task: String },
+}
+
+impl WorkflowSpec {
+    /// Convert to execution mode and name
+    pub fn into_parts(self) -> (ExecutionMode, String) {
+        match self {
+            WorkflowSpec::Static { name } => (ExecutionMode::Static, name),
+            WorkflowSpec::Agent { task } => (ExecutionMode::Agent, task),
+        }
+    }
 }
 
 /// Configuration for retry behavior
@@ -815,15 +825,47 @@ impl DagExecutor {
         cache: &Cache,
         cancel_rx: oneshot::Receiver<()>,
     ) -> Result<DagExecutionReport, DagError> {
-        match spec {
-            WorkflowSpec::Static { name } => {
+        let (mode, name) = spec.into_parts();
+        self.execute_dag_with_mode(mode, &name, cache, cancel_rx).await
+    }
+
+    /// Executes a static DAG by name (simplified interface)
+    pub async fn execute_static_dag(
+        &mut self,
+        name: &str,
+        cache: &Cache,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<DagExecutionReport, DagError> {
+        self.execute_dag_with_mode(ExecutionMode::Static, name, cache, cancel_rx).await
+    }
+
+    /// Executes an agent-driven DAG (simplified interface)
+    pub async fn execute_agent_dag(
+        &mut self,
+        task_name: &str,
+        cache: &Cache,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<DagExecutionReport, DagError> {
+        self.execute_dag_with_mode(ExecutionMode::Agent, task_name, cache, cancel_rx).await
+    }
+
+    /// Executes the DAG with the new simplified interface
+    pub async fn execute_dag_with_mode(
+        &mut self,
+        mode: ExecutionMode,
+        name: &str,
+        cache: &Cache,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> Result<DagExecutionReport, DagError> {
+        match mode {
+            ExecutionMode::Static => {
                 // Get read lock to access prebuilt DAG
                 let prebuilt_dag = {
                     let dags = self
                         .prebuilt_dags
                         .read()
                         .map_err(|e| DagError::LockError(e.to_string()))?;
-                    dags.get(&name)
+                    dags.get(name)
                         .ok_or_else(|| {
                             DagError::NodeNotFound(format!("Graph '{}' not found", name))
                         })?
@@ -844,7 +886,7 @@ impl DagExecutor {
                     result = execute_dag_async(self, &dag, cache) => {
                         let (report, needs_human_check) = result;
                         if needs_human_check {
-                            self.add_node(&name, format!("human_check_{}", cuid2::create_id()),
+                            self.add_node(name, format!("human_check_{}", cuid2::create_id()),
                                          "human_interrupt".to_string(), vec![])?;
                         }
                         Ok(report)
@@ -852,7 +894,7 @@ impl DagExecutor {
                     _ = cancel_rx => Err(DagError::Cancelled),
                 }
             }
-            WorkflowSpec::Agent { task } => {
+            ExecutionMode::Agent => {
                 // Verify supervisor action is registered first
                 {
                     let registry = self.function_registry.read().unwrap();
@@ -868,8 +910,8 @@ impl DagExecutor {
                         .bootstrapped_agents
                         .write()
                         .map_err(|e| DagError::LockError(e.to_string()))?;
-                    if !bootstrapped.contains(&task) {
-                        bootstrapped.insert(task.clone());
+                    if !bootstrapped.contains(name) {
+                        bootstrapped.insert(name.to_string());
                         true
                     } else {
                         false
@@ -883,10 +925,10 @@ impl DagExecutor {
                         .write()
                         .map_err(|e| DagError::LockError(e.to_string()))?;
 
-                    if !dags.contains_key(&task) {
+                    if !dags.contains_key(name) {
                         // Create bootstrap graph
                         let graph = Graph {
-                            name: task.clone(),
+                            name: name.to_string(),
                             nodes: vec![Node {
                                 id: "supervisor_start".to_string(),
                                 action: "supervisor_step".to_string(),
@@ -900,7 +942,7 @@ impl DagExecutor {
                                 try_count: self.config.max_attempts.unwrap_or(3),
                                 instructions: None,
                             }],
-                            description: format!("Agent-driven DAG for task: {}", task),
+                            description: format!("Agent-driven DAG for task: {}", name),
                             instructions: None,
                             tags: vec!["agent".to_string()],
                             author: "system".to_string(),
@@ -912,8 +954,8 @@ impl DagExecutor {
                         let (mut dag, indices) = self
                             .build_dag_internal(&graph)
                             .map_err(|e| DagError::InvalidGraph(e.to_string()))?;
-                        self.graphs.write().unwrap().insert(task.clone(), graph);
-                        dags.insert(task.clone(), (dag, indices));
+                        self.graphs.write().unwrap().insert(name.to_string(), graph);
+                        dags.insert(name.to_string(), (dag, indices));
                     }
                 }
 
@@ -923,9 +965,9 @@ impl DagExecutor {
                         .prebuilt_dags
                         .read()
                         .map_err(|e| DagError::LockError(e.to_string()))?;
-                    dags.get(&task)
+                    dags.get(name)
                         .ok_or_else(|| {
-                            DagError::NodeNotFound(format!("Agent DAG '{}' not found", task))
+                            DagError::NodeNotFound(format!("Agent DAG '{}' not found", name))
                         })?
                         .clone()
                 };
@@ -935,10 +977,10 @@ impl DagExecutor {
                 // Record active DAG in Sled
                 let active_tree = self.sled_db.open_tree("active")?;
                 active_tree.insert(
-                    task.as_bytes(),
+                    name.as_bytes(),
                     serde_json::to_vec(&DagMetadata {
                         status: "Running".to_string(),
-                        task: task.clone(),
+                        task: name.to_string(),
                     })?,
                 )?;
 
@@ -946,7 +988,7 @@ impl DagExecutor {
                     result = execute_dag_async(self, &dag, cache) => {
                         let (report, needs_human_check) = result;
                         if needs_human_check {
-                            self.add_node(&task, format!("human_check_{}", cuid2::create_id()),
+                            self.add_node(name, format!("human_check_{}", cuid2::create_id()),
                                       "human_interrupt".to_string(), vec![])?;
                         }
                         Ok(report)
@@ -1382,14 +1424,7 @@ impl DagExecutor {
 
         // Resume execution
         let (tx, rx) = oneshot::channel();
-        self.execute_dag(
-            WorkflowSpec::Static {
-                name: dag_id.to_string(),
-            },
-            &cache,
-            rx,
-        )
-        .await
+        self.execute_static_dag(dag_id, &cache, rx).await
     }
 
     /// Serializes an execution tree to JSON format
@@ -2427,5 +2462,20 @@ impl SerializableExecutionTree {
         }
 
         tree
+    }
+}
+
+/// Execution mode for workflows
+#[derive(Debug, Clone)]
+pub enum ExecutionMode {
+    /// Execute a static, pre-loaded DAG
+    Static,
+    /// Start an agent-driven flow 
+    Agent,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::Static
     }
 }
