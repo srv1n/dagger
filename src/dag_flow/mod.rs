@@ -1,4 +1,5 @@
 pub mod dag_flow;
+pub mod dag_flow_parallel;
 // pub mod enhanced_dag_flow;
 pub mod any;
 pub mod dag_builder;

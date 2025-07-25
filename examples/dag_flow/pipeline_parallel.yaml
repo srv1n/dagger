@@ -1,0 +1,86 @@
+name: parallel_demo
+description: A pipeline with parallel branches to demonstrate parallel execution
+author: Rzn,Inc
+version: 0.0.1
+signature: example
+tags:
+  - parallel
+  - demo
+nodes:
+  - id: node1
+    dependencies: []
+    inputs:
+      - name: num1
+        description: First number to add
+        reference: inputs.num1
+      - name: num2
+        description: Second number to add
+        reference: inputs.num2
+    outputs:
+      - name: sum
+        description: Sum of num1 and num2
+    action: add_numbers
+    failure: failure_function1
+    onfailure: true
+    description: Adds two numbers
+    timeout: 3600
+    try_count: 3
+    
+  # Two parallel branches from node1
+  - id: node2a
+    dependencies:
+      - node1
+    inputs:
+      - name: input
+        description: Result from node1 to square
+        reference: node1.sum
+    outputs:
+      - name: squared_result
+        description: Squared result
+    action: square_number
+    failure: failure_function2
+    onfailure: false
+    description: Squares the sum from node1 (branch A)
+    timeout: 1800
+    try_count: 2
+    
+  - id: node2b
+    dependencies:
+      - node1
+    inputs:
+      - name: input
+        description: Result from node1 to triple
+        reference: node1.sum
+    outputs:
+      - name: tripled_result
+        description: Tripled result
+      - name: test_string
+        description: Example string output
+    action: triple_number_and_add_string
+    failure: failure_function3
+    onfailure: true
+    description: Triples the sum from node1 (branch B)
+    timeout: 3600
+    try_count: 3
+    
+  # Final node depends on both branches
+  - id: node3
+    dependencies:
+      - node2a
+      - node2b
+    inputs:
+      - name: num1
+        description: Squared result from branch A
+        reference: node2a.squared_result
+      - name: num2
+        description: Tripled result from branch B
+        reference: node2b.tripled_result
+    outputs:
+      - name: sum
+        description: Sum of squared and tripled results
+    action: add_numbers
+    failure: failure_function1
+    onfailure: true
+    description: Adds results from both branches
+    timeout: 3600
+    try_count: 3

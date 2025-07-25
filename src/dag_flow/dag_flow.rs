@@ -25,11 +25,13 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::oneshot;
+use tokio::sync::Semaphore;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 // use tokio::sync::RwLock;
 use serde_json::error::Error as JsonError;
-use tokio::time::{sleep, timeout, Duration};
-use tracing::{debug, error, info, trace, warn, Level}; // Assuming you're using Tokio for async runtime // Add at top with other imports
+use tokio::time::{sleep, timeout, Duration, Instant};
+use tracing::{debug, error, info, trace, warn, Level, instrument}; // Assuming you're using Tokio for async runtime // Add at top with other imports
 
 // Add these imports at the top with other imports
 use serde::de::Error as SerdeError;
@@ -136,6 +138,26 @@ pub struct DagConfig {
     pub review_frequency: Option<u32>,
     /// Retry strategy configuration
     pub retry_strategy: RetryStrategy,
+    /// Enable parallel execution of independent nodes (default: true)
+    #[serde(default)]
+    pub enable_parallel_execution: bool,
+    /// Maximum number of nodes to execute in parallel (default: 3)
+    #[serde(default = "default_max_parallel_nodes")]
+    pub max_parallel_nodes: usize,
+    /// Enable incremental cache updates
+    #[serde(default)]
+    pub enable_incremental_cache: bool,
+    /// Cache snapshot interval in seconds
+    #[serde(default = "default_cache_snapshot_interval")]
+    pub cache_snapshot_interval: u64,
+}
+
+fn default_max_parallel_nodes() -> usize {
+    3
+}
+
+fn default_cache_snapshot_interval() -> u64 {
+    300 // 5 minutes
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +185,10 @@ impl Default for DagConfig {
             max_iterations: Some(50),
             review_frequency: Some(5),
             retry_strategy: RetryStrategy::default(),
+            enable_parallel_execution: true,
+            max_parallel_nodes: 3,
+            enable_incremental_cache: false,
+            cache_snapshot_interval: default_cache_snapshot_interval(),
         }
     }
 }
@@ -228,6 +254,18 @@ impl DagConfig {
             max_iterations: override_with.max_iterations.or(base.max_iterations),
             review_frequency: override_with.review_frequency.or(base.review_frequency),
             retry_strategy: override_with.retry_strategy.clone(),
+            enable_parallel_execution: override_with.enable_parallel_execution,
+            max_parallel_nodes: if override_with.enable_parallel_execution { 
+                override_with.max_parallel_nodes 
+            } else { 
+                base.max_parallel_nodes 
+            },
+            enable_incremental_cache: override_with.enable_incremental_cache,
+            cache_snapshot_interval: if override_with.enable_incremental_cache {
+                override_with.cache_snapshot_interval
+            } else {
+                base.cache_snapshot_interval
+            },
         };
 
         // Validate merged configuration
@@ -685,6 +723,27 @@ pub enum DagError {
 }
 
 type ActionRegistry = Arc<RwLock<HashMap<String, Arc<dyn NodeAction>>>>;
+
+/// Execution context for resource management
+#[derive(Clone)]
+pub struct ExecutionContext {
+    pub max_parallel_nodes: usize,
+    pub semaphore: Arc<Semaphore>,
+    pub cache_last_snapshot: Arc<RwLock<Instant>>,
+    pub cache_delta_size: Arc<RwLock<usize>>,
+}
+
+impl ExecutionContext {
+    pub fn new(max_parallel: usize) -> Self {
+        Self {
+            max_parallel_nodes: max_parallel,
+            semaphore: Arc::new(Semaphore::new(max_parallel)),
+            cache_last_snapshot: Arc::new(RwLock::new(Instant::now())),
+            cache_delta_size: Arc::new(RwLock::new(0)),
+        }
+    }
+}
+
 /// The main executor for DAGs.
 pub struct DagExecutor {
     /// A registry of custom actions.
@@ -702,9 +761,15 @@ pub struct DagExecutor {
     pub tree: Arc<RwLock<HashMap<String, ExecutionTree>>>,
     /// Track bootstrapped agent DAGs
     pub bootstrapped_agents: Arc<RwLock<HashSet<String>>>,
+    /// Execution context for resource management
+    pub execution_context: Option<ExecutionContext>,
 }
 
 impl DagExecutor {
+    fn normalize_dag_name(dag_id: &str) -> String {
+        dag_id.to_lowercase()
+    }
+    
     /// Creates a new `DagExecutor` with optional configuration
     pub fn new(
         config: Option<DagConfig>,
@@ -712,18 +777,26 @@ impl DagExecutor {
         sled_path: &str,
     ) -> Result<Self, Error> {
         let sled_db = sled::open(sled_path)?;
+        let config = config.unwrap_or_default();
+        
+        let execution_context = if config.enable_parallel_execution {
+            Some(ExecutionContext::new(config.max_parallel_nodes))
+        } else {
+            None
+        };
 
         Ok(DagExecutor {
             function_registry: registry,
             graphs: Arc::new(RwLock::new(HashMap::new())),
             prebuilt_dags: Arc::new(RwLock::new(HashMap::new())),
-            config: config.unwrap_or_default(),
+            config,
             sled_db,
             stopped: Arc::new(RwLock::new(false)),
             paused: Arc::new(RwLock::new(false)),
             start_time: chrono::Local::now().naive_local(),
             tree: Arc::new(RwLock::new(HashMap::new())),
             bootstrapped_agents: Arc::new(RwLock::new(HashSet::new())),
+            execution_context,
         })
     }
 
@@ -883,7 +956,7 @@ impl DagExecutor {
                 self.start_time = chrono::Local::now().naive_local();
 
                 tokio::select! {
-                    result = execute_dag_async(self, &dag, cache) => {
+                    result = execute_dag_async(self, &dag, cache, name) => {
                         let (report, needs_human_check) = result;
                         if needs_human_check {
                             self.add_node(name, format!("human_check_{}", cuid2::create_id()),
@@ -985,7 +1058,7 @@ impl DagExecutor {
                 )?;
 
                 tokio::select! {
-                    result = execute_dag_async(self, &dag, cache) => {
+                    result = execute_dag_async(self, &dag, cache, name) => {
                         let (report, needs_human_check) = result;
                         if needs_human_check {
                             self.add_node(name, format!("human_check_{}", cuid2::create_id()),
@@ -1477,7 +1550,7 @@ impl DagExecutor {
 
     /// Serializes an execution tree to DOT format for visualization
     pub fn serialize_tree_to_dot(&self, dag_id: &str) -> Result<String> {
-        let normalized_id = normalize_dag_name(dag_id);
+        let normalized_id = Self::normalize_dag_name(dag_id);
         info!("Generating DOT graph for DAG '{}'", normalized_id);
 
         let trees = self.tree.read().unwrap();
@@ -1653,7 +1726,7 @@ impl DagExecutor {
 
     /// Loads cache from Sled for a given DAG
     fn load_cache(&self, dag_id: &str) -> Result<Cache> {
-        let normalized_id = normalize_dag_name(dag_id);
+        let normalized_id = Self::normalize_dag_name(dag_id);
         info!("Loading cache for DAG: {}", normalized_id);
 
         let cache_tree = self.sled_db.open_tree("cache")?;
@@ -1725,7 +1798,7 @@ impl DagExecutor {
                 DagError::SerializationError(serde_json::Error::custom(e.to_string()))
             })?;
             let tree_store = self.sled_db.open_tree("execution_trees")?;
-            tree_store.insert(normalize_dag_name(dag_id).as_bytes(), compressed)?;
+            tree_store.insert(Self::normalize_dag_name(dag_id).as_bytes(), compressed)?;
             info!("Saved execution tree for '{}'", dag_id);
         } else {
             warn!("No execution tree found to save for '{}'", dag_id);
@@ -1735,7 +1808,7 @@ impl DagExecutor {
 
     /// Loads the execution tree from Sled
     pub fn load_execution_tree(&self, dag_id: &str) -> Result<Option<ExecutionTree>> {
-        let normalized_id = normalize_dag_name(dag_id);
+        let normalized_id = Self::normalize_dag_name(dag_id);
         let tree_store = self.sled_db.open_tree("execution_trees")?;
         if let Some(compressed) = tree_store.get(normalized_id.as_bytes())? {
             let bytes = zstd::decode_all(&compressed[..])?;
@@ -1941,47 +2014,477 @@ fn record_execution_snapshot(
     }
 }
 
+/// Helper function to find nodes ready for execution
+fn find_ready_nodes(
+    dag: &DiGraph<Node, ()>,
+    executed_nodes: &HashSet<String>,
+    executing_nodes: &HashSet<String>,
+) -> Vec<(NodeIndex, Node)> {
+    let mut ready_nodes = Vec::new();
+    
+    for node_ref in dag.node_references() {
+        let (node_idx, node) = node_ref;
+        
+        // Skip if already executed or currently executing
+        if executed_nodes.contains(&node.id) || executing_nodes.contains(&node.id) {
+            continue;
+        }
+        
+        // Check if all dependencies are satisfied
+        let all_deps_satisfied = node.dependencies.iter().all(|dep| executed_nodes.contains(dep));
+        
+        if all_deps_satisfied {
+            ready_nodes.push((node_idx, node.clone()));
+        }
+    }
+    
+    ready_nodes
+}
+
+/// Execute node with context for parallel execution
+pub(super) async fn execute_node_with_context(
+    node: &Node,
+    cache: &Cache,
+    registry: ActionRegistry,
+    config: DagConfig,
+    sled_db: sled::Db,
+    tree: Arc<RwLock<HashMap<String, ExecutionTree>>>,
+    graphs: Arc<RwLock<HashMap<String, Graph>>>,
+) -> NodeExecutionOutcome {
+    let mut outcome = NodeExecutionOutcome {
+        node_id: node.id.clone(),
+        success: false,
+        retry_messages: Vec::with_capacity(node.try_count as usize),
+        final_error: None,
+    };
+
+    let action = match registry.read() {
+        Ok(reg) => match reg.get(&node.action) {
+            Some(action) => action.clone(),
+            None => {
+                let error = format!(
+                    "Action '{}' not registered for node '{}'",
+                    node.action, node.id
+                );
+                error!("{}", error);
+                outcome.final_error = Some(error);
+                return outcome;
+            }
+        },
+        Err(e) => {
+            let error = format!("Failed to acquire registry lock: {}", e);
+            error!("{}", error);
+            outcome.final_error = Some(error);
+            return outcome;
+        }
+    };
+
+    let mut retries_left = node.try_count;
+    
+    while retries_left > 0 {
+        let attempt_number = node.try_count - retries_left + 1;
+        info!(
+            attempt = attempt_number,
+            max_attempts = node.try_count,
+            node_id = %node.id,
+            "Executing node"
+        );
+
+        let node_timeout = Duration::from_secs(node.timeout);
+        
+        // Create a temporary executor for this node execution
+        let mut temp_executor = DagExecutor {
+            function_registry: registry.clone(),
+            graphs: graphs.clone(),
+            prebuilt_dags: Arc::new(RwLock::new(HashMap::new())),
+            config: config.clone(),
+            sled_db: sled_db.clone(),
+            stopped: Arc::new(RwLock::new(false)),
+            paused: Arc::new(RwLock::new(false)),
+            start_time: chrono::Local::now().naive_local(),
+            tree: tree.clone(),
+            bootstrapped_agents: Arc::new(RwLock::new(HashSet::new())),
+            execution_context: None,
+        };
+
+        let execution_result =
+            timeout(node_timeout, action.execute(&mut temp_executor, node, cache)).await;
+
+        match execution_result {
+            Ok(Ok(_)) => {
+                info!(
+                    "Node '{}' execution succeeded on attempt {}",
+                    node.id, attempt_number
+                );
+                outcome.success = true;
+                // Record snapshot
+                if let Some((dag_name, _)) = graphs
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, g)| g.nodes.iter().any(|n| n.id == node.id))
+                {
+                    record_execution_snapshot_simple(&temp_executor, node, &outcome, cache, dag_name);
+                }
+                return outcome;
+            }
+            Ok(Err(e)) => {
+                let err_message = e.to_string();
+                outcome.retry_messages.push(format!(
+                    "Attempt {} failed: {}",
+                    attempt_number, err_message
+                ));
+
+                if node.onfailure && retries_left > 1 {
+                    let delay = calculate_retry_delay(&config.retry_strategy, node.try_count - retries_left);
+                    if delay > 0 {
+                        info!(
+                            "Waiting {} seconds before retry {} for node '{}'",
+                            delay,
+                            attempt_number + 1,
+                            node.id
+                        );
+                        sleep(Duration::from_secs(delay)).await;
+                    }
+                    retries_left -= 1;
+                } else {
+                    outcome.final_error = Some(format!(
+                        "Failed after {} attempts. Last error: {}",
+                        attempt_number, err_message
+                    ));
+                    return outcome;
+                }
+            }
+            Err(_) => {
+                let err_message = format!("Timeout after {:?}", node_timeout);
+                outcome.retry_messages.push(format!(
+                    "Attempt {} failed: {}",
+                    attempt_number, err_message
+                ));
+
+                error!(
+                    "Node '{}' execution timed out (attempt {}/{}): {}",
+                    node.id, attempt_number, node.try_count, err_message
+                );
+
+                if node.onfailure && retries_left > 1 {
+                    let delay = calculate_retry_delay(&config.retry_strategy, node.try_count - retries_left);
+                    if delay > 0 {
+                        sleep(Duration::from_secs(delay)).await;
+                    }
+                    retries_left -= 1;
+                } else {
+                    outcome.final_error = Some(format!(
+                        "Node '{}' timed out after {} attempts",
+                        node.id, attempt_number
+                    ));
+                    return outcome;
+                }
+            }
+        }
+    }
+
+    outcome.final_error = Some(format!(
+        "Node '{}' failed after {} attempts",
+        node.id, node.try_count
+    ));
+    outcome
+}
+
+/// Calculate retry delay based on strategy
+fn calculate_retry_delay(strategy: &RetryStrategy, attempt: u8) -> u64 {
+    match strategy {
+        RetryStrategy::Exponential {
+            initial_delay_secs,
+            max_delay_secs,
+            multiplier,
+        } => {
+            let delay = (*initial_delay_secs as f64 * multiplier.powf(attempt as f64)).round() as u64;
+            delay.min(*max_delay_secs)
+        }
+        RetryStrategy::Linear { delay_secs } => *delay_secs,
+        RetryStrategy::Immediate => 0,
+    }
+}
+
+/// Simplified record execution snapshot for parallel execution
+fn record_execution_snapshot_simple(
+    executor: &DagExecutor,
+    node: &Node,
+    outcome: &NodeExecutionOutcome,
+    cache: &Cache,
+    dag_name: &str,
+) {
+    info!(
+        "Recording snapshot for DAG '{}', node '{}'",
+        dag_name, node.id
+    );
+
+    let snapshot = NodeSnapshot {
+        node_id: node.id.clone(),
+        outcome: outcome.clone(),
+        cache_ref: generate_cache_ref(&node.id),
+        timestamp: chrono::Local::now().naive_local(),
+        channel: None,
+        message_id: None,
+    };
+
+    // Update in-memory execution tree
+    if let Ok(mut trees) = executor.tree.write() {
+        let tree = trees.entry(dag_name.to_string()).or_insert_with(DiGraph::new);
+        let node_idx = tree.add_node(snapshot.clone());
+
+        // Add edges for dependencies
+        for parent_id in &node.dependencies {
+            if let Some(parent_idx) = tree.node_indices().find(|i| tree[*i].node_id == *parent_id) {
+                tree.add_edge(
+                    parent_idx,
+                    node_idx,
+                    ExecutionEdge {
+                        parent: parent_id.clone(),
+                        label: "executed_after".to_string(),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Forward to the parallel execution implementation
+async fn execute_dag_parallel(
+    executor: &mut DagExecutor,
+    dag: &DiGraph<Node, ()>,
+    cache: &Cache,
+    dag_name: &str,
+) -> (DagExecutionReport, bool) {
+    super::dag_flow_parallel::execute_dag_parallel(executor, dag, cache, dag_name).await
+}
+
+/// DEPRECATED: Old parallel execution implementation
+#[allow(dead_code)]
+async fn execute_dag_parallel_old(
+    executor: &mut DagExecutor,
+    dag: &DiGraph<Node, ()>,
+    cache: &Cache,
+    dag_name: &str,
+) -> (DagExecutionReport, bool) {
+    let mut node_outcomes = Vec::new();
+    let mut overall_success = true;
+    let mut executed_nodes = HashSet::new();
+    let mut executing_nodes = HashSet::new();
+    let mut futures = FuturesUnordered::new();
+    
+    let context = executor.execution_context.as_ref().unwrap();
+    
+    while !*executor.stopped.read().unwrap() {
+        // Get the latest DAG state
+        let current_dag = {
+            let dags = match executor.prebuilt_dags.read() {
+                Ok(dags) => dags,
+                Err(e) => {
+                    return (
+                        create_execution_report(Vec::new(), false, Some(e.to_string())),
+                        false,
+                    )
+                }
+            };
+            
+            match dags.get(dag_name) {
+                Some((dag, _)) => dag.clone(),
+                None => break,
+            }
+        };
+        
+        // Check limits and timeouts
+        let supervisor_iteration: usize = if let Some(supervisor_node) = current_dag
+            .node_references()
+            .find(|(_, node)| node.action == "supervisor_step")
+        {
+            parse_input_from_name(cache, "iteration".to_string(), &supervisor_node.1.inputs)
+                .unwrap_or(0)
+        } else {
+            executed_nodes.len()
+        };
+        
+        if let Some(max_iter) = executor.config.max_iterations {
+            if supervisor_iteration >= max_iter as usize {
+                return (
+                    create_execution_report(
+                        node_outcomes,
+                        false,
+                        Some(format!("Maximum iterations ({}) reached", max_iter)),
+                    ),
+                    true,
+                );
+            }
+        }
+        
+        let elapsed = chrono::Local::now().naive_local() - executor.start_time;
+        if elapsed.num_seconds() > executor.config.timeout_seconds.unwrap_or(3600) as i64 {
+            return (
+                create_execution_report(
+                    node_outcomes,
+                    false,
+                    Some("DAG timeout exceeded".to_string()),
+                ),
+                false,
+            );
+        }
+        
+        // Find all nodes ready for execution
+        let ready_nodes = find_ready_nodes(&current_dag, &executed_nodes, &executing_nodes);
+        
+        debug!("Ready nodes: {}, Executing nodes: {}, Executed nodes: {}", 
+            ready_nodes.len(), executing_nodes.len(), executed_nodes.len());
+        
+        if ready_nodes.is_empty() && executing_nodes.is_empty() {
+            // No more work to do
+            info!("No more work to do, breaking execution loop");
+            break;
+        }
+        
+        // Launch ready nodes up to parallel limit
+        let max_to_launch = context.max_parallel_nodes.saturating_sub(executing_nodes.len());
+        
+        if !ready_nodes.is_empty() {
+            info!("Found {} ready nodes, can launch up to {}", ready_nodes.len(), max_to_launch);
+        }
+        
+        for (_, node) in ready_nodes.iter().take(max_to_launch) {
+            info!("Launching node {} for parallel execution", node.id);
+            executing_nodes.insert(node.id.clone());
+            
+            let node_clone = node.clone();
+            let cache_clone = cache.clone();
+            let semaphore = context.semaphore.clone();
+            let registry = executor.function_registry.clone();
+            let config = executor.config.clone();
+            let sled_db = executor.sled_db.clone();
+            let tree = executor.tree.clone();
+            let graphs = executor.graphs.clone();
+            
+            futures.push(async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                execute_node_with_context(
+                    &node_clone,
+                    &cache_clone,
+                    registry,
+                    config,
+                    sled_db,
+                    tree,
+                    graphs,
+                ).await
+            });
+        }
+        
+        // Wait for any executing nodes to complete
+        if !futures.is_empty() || !executing_nodes.is_empty() {
+            // Poll futures if we have any
+            if !futures.is_empty() {
+                info!("Waiting for {} futures to complete", futures.len());
+                if let Some(outcome) = futures.next().await {
+                info!("Node {} completed with success={}", outcome.node_id, outcome.success);
+                executing_nodes.remove(&outcome.node_id);
+                executed_nodes.insert(outcome.node_id.clone());
+                
+                if !outcome.success {
+                    match executor.config.on_failure {
+                        OnFailure::Stop => {
+                            overall_success = false;
+                            node_outcomes.push(outcome);
+                            return (create_execution_report(node_outcomes, false, None), false);
+                        }
+                        OnFailure::Pause => {
+                            if let Err(e) = executor.save_cache(&outcome.node_id, cache) {
+                                error!("Failed to save cache before pause: {}", e);
+                            }
+                            overall_success = false;
+                            node_outcomes.push(outcome);
+                            return (create_execution_report(node_outcomes, false, None), false);
+                        }
+                        OnFailure::Continue => {
+                            overall_success = false;
+                            node_outcomes.push(outcome);
+                        }
+                    }
+                } else {
+                    node_outcomes.push(outcome);
+                }
+                
+                // Check if we need incremental cache save
+                if executor.config.enable_incremental_cache {
+                    let should_snapshot = {
+                        let last_snapshot = *context.cache_last_snapshot.read().unwrap();
+                        let delta_size = *context.cache_delta_size.read().unwrap();
+                        
+                        last_snapshot.elapsed().as_secs() > executor.config.cache_snapshot_interval ||
+                        delta_size > 1000 // Threshold for delta size
+                    };
+                    
+                    if should_snapshot {
+                        if let Err(e) = executor.save_cache(dag_name, cache) {
+                            warn!("Failed to save incremental cache: {}", e);
+                        }
+                        *context.cache_last_snapshot.write().unwrap() = Instant::now();
+                        *context.cache_delta_size.write().unwrap() = 0;
+                    } else {
+                        *context.cache_delta_size.write().unwrap() += 1;
+                    }
+                }
+            }
+            }
+        } else if !executing_nodes.is_empty() {
+            // Small delay to prevent tight loop when waiting for executing nodes
+            info!("No futures to wait for, but {} nodes still executing", executing_nodes.len());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        } else {
+            // No futures and no executing nodes - we might be done or stuck
+            info!("No futures and no executing nodes, checking if we're done");
+        }
+        
+        if *executor.paused.read().unwrap() {
+            return (
+                create_execution_report(node_outcomes, overall_success, None),
+                false,
+            );
+        }
+    }
+    
+    // The executing_nodes tracking is handled in the main loop
+    // No need to wait here as all nodes should be completed
+    
+    if let Err(e) = executor.save_execution_tree(dag_name) {
+        error!("Failed to save execution tree: {}", e);
+    }
+    
+    if let Err(e) = executor.save_cache(dag_name, cache) {
+        error!("Failed to save cache for '{}': {}", dag_name, e);
+    }
+    
+    (
+        create_execution_report(node_outcomes, overall_success, None),
+        false,
+    )
+}
+
 /// Executes the DAG asynchronously and produces a `DagExecutionReport` summarizing the outcomes.
 pub async fn execute_dag_async(
     executor: &mut DagExecutor,
     dag: &DiGraph<Node, ()>,
     cache: &Cache,
+    dag_name: &str,
 ) -> (DagExecutionReport, bool) {
-    // Get DAG name and validate it exists
-    let dag_name = {
-        let graphs = match executor.graphs.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                error!("Failed to acquire read lock: {}", e);
-                return (
-                    create_execution_report(
-                        Vec::new(),
-                        false,
-                        Some("Failed to acquire lock".to_string()),
-                    ),
-                    false,
-                );
-            }
-        };
-
-        match dag
-            .node_references()
-            .next()
-            .and_then(|(_, node)| graphs.iter().find(|(_, g)| g.nodes.contains(node)))
-        {
-            Some((name, _)) if !name.is_empty() => name.clone(),
-            _ => {
-                return (
-                    create_execution_report(
-                        Vec::new(),
-                        false,
-                        Some("Unable to determine DAG name - execution aborted".to_string()),
-                    ),
-                    false,
-                );
-            }
-        }
-    };
+    // Use parallel execution if enabled
+    if executor.config.enable_parallel_execution && executor.execution_context.is_some() {
+        info!("Using parallel execution for DAG '{}'", dag_name);
+        return execute_dag_parallel(executor, dag, cache, dag_name).await;
+    } else {
+        info!("Using sequential execution for DAG '{}' (parallel={}, context={})", 
+            dag_name, 
+            executor.config.enable_parallel_execution,
+            executor.execution_context.is_some()
+        );
+    }
 
     let mut node_outcomes = Vec::new();
     let mut overall_success = true;
@@ -2001,7 +2504,7 @@ pub async fn execute_dag_async(
                 }
             };
 
-            match dags.get(&dag_name) {
+            match dags.get(dag_name) {
                 Some((dag, _)) => dag.clone(),
                 None => break, // Exit if we can't get the DAG
             }
@@ -2105,12 +2608,12 @@ pub async fn execute_dag_async(
     }
 
     // Save execution tree before returning
-    if let Err(e) = executor.save_execution_tree(&dag_name) {
+    if let Err(e) = executor.save_execution_tree(dag_name) {
         error!("Failed to save execution tree: {}", e);
     }
 
     // Save the full cache state before returning
-    if let Err(e) = executor.save_cache(&dag_name, cache) {
+    if let Err(e) = executor.save_cache(dag_name, cache) {
         error!("Failed to save cache for '{}': {}", dag_name, e);
     }
 
@@ -2121,11 +2624,21 @@ pub async fn execute_dag_async(
 }
 
 /// Modified execute_node_async with configurable retry strategy
+#[instrument(skip(executor, cache), fields(node_id = %node.id, action = %node.action))]
 async fn execute_node_async(
     executor: &mut DagExecutor,
     node: &Node,
     cache: &Cache,
 ) -> NodeExecutionOutcome {
+    let span = tracing::span!(
+        Level::INFO,
+        "node_execution",
+        node_id = %node.id,
+        action = %node.action,
+        try_count = node.try_count
+    );
+    let _enter = span.enter();
+    
     let mut outcome = NodeExecutionOutcome {
         node_id: node.id.clone(),
         success: false,
@@ -2161,8 +2674,9 @@ async fn execute_node_async(
     while retries_left > 0 {
         let attempt_number = node.try_count - retries_left + 1;
         info!(
-            "Executing node '{}' (attempt {}/{})",
-            node.id, attempt_number, node.try_count
+            attempt = attempt_number,
+            max_attempts = node.try_count,
+            "Executing node"
         );
 
         // Add per-node timeout enforcement
@@ -2303,7 +2817,7 @@ async fn handle_failure(
 }
 
 /// Helper function to create execution reports
-fn create_execution_report(
+pub(super) fn create_execution_report(
     node_outcomes: Vec<NodeExecutionOutcome>,
     overall_success: bool,
     error: Option<String>,
@@ -2400,11 +2914,6 @@ impl HumanInterrupt {
         }
     }
 }
-
-
-  fn normalize_dag_name(dag_id: &str) -> String {
-            dag_id.to_lowercase()
-        }
 
 
         // When creating new nodes, initialize cache_ref with a unique identifier:
