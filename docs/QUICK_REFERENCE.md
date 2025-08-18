@@ -101,13 +101,13 @@ let report = executor.execute_agent_dag("task_description", &cache, cancel_rx).a
 ## Cache Operations
 
 ```rust
-// Insert values
+// Insert values (use owned types like String, not &str)
 insert_value(&cache, "namespace", "key", value)?;
 insert_value(&cache, &node.id, &output.name, result)?;
 
-// Get values
+// Get values (note the signatures)
 let value: String = get_global_input(&cache, "namespace", "key")?;
-let input: f64 = parse_input_from_name(&cache, "input_name", &node.inputs)?;
+let input: f64 = parse_input_from_name(&cache, "input_name".to_string(), &node.inputs)?;
 
 // Check existence
 if cache.data.contains_key("namespace.key") {
@@ -126,8 +126,8 @@ async fn process_data(
     node: &Node,
     cache: &Cache
 ) -> Result<()> {
-    // Get inputs
-    let input_data: Vec<f64> = parse_input_from_name(cache, "data", &node.inputs)?;
+    // Get inputs (parse_input_from_name takes String, not &str)
+    let input_data: Vec<f64> = parse_input_from_name(cache, "data".to_string(), &node.inputs)?;
     
     // Process
     let result = input_data.iter().sum::<f64>() / input_data.len() as f64;
@@ -188,7 +188,7 @@ config:
 ```rust
 // In actions
 async fn safe_action(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    let input = parse_input_from_name(cache, "input", &node.inputs)
+    let input = parse_input_from_name(cache, "input".to_string(), &node.inputs)
         .map_err(|e| anyhow!("Failed to parse input: {}", e))?;
     
     match process(input) {
@@ -319,7 +319,7 @@ nodes:
 ### Conditional Execution
 ```rust
 async fn conditional_action(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    let condition = parse_input_from_name(cache, "condition", &node.inputs)?;
+    let condition = parse_input_from_name(cache, "condition".to_string(), &node.inputs)?;
     
     if condition {
         // Execute path A

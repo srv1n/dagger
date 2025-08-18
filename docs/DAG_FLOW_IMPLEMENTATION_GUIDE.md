@@ -491,82 +491,200 @@ nodes:
     timeout: 900
 ```
 
-### Listing and Filtering Workflows
+### Listing and Querying Workflows
 
 ```rust
-// List all loaded workflows
-let all_dags = executor.list_dags()?;
-println!("Available workflows: {:?}", all_dags);
-
-// Filter workflows by tags
-let production_dags = executor.list_dags_by_tags(&["production"])?;
-println!("Production workflows: {:?}", production_dags);
-
-// Get workflows with multiple tags (AND condition)
-let customer_etl = executor.list_dags_by_tags(&["customer_data", "etl"])?;
-
-// Check if a workflow exists
-if executor.has_dag("data_processing_pipeline") {
-    println!("Workflow exists!");
+// List all loaded workflows with descriptions
+let all_dags = executor.list_dags().await?;
+for (name, description) in all_dags {
+    println!("{}: {}", name, description);
 }
 
-// Get workflow metadata
-let metadata = executor.get_dag_metadata("data_processing_pipeline")?;
-println!("Author: {}, Version: {}", metadata.author, metadata.version);
+// Filter workflows by single tag
+let production_dags = executor.list_dag_filtered_tag("production").await?;
+
+// Filter workflows by multiple tags (must have ALL tags)
+let customer_etl = executor.list_dag_multiple_tags(
+    vec!["customer_data".to_string(), "etl".to_string()]
+).await?;
+
+// Get detailed metadata for all workflows
+let metadata = executor.list_dags_metadata().await?;
+for (name, desc, author, version, signature) in metadata {
+    println!("Workflow: {}", name);
+    println!("  Description: {}", desc);
+    println!("  Author: {}", author);
+    println!("  Version: {}", version);
+    println!("  Signature: {}", signature);
+}
 ```
 
 ## Cache Operations
 
+### Complete Cache API
+
+The cache provides thread-safe storage for data sharing between nodes with both in-memory (DashMap) and persistent (SQLite) layers.
+
 ### Writing to Cache
 
 ```rust
-use dagger::{Cache, insert_value};
+use dagger::{Cache, insert_value, insert_global_value, append_global_value};
 
 // Create cache
 let cache = Cache::new();
 
-// Write simple values
-insert_value(&cache, "inputs", "username", "john_doe")?;
-insert_value(&cache, "inputs", "age", 30)?;
-insert_value(&cache, "inputs", "active", true)?;
+// 1. Basic value insertion (node-scoped)
+// Note: Values must be serializable. Use owned types (String not &str)
+insert_value(&cache, "node_id", "output_name", "value".to_string())?;
+insert_value(&cache, "fetch_node", "data", vec![1, 2, 3])?;
+insert_value(&cache, "process_node", "result", json!({"status": "ok"}))?;
 
-// Write complex structures
+// 2. Global value insertion (accessible across all nodes)
+insert_global_value(&cache, "config", "api_key", "secret_key_123".to_string())?;
+insert_global_value(&cache, "shared", "batch_size", 100)?;
+insert_global_value(&cache, "metadata", "run_id", "run_2024_001".to_string())?;
+
+// 3. Append to existing arrays/vectors
+append_global_value(&cache, "logs", "entries", "Started processing".to_string())?;
+append_global_value(&cache, "logs", "entries", "Step 1 complete".to_string())?;
+append_global_value(&cache, "results", "items", json!({"id": 1, "value": 42}))?;
+
+// 4. Complex nested structures
 let config = json!({
-    "timeout": 30,
-    "retries": 3,
-    "endpoints": ["api1.example.com", "api2.example.com"]
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "credentials": {
+            "user": "admin",
+            "password": "secret"
+        }
+    },
+    "features": ["auth", "logging", "metrics"],
+    "limits": {
+        "max_connections": 100,
+        "timeout_ms": 5000
+    }
 });
 insert_value(&cache, "inputs", "config", config)?;
-
-// Write to node-specific namespace
-insert_value(&cache, "node1", "status", "completed")?;
-insert_value(&cache, "node1", "result", vec![1, 2, 3, 4, 5])?;
 ```
 
 ### Reading from Cache
 
 ```rust
-use dagger::{parse_input_from_name, get_value_from_cache};
+use dagger::{
+    parse_input_from_name, get_input, get_global_input,
+    Cache, Node
+};
 
-// In an action function
+// 1. Parse input using node's input field definitions
 async fn my_action(
     _executor: &mut DagExecutor,
     node: &Node,
     cache: &Cache
 ) -> Result<()> {
-    // Read input using node input references
-    let username: String = parse_input_from_name(
-        cache, "username", &node.inputs
+    // Read based on input field references (looks up the reference in node.inputs)
+    // IMPORTANT: parse_input_from_name takes a String, not &str
+    let data: Vec<i32> = parse_input_from_name(
+        cache, "data".to_string(), &node.inputs
     )?;
     
-    // Read with type inference
-    let age: i32 = parse_input_from_name(
-        cache, "age", &node.inputs
+    // Type inference works
+    let batch_size = parse_input_from_name::<i32>(
+        cache, "batch_size".to_string(), &node.inputs
     )?;
     
-    // Read complex types
+    // Complex types
     let config: HashMap<String, Value> = parse_input_from_name(
-        cache, "config", &node.inputs
+        cache, "config".to_string(), &node.inputs
+    )?;
+    
+    Ok(())
+}
+
+// 2. Direct cache access (requires node_id and key separately)
+let value: String = get_input(
+    cache, 
+    "node1",       // Node ID
+    "output_name"  // Key within that node's namespace
+)?;
+
+// Example: get output from a previous node
+let previous_result: Vec<f64> = get_input(
+    cache,
+    "transform_node",  // Node ID
+    "processed_data"   // Output key
+)?;
+
+// 3. Global value access (two-part namespace)
+let api_key: String = get_global_input(cache, "config", "api_key")?;
+let batch_size: i32 = get_global_input(cache, "shared", "batch_size")?;
+let log_entries: Vec<String> = get_global_input(cache, "logs", "entries")?;
+
+// 4. Check if value exists
+if cache.data.contains_key("node1.status") {
+    println!("Node 1 has completed");
+}
+
+// 5. Iterate over cache entries
+for entry in cache.data.iter() {
+    let key = entry.key();
+    let value = entry.value();
+    println!("{}: {:?}", key, value);
+}
+```
+
+### Cache Serialization and Debugging
+
+```rust
+use dagger::{serialize_cache_to_json, serialize_cache_to_prettyjson};
+
+// Export cache as JSON (compact)
+let json = serialize_cache_to_json(&cache)?;
+std::fs::write("cache_dump.json", json)?;
+
+// Export cache as pretty JSON (formatted)
+let pretty_json = serialize_cache_to_prettyjson(&cache)?;
+println!("Cache contents:\n{}", pretty_json);
+
+// Clear cache
+cache.data.clear();
+
+// Get cache size
+let size = cache.data.len();
+println!("Cache contains {} entries", size);
+```
+
+### Advanced Cache Patterns
+
+```rust
+// 1. Conditional caching
+if !cache.data.contains_key("expensive_computation.result") {
+    let result = perform_expensive_computation()?;
+    insert_value(&cache, "expensive_computation", "result", result)?;
+}
+
+// 2. Cache with TTL (using metadata)
+insert_value(&cache, "temp_data", "value", data)?;
+insert_value(&cache, "temp_data", "expires_at", 
+    chrono::Utc::now() + chrono::Duration::hours(1))?;
+
+// 3. Batch operations
+let batch_data: Vec<(String, Value)> = vec![
+    ("item1".to_string(), json!(1)),
+    ("item2".to_string(), json!(2)),
+    ("item3".to_string(), json!(3)),
+];
+for (key, value) in batch_data {
+    insert_value(&cache, "batch", &key, value)?;
+}
+
+// 4. Namespace iteration
+let node_prefix = "process_node.";
+for entry in cache.data.iter() {
+    if entry.key().starts_with(node_prefix) {
+        println!("Found output: {}", entry.key());
+    }
+}
     )?;
     
     // Direct cache access (outside of actions)
@@ -590,10 +708,264 @@ executor.save_cache_snapshot("workflow_name", &cache).await?;
 // Load cache from previous execution
 let restored_cache = executor.load_cache_snapshot("workflow_name").await?;
 
+```
+
+### Direct Cache Access
+
+For cases where the helper functions don't meet your needs, you can access the cache directly:
+
+```rust
+// The cache uses DashMap for thread-safe concurrent access
+use serde_json::Value;
+
+// Direct read from cache
+if let Some(entry) = cache.data.get("node1.output") {
+    let value: &Value = entry.value();
+    println!("Found value: {:?}", value);
+}
+
+// Direct write to cache (not recommended - use insert_value instead)
+cache.data.insert(
+    "custom.key".to_string(), 
+    serde_json::to_value("custom_value")?
+);
+
 // Get cache as JSON for debugging
 let cache_json = serialize_cache_to_prettyjson(&cache)?;
 println!("Cache contents:\n{}", cache_json);
+
+## Macros and Code Generation
+
+### The register_action! Macro
+
+The `register_action!` macro simplifies action registration by generating the boilerplate NodeAction implementation:
+
+```rust
+// Using the macro (recommended approach)
+register_action!(executor, "action_name", action_function).await?;
+
+// What it expands to:
+struct Action;
+#[async_trait]
+impl NodeAction for Action {
+    fn name(&self) -> String {
+        "action_name".to_string()
+    }
+    
+    async fn execute(
+        &self,
+        executor: &mut DagExecutor,
+        node: &Node,
+        cache: &Cache,
+    ) -> Result<()> {
+        action_function(executor, node, cache).await
+    }
+    
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "name": "action_name",
+            "description": "Manually registered action",
+            "parameters": { "type": "object", "properties": {} },
+            "returns": { "type": "object" }
+        })
+    }
+}
+executor.register_action(Arc::new(Action)).await
 ```
+
+**Usage Examples:**
+
+```rust
+// Simple action registration
+async fn process_data(executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
+    let input = parse_input_from_name(cache, "data", &node.inputs)?;
+    let result = transform(input)?;
+    insert_value(cache, &node.id, "output", result)?;
+    Ok(())
+}
+
+register_action!(executor, "process_data", process_data).await?;
+
+// Multiple registrations
+register_action!(executor, "fetch", fetch_data).await?;
+register_action!(executor, "validate", validate_data).await?;
+register_action!(executor, "transform", transform_data).await?;
+register_action!(executor, "save", save_results).await?;
+```
+
+### The #[action] Procedural Macro
+
+For more sophisticated actions with automatic schema generation:
+
+```rust
+use dagger_macros::action;
+
+#[action(
+    description = "Fetches data from external API",
+    timeout = 30,
+    retries = 3
+)]
+async fn fetch_external_data(
+    executor: &mut DagExecutor, 
+    node: &Node, 
+    cache: &Cache
+) -> Result<()> {
+    let endpoint: String = parse_input_from_name(cache, "endpoint", &node.inputs)?;
+    let auth_token: String = get_global_input(cache, "config", "auth_token")?;
+    
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&endpoint)
+        .bearer_auth(auth_token)
+        .send()
+        .await?;
+    
+    let data = response.json::<Value>().await?;
+    insert_value(cache, &node.id, "fetched_data", data)?;
+    
+    Ok(())
+}
+
+// The macro generates:
+// - NodeAction implementation
+// - Proper schema with inputs/outputs
+// - Metadata (description, timeout, retries)
+```
+
+### The #[task_agent] Macro
+
+For task-based agents with dynamic dependency creation:
+
+```rust
+use dagger_macros::task_agent;
+use serde_json::{json, Value};
+
+#[task_agent(
+    name = "document_analyzer",
+    description = "Analyzes documents and creates subtasks"
+)]
+async fn analyze_document(task: Task) -> Result<Value> {
+    let doc_type = task.input["type"].as_str().unwrap_or("unknown");
+    
+    // Create subtasks based on document type
+    match doc_type {
+        "pdf" => {
+            create_subtask("extract_text", json!({ "doc_id": task.input["id"] }))?;
+            create_subtask("extract_images", json!({ "doc_id": task.input["id"] }))?;
+        }
+        "spreadsheet" => {
+            create_subtask("parse_sheets", json!({ "doc_id": task.input["id"] }))?;
+            create_subtask("validate_formulas", json!({ "doc_id": task.input["id"] }))?;
+        }
+        _ => {
+            create_subtask("basic_parse", json!({ "doc_id": task.input["id"] }))?;
+        }
+    }
+    
+    Ok(json!({
+        "status": "analyzing",
+        "document_type": doc_type,
+        "subtasks_created": true
+    }))
+}
+
+// Usage:
+let task_manager = TaskManager::new(registry, "task_db")?;
+task_manager.register_agent(analyze_document);
+```
+
+### The #[pubsub_agent] Macro
+
+For event-driven pub/sub agents:
+
+```rust
+use dagger_macros::pubsub_agent;
+
+#[pubsub_agent(
+    subscribe = "raw_events",
+    publish = "processed_events",
+    schema_in = json!({
+        "type": "object",
+        "properties": {
+            "event_type": { "type": "string" },
+            "payload": { "type": "object" }
+        }
+    }),
+    schema_out = json!({
+        "type": "object",
+        "properties": {
+            "processed": { "type": "boolean" },
+            "result": { "type": "object" }
+        }
+    })
+)]
+async fn event_processor(msg: Message) -> Result<()> {
+    let event_type = msg.payload["event_type"].as_str().unwrap();
+    
+    let result = match event_type {
+        "user_action" => process_user_action(&msg.payload),
+        "system_event" => process_system_event(&msg.payload),
+        _ => Ok(json!({ "skipped": true }))
+    }?;
+    
+    publish("processed_events", json!({
+        "processed": true,
+        "result": result,
+        "timestamp": chrono::Utc::now()
+    })).await?;
+    
+    Ok(())
+}
+
+// Registration:
+let pubsub = PubSubExecutor::new();
+pubsub.register_agent(event_processor).await?;
+```
+
+### Custom Macro Patterns
+
+You can create your own macros for repeated patterns:
+
+```rust
+// Define a macro for common validation actions
+macro_rules! validation_action {
+    ($name:ident, $field:expr, $validator:expr) => {
+        async fn $name(
+            _executor: &mut DagExecutor,
+            node: &Node,
+            cache: &Cache
+        ) -> Result<()> {
+            let input = parse_input_from_name(cache, $field, &node.inputs)?;
+            
+            if !$validator(&input) {
+                return Err(anyhow!("Validation failed for {}", $field));
+            }
+            
+            insert_value(cache, &node.id, "validated", input)?;
+            insert_value(cache, &node.id, "status", "valid")?;
+            Ok(())
+        }
+    };
+}
+
+// Use the macro
+validation_action!(validate_email, "email", |e: &String| e.contains('@'));
+validation_action!(validate_age, "age", |a: &i32| *a >= 18 && *a <= 120);
+validation_action!(validate_phone, "phone", |p: &String| p.len() == 10);
+
+// Register them
+register_action!(executor, "validate_email", validate_email).await?;
+register_action!(executor, "validate_age", validate_age).await?;
+register_action!(executor, "validate_phone", validate_phone).await?;
+```
+
+### Macro Best Practices
+
+1. **Use macros for boilerplate reduction**: When you have repetitive patterns
+2. **Prefer procedural macros for complex logic**: They provide better error messages
+3. **Document macro expansions**: Show what code is generated
+4. **Keep macro logic simple**: Complex macros are hard to debug
+5. **Use type safety**: Let Rust's type system catch errors at compile time
 
 ### SQLite Storage Details
 
