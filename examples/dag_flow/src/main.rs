@@ -1,7 +1,7 @@
 use anyhow::{Error, Result};
 use dagger::{
     insert_value, parse_input_from_name, register_action, serialize_cache_to_prettyjson, 
-    DagExecutionReport, DagExecutor, Node, WorkflowSpec, NodeAction, ExecutionContext,
+    DagExecutionReport, DagExecutor, Node, NodeAction, ExecutionContext,
 };
 use dagger::dag_flow::Cache;
 use std::collections::HashMap;
@@ -9,7 +9,8 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 // Performs addition of two f64 numbers.
 async fn add_numbers(_executor: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
@@ -66,22 +67,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config_parallel.max_parallel_nodes = 4; // Override default of 3 for this test
     
     let registry = Arc::new(RwLock::new(HashMap::new()));
-    let mut executor = DagExecutor::new(Some(config_sequential.clone()), registry.clone(), "dagger_db")?;
+    let mut executor = DagExecutor::new(Some(config_sequential.clone()), registry.clone(), "sqlite::memory:").await?;
 
     // Register the actions using register_action!
-    register_action!(executor, "add_numbers", add_numbers);
-    register_action!(executor, "square_number", square_number);
-    register_action!(executor, "triple_number_and_add_string", triple_number_and_add_string);
+    register_action!(executor, "add_numbers", add_numbers).await?;
+    register_action!(executor, "square_number", square_number).await?;
+    register_action!(executor, "triple_number_and_add_string", triple_number_and_add_string).await?;
 
     // Load both pipelines
     executor
         .load_yaml_file("pipeline.yaml")
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline.yaml: {}", e))?;
     executor
         .load_yaml_file("pipeline_parallel.yaml")
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline_parallel.yaml: {}", e))?;
 
-    let dag_names = executor.list_dags()?;
+    let dag_names = executor.list_dags().await?;
     println!("Loaded DAGs: {:#?}", dag_names);
 
     let cache = Cache::new();
@@ -130,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Cache as JSON:\n{}", json_output);
     println!("DAG Execution Report: {:#?}", dag_report);
 
-    let dot_output = executor.serialize_tree_to_dot("parallel_demo")?;
+    let dot_output = executor.serialize_tree_to_dot("parallel_demo").await?;
     println!("Execution Tree (DOT):\n{}", dot_output);
 
     Ok(())

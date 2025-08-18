@@ -1,10 +1,10 @@
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 
 // Type aliases
 pub type TaskId = u64;
@@ -14,8 +14,8 @@ pub type AgentId = u16;
 /// Task durability mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Durability {
-    BestEffort,   // Idempotent - safe to rerun
-    AtMostOnce,   // Must not rerun automatically
+    BestEffort, // Idempotent - safe to rerun
+    AtMostOnce, // Must not rerun automatically
 }
 
 /// Task status with atomic representation
@@ -73,7 +73,7 @@ pub struct Task {
     pub retry_count: AtomicU8,
     pub dependencies: SmallVec<[TaskId; 4]>,
     pub payload: Arc<TaskPayload>,
-    
+
     // Additional fields
     pub parent: Option<TaskId>,
     pub task_type: TaskType,
@@ -81,12 +81,12 @@ pub struct Task {
     pub timeout: Option<Duration>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    
+
     // Optional fields from architect's extended design
     pub acceptance_criteria: Option<Arc<str>>,
     pub status_reason: Option<Arc<str>>,
     pub summary: Option<Arc<str>>,
-    
+
     // Error storage
     pub error: Option<Bytes>,
 }
@@ -126,9 +126,9 @@ pub struct Job {
 /// Agent error types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentError {
-    User(String),          // Serializable user error
-    System(String),        // System error (from anyhow)
-    Timeout(Duration),     // Timeout error
+    User(String),      // Serializable user error
+    System(String),    // System error (from anyhow)
+    Timeout(Duration), // Timeout error
 }
 
 impl AgentError {
@@ -185,7 +185,7 @@ impl Task {
             error: None,
         }
     }
-    
+
     /// Record an error
     pub fn record_error(&self, err: &AgentError) {
         let error_bytes = match err {
@@ -202,14 +202,14 @@ impl Task {
 mod atomic_u8 {
     use super::*;
     use serde::{Deserializer, Serializer};
-    
+
     pub fn serialize<S>(atomic: &AtomicU8, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_u8(atomic.load(Ordering::Relaxed))
     }
-    
+
     pub fn deserialize<'de, D>(deserializer: D) -> Result<AtomicU8, D::Error>
     where
         D: Deserializer<'de>,

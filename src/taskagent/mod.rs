@@ -1,7 +1,7 @@
 pub mod taskagent;
 // pub mod enhanced_taskagent;
-pub mod registry;
 pub mod errors;
+pub mod registry;
 pub mod taskagent_builder;
 
 // Re-export all the key structs and functions

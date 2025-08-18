@@ -10,8 +10,8 @@ use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::dag_flow::Cache;
 use crate::core::errors::{DaggerError, Result as DaggerResult};
+use crate::dag_flow::Cache;
 
 /// A message in the pub/sub system
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -372,7 +372,7 @@ impl PubSubExecutor {
                                 // Create a mutable executor for the agent to use
                                 let config = PubSubConfig::default();
                                 let mut executor = PubSubExecutor::new(Some(config));
-                                
+
                                 // Copy channels and agents to the new executor
                                 {
                                     let channels_read = channels.read().await;
@@ -419,7 +419,10 @@ impl PubSubExecutor {
     /// Get list of registered agents
     pub async fn list_agents(&self) -> Vec<AgentMetadata> {
         let agents = self.agents.read().await;
-        agents.values().map(|entry| entry.metadata.clone()).collect()
+        agents
+            .values()
+            .map(|entry| entry.metadata.clone())
+            .collect()
     }
 
     /// Get list of available channels
@@ -493,7 +496,9 @@ mod tests {
                 "response": format!("Processed: {}", message.payload["message"].as_str().unwrap_or(""))
             });
             let response = Message::new(node_id.to_string(), response_payload);
-            executor.publish("test_output", response, cache, None).await?;
+            executor
+                .publish("test_output", response, cache, None)
+                .await?;
             Ok(())
         }
     }
@@ -501,13 +506,13 @@ mod tests {
     #[tokio::test]
     async fn test_basic_pubsub() {
         let mut executor = PubSubExecutor::new(None);
-        
+
         let agent = Arc::new(TestAgent {
             name: "test_agent".to_string(),
         });
-        
+
         executor.register_agent(agent).await.unwrap();
-        
+
         let agents = executor.list_agents().await;
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "test_agent");

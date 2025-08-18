@@ -1,7 +1,7 @@
 // use crate::core::builders::DaggerConfig;
 use crate::core::errors::{DaggerError, Result};
-use crate::core::memory::Cache;
 use crate::core::limits::ResourceTracker;
+use crate::core::memory::Cache;
 // use crate::core::concurrency::{ConcurrentTaskRegistry, TaskNotificationSystem, AtomicTaskState};
 // use crate::core::performance::PerformanceMonitor;
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,7 @@ impl Default for AgentResourceLimits {
         Self {
             max_memory_bytes: 512 * 1024 * 1024, // 512MB
             max_cpu_percent: 80.0,
-            max_disk_bytes: 1024 * 1024 * 1024, // 1GB
+            max_disk_bytes: 1024 * 1024 * 1024,          // 1GB
             max_network_bytes_per_sec: 10 * 1024 * 1024, // 10MB/s
             max_file_handles: 100,
         }
@@ -412,11 +412,15 @@ impl TaskAgentBuilder {
         }
 
         if self.config.max_concurrent_tasks == 0 {
-            return Err(DaggerError::configuration("max_concurrent_tasks must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_concurrent_tasks must be greater than 0",
+            ));
         }
 
         if self.config.supported_task_types.is_empty() {
-            return Err(DaggerError::configuration("Agent must support at least one task type"));
+            return Err(DaggerError::configuration(
+                "Agent must support at least one task type",
+            ));
         }
 
         Ok(())
@@ -646,11 +650,7 @@ impl TaskAgentBuilder {
         Self::new()
             .max_concurrent_tasks(10)
             .support_types(task_types)
-            .capabilities(|caps| {
-                caps.caching(true)
-                    .validation(true)
-                    .retries(true)
-            })
+            .capabilities(|caps| caps.caching(true).validation(true).retries(true))
     }
 }
 
@@ -685,7 +685,10 @@ mod tests {
 
         assert_eq!(config.name, "test_agent");
         assert_eq!(config.max_concurrent_tasks, 10);
-        assert_eq!(config.supported_task_types, vec!["processor", "transformer"]);
+        assert_eq!(
+            config.supported_task_types,
+            vec!["processor", "transformer"]
+        );
         assert!(config.capabilities.caching);
         assert!(config.capabilities.streaming);
         assert!(config.resource_limits.is_some());
@@ -695,7 +698,14 @@ mod tests {
     fn test_preset_configurations() {
         let lightweight = TaskAgentBuilder::lightweight().build().unwrap();
         assert_eq!(lightweight.max_concurrent_tasks, 2);
-        assert_eq!(lightweight.resource_limits.as_ref().unwrap().max_memory_bytes, 256 * 1024 * 1024);
+        assert_eq!(
+            lightweight
+                .resource_limits
+                .as_ref()
+                .unwrap()
+                .max_memory_bytes,
+            256 * 1024 * 1024
+        );
 
         let high_perf = TaskAgentBuilder::high_performance().build().unwrap();
         assert_eq!(high_perf.max_concurrent_tasks, 20);
@@ -704,7 +714,10 @@ mod tests {
         let specialized = TaskAgentBuilder::specialized(vec!["ml_training", "data_processing"])
             .build()
             .unwrap();
-        assert_eq!(specialized.supported_task_types, vec!["ml_training", "data_processing"]);
+        assert_eq!(
+            specialized.supported_task_types,
+            vec!["ml_training", "data_processing"]
+        );
     }
 
     #[test]
@@ -718,7 +731,9 @@ mod tests {
         assert!(result.is_err());
 
         // Test empty task types
-        let result = TaskAgentBuilder::new().supported_task_types(Vec::<String>::new()).build();
+        let result = TaskAgentBuilder::new()
+            .supported_task_types(Vec::<String>::new())
+            .build();
         assert!(result.is_err());
     }
 }

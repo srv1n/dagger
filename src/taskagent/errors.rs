@@ -33,7 +33,7 @@ pub enum TaskError {
     #[error("Invalid task input: {0}")]
     InvalidTaskInput(String), // More specific input validation
     #[error("Invalid task output: {0}")]
-    InvalidTaskOutput(String),  // More specific output validation
+    InvalidTaskOutput(String), // More specific output validation
 
     // Job-Specific Errors
     #[error("Job stalled: {0}")]

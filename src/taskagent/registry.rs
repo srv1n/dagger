@@ -1,9 +1,9 @@
+use super::taskagent::TaskAgent;
+use anyhow::Result;
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use anyhow::Result;
-use std::any::{Any, TypeId};
-use super::taskagent::TaskAgent;
 
 #[derive(Clone)]
 pub struct GlobalAgentRegistry {
@@ -29,7 +29,9 @@ impl GlobalAgentRegistry {
 
     pub async fn create_agent(&self, name: &str) -> Result<Arc<dyn TaskAgent>> {
         let agents = self.agents.read().await;
-        let factory = agents.get(name).ok_or(anyhow::anyhow!("Agent {} not found", name))?;
+        let factory = agents
+            .get(name)
+            .ok_or(anyhow::anyhow!("Agent {} not found", name))?;
         Ok(factory())
     }
 
@@ -42,7 +44,6 @@ impl GlobalAgentRegistry {
 lazy_static::lazy_static! {
     pub static ref GLOBAL_REGISTRY: GlobalAgentRegistry = GlobalAgentRegistry::new();
 }
-
 
 #[derive(Default)]
 pub struct TypeRegistry {
@@ -64,7 +65,8 @@ impl TypeRegistry {
 
     pub async fn get<T: 'static + Clone + Send + Sync>(&self) -> Option<T> {
         let types = self.types.read().await;
-        types.get(&TypeId::of::<T>())
+        types
+            .get(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref::<T>())
             .cloned()
     }

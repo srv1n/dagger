@@ -33,7 +33,7 @@ async-trait = "0.1.86"
 chrono = { version = "0.4.35", features = ["serde"] }
 dyn-clone = "1.0.17"
 lazy_static = "1.4.0"
-sled = "0.34"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "json", "chrono"] }
 zstd = "0.13"
 cuid2 = "0.1.4"
 thiserror = "1.0"
@@ -48,7 +48,11 @@ linkme = "0.3"
 uuid = { version = "1.0", features = ["v4"] }
 tracing-subscriber = "0.3"
 fastrand = "2.0"
+parking_lot = "0.12"
+bytes = "1.0"
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"
+tempfile = "3.0"
+colored = "2.0"
 

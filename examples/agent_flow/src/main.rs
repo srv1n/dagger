@@ -6,7 +6,8 @@ use dagger::{
 };
 use async_openai::{Client, ChatCompletionBuilder}; // Hypothetical async OpenAI client
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -21,7 +22,7 @@ async fn main() -> Result<()> {
 
     // Initialize Dagger executor
     let registry = Arc::new(RwLock::new(std::collections::HashMap::new()));
-    let mut executor = DagExecutor::new(None, registry.clone(), "dagger_db")?;
+    let mut executor = DagExecutor::new(None, registry.clone(), "sqlite::memory:").await?;
 
     // Register actions
     register_action!(executor, "supervisor_step", supervisor_step);

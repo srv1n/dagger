@@ -115,7 +115,7 @@ mod tests {
     #[test]
     fn test_basic_operations() {
         let queue = ReadyQueue::new(3);
-        
+
         // Test empty queue
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
@@ -269,7 +269,7 @@ mod tests {
 
         // Should have performed many operations without issues
         assert!(total_operations > 0);
-        
+
         // Clear the queue to check final state
         queue.clear();
         assert!(queue.is_empty());
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_clear_concurrent() {
         let queue = Arc::new(ReadyQueue::new(100));
-        
+
         // Fill the queue
         for i in 0..50 {
             queue.push(i);

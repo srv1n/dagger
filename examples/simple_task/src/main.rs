@@ -1,12 +1,12 @@
 use anyhow::Result;
 use dagger::{
-    Cache, DagExecutor, ExecutionMode, WorkflowSpec,
+    Cache, DagExecutor, ExecutionMode,
     insert_value, register_action,
     Node, NodeAction,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use tokio::sync::{oneshot, RwLock};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -27,10 +27,10 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     let registry = Arc::new(RwLock::new(HashMap::new()));
-    let mut executor = DagExecutor::new(None, registry.clone(), "simple_db")?;
+    let mut executor = DagExecutor::new(None, registry.clone(), "sqlite::memory:").await?;
 
     // Register action
-    register_action!(executor, "hello_world", hello_world);
+    register_action!(executor, "hello_world", hello_world).await?;
 
     let cache = Cache::new();
     let (_cancel_tx, cancel_rx) = oneshot::channel::<()>();

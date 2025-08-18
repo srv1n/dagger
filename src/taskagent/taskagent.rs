@@ -7,7 +7,7 @@ use dashmap::{DashMap, DashSet};
 use linkme;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sled::{Db, IVec};
+// Removed sled import - persistence is now handled by newer task-core system
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::path::Path;
@@ -485,48 +485,30 @@ impl TaskExecutor {
         }
     }
 
-    /// Persists the current state of the job to sled
+    /// Persists the current state of the job (no-op - use newer task-core system for persistence)
     pub fn persist_state(&self) -> Result<()> {
-        if let Some(sled_path) = &self.config.sled_db_path {
-            self.task_manager
-                .persist_job_state(&self.job_id, sled_path)?;
-            info!(
-                "Persisted state for job {} to sled at {:?}",
-                self.job_id, sled_path
-            );
-        }
+        warn!("persist_state is deprecated - use the newer task-core system for persistence");
         Ok(())
     }
 
-    /// Rehydrates the state of the job from sled
+    /// Rehydrates the state of the job (no-op - use newer task-core system for persistence)
     pub fn rehydrate_state(&self) -> Result<()> {
-        if let Some(sled_path) = &self.config.sled_db_path {
-            self.task_manager
-                .rehydrate_job_state(&self.job_id, sled_path)?;
-            info!(
-                "Rehydrated state for job {} from sled at {:?}",
-                self.job_id, sled_path
-            );
-        }
+        warn!("rehydrate_state is deprecated - use the newer task-core system for persistence");
         Ok(())
     }
 
-    /// Resumes a previously paused job from sled storage
+    /// Resumes a previously paused job (deprecated - use newer task-core system)
     pub async fn resume_job(
         &mut self,
         job_id: String,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<TaskExecutionReport> {
+        warn!("resume_job is deprecated - use the newer task-core system for job resumption");
+        
         // Update the job ID
         self.job_id = job_id.clone();
 
-        // Rehydrate the state from sled
-        if let Some(sled_path) = &self.config.sled_db_path {
-            info!("Resuming job {} from sled storage", job_id);
-            self.task_manager.rehydrate_job_state(&job_id, sled_path)?;
-        } else {
-            return Err(anyhow!("Cannot resume job without sled storage path"));
-        }
+        // Skip sled rehydration - deprecated functionality
 
         // Reset the stopped flag
         *self.stopped.write().await = false;
@@ -602,6 +584,7 @@ pub struct TaskManager {
     pub last_activity: Arc<DashMap<String, Instant>>,
     pub cache: Arc<Cache>,
     pub agent_registry: Arc<TaskAgentRegistry>,
+    // Deprecated: sled_db_path - use newer task-core system for persistence
     pub sled_db_path: Option<PathBuf>,
     pub jobs: Arc<DashMap<String, JobHandle>>,
 }
@@ -1542,120 +1525,15 @@ impl TaskManager {
         dot
     }
 
-    /// Persists the entire state of a job to the sled database
-    pub fn persist_job_state(&self, job_id: &str, sled_path: &Path) -> Result<()> {
-        // Open the sled database
-        let db = sled::open(sled_path)?;
-
-        // Get all tasks for this job
-        if let Some(task_ids) = self.tasks_by_job.get(job_id) {
-            // Create a tree for this job
-            let job_tree = db.open_tree(format!("job_{}", job_id))?;
-
-            // Store job metadata
-            if let Some(last_activity) = self.last_activity.get(job_id) {
-                let elapsed = last_activity.elapsed().as_secs();
-                job_tree.insert("last_activity", bincode::serialize(&elapsed)?)?;
-            }
-
-            // Store all tasks
-            for task_id_ref in task_ids.iter() {
-                let task_id = task_id_ref.key();
-                if let Some(task) = self.tasks_by_id.get(task_id) {
-                    // Serialize the task
-                    let task_data = bincode::serialize(&*task)?;
-
-                    // Store in sled
-                    job_tree.insert(format!("task_{}", task_id), task_data)?;
-                }
-            }
-
-            // Store ready tasks
-            // let mut ready_tasks_for_job = Vec::new();
-            // for task_id in self.ready_tasks.iter() {
-            //     if let Some(task) = self.tasks_by_id.get(task_id.key()) {
-            //         if task.job_id == job_id {
-            //             ready_tasks_for_job.push(task_id.key().clone());
-            //         }
-            //     }
-            // }
-            // job_tree.insert("ready_tasks", bincode::serialize(&ready_tasks_for_job)?)?;
-
-            // Flush to ensure data is written
-            job_tree.flush()?;
-            db.flush()?;
-        }
-
+    /// Persists the entire state of a job (deprecated - use newer task-core system)
+    pub fn persist_job_state(&self, _job_id: &str, _sled_path: &Path) -> Result<()> {
+        warn!("persist_job_state is deprecated - use the newer task-core system for persistence");
         Ok(())
     }
 
-    /// Rehydrates a job's state from the sled database
-    pub fn rehydrate_job_state(&self, job_id: &str, sled_path: &Path) -> Result<()> {
-        // Open the sled database
-        let db = sled::open(sled_path)?;
-
-        // Try to open the tree for this job
-        if let Ok(job_tree) = db.open_tree(format!("job_{}", job_id)) {
-            // Clear any existing state for this job
-            self.clear_job_state(job_id);
-
-            // Rehydrate tasks
-            for result in job_tree.iter() {
-                let (key, value) = result?;
-                let key_str = String::from_utf8(key.to_vec())?;
-
-                if key_str.starts_with("task_") {
-                    // Deserialize task
-                    let task: Task = bincode::deserialize(&value)?;
-
-                    // Add to tasks_by_id
-                    self.tasks_by_id.insert(task.task_id.clone(), task.clone());
-
-                    // Add to tasks_by_job
-                    if let Some(job_tasks) = self.tasks_by_job.get_mut(job_id) {
-                        job_tasks.insert(task.task_id.clone());
-                    } else {
-                        let mut set = DashSet::new();
-                        set.insert(task.task_id.clone());
-                        self.tasks_by_job.insert(task.job_id.clone(), set);
-                    }
-
-                    // Add to tasks_by_assignee
-                    if let Some(assignee_tasks) = self.tasks_by_assignee.get_mut(&task.agent) {
-                        assignee_tasks.insert(task.task_id.clone());
-                    } else {
-                        let mut set = DashSet::new();
-                        set.insert(task.task_id.clone());
-                        self.tasks_by_assignee.insert(task.agent.clone(), set);
-                    }
-
-                    // Add to tasks_by_status
-                    if let Some(status_tasks) = self.tasks_by_status.get_mut(&task.status) {
-                        status_tasks.insert(task.task_id.clone());
-                    } else {
-                        let mut set = DashSet::new();
-                        set.insert(task.task_id.clone());
-                        self.tasks_by_status.insert(task.status.clone(), set);
-                    }
-
-                    // Add to tasks_by_parent if applicable
-                    if let Some(parent_id) = &task.parent_task_id {
-                        if let Some(parent_tasks) = self.tasks_by_parent.get_mut(parent_id) {
-                            parent_tasks.insert(task.task_id.clone());
-                        }
-                    }
-                } else if key_str == "last_activity" {
-                    // Rehydrate last activity
-                    let elapsed_secs: u64 = bincode::deserialize(&value)?;
-                    let now = Instant::now();
-                    let last_activity = now - Duration::from_secs(elapsed_secs);
-                    self.last_activity.insert(job_id.to_string(), last_activity);
-                }
-            }
-        } else {
-            return Err(anyhow!("No saved state found for job {}", job_id));
-        }
-
+    /// Rehydrates a job's state (deprecated - use newer task-core system)
+    pub fn rehydrate_job_state(&self, _job_id: &str, _sled_path: &Path) -> Result<()> {
+        warn!("rehydrate_job_state is deprecated - use the newer task-core system for persistence");
         Ok(())
     }
 
@@ -1948,6 +1826,7 @@ pub struct TaskConfiguration {
     pub max_execution_time: Option<Duration>,
     pub retry_strategy: RetryStrategy,
     pub human_timeout_action: HumanTimeoutAction,
+    // Deprecated: sled_db_path - use newer task-core system for persistence
     pub sled_db_path: Option<PathBuf>,
 }
 

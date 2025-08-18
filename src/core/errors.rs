@@ -103,10 +103,7 @@ pub enum DaggerError {
 
     /// Timeout errors
     #[error("Operation timed out: {operation} (timeout: {timeout_ms}ms)")]
-    Timeout {
-        operation: String,
-        timeout_ms: u64,
-    },
+    Timeout { operation: String, timeout_ms: u64 },
 
     /// Cancellation errors
     #[error("Operation was cancelled: {operation}")]
@@ -126,10 +123,7 @@ pub enum DaggerError {
 
 impl DaggerError {
     /// Create an execution error with context
-    pub fn execution<S: Into<String>>(
-        component: S,
-        message: S,
-    ) -> Self {
+    pub fn execution<S: Into<String>>(component: S, message: S) -> Self {
         Self::Execution {
             component: component.into(),
             message: message.into(),
@@ -154,18 +148,17 @@ impl DaggerError {
 
     /// Add context to an execution error
     pub fn with_context<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
-        if let Self::Execution { ref mut context, .. } = self {
+        if let Self::Execution {
+            ref mut context, ..
+        } = self
+        {
             context.insert(key.into(), value.into());
         }
         self
     }
 
     /// Create a resource exhaustion error
-    pub fn resource_exhausted<S: Into<String>>(
-        resource: S,
-        current: u64,
-        limit: u64,
-    ) -> Self {
+    pub fn resource_exhausted<S: Into<String>>(resource: S, current: u64, limit: u64) -> Self {
         Self::ResourceExhaustion {
             resource: resource.into(),
             current,
@@ -185,10 +178,7 @@ impl DaggerError {
     }
 
     /// Create a validation error with field
-    pub fn validation_field<S: Into<String>, F: Into<String>>(
-        message: S,
-        field: F,
-    ) -> Self {
+    pub fn validation_field<S: Into<String>, F: Into<String>>(message: S, field: F) -> Self {
         Self::Validation {
             message: message.into(),
             field: Some(field.into()),
@@ -347,11 +337,7 @@ impl From<serde_json::Error> for DaggerError {
     }
 }
 
-impl From<sled::Error> for DaggerError {
-    fn from(err: sled::Error) -> Self {
-        Self::database("sled_operation", err)
-    }
-}
+// Removed sled::Error conversion as Sled is no longer used
 
 impl From<anyhow::Error> for DaggerError {
     fn from(err: anyhow::Error) -> Self {
@@ -377,7 +363,10 @@ impl ErrorContext {
     }
 
     pub fn apply_to_error(self, mut error: DaggerError) -> DaggerError {
-        if let DaggerError::Execution { ref mut context, .. } = error {
+        if let DaggerError::Execution {
+            ref mut context, ..
+        } = error
+        {
             context.extend(self.context);
         }
         error
@@ -423,7 +412,7 @@ mod tests {
         let err = DaggerError::execution("test", "message")
             .with_context("key1", "value1")
             .with_context("key2", "value2");
-        
+
         if let DaggerError::Execution { context, .. } = err {
             assert_eq!(context.get("key1"), Some(&"value1".to_string()));
             assert_eq!(context.get("key2"), Some(&"value2".to_string()));
@@ -443,7 +432,7 @@ mod tests {
     fn test_macro() {
         let err = dagger_error!(execution, "component", "message");
         assert!(matches!(err, DaggerError::Execution { .. }));
-        
+
         let err = dagger_error!(validation, "invalid input");
         assert!(matches!(err, DaggerError::Validation { .. }));
     }

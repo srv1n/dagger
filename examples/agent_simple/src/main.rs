@@ -7,7 +7,8 @@ use dagger::{
 use dagger_macros::action;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -91,7 +92,7 @@ async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder().with_max_level(Level::INFO).finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
     let registry = Arc::new(RwLock::new(HashMap::new()));
-    let mut executor = DagExecutor::new(None, registry.clone(), "dagger_db")?;
+    let mut executor = DagExecutor::new(None, registry.clone(), "sqlite::memory:").await?;
 
     // Register actions using UPPERCASE static names with clone
     let _ = register_action!(executor, "supervisor_step", supervisor_step);

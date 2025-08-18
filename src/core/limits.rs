@@ -60,28 +60,44 @@ impl Default for ResourceLimits {
 impl ResourceLimits {
     pub fn validate(&self) -> Result<()> {
         if self.max_memory_bytes == 0 {
-            return Err(DaggerError::configuration("max_memory_bytes must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_memory_bytes must be greater than 0",
+            ));
         }
         if self.max_concurrent_tasks == 0 {
-            return Err(DaggerError::configuration("max_concurrent_tasks must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_concurrent_tasks must be greater than 0",
+            ));
         }
         if self.max_execution_tree_nodes == 0 {
-            return Err(DaggerError::configuration("max_execution_tree_nodes must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_execution_tree_nodes must be greater than 0",
+            ));
         }
         if self.max_cache_entries == 0 {
-            return Err(DaggerError::configuration("max_cache_entries must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_cache_entries must be greater than 0",
+            ));
         }
         if self.max_dependency_depth == 0 {
-            return Err(DaggerError::configuration("max_dependency_depth must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_dependency_depth must be greater than 0",
+            ));
         }
         if self.max_cpu_usage_percent <= 0.0 || self.max_cpu_usage_percent > 100.0 {
-            return Err(DaggerError::configuration("max_cpu_usage_percent must be between 0 and 100"));
+            return Err(DaggerError::configuration(
+                "max_cpu_usage_percent must be between 0 and 100",
+            ));
         }
         if self.max_message_size_bytes == 0 {
-            return Err(DaggerError::configuration("max_message_size_bytes must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_message_size_bytes must be greater than 0",
+            ));
         }
         if self.max_channel_queue_size == 0 {
-            return Err(DaggerError::configuration("max_channel_queue_size must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_channel_queue_size must be greater than 0",
+            ));
         }
         Ok(())
     }
@@ -129,7 +145,7 @@ impl ResourceLimits {
 #[derive(Debug)]
 pub struct ResourceTracker {
     limits: ResourceLimits,
-    
+
     // Current usage counters
     memory_usage: AtomicU64,
     concurrent_tasks: AtomicUsize,
@@ -137,10 +153,10 @@ pub struct ResourceTracker {
     cache_entries: AtomicUsize,
     file_handles: AtomicUsize,
     network_connections: AtomicUsize,
-    
+
     // Execution time tracking
     start_time: RwLock<Option<Instant>>,
-    
+
     // Statistics
     peak_memory_usage: AtomicU64,
     peak_concurrent_tasks: AtomicUsize,
@@ -151,7 +167,7 @@ pub struct ResourceTracker {
 impl ResourceTracker {
     pub fn new(limits: ResourceLimits) -> Result<Self> {
         limits.validate()?;
-        
+
         Ok(Self {
             limits,
             memory_usage: AtomicU64::new(0),
@@ -193,7 +209,7 @@ impl ResourceTracker {
     pub fn allocate_memory(&self, bytes: u64) -> Result<MemoryAllocation> {
         let current = self.memory_usage.load(Ordering::Relaxed);
         let new_total = current + bytes;
-        
+
         if new_total > self.limits.max_memory_bytes {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -204,7 +220,7 @@ impl ResourceTracker {
         }
 
         self.memory_usage.store(new_total, Ordering::Relaxed);
-        
+
         // Update peak
         let current_peak = self.peak_memory_usage.load(Ordering::Relaxed);
         if new_total > current_peak {
@@ -230,7 +246,7 @@ impl ResourceTracker {
     pub fn start_task(&self) -> Result<TaskExecution> {
         let current = self.concurrent_tasks.load(Ordering::Relaxed);
         let new_total = current + 1;
-        
+
         if new_total > self.limits.max_concurrent_tasks {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -241,11 +257,12 @@ impl ResourceTracker {
         }
 
         self.concurrent_tasks.store(new_total, Ordering::Relaxed);
-        
+
         // Update peak
         let current_peak = self.peak_concurrent_tasks.load(Ordering::Relaxed);
         if new_total > current_peak {
-            self.peak_concurrent_tasks.store(new_total, Ordering::Relaxed);
+            self.peak_concurrent_tasks
+                .store(new_total, Ordering::Relaxed);
         }
 
         self.total_tasks_executed.fetch_add(1, Ordering::Relaxed);
@@ -275,7 +292,10 @@ impl ResourceTracker {
             ));
         }
 
-        debug!("Ended task, concurrent: {}, duration: {:?}", new_total, execution_time);
+        debug!(
+            "Ended task, concurrent: {}, duration: {:?}",
+            new_total, execution_time
+        );
         Ok(())
     }
 
@@ -283,7 +303,7 @@ impl ResourceTracker {
     pub fn add_execution_tree_node(&self) -> Result<()> {
         let current = self.execution_tree_nodes.load(Ordering::Relaxed);
         let new_total = current + 1;
-        
+
         if new_total > self.limits.max_execution_tree_nodes {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -293,7 +313,8 @@ impl ResourceTracker {
             ));
         }
 
-        self.execution_tree_nodes.store(new_total, Ordering::Relaxed);
+        self.execution_tree_nodes
+            .store(new_total, Ordering::Relaxed);
         Ok(())
     }
 
@@ -301,14 +322,15 @@ impl ResourceTracker {
     pub fn remove_execution_tree_node(&self) {
         let current = self.execution_tree_nodes.load(Ordering::Relaxed);
         let new_total = current.saturating_sub(1);
-        self.execution_tree_nodes.store(new_total, Ordering::Relaxed);
+        self.execution_tree_nodes
+            .store(new_total, Ordering::Relaxed);
     }
 
     /// Add cache entry
     pub fn add_cache_entry(&self) -> Result<()> {
         let current = self.cache_entries.load(Ordering::Relaxed);
         let new_total = current + 1;
-        
+
         if new_total > self.limits.max_cache_entries {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -333,7 +355,7 @@ impl ResourceTracker {
     pub fn open_file_handle(&self) -> Result<FileHandle> {
         let current = self.file_handles.load(Ordering::Relaxed);
         let new_total = current + 1;
-        
+
         if new_total > self.limits.max_file_handles {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -360,7 +382,7 @@ impl ResourceTracker {
     pub fn open_network_connection(&self) -> Result<NetworkConnection> {
         let current = self.network_connections.load(Ordering::Relaxed);
         let new_total = current + 1;
-        
+
         if new_total > self.limits.max_network_connections {
             self.total_limit_violations.fetch_add(1, Ordering::Relaxed);
             return Err(DaggerError::resource_exhausted(
@@ -441,14 +463,23 @@ impl ResourceTracker {
     /// Get resource utilization percentages
     pub fn get_utilization(&self) -> ResourceUtilization {
         let stats = self.get_usage_stats();
-        
+
         ResourceUtilization {
-            memory_utilization: (stats.memory_usage as f64 / self.limits.max_memory_bytes as f64) * 100.0,
-            task_utilization: (stats.concurrent_tasks as f64 / self.limits.max_concurrent_tasks as f64) * 100.0,
-            tree_utilization: (stats.execution_tree_nodes as f64 / self.limits.max_execution_tree_nodes as f64) * 100.0,
-            cache_utilization: (stats.cache_entries as f64 / self.limits.max_cache_entries as f64) * 100.0,
-            file_utilization: (stats.file_handles as f64 / self.limits.max_file_handles as f64) * 100.0,
-            network_utilization: (stats.network_connections as f64 / self.limits.max_network_connections as f64) * 100.0,
+            memory_utilization: (stats.memory_usage as f64 / self.limits.max_memory_bytes as f64)
+                * 100.0,
+            task_utilization: (stats.concurrent_tasks as f64
+                / self.limits.max_concurrent_tasks as f64)
+                * 100.0,
+            tree_utilization: (stats.execution_tree_nodes as f64
+                / self.limits.max_execution_tree_nodes as f64)
+                * 100.0,
+            cache_utilization: (stats.cache_entries as f64 / self.limits.max_cache_entries as f64)
+                * 100.0,
+            file_utilization: (stats.file_handles as f64 / self.limits.max_file_handles as f64)
+                * 100.0,
+            network_utilization: (stats.network_connections as f64
+                / self.limits.max_network_connections as f64)
+                * 100.0,
         }
     }
 
@@ -616,10 +647,17 @@ mod tests {
         let limits = ResourceLimits::conservative();
         let tracker = ResourceTracker::new(limits.clone()).unwrap();
 
-        let _allocation = tracker.allocate_memory(limits.max_memory_bytes / 2).unwrap();
+        let _allocation = tracker
+            .allocate_memory(limits.max_memory_bytes / 2)
+            .unwrap();
         let utilization = tracker.get_utilization();
-        
+
         assert!((utilization.memory_utilization - 50.0).abs() < 1.0);
+        
+        // Allocate more to trigger approaching limits (>80%)
+        let _allocation2 = tracker
+            .allocate_memory((limits.max_memory_bytes * 35) / 100)
+            .unwrap();
         assert!(tracker.is_approaching_limits());
     }
 
@@ -627,13 +665,13 @@ mod tests {
     async fn test_execution_time_limits() {
         let mut limits = ResourceLimits::default();
         limits.max_total_execution_time = Duration::from_millis(100);
-        
+
         let tracker = ResourceTracker::new(limits.clone()).unwrap();
         tracker.start_execution().await;
 
         // Wait for limit to be exceeded
         sleep(Duration::from_millis(150)).await;
-        
+
         let result = tracker.check_execution_time().await;
         assert!(result.is_err());
     }
@@ -657,14 +695,20 @@ mod tests {
 
         // Message size validation
         assert!(tracker.validate_message_size(1000).is_ok());
-        assert!(tracker.validate_message_size(limits.max_message_size_bytes + 1).is_err());
+        assert!(tracker
+            .validate_message_size(limits.max_message_size_bytes + 1)
+            .is_err());
 
         // Dependency depth validation
         assert!(tracker.validate_dependency_depth(5).is_ok());
-        assert!(tracker.validate_dependency_depth(limits.max_dependency_depth + 1).is_err());
+        assert!(tracker
+            .validate_dependency_depth(limits.max_dependency_depth + 1)
+            .is_err());
 
         // Retry count validation
         assert!(tracker.validate_retry_count(2).is_ok());
-        assert!(tracker.validate_retry_count(limits.max_task_retries + 1).is_err());
+        assert!(tracker
+            .validate_retry_count(limits.max_task_retries + 1)
+            .is_err());
     }
 }

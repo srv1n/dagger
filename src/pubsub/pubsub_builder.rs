@@ -1,7 +1,7 @@
 // use crate::core::builders::DaggerConfig;
 use crate::core::errors::{DaggerError, Result};
-use crate::core::memory::Cache;
 use crate::core::limits::ResourceTracker;
+use crate::core::memory::Cache;
 // use crate::core::performance::PerformanceMonitor;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -478,7 +478,8 @@ impl PubSubBuilder {
     {
         let builder = SubscriptionBuilder::new();
         let subscription = configure(builder).build();
-        self.subscriptions.insert(subscription.name.clone(), subscription);
+        self.subscriptions
+            .insert(subscription.name.clone(), subscription);
         self
     }
 
@@ -495,7 +496,13 @@ impl PubSubBuilder {
     }
 
     /// Build the configuration
-    pub fn build(self) -> Result<(PubSubConfig, HashMap<String, ChannelConfig>, HashMap<String, SubscriptionConfig>)> {
+    pub fn build(
+        self,
+    ) -> Result<(
+        PubSubConfig,
+        HashMap<String, ChannelConfig>,
+        HashMap<String, SubscriptionConfig>,
+    )> {
         self.validate()?;
         Ok((self.config, self.channels, self.subscriptions))
     }
@@ -507,15 +514,21 @@ impl PubSubBuilder {
         }
 
         if self.config.max_channels == 0 {
-            return Err(DaggerError::configuration("max_channels must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_channels must be greater than 0",
+            ));
         }
 
         if self.config.max_subscribers_per_channel == 0 {
-            return Err(DaggerError::configuration("max_subscribers_per_channel must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_subscribers_per_channel must be greater than 0",
+            ));
         }
 
         if self.config.max_message_size_bytes == 0 {
-            return Err(DaggerError::configuration("max_message_size_bytes must be greater than 0"));
+            return Err(DaggerError::configuration(
+                "max_message_size_bytes must be greater than 0",
+            ));
         }
 
         // Validate subscriptions reference existing channels
@@ -930,7 +943,10 @@ mod tests {
         assert_eq!(config.name, "test_pubsub");
         assert_eq!(config.max_channels, 500);
         assert_eq!(config.max_message_size_bytes, 5 * 1024 * 1024);
-        assert!(matches!(config.delivery_guarantees, DeliveryGuarantees::ExactlyOnce));
+        assert!(matches!(
+            config.delivery_guarantees,
+            DeliveryGuarantees::ExactlyOnce
+        ));
         assert!(channels.contains_key("events"));
         assert!(subscriptions.contains_key("event_processor"));
         assert_eq!(subscriptions["event_processor"].channel, "events");
@@ -940,9 +956,7 @@ mod tests {
     fn test_validation() {
         // Test subscription referencing non-existent channel
         let result = PubSubBuilder::new()
-            .subscription(|sub| {
-                sub.name("test_sub").channel("nonexistent")
-            })
+            .subscription(|sub| sub.name("test_sub").channel("nonexistent"))
             .build();
 
         assert!(result.is_err());

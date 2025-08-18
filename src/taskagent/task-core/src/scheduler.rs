@@ -3,22 +3,22 @@ use dashmap::{DashMap, DashSet};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::storage::Storage;
-use crate::ready_queue::ReadyQueue;
 use crate::model::{Task, TaskStatus};
+use crate::ready_queue::ReadyQueue;
+use crate::storage::Storage;
 
 /// Scheduler manages task dependencies and scheduling
 pub struct Scheduler {
     /// Storage backend for task persistence
     storage: Arc<dyn Storage>,
-    
+
     /// Ready queue for tasks that are ready to execute
     ready_queue: Arc<ReadyQueue<String>>,
-    
+
     /// Index mapping task_id to dependent task_ids
     /// If task A depends on task B, then dependency_index[B] contains A
     dependency_index: Arc<DashMap<String, DashSet<String>>>,
-    
+
     /// Reverse index: mapping task_id to its dependencies
     /// If task A depends on task B, then task_dependencies[A] contains B
     task_dependencies: Arc<DashMap<String, DashSet<String>>>,
@@ -37,29 +37,36 @@ impl Scheduler {
 
     /// Handle task status changes and check if dependent tasks can be scheduled
     pub async fn on_status_change(&self, task_id: &str, new_status: TaskStatus) -> Result<()> {
-        debug!("Processing status change for task {} to {:?}", task_id, new_status);
+        debug!(
+            "Processing status change for task {} to {:?}",
+            task_id, new_status
+        );
 
         // Only process completed or failed tasks
         match new_status {
             TaskStatus::Completed | TaskStatus::Failed => {
                 // Get all tasks that depend on this task
                 if let Some(dependent_tasks) = self.dependency_index.get(task_id) {
-                    let dependents: Vec<String> = dependent_tasks.iter().map(|s| s.clone()).collect();
-                    
+                    let dependents: Vec<String> =
+                        dependent_tasks.iter().map(|s| s.clone()).collect();
+
                     debug!("Task {} has {} dependent tasks", task_id, dependents.len());
-                    
+
                     // Check each dependent task
                     for dependent_task_id in dependents {
                         self.check_and_schedule_task(&dependent_task_id).await?;
                     }
                 }
-                
+
                 // Clean up the completed/failed task from indices
                 self.remove_task_from_indices(task_id);
             }
             _ => {
                 // For other status changes, we don't need to check dependencies
-                debug!("Status change to {:?} for task {} - no dependency checks needed", new_status, task_id);
+                debug!(
+                    "Status change to {:?} for task {} - no dependency checks needed",
+                    new_status, task_id
+                );
             }
         }
 
@@ -79,19 +86,28 @@ impl Scheduler {
 
         // Skip if task is not pending
         if task.status != TaskStatus::Pending {
-            debug!("Task {} is not pending (status: {:?}), skipping", task_id, task.status);
+            debug!(
+                "Task {} is not pending (status: {:?}), skipping",
+                task_id, task.status
+            );
             return Ok(());
         }
 
         // Check if all dependencies are met
         if self.dependencies_met(&task).await? {
-            info!("All dependencies met for task {}, pushing to ready queue", task_id);
-            
+            info!(
+                "All dependencies met for task {}, pushing to ready queue",
+                task_id
+            );
+
             // Try to push to ready queue
             if self.ready_queue.push(task_id.to_string()) {
                 debug!("Successfully pushed task {} to ready queue", task_id);
             } else {
-                warn!("Failed to push task {} to ready queue (queue full)", task_id);
+                warn!(
+                    "Failed to push task {} to ready queue (queue full)",
+                    task_id
+                );
                 // The task remains pending and will be retried later
             }
         } else {
@@ -107,7 +123,11 @@ impl Scheduler {
             return Ok(true);
         }
 
-        debug!("Checking {} dependencies for task {}", task.dependencies.len(), task.task_id);
+        debug!(
+            "Checking {} dependencies for task {}",
+            task.dependencies.len(),
+            task.task_id
+        );
 
         for dep_id in &task.dependencies {
             // Get dependency task status
@@ -122,10 +142,16 @@ impl Scheduler {
             // Check if dependency is satisfied
             match dep_status {
                 TaskStatus::Completed | TaskStatus::Accepted => {
-                    debug!("Dependency {} is satisfied (status: {:?})", dep_id, dep_status);
+                    debug!(
+                        "Dependency {} is satisfied (status: {:?})",
+                        dep_id, dep_status
+                    );
                 }
                 _ => {
-                    debug!("Dependency {} is not satisfied (status: {:?})", dep_id, dep_status);
+                    debug!(
+                        "Dependency {} is not satisfied (status: {:?})",
+                        dep_id, dep_status
+                    );
                     return Ok(false);
                 }
             }
@@ -136,30 +162,41 @@ impl Scheduler {
 
     /// Add a task to the dependency tracking system
     pub async fn add_task(&self, task: &Task) -> Result<()> {
-        debug!("Adding task {} to scheduler with {} dependencies", 
-               task.task_id, task.dependencies.len());
+        debug!(
+            "Adding task {} to scheduler with {} dependencies",
+            task.task_id,
+            task.dependencies.len()
+        );
 
         // If task has no dependencies and is pending, add to ready queue immediately
         if task.dependencies.is_empty() && task.status == TaskStatus::Pending {
             if self.ready_queue.push(task.task_id.clone()) {
-                info!("Task {} has no dependencies, pushed to ready queue", task.task_id);
+                info!(
+                    "Task {} has no dependencies, pushed to ready queue",
+                    task.task_id
+                );
             } else {
-                warn!("Failed to push task {} to ready queue (queue full)", task.task_id);
+                warn!(
+                    "Failed to push task {} to ready queue (queue full)",
+                    task.task_id
+                );
             }
             return Ok(());
         }
 
         // Add task dependencies to the task_dependencies index
         if !task.dependencies.is_empty() {
-            let deps = self.task_dependencies
+            let deps = self
+                .task_dependencies
                 .entry(task.task_id.clone())
                 .or_insert_with(DashSet::new);
-            
+
             for dep_id in &task.dependencies {
                 deps.insert(dep_id.clone());
-                
+
                 // Add to dependency index (reverse mapping)
-                let dependents = self.dependency_index
+                let dependents = self
+                    .dependency_index
                     .entry(dep_id.clone())
                     .or_insert_with(DashSet::new);
                 dependents.insert(task.task_id.clone());
@@ -210,8 +247,11 @@ impl Scheduler {
             }
         }
 
-        debug!("Batch dependency check: {} of {} tasks are ready", 
-               ready_tasks.len(), task_ids.len());
+        debug!(
+            "Batch dependency check: {} of {} tasks are ready",
+            ready_tasks.len(),
+            task_ids.len()
+        );
 
         Ok(ready_tasks)
     }
@@ -244,7 +284,7 @@ impl Scheduler {
 
         // Get all tasks for the job
         let tasks = self.storage.list_tasks_by_job(job_id).await?;
-        
+
         debug!("Found {} tasks for job {}", tasks.len(), job_id);
 
         // Add all tasks to the scheduler
@@ -261,11 +301,14 @@ impl Scheduler {
 
         if !pending_tasks.is_empty() {
             let ready_tasks = self.batch_check_dependencies(&pending_tasks).await?;
-            
+
             // Push ready tasks to the queue
             for task_id in ready_tasks {
                 if !self.ready_queue.push(task_id.clone()) {
-                    warn!("Failed to push task {} to ready queue during initialization", task_id);
+                    warn!(
+                        "Failed to push task {} to ready queue during initialization",
+                        task_id
+                    );
                 }
             }
         }
@@ -297,15 +340,16 @@ pub struct SchedulerStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::model::{TaskOutput, TaskType};
+    use crate::sqlite_storage::SqliteStorage;
     use chrono::Utc;
     use serde_json::json;
-    use crate::model::{TaskOutput, TaskType};
-    use crate::storage::SledStorage;
+    use tempfile::TempDir;
 
     async fn create_test_scheduler() -> (Scheduler, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let storage = Arc::new(SledStorage::new(temp_dir.path()).unwrap()) as Arc<dyn Storage>;
+        let db_path = temp_dir.path().join("test.db");
+        let storage = Arc::new(SqliteStorage::open(db_path).await.unwrap()) as Arc<dyn Storage>;
         let ready_queue = Arc::new(ReadyQueue::new(100));
         let scheduler = Scheduler::new(storage, ready_queue);
         (scheduler, temp_dir)
@@ -341,16 +385,16 @@ mod tests {
     #[tokio::test]
     async fn test_task_with_no_dependencies() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create a task with no dependencies
         let task = create_test_task("task1", vec![], TaskStatus::Pending);
-        
+
         // Store the task
         scheduler.storage.put(&task).await.unwrap();
-        
+
         // Add task to scheduler
         scheduler.add_task(&task).await.unwrap();
-        
+
         // Task should be in ready queue
         assert_eq!(scheduler.ready_queue.len(), 1);
         assert_eq!(scheduler.ready_queue.pop(), Some("task1".to_string()));
@@ -359,67 +403,93 @@ mod tests {
     #[tokio::test]
     async fn test_dependency_tracking() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create tasks with dependencies
         let task_a = create_test_task("task_a", vec![], TaskStatus::Pending);
         let task_b = create_test_task("task_b", vec!["task_a".to_string()], TaskStatus::Pending);
         let task_c = create_test_task("task_c", vec!["task_b".to_string()], TaskStatus::Pending);
-        
+
         // Store tasks
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
         scheduler.storage.put(&task_c).await.unwrap();
-        
+
         // Add tasks to scheduler
         scheduler.add_task(&task_a).await.unwrap();
         scheduler.add_task(&task_b).await.unwrap();
         scheduler.add_task(&task_c).await.unwrap();
-        
+
         // Only task_a should be in ready queue
         assert_eq!(scheduler.ready_queue.len(), 1);
         assert_eq!(scheduler.ready_queue.pop(), Some("task_a".to_string()));
-        
+
         // Check dependency indices
-        assert_eq!(scheduler.get_dependent_tasks("task_a"), vec!["task_b".to_string()]);
-        assert_eq!(scheduler.get_dependent_tasks("task_b"), vec!["task_c".to_string()]);
-        assert_eq!(scheduler.get_task_dependencies("task_b"), vec!["task_a".to_string()]);
-        assert_eq!(scheduler.get_task_dependencies("task_c"), vec!["task_b".to_string()]);
+        assert_eq!(
+            scheduler.get_dependent_tasks("task_a"),
+            vec!["task_b".to_string()]
+        );
+        assert_eq!(
+            scheduler.get_dependent_tasks("task_b"),
+            vec!["task_c".to_string()]
+        );
+        assert_eq!(
+            scheduler.get_task_dependencies("task_b"),
+            vec!["task_a".to_string()]
+        );
+        assert_eq!(
+            scheduler.get_task_dependencies("task_c"),
+            vec!["task_b".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn test_on_status_change() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create dependency chain: A -> B -> C
         let task_a = create_test_task("task_a", vec![], TaskStatus::InProgress);
         let task_b = create_test_task("task_b", vec!["task_a".to_string()], TaskStatus::Pending);
         let task_c = create_test_task("task_c", vec!["task_b".to_string()], TaskStatus::Pending);
-        
+
         // Store tasks
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
         scheduler.storage.put(&task_c).await.unwrap();
-        
+
         // Add tasks to scheduler
         scheduler.add_task(&task_a).await.unwrap();
         scheduler.add_task(&task_b).await.unwrap();
         scheduler.add_task(&task_c).await.unwrap();
-        
+
         // Initially, ready queue should be empty (task_a is already InProgress)
         assert_eq!(scheduler.ready_queue.len(), 0);
-        
+
         // Complete task_a
-        scheduler.storage.update_status("task_a", TaskStatus::Completed).await.unwrap();
-        scheduler.on_status_change("task_a", TaskStatus::Completed).await.unwrap();
-        
+        scheduler
+            .storage
+            .update_status("task_a", TaskStatus::Completed)
+            .await
+            .unwrap();
+        scheduler
+            .on_status_change("task_a", TaskStatus::Completed)
+            .await
+            .unwrap();
+
         // task_b should now be in ready queue
         assert_eq!(scheduler.ready_queue.len(), 1);
         assert_eq!(scheduler.ready_queue.pop(), Some("task_b".to_string()));
-        
+
         // Complete task_b
-        scheduler.storage.update_status("task_b", TaskStatus::Completed).await.unwrap();
-        scheduler.on_status_change("task_b", TaskStatus::Completed).await.unwrap();
-        
+        scheduler
+            .storage
+            .update_status("task_b", TaskStatus::Completed)
+            .await
+            .unwrap();
+        scheduler
+            .on_status_change("task_b", TaskStatus::Completed)
+            .await
+            .unwrap();
+
         // task_c should now be in ready queue
         assert_eq!(scheduler.ready_queue.len(), 1);
         assert_eq!(scheduler.ready_queue.pop(), Some("task_c".to_string()));
@@ -428,39 +498,57 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_dependencies() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create tasks where C depends on both A and B
         let task_a = create_test_task("task_a", vec![], TaskStatus::Pending);
         let task_b = create_test_task("task_b", vec![], TaskStatus::Pending);
-        let task_c = create_test_task("task_c", vec!["task_a".to_string(), "task_b".to_string()], TaskStatus::Pending);
-        
+        let task_c = create_test_task(
+            "task_c",
+            vec!["task_a".to_string(), "task_b".to_string()],
+            TaskStatus::Pending,
+        );
+
         // Store tasks
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
         scheduler.storage.put(&task_c).await.unwrap();
-        
+
         // Add tasks to scheduler
         scheduler.add_task(&task_a).await.unwrap();
         scheduler.add_task(&task_b).await.unwrap();
         scheduler.add_task(&task_c).await.unwrap();
-        
+
         // Both A and B should be in ready queue
         assert_eq!(scheduler.ready_queue.len(), 2);
-        
+
         // Complete only task_a
-        scheduler.storage.update_status("task_a", TaskStatus::Completed).await.unwrap();
-        scheduler.on_status_change("task_a", TaskStatus::Completed).await.unwrap();
-        
+        scheduler
+            .storage
+            .update_status("task_a", TaskStatus::Completed)
+            .await
+            .unwrap();
+        scheduler
+            .on_status_change("task_a", TaskStatus::Completed)
+            .await
+            .unwrap();
+
         // task_c should not be ready yet (still waiting for task_b)
         let ready_tasks: Vec<String> = (0..scheduler.ready_queue.len())
             .filter_map(|_| scheduler.ready_queue.pop())
             .collect();
         assert!(!ready_tasks.contains(&"task_c".to_string()));
-        
+
         // Complete task_b
-        scheduler.storage.update_status("task_b", TaskStatus::Completed).await.unwrap();
-        scheduler.on_status_change("task_b", TaskStatus::Completed).await.unwrap();
-        
+        scheduler
+            .storage
+            .update_status("task_b", TaskStatus::Completed)
+            .await
+            .unwrap();
+        scheduler
+            .on_status_change("task_b", TaskStatus::Completed)
+            .await
+            .unwrap();
+
         // Now task_c should be ready
         assert_eq!(scheduler.ready_queue.pop(), Some("task_c".to_string()));
     }
@@ -468,23 +556,30 @@ mod tests {
     #[tokio::test]
     async fn test_failed_dependency() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create tasks with dependencies
         let task_a = create_test_task("task_a", vec![], TaskStatus::InProgress);
         let task_b = create_test_task("task_b", vec!["task_a".to_string()], TaskStatus::Pending);
-        
+
         // Store tasks
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
-        
+
         // Add tasks to scheduler
         scheduler.add_task(&task_a).await.unwrap();
         scheduler.add_task(&task_b).await.unwrap();
-        
+
         // Fail task_a
-        scheduler.storage.update_status("task_a", TaskStatus::Failed).await.unwrap();
-        scheduler.on_status_change("task_a", TaskStatus::Failed).await.unwrap();
-        
+        scheduler
+            .storage
+            .update_status("task_a", TaskStatus::Failed)
+            .await
+            .unwrap();
+        scheduler
+            .on_status_change("task_a", TaskStatus::Failed)
+            .await
+            .unwrap();
+
         // task_b should not be in ready queue (dependency failed)
         assert_eq!(scheduler.ready_queue.len(), 0);
     }
@@ -492,41 +587,41 @@ mod tests {
     #[tokio::test]
     async fn test_batch_dependency_check() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create multiple independent tasks
         let tasks: Vec<Task> = (0..5)
             .map(|i| create_test_task(&format!("task_{}", i), vec![], TaskStatus::Pending))
             .collect();
-        
+
         // Store and add tasks
         for task in &tasks {
             scheduler.storage.put(task).await.unwrap();
             // Don't add to scheduler yet to test batch check
         }
-        
+
         // Batch check should find all tasks ready
         let task_ids: Vec<String> = tasks.iter().map(|t| t.task_id.clone()).collect();
         let ready_tasks = scheduler.batch_check_dependencies(&task_ids).await.unwrap();
-        
+
         assert_eq!(ready_tasks.len(), 5);
     }
 
     #[tokio::test]
     async fn test_initialize_from_storage() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Create and store tasks
         let task_a = create_test_task("task_a", vec![], TaskStatus::Completed);
         let task_b = create_test_task("task_b", vec!["task_a".to_string()], TaskStatus::Pending);
         let task_c = create_test_task("task_c", vec!["task_b".to_string()], TaskStatus::Pending);
-        
+
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
         scheduler.storage.put(&task_c).await.unwrap();
-        
+
         // Initialize scheduler from storage
         scheduler.initialize_from_storage("test_job").await.unwrap();
-        
+
         // task_b should be ready (task_a is already completed)
         assert_eq!(scheduler.ready_queue.len(), 1);
         assert_eq!(scheduler.ready_queue.pop(), Some("task_b".to_string()));
@@ -535,17 +630,17 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_stats() {
         let (scheduler, _temp_dir) = create_test_scheduler().await;
-        
+
         // Add some tasks
         let task_a = create_test_task("task_a", vec![], TaskStatus::Pending);
         let task_b = create_test_task("task_b", vec!["task_a".to_string()], TaskStatus::Pending);
-        
+
         scheduler.storage.put(&task_a).await.unwrap();
         scheduler.storage.put(&task_b).await.unwrap();
-        
+
         scheduler.add_task(&task_a).await.unwrap();
         scheduler.add_task(&task_b).await.unwrap();
-        
+
         let stats = scheduler.get_stats();
         assert_eq!(stats.dependency_index_size, 1); // task_a has task_b as dependent
         assert_eq!(stats.task_dependencies_size, 1); // task_b has dependencies

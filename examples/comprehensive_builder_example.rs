@@ -1,12 +1,11 @@
-use dagger::{
-    DaggerBuilder, DagFlowBuilder, TaskAgentBuilder, PubSubBuilder,
-    DaggerConfig, Dagger
-};
-use dagger::pubsub_builder::{
-    DeliveryGuarantees, MessageOrdering, SubscriptionType, StartPosition
-};
-use dagger::dag_builder::{ErrorHandling, BackoffStrategy};
 use dagger::builders::LogLevel;
+use dagger::dag_builder::{BackoffStrategy, ErrorHandling};
+use dagger::pubsub_builder::{
+    DeliveryGuarantees, MessageOrdering, StartPosition, SubscriptionType,
+};
+use dagger::{
+    DagFlowBuilder, Dagger, DaggerBuilder, DaggerConfig, PubSubBuilder, TaskAgentBuilder,
+};
 use serde_json::json;
 use std::time::Duration;
 use tokio;
@@ -36,8 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_cpu_usage_percent(85.0)
         })
         .performance(|perf| {
-            perf
-                .async_serialization_threshold_kb(100)
+            perf.async_serialization_threshold_kb(100)
                 .database_batch_size(100)
                 .connection_pool_size(10)
                 .background_task_interval(Duration::from_secs(30))
@@ -46,23 +44,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .compression_threshold_mb(1)
         })
         .logging(|log| {
-            log
-                .info()
+            log.info()
                 .structured(true)
                 .max_file_size_mb(100)
                 .max_files(5)
         })
         .network(|net| {
-            net
-                .bind_address("0.0.0.0")
+            net.bind_address("0.0.0.0")
                 .port(8080)
                 .max_connections(1000)
                 .connection_timeout(Duration::from_secs(30))
                 .keep_alive(true)
         })
         .security(|sec| {
-            sec
-                .enable_auth(true)
+            sec.enable_auth(true)
                 .auth_token_ttl(Duration::from_secs(3600))
                 .enable_tls(false)
                 .rate_limit_requests_per_minute(10000)
@@ -94,11 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_metrics(true)
         .metadata("version", "1.0.0")
         .metadata("owner", "data-team")
-
         // Add nodes to the DAG
         .node(|node| {
-            node
-                .id("data_ingestion")
+            node.id("data_ingestion")
                 .name("Data Ingestion")
                 .description("Ingest data from external sources")
                 .node_type("ingestion")
@@ -112,8 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .metadata("estimated_duration", "5min")
         })
         .node(|node| {
-            node
-                .id("data_validation")
+            node.id("data_validation")
                 .name("Data Validation")
                 .description("Validate ingested data quality")
                 .node_type("validation")
@@ -130,8 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
         })
         .node(|node| {
-            node
-                .id("data_transformation")
+            node.id("data_transformation")
                 .name("Data Transformation")
                 .description("Transform and enrich data")
                 .node_type("transformation")
@@ -143,8 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .cacheable(true)
         })
         .node(|node| {
-            node
-                .id("data_analysis")
+            node.id("data_analysis")
                 .name("Data Analysis")
                 .description("Perform analytical computations")
                 .node_type("analysis")
@@ -156,8 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .metadata("resource_intensive", true)
         })
         .node(|node| {
-            node
-                .id("report_generation")
+            node.id("report_generation")
                 .name("Report Generation")
                 .description("Generate final reports")
                 .node_type("reporting")
@@ -167,13 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }))
                 .timeout(Duration::from_secs(120))
         })
-
         // Define dependencies
         .depends_on("data_validation", "data_ingestion")
         .depends_on("data_transformation", "data_validation")
         .depends_on_all("data_analysis", vec!["data_transformation"])
         .depends_on("report_generation", "data_analysis")
-
         .build()?;
 
     println!("✅ DAG pipeline configured with {} nodes", dag_nodes.len());
@@ -195,8 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .description("Handles ML and heavy computational tasks")
         .support_types(vec!["analysis", "ml_training", "transformation"])
         .capabilities(|caps| {
-            caps
-                .enable_all_basic()
+            caps.enable_all_basic()
                 .custom("gpu_enabled", true)
                 .custom("distributed_processing", true)
         })
@@ -220,8 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_concurrent_tasks(15)
         .task_timeout(Duration::from_secs(600))
         .capabilities(|caps| {
-            caps
-                .caching(true)
+            caps.caching(true)
                 .streaming(true)
                 .validation(true)
                 .custom("file_formats", json!(["csv", "json", "parquet", "avro"]))
@@ -239,17 +224,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_message_size_mb(5)
         .delivery_guarantees(DeliveryGuarantees::AtLeastOnce)
         .ordering(MessageOrdering::PerPublisher)
-        
         .retention_policy(|policy| {
             policy
                 .max_messages(10000)
                 .max_age(Duration::from_secs(3600 * 24)) // 24 hours
                 .max_storage_mb(100)
         })
-        
         .performance(|perf| {
-            perf
-                .channel_buffer_size(2000)
+            perf.channel_buffer_size(2000)
                 .batch_size(100)
                 .flush_interval(Duration::from_millis(50))
                 .worker_threads(8)
@@ -257,25 +239,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .compression_threshold(1024)
                 .async_persistence(true)
         })
-        
         .security(|sec| {
-            sec
-                .enable_publisher_auth(true)
+            sec.enable_publisher_auth(true)
                 .enable_subscriber_auth(true)
                 .enable_encryption(false)
                 .enable_acl(true)
                 .rate_limiting(|rate| {
-                    rate
-                        .max_messages_per_sec(1000)
+                    rate.max_messages_per_sec(1000)
                         .max_bytes_per_sec(10 * 1024 * 1024) // 10MB/s
                         .window_size(Duration::from_secs(1))
                 })
         })
-
         // Define channels
         .channel(|ch| {
-            ch
-                .name("task_events")
+            ch.name("task_events")
                 .description("Task lifecycle events")
                 .persistent(true)
                 .delivery_guarantees(DeliveryGuarantees::ExactlyOnce)
@@ -295,27 +272,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "required": ["task_id", "event_type", "timestamp"]
                 }))
         })
-        
         .channel(|ch| {
-            ch
-                .name("metrics_stream")
+            ch.name("metrics_stream")
                 .description("Real-time metrics and monitoring data")
                 .persistent(false)
                 .metadata("high_frequency", true)
         })
-        
         .channel(|ch| {
-            ch
-                .name("error_notifications")
+            ch.name("error_notifications")
                 .description("Error and alert notifications")
                 .persistent(true)
                 .delivery_guarantees(DeliveryGuarantees::ExactlyOnce)
         })
-
         // Define subscriptions
         .subscription(|sub| {
-            sub
-                .name("task_monitor")
+            sub.name("task_monitor")
                 .channel("task_events")
                 .subscription_type(SubscriptionType::Shared)
                 .start_position(StartPosition::Latest)
@@ -323,27 +294,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ack_timeout(Duration::from_secs(30))
                 .metadata("consumer_group", "monitoring")
         })
-        
         .subscription(|sub| {
-            sub
-                .name("metrics_collector")
+            sub.name("metrics_collector")
                 .channel("metrics_stream")
                 .subscription_type(SubscriptionType::Exclusive)
                 .start_position(StartPosition::Earliest)
                 .filter("event_type = 'performance'")
                 .metadata("purpose", "analytics")
         })
-        
         .subscription(|sub| {
-            sub
-                .name("alert_handler")
+            sub.name("alert_handler")
                 .channel("error_notifications")
                 .subscription_type(SubscriptionType::Failover)
                 .start_position(StartPosition::Latest)
                 .max_unacked_messages(100)
                 .metadata("priority", "high")
         })
-
         .metadata("environment", "production")
         .metadata("version", "2.0.0")
         .build()?;
@@ -352,30 +318,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 6. Demonstrate configuration introspection
     println!("\n📊 System Configuration Summary:");
-    println!("├── Cache: {}MB max, {} entries max", 
+    println!(
+        "├── Cache: {}MB max, {} entries max",
         dagger.config().cache.max_memory_bytes / (1024 * 1024),
-        dagger.config().cache.max_entries);
-    println!("├── Concurrency: {} max tasks", 
-        dagger.config().limits.max_concurrent_tasks);
-    println!("├── Performance: {}KB async threshold", 
-        dagger.config().performance.async_serialization_threshold / 1024);
-    println!("├── Network: {}:{}", 
+        dagger.config().cache.max_entries
+    );
+    println!(
+        "├── Concurrency: {} max tasks",
+        dagger.config().limits.max_concurrent_tasks
+    );
+    println!(
+        "├── Performance: {}KB async threshold",
+        dagger.config().performance.async_serialization_threshold / 1024
+    );
+    println!(
+        "├── Network: {}:{}",
         dagger.config().network.bind_address,
-        dagger.config().network.port);
-    println!("└── Security: auth={}, tls={}", 
+        dagger.config().network.port
+    );
+    println!(
+        "└── Security: auth={}, tls={}",
         dagger.config().security.enable_auth,
-        dagger.config().security.enable_tls);
+        dagger.config().security.enable_tls
+    );
 
     println!("\n🔧 Agent Configurations:");
-    println!("├── Lightweight: {} max tasks, supports {:?}", 
-        lightweight_agent.max_concurrent_tasks,
-        lightweight_agent.supported_task_types);
-    println!("├── High-performance: {} max tasks, {}GB memory limit", 
+    println!(
+        "├── Lightweight: {} max tasks, supports {:?}",
+        lightweight_agent.max_concurrent_tasks, lightweight_agent.supported_task_types
+    );
+    println!(
+        "├── High-performance: {} max tasks, {}GB memory limit",
         high_performance_agent.max_concurrent_tasks,
-        high_performance_agent.resource_limits.as_ref().unwrap().max_memory_bytes / (1024 * 1024 * 1024));
-    println!("└── Specialized: {} max tasks, supports {:?}", 
-        specialized_agent.max_concurrent_tasks,
-        specialized_agent.supported_task_types);
+        high_performance_agent
+            .resource_limits
+            .as_ref()
+            .unwrap()
+            .max_memory_bytes
+            / (1024 * 1024 * 1024)
+    );
+    println!(
+        "└── Specialized: {} max tasks, supports {:?}",
+        specialized_agent.max_concurrent_tasks, specialized_agent.supported_task_types
+    );
 
     println!("\n🌐 DAG Pipeline:");
     println!("├── Name: {}", dag_config.name);
@@ -383,12 +368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("├── Timeout: {:?}", dag_config.max_execution_time);
     println!("├── Error handling: {:?}", dag_config.error_handling);
     println!("└── Nodes: {}", dag_nodes.len());
-    
+
     for (node_id, node) in &dag_nodes {
-        println!("    ├── {}: {} (type: {})", 
-            node_id, 
-            node.name, 
-            node.node_type);
+        println!(
+            "    ├── {}: {} (type: {})",
+            node_id, node.name, node.node_type
+        );
         if !node.dependencies.is_empty() {
             println!("    │   └── depends on: {:?}", node.dependencies);
         }
@@ -396,20 +381,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 7. Show how to create different configuration presets
     println!("\n🎯 Configuration Presets Demo:");
-    
+
     // Development configuration
     let dev_config = DaggerBuilder::development()
         .database_path("/tmp/dagger_dev.db")
         .build()?;
-    println!("├── Development: {}MB cache, debug logging", 
-        dev_config.cache.max_memory_bytes / (1024 * 1024));
+    println!(
+        "├── Development: {}MB cache, debug logging",
+        dev_config.cache.max_memory_bytes / (1024 * 1024)
+    );
 
-    // Testing configuration  
-    let test_config = DaggerBuilder::testing()
-        .database_path(":memory:")
-        .build()?;
-    println!("├── Testing: {}MB cache, trace logging", 
-        test_config.cache.max_memory_bytes / (1024 * 1024));
+    // Testing configuration
+    let test_config = DaggerBuilder::testing().database_path(":memory:").build()?;
+    println!(
+        "├── Testing: {}MB cache, trace logging",
+        test_config.cache.max_memory_bytes / (1024 * 1024)
+    );
 
     // Custom configuration
     let custom_config = DaggerBuilder::new()
@@ -417,8 +404,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .limits(|limits| limits.max_concurrent_tasks(50))
         .logging(|log| log.warn().file_path("/var/log/dagger.log"))
         .build()?;
-    println!("└── Custom: {}GB cache, warn logging", 
-        custom_config.cache.max_memory_bytes / (1024 * 1024 * 1024));
+    println!(
+        "└── Custom: {}GB cache, warn logging",
+        custom_config.cache.max_memory_bytes / (1024 * 1024 * 1024)
+    );
 
     println!("\n✨ All configurations created successfully!");
     println!("The fluent builder pattern provides:");

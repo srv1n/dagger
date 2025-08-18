@@ -340,7 +340,7 @@ async fn main() -> Result<()> {
         max_execution_time: Some(Duration::from_secs(300)),
         retry_strategy: RetryStrategy::FixedRetry(3),
         human_timeout_action: HumanTimeoutAction::TimeoutAfter(Duration::from_secs(30)),
-        sled_db_path: Some(PathBuf::from("question_workflow.db")),
+        sled_db_path: Some(PathBuf::from("question_workflow.db")), // Deprecated - use newer task-core system
     };
 
     let job_id = "question_workflow".to_string();

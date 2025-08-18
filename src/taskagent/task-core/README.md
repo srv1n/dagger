@@ -15,7 +15,7 @@ Key features:
 - Task timeout support
 
 ### Storage
-The `Storage` trait defines the interface for task persistence, with `SledStorage` providing an embedded database implementation.
+The `Storage` trait defines the interface for task persistence, with `SqliteStorage` providing an embedded database implementation.
 
 Features:
 - Task and job persistence
@@ -56,11 +56,11 @@ Manages available agents with optional metadata:
 ## Usage Example
 
 ```rust
-use task_core::{Executor, ExecutorConfig, AgentRegistry, SledStorage};
+use task_core::{Executor, ExecutorConfig, AgentRegistry, SqliteStorage};
 use dagger::taskagent::{Task, TaskStatus, Cache};
 
 // Create storage
-let storage = Arc::new(SledStorage::new("./task_db")?);
+let storage = Arc::new(SqliteStorage::open("./task_db/tasks.db").await?);
 
 // Create agent registry and register agents
 let registry = Arc::new(AgentRegistry::new());

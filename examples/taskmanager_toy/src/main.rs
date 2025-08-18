@@ -282,7 +282,7 @@ async fn main() -> Result<()> {
         StallAction::TerminateJob, // Terminate job if stalled for 30 seconds
         cache,
         agent_registry.clone(),
-        Some(PathBuf::from("example_state.db")), // Persistence with Sled
+        Some(PathBuf::from("example_state.db")), // Deprecated Sled persistence - use task-core system
     );
 
     // Define TaskConfiguration with a 30-second human timeout and max execution time
@@ -290,7 +290,7 @@ async fn main() -> Result<()> {
         max_execution_time: Some(Duration::from_secs(60)), // Overall job timeout
         retry_strategy: RetryStrategy::FixedRetry(3),
         human_timeout_action: HumanTimeoutAction::TimeoutAfter(Duration::from_secs(30)),
-        sled_db_path: Some(PathBuf::from("example_state.db")),
+        sled_db_path: Some(PathBuf::from("example_state.db")), // Deprecated - use task-core system
     };
 
     // Create a job ID

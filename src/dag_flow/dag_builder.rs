@@ -1,7 +1,7 @@
 // use crate::core::builders::DaggerConfig;
 use crate::core::errors::{DaggerError, Result};
-use crate::core::memory::Cache;
 use crate::core::limits::ResourceTracker;
+use crate::core::memory::Cache;
 // use crate::core::concurrency::ConcurrentTaskRegistry;
 // use crate::core::performance::{PerformanceMonitor, AsyncSerializationService};
 use serde::{Deserialize, Serialize};
@@ -340,13 +340,13 @@ impl DagFlowBuilder {
     {
         let node_id = node.into();
         let dep_id = dependency.into();
-        
+
         if let Some(node_def) = self.nodes.get_mut(&node_id) {
             if !node_def.dependencies.contains(&dep_id) {
                 node_def.dependencies.push(dep_id.clone());
             }
         }
-        
+
         self.edges.push((dep_id, node_id));
         self
     }
@@ -358,7 +358,7 @@ impl DagFlowBuilder {
         I: IntoIterator<Item = S>,
     {
         let node_id = node.into();
-        
+
         for dep in dependencies {
             let dep_id = dep.into();
             if let Some(node_def) = self.nodes.get_mut(&node_id) {
@@ -368,7 +368,7 @@ impl DagFlowBuilder {
             }
             self.edges.push((dep_id, node_id.clone()));
         }
-        
+
         self
     }
 

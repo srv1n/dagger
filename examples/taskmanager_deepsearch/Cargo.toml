@@ -12,7 +12,7 @@ async-trait = "0.1.77"
 jsonschema = "0.16.1"
 dagger = {path = "../../"}
 dagger-macros = { path = "../../dagger-macros" }
-sled = "0.34.7"
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite", "json", "chrono"] }
 serde_json = "1.0.120"
 chrono = "0.4"
 linkme = "0.3"
