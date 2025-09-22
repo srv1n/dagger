@@ -1,4 +1,4 @@
-use crate::registry::GLOBAL_REGISTRY;
+// Registry functionality has been replaced by newer task management system
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bincode;

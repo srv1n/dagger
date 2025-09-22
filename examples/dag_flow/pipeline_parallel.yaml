@@ -1,13 +1,13 @@
 name: parallel_demo
 description: A pipeline with parallel branches to demonstrate parallel execution
-author: Rzn,Inc
-version: 0.0.1
-signature: example
-tags:
-  - parallel
-  - demo
+version: 1.0.0
+author: Dagger Team
+signature: demo_signature
+tags: ["demo", "parallel", "math"]
+
 nodes:
   - id: node1
+    description: Adds two numbers
     dependencies: []
     inputs:
       - name: num1
@@ -22,14 +22,12 @@ nodes:
     action: add_numbers
     failure: failure_function1
     onfailure: true
-    description: Adds two numbers
     timeout: 3600
     try_count: 3
-    
-  # Two parallel branches from node1
+
   - id: node2a
-    dependencies:
-      - node1
+    description: Squares the sum from node1 (branch A)
+    dependencies: [node1]
     inputs:
       - name: input
         description: Result from node1 to square
@@ -40,13 +38,12 @@ nodes:
     action: square_number
     failure: failure_function2
     onfailure: false
-    description: Squares the sum from node1 (branch A)
     timeout: 1800
     try_count: 2
-    
+
   - id: node2b
-    dependencies:
-      - node1
+    description: Triples the sum from node1 (branch B)
+    dependencies: [node1]
     inputs:
       - name: input
         description: Result from node1 to triple
@@ -59,15 +56,12 @@ nodes:
     action: triple_number_and_add_string
     failure: failure_function3
     onfailure: true
-    description: Triples the sum from node1 (branch B)
     timeout: 3600
     try_count: 3
-    
-  # Final node depends on both branches
+
   - id: node3
-    dependencies:
-      - node2a
-      - node2b
+    description: Adds results from both branches
+    dependencies: [node2a, node2b]
     inputs:
       - name: num1
         description: Squared result from branch A
@@ -81,6 +75,5 @@ nodes:
     action: add_numbers
     failure: failure_function1
     onfailure: true
-    description: Adds results from both branches
     timeout: 3600
     try_count: 3

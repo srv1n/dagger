@@ -42,30 +42,15 @@ use super::sqlite_cache::SqliteCache;
 #[macro_export]
 macro_rules! register_action {
     ($executor:expr, $action_name:expr, $action_func:path) => {{
-        struct Action;
-        #[async_trait::async_trait]
-        impl NodeAction for Action {
-            fn name(&self) -> String {
-                $action_name.to_string()
-            }
-            async fn execute(
-                &self,
-                executor: &mut DagExecutor,
-                node: &Node,
-                cache: &Cache,
-            ) -> Result<()> {
-                $action_func(executor, node, cache).await
-            }
-            fn schema(&self) -> serde_json::Value {
-                serde_json::json!({
-                    "name": $action_name,
-                    "description": "Manually registered action",
-                    "parameters": { "type": "object", "properties": {} },
-                    "returns": { "type": "object" }
-                })
-            }
-        }
-        $executor.register_action(Arc::new(Action))
+        // Create a function wrapper that can call the legacy function
+        let func: $crate::dag_flow::function_action::ActionFunction = |executor, node, cache| {
+            Box::pin($action_func(executor, node, cache))
+        };
+        let action = $crate::dag_flow::function_action::FunctionAction::new(
+            $action_name.to_string(),
+            func
+        );
+        $executor.register_action(std::sync::Arc::new(action))
     }};
 }
 
@@ -777,6 +762,22 @@ impl ExecutionContext {
     }
 }
 
+/// Trait for observing execution lifecycle events
+#[async_trait]
+pub trait ExecutionObserver: Send + Sync {
+    /// Called when a node starts execution
+    async fn on_node_started(&self, run_id: &str, dag_name: &str, node_id: &str);
+    
+    /// Called when a node completes successfully
+    async fn on_node_completed(&self, run_id: &str, dag_name: &str, node_id: &str);
+    
+    /// Called when a node fails
+    async fn on_node_failed(&self, run_id: &str, dag_name: &str, node_id: &str, error: &str);
+    
+    /// Called when new nodes are added dynamically
+    async fn on_nodes_added(&self, run_id: &str, dag_name: &str, node_ids: &[String]);
+}
+
 /// The main executor for DAGs.
 pub struct DagExecutor {
     /// A registry of custom actions.
@@ -812,6 +813,8 @@ pub struct DagExecutor {
     pub branches: super::branch::BranchRegistry,
     /// Counter for generating unique node IDs
     node_id_counter: Arc<std::sync::atomic::AtomicUsize>,
+    /// Execution observers for lifecycle events
+    pub observers: Vec<Arc<dyn ExecutionObserver>>,
 }
 
 impl DagExecutor {
@@ -854,6 +857,7 @@ impl DagExecutor {
             event_sink: None,
             branches: super::branch::BranchRegistry::new(),
             node_id_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            observers: Vec::new(),
         })
     }
 
@@ -895,7 +899,7 @@ impl DagExecutor {
     }
     
     /// Registers a custom action with the `DagExecutor`.
-    pub async fn register_action(&mut self, action: Arc<dyn NodeAction>) -> Result<(), DagError> {
+    pub async fn register_action(&mut self, action: Arc<dyn crate::coord::NodeAction>) -> Result<(), DagError> {
         info!("Registered action: {:#?}", action.name());
         self.function_registry.register(action);
         Ok(())
@@ -972,19 +976,7 @@ impl DagExecutor {
         }
     }
 
-    /// Executes the DAG and returns a `DagExecutionReport`.
-    pub async fn execute_dag(
-        &mut self,
-        spec: WorkflowSpec,
-        cache: &Cache,
-        cancel_rx: oneshot::Receiver<()>,
-    ) -> Result<DagExecutionReport, DagError> {
-        let (mode, name) = spec.into_parts();
-        self.execute_dag_with_mode(mode, &name, cache, cancel_rx)
-            .await
-    }
-
-    /// Executes a static DAG by name (simplified interface)
+    /// Executes a static DAG by name
     pub async fn execute_static_dag(
         &mut self,
         name: &str,
@@ -995,7 +987,7 @@ impl DagExecutor {
             .await
     }
 
-    /// Executes an agent-driven DAG (simplified interface)
+    /// Executes an agent-driven DAG
     pub async fn execute_agent_dag(
         &mut self,
         task_name: &str,
@@ -1006,7 +998,7 @@ impl DagExecutor {
             .await
     }
 
-    /// Executes the DAG with the new simplified interface
+    /// Executes the DAG with specified mode
     pub async fn execute_dag_with_mode(
         &mut self,
         mode: ExecutionMode,
@@ -1243,6 +1235,17 @@ impl DagExecutor {
         action_name: String, // Changed from Arc<dyn NodeAction> to String
         dependencies: Vec<String>,
     ) -> Result<(), DagError> {
+        self.add_node_with_timeout(name, node_id, action_name, dependencies, None).await
+    }
+    
+    pub async fn add_node_with_timeout(
+        &mut self,
+        name: &str,
+        node_id: String,
+        action_name: String,
+        dependencies: Vec<String>,
+        timeout: Option<u64>,
+    ) -> Result<(), DagError> {
         // Verify the action is registered
         if !self.function_registry.contains(&action_name) {
             return Err(DagError::ActionNotRegistered(action_name));
@@ -1278,7 +1281,7 @@ impl DagExecutor {
             failure: String::new(),
             onfailure: true,
             description: format!("Dynamically added node: {}", node_id),
-            timeout: self.config.timeout_seconds.unwrap_or(3600),
+            timeout: timeout.unwrap_or_else(|| self.config.timeout_seconds.unwrap_or(300)), // Use provided timeout or default to 300 seconds
             try_count: self.config.max_attempts.unwrap_or(3),
             instructions: None,
         };
@@ -1707,6 +1710,40 @@ impl DagExecutor {
         })
     }
     
+    /// Get a specific node output as JSON from the cache
+    /// 
+    /// # Arguments
+    /// * `dag_name` - Name of the DAG
+    /// * `node_id` - ID of the node  
+    /// * `key` - Key for the output value
+    /// 
+    /// # Returns
+    /// The JSON value if found, None otherwise
+    pub async fn get_node_output_json(&self, dag_name: &str, node_id: &str, key: &str) -> Result<Option<Value>, DagError> {
+        let normalized_dag = Self::normalize_dag_name(dag_name);
+        let path = format!("node/{}/{}", node_id, key);
+        
+        self.sqlite_cache.get_json(&normalized_dag, &path).await.map_err(|e| {
+            DagError::DatabaseError(sqlx::Error::Protocol(format!("Failed to get node output: {}", e).into()))
+        })
+    }
+    
+    /// Set a specific node output as JSON in the cache
+    /// 
+    /// # Arguments
+    /// * `dag_name` - Name of the DAG
+    /// * `node_id` - ID of the node
+    /// * `key` - Key for the output value
+    /// * `value` - JSON value to store
+    pub async fn set_node_output_json(&self, dag_name: &str, node_id: &str, key: &str, value: &Value) -> Result<(), DagError> {
+        let normalized_dag = Self::normalize_dag_name(dag_name);
+        let path = format!("node/{}/{}", node_id, key);
+        
+        self.sqlite_cache.set_json(&normalized_dag, &path, value.clone()).await.map_err(|e| {
+            DagError::DatabaseError(sqlx::Error::Protocol(format!("Failed to set node output: {}", e).into()))
+        })
+    }
+    
     // ============= New Methods for Enhanced Functionality =============
     
     /// Add a supervisor hook
@@ -1717,6 +1754,11 @@ impl DagExecutor {
     /// Set the event sink
     pub fn set_event_sink(&mut self, sink: Arc<dyn super::events::EventSink>) {
         self.event_sink = Some(sink);
+    }
+    
+    /// Add an execution observer
+    pub fn add_observer(&mut self, observer: Arc<dyn ExecutionObserver>) {
+        self.observers.push(observer);
     }
     
     /// Generate a unique node ID with a prefix
@@ -1730,6 +1772,7 @@ impl DagExecutor {
         &mut self,
         dag_name: &str,
         specs: Vec<super::planning::NodeSpec>,
+        cache: &Cache,
     ) -> Result<Vec<String>, DagError> {
         let mut node_ids = Vec::new();
         
@@ -1745,12 +1788,12 @@ impl DagExecutor {
         for spec in specs {
             let node_id = spec.id.unwrap_or_else(|| self.gen_node_id(&spec.action));
             
-            // Add the node
-            self.add_node(dag_name, node_id.clone(), spec.action, spec.deps).await?;
+            // Add the node with timeout from spec
+            self.add_node_with_timeout(dag_name, node_id.clone(), spec.action, spec.deps, spec.timeout).await?;
             
             // Set inputs if provided
             if !spec.inputs.is_null() {
-                self.set_node_inputs_json(dag_name, &node_id, spec.inputs)?;
+                self.set_node_inputs_json(dag_name, &node_id, spec.inputs, cache).await?;
             }
             
             node_ids.push(node_id);
@@ -1760,20 +1803,49 @@ impl DagExecutor {
     }
     
     /// Set node inputs from JSON
-    pub fn set_node_inputs_json(
+    /// 
+    /// This function converts JSON inputs to IField format and stores the values in cache.
+    /// The cache parameter is required because DagExecutor doesn't maintain a cache reference.
+    pub async fn set_node_inputs_json(
         &mut self,
         dag_name: &str,
         node_id: &str,
         inputs: serde_json::Value,
+        cache: &Cache,
     ) -> Result<(), DagError> {
-        // Store inputs in a special cache location for the node
-        let cache_key = format!("node_inputs.{}.{}", dag_name, node_id);
+        // Convert JSON inputs to IField format so they can be resolved by the coordinator
+        let mut ifields = Vec::new();
         
-        // For now, we'll use the sqlite cache to persist this
-        // In a real implementation, you might want to store this differently
-        // This is a placeholder that ensures the inputs are available when the node executes
+        if let Some(obj) = inputs.as_object() {
+            for (key, value) in obj {
+                // Create an IField that references the node's namespace in cache
+                let ifield = IField {
+                    name: key.clone(),
+                    description: None,
+                    reference: format!("{}.{}", node_id, key),  // Reference pattern: node_id.field_name
+                };
+                ifields.push(ifield);
+                
+                // CRITICAL: Store the actual value in the cache so it can be resolved later!
+                if let Err(e) = crate::insert_value(cache, node_id, key, value.clone()) {
+                    tracing::warn!("Failed to store input value in cache for {}.{}: {}", node_id, key, e);
+                }
+            }
+        }
         
-        Ok(())
+        // Update the node's inputs in the prebuilt DAG
+        // Use async write since we're in an async context
+        let mut dags = self.prebuilt_dags.write().await;
+        
+        if let Some((graph, node_map)) = dags.get_mut(dag_name) {
+            if let Some(&node_idx) = node_map.get(node_id) {
+                // Update the node's inputs with the IFields
+                graph[node_idx].inputs = ifields;
+                return Ok(());
+            }
+        }
+        
+        Err(DagError::NodeNotFound(node_id.to_string()))
     }
     
     /// Get node inputs as JSON
@@ -2199,15 +2271,46 @@ pub(super) async fn execute_node_with_context(
             completion_hooks: Arc::new(RwLock::new(HashMap::new())),
             services: services.clone(),
             supervisor_hooks: Vec::new(),
+            observers: Vec::new(),
             event_sink: None,
             branches: super::branch::BranchRegistry::new(),
             node_id_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
-        // TODO: Migrate to new Coordinator-based execution
-        // The new NodeAction trait only takes NodeCtx, not executor/node/cache
-        let execution_result: Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed> = 
-            Ok(Err(anyhow::anyhow!("Legacy execute call not compatible with new NodeAction")));
+        // Create NodeCtx for the new NodeAction trait
+        let mut resolved_inputs = serde_json::json!({});
+        for input_field in &node.inputs {
+            let value = if input_field.reference.starts_with("inputs.") {
+                let key = input_field.reference.strip_prefix("inputs.").unwrap();
+                match crate::get_input::<serde_json::Value>(cache, "inputs", key) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::Value::Null,
+                }
+            } else if input_field.reference.contains('.') {
+                let parts: Vec<&str> = input_field.reference.split('.').collect();
+                if parts.len() == 2 {
+                    match crate::get_input::<serde_json::Value>(cache, parts[0], parts[1]) {
+                        Ok(v) => v,
+                        Err(_) => serde_json::Value::Null,
+                    }
+                } else {
+                    serde_json::Value::Null
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            resolved_inputs[input_field.name.clone()] = value;
+        }
+        
+        let ctx = crate::coord::NodeCtx::new(
+            "dag",
+            node.id.clone(),
+            resolved_inputs,
+            cache.clone(),
+        ).with_app_data(Arc::new(node.clone()));
+        
+        // Execute the action using the new NodeAction trait
+        let execution_result = timeout(node_timeout, action.execute(&ctx)).await;
 
         match execution_result {
             Ok(Ok(_)) => {
@@ -2645,10 +2748,10 @@ pub async fn execute_dag_async(
     cache: &Cache,
     dag_name: &str,
 ) -> (DagExecutionReport, bool) {
-    // Use parallel execution if enabled
+    // Use the old parallel execution for now since Coordinator doesn't work with legacy actions
     if executor.config.enable_parallel_execution && executor.execution_context.is_some() {
         info!("Using parallel execution for DAG '{}'", dag_name);
-        return execute_dag_parallel(executor, dag, cache, dag_name).await;
+        return super::dag_flow_parallel::execute_dag_parallel(executor, dag, cache, dag_name).await;
     } else {
         info!(
             "Using sequential execution for DAG '{}' (parallel={}, context={})",
@@ -2847,12 +2950,40 @@ async fn execute_node_async(
         let effective_timeout = node_timeout.min(global_remaining);
 
         // Execute with timeout and handle errors
-        // TODO: Migrate to new Coordinator-based execution
-        // The new NodeAction trait only takes NodeCtx, not executor/node/cache
-        // This will be handled by the Coordinator in the new architecture
-        let execution_result: Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed> = Ok(Err(anyhow::anyhow!(
-            "Legacy execute_node_async not compatible with new NodeAction trait"
-        )));
+        // Create NodeCtx for the new NodeAction trait
+        let mut resolved_inputs = serde_json::json!({});
+        for input_field in &node.inputs {
+            let value = if input_field.reference.starts_with("inputs.") {
+                let key = input_field.reference.strip_prefix("inputs.").unwrap();
+                match crate::get_input::<serde_json::Value>(cache, "inputs", key) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::Value::Null,
+                }
+            } else if input_field.reference.contains('.') {
+                let parts: Vec<&str> = input_field.reference.split('.').collect();
+                if parts.len() == 2 {
+                    match crate::get_input::<serde_json::Value>(cache, parts[0], parts[1]) {
+                        Ok(v) => v,
+                        Err(_) => serde_json::Value::Null,
+                    }
+                } else {
+                    serde_json::Value::Null
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            resolved_inputs[input_field.name.clone()] = value;
+        }
+        
+        let ctx = crate::coord::NodeCtx::new(
+            "dag",
+            node.id.clone(),
+            resolved_inputs,
+            cache.clone(),
+        ).with_app_data(Arc::new(node.clone()));
+        
+        // Execute the action using the new NodeAction trait
+        let execution_result = timeout(effective_timeout, action.execute(&ctx)).await;
 
         match execution_result {
             Ok(Ok(_)) => {

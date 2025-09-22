@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use petgraph::graph::NodeIndex;
 
-use crate::dag_flow::{DagExecutor, Cache};
+use crate::dag_flow::{DagExecutor, Cache, ExecutionObserver};
 use crate::coord::types::{ExecutionEvent, ExecutorCommand, NodeRef, NodeOutcome, NodeSpec};
 use crate::coord::hooks::{EventHook, HookContext};
 use crate::coord::action::{NodeCtx, NodeAction};
@@ -91,54 +91,33 @@ impl Coordinator {
             in_flight.insert(node_id);
         }
         
-        // Spawn event processor: hooks -> commands
-        let hooks = self.hooks.clone();
-        let cmd_tx = self.cmd_tx.clone();
-        let dag_name_s = dag_name.to_string();
-        let run_id_s = run_id.to_string();
-        let mut evt_rx = self.evt_rx;
+        // Create the hook context
+        let hook_ctx = HookContext::new(run_id.to_string(), dag_name.to_string())
+            .with_app_data(Arc::new(cache.clone()));
         
-        let event_processor = tokio::spawn(async move {
-            let hook_ctx = HookContext::new(run_id_s, dag_name_s);
-            
-            // Call on_start hooks
-            for hook in &hooks {
-                let cmds = hook.on_start(&hook_ctx).await;
-                for cmd in cmds {
-                    let _ = cmd_tx.send(cmd).await;
-                }
+        // Call on_start hooks
+        for hook in &self.hooks {
+            let cmds = hook.on_start(&hook_ctx).await;
+            for cmd in cmds {
+                let _ = self.cmd_tx.send(cmd).await;
             }
-            
-            // Process events
-            while let Some(event) = evt_rx.recv().await {
-                for hook in &hooks {
-                    let cmds = hook.handle(&hook_ctx, &event).await;
-                    for cmd in cmds {
-                        if cmd_tx.send(cmd).await.is_err() {
-                            // Coordinator gone
-                            return;
-                        }
-                    }
-                }
-            }
-            
-            // Call on_complete hooks
-            for hook in &hooks {
-                let cmds = hook.on_complete(&hook_ctx, true).await;
-                for cmd in cmds {
-                    let _ = cmd_tx.send(cmd).await;
-                }
-            }
-        });
+        }
         
         // Main command/mutation loop with graceful shutdown
         let mut cmd_rx = self.cmd_rx;
+        let mut evt_rx = self.evt_rx;
         
         loop {
+            // Check completion condition first, before select!
+            if in_flight.is_empty() && is_complete(exec, dag_name, &completed).await? {
+                tracing::info!("DAG execution complete - all nodes finished");
+                break;
+            }
+            
             tokio::select! {
                 // Process commands from hooks
                 Some(cmd) = cmd_rx.recv() => {
-                    apply_command(exec, dag_name, cmd).await?;
+                    apply_command(exec, dag_name, cache, cmd).await?;
                     
                     // Schedule any newly ready nodes
                     let ready = get_ready_nodes(exec, dag_name, &completed).await?;
@@ -158,18 +137,66 @@ impl Coordinator {
                 }
                 
                 // Process events from workers
-                Some(event) = async {
-                    // Try to receive event without blocking command processing
-                    tokio::time::timeout(
-                        std::time::Duration::from_millis(5),
-                        async { None::<ExecutionEvent> }
-                    ).await.ok().flatten()
-                } => {
-                    match event {
-                        ExecutionEvent::NodeCompleted { ref node, .. } |
-                        ExecutionEvent::NodeFailed { ref node, .. } => {
+                Some(event) = evt_rx.recv() => {
+                    // First, call hooks to generate any commands
+                    for hook in &self.hooks {
+                        let cmds = hook.handle(&hook_ctx, &event).await;
+                        for cmd in cmds {
+                            // Apply commands immediately
+                            apply_command(exec, dag_name, cache, cmd).await?;
+                        }
+                    }
+                    
+                    // Update execution state and call observers
+                    match &event {
+                        ExecutionEvent::NodeStarted { node } => {
+                            for observer in &exec.observers {
+                                observer.on_node_started(run_id, dag_name, &node.node_id).await;
+                            }
+                        }
+                        ExecutionEvent::NodeCompleted { node, .. } => {
+                            tracing::debug!("Node completed: {}", node.node_id);
                             in_flight.remove(&node.node_id);
                             completed.insert(node.node_id.clone());
+                            for observer in &exec.observers {
+                                observer.on_node_completed(run_id, dag_name, &node.node_id).await;
+                            }
+                            
+                            // IMPORTANT: Schedule dependent nodes after completion
+                            let ready = get_ready_nodes(exec, dag_name, &completed).await?;
+                            tracing::debug!("Ready nodes after {}: {:?}", node.node_id, ready);
+                            for node_id in ready {
+                                if !in_flight.contains(&node_id) && !completed.contains(&node_id) {
+                                    tracing::info!("Scheduling dependent node: {}", node_id);
+                                    spawn_worker(
+                                        exec,
+                                        dag_name,
+                                        node_id.clone(),
+                                        semaphore.clone(),
+                                        self.evt_tx.clone(),
+                                        cache.clone(),
+                                    ).await?;
+                                    in_flight.insert(node_id);
+                                }
+                            }
+                            
+                            // Check if this was the last node
+                            if in_flight.is_empty() && is_complete(exec, dag_name, &completed).await? {
+                                tracing::info!("DAG execution complete after processing node: {}", node.node_id);
+                                // Process completion in next iteration to ensure all events are handled
+                            }
+                        }
+                        ExecutionEvent::NodeFailed { node, error } => {
+                            in_flight.remove(&node.node_id);
+                            completed.insert(node.node_id.clone());
+                            for observer in &exec.observers {
+                                observer.on_node_failed(run_id, dag_name, &node.node_id, error).await;
+                            }
+                            
+                            // Check if this was the last node (even if failed)
+                            if in_flight.is_empty() && is_complete(exec, dag_name, &completed).await? {
+                                tracing::info!("DAG execution complete after node failure: {}", node.node_id);
+                            }
                         }
                         _ => {}
                     }
@@ -181,24 +208,24 @@ impl Coordinator {
                     break;
                 }
                 
-                // Check if execution is complete
-                else => {
-                    if in_flight.is_empty() && is_complete(exec, dag_name, &completed).await? {
-                        tracing::info!("DAG execution complete");
-                        break;
-                    }
-                    // Small yield to prevent busy loop
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                // Add a timeout to prevent infinite waiting on empty channels
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    // This acts as a periodic check for completion
+                    // Continue to next iteration where completion will be checked
                 }
             }
         }
         
-        // Shutdown event processor
+        // Call on_complete hooks
+        for hook in &self.hooks {
+            let cmds = hook.on_complete(&hook_ctx, true).await;
+            for cmd in cmds {
+                let _ = apply_command(exec, dag_name, cache, cmd).await;
+            }
+        }
+        
+        // Shutdown by dropping event sender
         drop(self.evt_tx);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            event_processor
-        ).await;
         
         Ok(())
     }
@@ -207,7 +234,7 @@ impl Coordinator {
 /// Apply a command to mutate the executor
 /// 
 /// This is the ONLY place where we have &mut DagExecutor
-async fn apply_command(exec: &mut DagExecutor, dag_name: &str, cmd: ExecutorCommand) -> Result<()> {
+async fn apply_command(exec: &mut DagExecutor, dag_name: &str, cache: &Cache, cmd: ExecutorCommand) -> Result<()> {
     use ExecutorCommand::*;
     
     match cmd {
@@ -216,21 +243,33 @@ async fn apply_command(exec: &mut DagExecutor, dag_name: &str, cmd: ExecutorComm
                 anyhow::bail!("Command for wrong DAG: {} vs {}", dn, dag_name);
             }
             let id = spec.id.clone().unwrap_or_else(|| exec.gen_node_id(&spec.action));
-            exec.add_node(dag_name, id, spec.action, spec.deps).await?;
+            exec.add_node(dag_name, id.clone(), spec.action, spec.deps).await?;
             // Store inputs if provided
             if !spec.inputs.is_null() {
-                // exec.set_node_inputs_json(dag_name, &id, spec.inputs)?;
+                exec.set_node_inputs_json(dag_name, &id, spec.inputs, cache).await?;
+            }
+            // Notify observers about added node
+            for observer in &exec.observers {
+                observer.on_nodes_added("", dag_name, &[id.clone()]).await;
             }
         }
         AddNodes { dag_name: dn, specs } => {
             if dn != dag_name {
                 anyhow::bail!("Command for wrong DAG: {} vs {}", dn, dag_name);
             }
+            let mut node_ids = Vec::new();
             for spec in specs {
                 let id = spec.id.clone().unwrap_or_else(|| exec.gen_node_id(&spec.action));
                 exec.add_node(dag_name, id.clone(), spec.action, spec.deps).await?;
                 if !spec.inputs.is_null() {
-                    // exec.set_node_inputs_json(dag_name, &id, spec.inputs)?;
+                    exec.set_node_inputs_json(dag_name, &id, spec.inputs, cache).await?;
+                }
+                node_ids.push(id);
+            }
+            // Notify observers about added nodes
+            if !node_ids.is_empty() {
+                for observer in &exec.observers {
+                    observer.on_nodes_added("", dag_name, &node_ids).await;
                 }
             }
         }
@@ -238,7 +277,7 @@ async fn apply_command(exec: &mut DagExecutor, dag_name: &str, cmd: ExecutorComm
             if dn != dag_name {
                 anyhow::bail!("Command for wrong DAG: {} vs {}", dn, dag_name);
             }
-            exec.set_node_inputs_json(dag_name, &node_id, inputs)?;
+            exec.set_node_inputs_json(dag_name, &node_id, inputs, cache).await?;
         }
         PauseBranch { branch_id, reason } => {
             exec.pause_branch(&branch_id, reason.as_deref());
@@ -316,7 +355,7 @@ async fn spawn_worker(
     evt_tx: mpsc::Sender<ExecutionEvent>,
     cache: Cache,
 ) -> Result<()> {
-    // Get the node's action
+    // Get the node's action and inputs
     let dags = exec.prebuilt_dags.read().await;
     
     let (graph, node_map) = dags.get(dag_name)
@@ -327,6 +366,8 @@ async fn spawn_worker(
     
     let node = &graph[node_idx];
     let action_name = node.action.clone();
+    let node_inputs = node.inputs.clone();
+    let node_timeout = node.timeout; // Get the timeout from the node config
     
     drop(dags);
     
@@ -334,11 +375,43 @@ async fn spawn_worker(
     let action = exec.function_registry.get(&action_name)
         .ok_or_else(|| anyhow::anyhow!("Action not found: {}", action_name))?;
     
-    // Create node context
+    // Resolve node inputs from references
+    let mut resolved_inputs = serde_json::json!({});
+    for input_field in &node_inputs {
+        let value = if input_field.reference.starts_with("inputs.") {
+            // Reference to DAG inputs stored in cache
+            let key = input_field.reference.strip_prefix("inputs.").unwrap();
+            match crate::get_input::<serde_json::Value>(&cache, "inputs", key) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("Failed to resolve input {}: {}", input_field.reference, e);
+                    serde_json::Value::Null
+                }
+            }
+        } else if input_field.reference.contains('.') {
+            // Reference to another node's output
+            let parts: Vec<&str> = input_field.reference.split('.').collect();
+            if parts.len() == 2 {
+                match crate::get_input::<serde_json::Value>(&cache, parts[0], parts[1]) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::Value::Null
+                }
+            } else {
+                serde_json::Value::Null
+            }
+        } else {
+            // Direct value or default
+            serde_json::Value::Null
+        };
+        
+        resolved_inputs[input_field.name.clone()] = value;
+    }
+    
+    // Create node context with resolved inputs
     let ctx = NodeCtx::new(
         dag_name,
         node_id.clone(),
-        serde_json::json!({}), // TODO: Get actual inputs
+        resolved_inputs,
         cache.clone(),
     );
     
@@ -360,17 +433,15 @@ async fn spawn_worker(
         // Actions are compute-only and don't need executor
         
         match tokio::time::timeout(
-            std::time::Duration::from_secs(30), // TODO: Get from node config
-            async {
-                // This is a placeholder - need to create proper NodeAction instance
-                // For now, just succeed
-                Ok::<(), anyhow::Error>(())
-            }
+            std::time::Duration::from_secs(node_timeout), // Use node's configured timeout
+            action.execute(&ctx)
         ).await {
-            Ok(Ok(())) => {
+            Ok(Ok(output)) => {
+                // The output is already stored in cache by the node implementation
+                // We just need to send the completion event
                 let _ = evt_tx.send(ExecutionEvent::NodeCompleted {
                     node: node_ref,
-                    outcome: NodeOutcome::Success { outputs: None },
+                    outcome: NodeOutcome::Success { outputs: output.outputs },
                 }).await;
             }
             Ok(Err(e)) => {

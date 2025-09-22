@@ -73,10 +73,11 @@ impl SqliteCache {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 dag_id TEXT NOT NULL,
                 snapshot_data BLOB NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (dag_id, created_at)
+                UNIQUE(dag_id, created_at)
             )
             "#
         )
@@ -242,6 +243,68 @@ impl SqliteCache {
         Ok(Cache { data: Arc::new(cache_data) })
     }
 
+    /// Get a specific node output as JSON from the cache
+    pub async fn get_json(&self, dag_id: &str, path: &str) -> Result<Option<Value>> {
+        // Parse path like "node/{node_id}/{key}"
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() < 3 || parts[0] != "node" {
+            return Err(anyhow!("Invalid path format. Expected: node/{{node_id}}/{{key}}"));
+        }
+        
+        let node_id = parts[1];
+        let key = parts[2..].join("/"); // Allow keys with slashes
+        
+        let row = sqlx::query_as::<_, (String,)>(
+            "SELECT value FROM artifacts WHERE dag_id = ? AND node_id = ? AND key = ?"
+        )
+        .bind(dag_id)
+        .bind(node_id)
+        .bind(&key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((value_str,)) => {
+                let value: Value = serde_json::from_str(&value_str)
+                    .map_err(|e| anyhow!("Failed to deserialize JSON value: {}", e))?;
+                Ok(Some(value))
+            }
+            None => Ok(None)
+        }
+    }
+
+    /// Set a specific node output as JSON in the cache
+    pub async fn set_json(&self, dag_id: &str, path: &str, value: Value) -> Result<()> {
+        // Parse path like "node/{node_id}/{key}"
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() < 3 || parts[0] != "node" {
+            return Err(anyhow!("Invalid path format. Expected: node/{{node_id}}/{{key}}"));
+        }
+        
+        let node_id = parts[1];
+        let key = parts[2..].join("/"); // Allow keys with slashes
+        
+        let serialized_value = serde_json::to_string(&value)
+            .map_err(|e| anyhow!("Failed to serialize JSON value: {}", e))?;
+
+        // Use INSERT OR REPLACE for upsert behavior
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO artifacts (dag_id, node_id, key, value, updated_at) 
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            "#
+        )
+        .bind(dag_id)
+        .bind(node_id)
+        .bind(&key)
+        .bind(&serialized_value)
+        .execute(&self.pool)
+        .await?;
+
+        debug!("Set JSON value at path: {}/{}", dag_id, path);
+        Ok(())
+    }
+
     /// Save execution tree to SQLite
     pub async fn save_execution_tree(&self, dag_id: &str, tree: &ExecutionTree) -> Result<()> {
         let serializable_tree = SerializableExecutionTree::from_execution_tree(tree);
@@ -288,16 +351,42 @@ impl SqliteCache {
         let compressed = zstd::encode_all(snapshot_data, 3)
             .map_err(|e| anyhow!("Failed to compress snapshot: {}", e))?;
 
-        sqlx::query(
-            "INSERT INTO snapshots (dag_id, snapshot_data) VALUES (?, ?)"
-        )
-        .bind(dag_id)
-        .bind(&compressed)
-        .execute(&self.pool)
-        .await?;
-
-        debug!("Saved snapshot for DAG: {}", dag_id);
-        Ok(())
+        // Retry a few times with small delays to handle concurrent snapshots
+        let mut retries = 3;
+        loop {
+            // Use high-precision timestamp to avoid collisions
+            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let result = sqlx::query(
+                "INSERT INTO snapshots (dag_id, snapshot_data, created_at) VALUES (?, ?, ?)"
+            )
+            .bind(dag_id)
+            .bind(&compressed)
+            .bind(&timestamp)
+            .execute(&self.pool)
+            .await;
+            
+            match result {
+                Ok(_) => {
+                    debug!("Saved snapshot for DAG: {}", dag_id);
+                    return Ok(());
+                }
+                Err(e) if retries > 0 => {
+                    // Check if it's a unique constraint violation
+                    let error_str = e.to_string();
+                    info!("Snapshot save error for '{}': {}", dag_id, error_str);
+                    if error_str.contains("UNIQUE constraint") || error_str.contains("2067") {
+                        // Wait a small amount to ensure different timestamp
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        retries -= 1;
+                        info!("Retrying snapshot save for '{}' due to unique constraint (retries left: {})", dag_id, retries);
+                        continue;
+                    } else {
+                        return Err(anyhow!("Database error: {}", e));
+                    }
+                }
+                Err(e) => return Err(anyhow!("Failed to save snapshot: {}", e)),
+            }
+        }
     }
 
     /// Load latest snapshot

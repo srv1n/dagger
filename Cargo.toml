@@ -55,4 +55,9 @@ bytes = "1.0"
 pretty_assertions = "1.2.1"
 tempfile = "3.0"
 colored = "2.0"
+tracing-subscriber = "0.3"
+
+[[example]]
+name = "dynamic_nodes_demo"
+path = "examples/dynamic_nodes_demo.rs"
 

@@ -7,9 +7,7 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
 ## Quick Start Guide
 
 - **[Getting Started](../README.md)** - Installation and basic usage
-- **[Quick Reference](QUICK_REFERENCE.md)** - Common patterns and code snippets
 - **[Examples](../examples/)** - Working examples for each paradigm
-- **[API Reference](#api-reference)** - Complete API documentation
 
 ## Core Documentation
 
@@ -22,13 +20,17 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
 
 ### Execution Paradigms
 
-#### 1. DAG Flow - Static Workflow Execution
-- **[DAG_FLOW_IMPLEMENTATION_GUIDE.md](DAG_FLOW_IMPLEMENTATION_GUIDE.md)** - Complete implementation guide
+#### 1. DAG Flow - Static and Dynamic Workflow Execution
+- **[DAG_FLOW_COMPLETE_GUIDE.md](DAG_FLOW_COMPLETE_GUIDE.md)** - Comprehensive DAG Flow documentation
+  - Architecture and execution flow
   - YAML workflow definition
   - Parallel execution with Coordinator
-  - NodeAction trait for pure computation
-  - EventHook system for control flow
+  - Dynamic node addition with hooks
+  - NodeAction trait and action system
   - Cache operations and persistence
+  - Performance optimization
+  - Complete API reference
+  - Troubleshooting guide
 
 #### 2. Task Agent - Dynamic Task Orchestration  
 - **[TASK_AGENT_ARCHITECTURE.md](TASK_AGENT_ARCHITECTURE.md)** - Task system architecture
@@ -43,13 +45,6 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
   - Dynamic channel creation
   - Message routing and validation
   - Schema enforcement
-
-### Storage & Persistence
-- **[SQLITE_DAG_STORAGE_GUIDE.md](SQLITE_DAG_STORAGE_GUIDE.md)** - SQLite storage implementation
-  - Database schema and tables
-  - ACID transactions
-  - Compression (3-10x reduction)
-  - Query patterns and optimization
 
 ## API Reference
 

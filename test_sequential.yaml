@@ -1,0 +1,46 @@
+name: test_sequential
+description: Test sequential DAG execution
+version: 1.0.0
+author: Test
+signature: test_sig
+tags: []
+nodes:
+  - id: node1
+    description: First node
+    dependencies: []
+    inputs: []
+    outputs:
+      - name: output
+    action: print_message
+    failure: ""
+    onfailure: false
+    timeout: 10
+    try_count: 1
+  
+  - id: node2
+    description: Second node depends on node1
+    dependencies: [node1]
+    inputs:
+      - name: input
+        reference: node1.output
+    outputs:
+      - name: output
+    action: print_message
+    failure: ""
+    onfailure: false
+    timeout: 10
+    try_count: 1
+  
+  - id: node3
+    description: Third node depends on node2
+    dependencies: [node2]
+    inputs:
+      - name: input
+        reference: node2.output
+    outputs:
+      - name: output
+    action: print_message
+    failure: ""
+    onfailure: false
+    timeout: 10
+    try_count: 1

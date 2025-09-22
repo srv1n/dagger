@@ -1,0 +1,7 @@
+name: dynamic_dag
+description: "A minimal DAG for demonstrating dynamic node addition"
+tags: []
+author: "example"
+version: "1.0.0"
+signature: ""
+nodes: []
