@@ -1,12 +1,12 @@
 //! Simplified Working Solution for Supervisor Hooks
-//! 
+//!
 //! This demonstrates a practical, working solution for the supervisor hooks problem.
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use std::collections::HashMap;
 
 // ============= Core Types =============
 
@@ -50,7 +50,10 @@ impl EventBasedHook for LoggingHook {
                 println!("[LoggingHook] Node '{}' started", node.id);
             }
             ExecutionEvent::NodeCompleted { node, success } => {
-                println!("[LoggingHook] Node '{}' completed (success: {})", node.id, success);
+                println!(
+                    "[LoggingHook] Node '{}' completed (success: {})",
+                    node.id, success
+                );
             }
             ExecutionEvent::NodeFailed { node, error } => {
                 println!("[LoggingHook] Node '{}' failed: {}", node.id, error);
@@ -66,8 +69,12 @@ pub struct DynamicNodeHook;
 impl EventBasedHook for DynamicNodeHook {
     async fn handle_event(&self, event: &ExecutionEvent) -> Vec<ExecutorCommand> {
         let mut commands = Vec::new();
-        
-        if let ExecutionEvent::NodeCompleted { node, success: true } = event {
+
+        if let ExecutionEvent::NodeCompleted {
+            node,
+            success: true,
+        } = event
+        {
             if node.action == "process" {
                 println!("[DynamicNodeHook] Adding cleanup node for '{}'", node.id);
                 commands.push(ExecutorCommand::AddNode {
@@ -79,7 +86,7 @@ impl EventBasedHook for DynamicNodeHook {
                 });
             }
         }
-        
+
         commands
     }
 }
@@ -93,23 +100,27 @@ pub struct EventDrivenExecutor {
 }
 
 impl EventDrivenExecutor {
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<ExecutionEvent>, mpsc::UnboundedReceiver<ExecutorCommand>) {
+    pub fn new() -> (
+        Self,
+        mpsc::UnboundedReceiver<ExecutionEvent>,
+        mpsc::UnboundedReceiver<ExecutorCommand>,
+    ) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        
+
         let executor = Self {
             hooks: Vec::new(),
             event_tx,
             command_tx,
         };
-        
+
         (executor, event_rx, command_rx)
     }
-    
+
     pub fn add_hook(&mut self, hook: Arc<dyn EventBasedHook>) {
         self.hooks.push(hook);
     }
-    
+
     /// Process events in a separate task
     pub async fn process_events(
         hooks: Vec<Arc<dyn EventBasedHook>>,
@@ -118,7 +129,7 @@ impl EventDrivenExecutor {
     ) {
         while let Some(event) = event_rx.recv().await {
             println!("\n[EventProcessor] Processing: {:?}", event);
-            
+
             // Let each hook handle the event
             for hook in &hooks {
                 let commands = hook.handle_event(&event).await;
@@ -130,7 +141,7 @@ impl EventDrivenExecutor {
         }
         println!("[EventProcessor] Shutting down");
     }
-    
+
     /// Process commands in a separate task (with mutable state access)
     pub async fn process_commands(
         mut command_rx: mpsc::UnboundedReceiver<ExecutorCommand>,
@@ -140,7 +151,10 @@ impl EventDrivenExecutor {
             let mut state = state.lock().await;
             match command {
                 ExecutorCommand::AddNode { dag_name, node } => {
-                    println!("[CommandProcessor] Adding node '{}' to DAG '{}'", node.id, dag_name);
+                    println!(
+                        "[CommandProcessor] Adding node '{}' to DAG '{}'",
+                        node.id, dag_name
+                    );
                     state.pending_nodes.push(node);
                 }
                 ExecutorCommand::PauseExecution { reason } => {
@@ -155,26 +169,21 @@ impl EventDrivenExecutor {
         }
         println!("[CommandProcessor] Shutting down");
     }
-    
+
     /// Simulate parallel node execution
-    pub async fn execute_nodes(
-        nodes: Vec<Node>,
-        event_tx: mpsc::UnboundedSender<ExecutionEvent>,
-    ) {
+    pub async fn execute_nodes(nodes: Vec<Node>, event_tx: mpsc::UnboundedSender<ExecutionEvent>) {
         let mut handles = Vec::new();
-        
+
         for node in nodes {
             let event_tx = event_tx.clone();
             let handle = tokio::spawn(async move {
                 // Notify start
-                let _ = event_tx.send(ExecutionEvent::NodeStarted { 
-                    node: node.clone() 
-                });
-                
+                let _ = event_tx.send(ExecutionEvent::NodeStarted { node: node.clone() });
+
                 // Simulate work
                 println!("[Executor] Executing node '{}'", node.id);
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                
+
                 // Notify completion (always success for demo)
                 let _ = event_tx.send(ExecutionEvent::NodeCompleted {
                     node: node.clone(),
@@ -183,7 +192,7 @@ impl EventDrivenExecutor {
             });
             handles.push(handle);
         }
-        
+
         // Wait for all nodes
         for handle in handles {
             let _ = handle.await;
@@ -202,54 +211,63 @@ pub struct ExecutorState {
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== Event-Driven Supervisor Hooks Solution ===\n");
-    
+
     // Create executor and channels
     let (mut executor, event_rx, command_rx) = EventDrivenExecutor::new();
-    
+
     // Add hooks
     executor.add_hook(Arc::new(LoggingHook));
     executor.add_hook(Arc::new(DynamicNodeHook));
-    
+
     // Create shared state
     let state = Arc::new(Mutex::new(ExecutorState {
         pending_nodes: Vec::new(),
         is_paused: false,
     }));
-    
+
     // Clone what we need
     let hooks = executor.hooks.clone();
     let event_tx = executor.event_tx.clone();
     let command_tx = executor.command_tx.clone();
-    
+
     // Start event processor
     let event_processor = tokio::spawn(EventDrivenExecutor::process_events(
         hooks,
         event_rx,
         command_tx.clone(),
     ));
-    
+
     // Start command processor
     let state_clone = state.clone();
     let command_processor = tokio::spawn(EventDrivenExecutor::process_commands(
         command_rx,
         state_clone,
     ));
-    
+
     // Define initial nodes
     let nodes = vec![
-        Node { id: "fetch".to_string(), action: "fetch".to_string() },
-        Node { id: "process".to_string(), action: "process".to_string() },
-        Node { id: "save".to_string(), action: "save".to_string() },
+        Node {
+            id: "fetch".to_string(),
+            action: "fetch".to_string(),
+        },
+        Node {
+            id: "process".to_string(),
+            action: "process".to_string(),
+        },
+        Node {
+            id: "save".to_string(),
+            action: "save".to_string(),
+        },
     ];
-    
+
     println!("Starting execution with {} nodes\n", nodes.len());
-    
+
     // Execute nodes (this would be in parallel in real implementation)
     EventDrivenExecutor::execute_nodes(nodes, event_tx.clone()).await;
-    
+
     // Give time for events to process
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    
+
     // Check if new nodes were added
     {
         let state = state.lock().await;
@@ -260,21 +278,15 @@ async fn main() -> Result<()> {
         }
         println!("Is paused: {}", state.is_paused);
     }
-    
+
     // Cleanup
     drop(executor.event_tx);
     drop(executor.command_tx);
-    
+
     // Wait for processors to finish
-    let _ = tokio::time::timeout(
-        tokio::time::Duration::from_secs(1),
-        event_processor
-    ).await;
-    let _ = tokio::time::timeout(
-        tokio::time::Duration::from_secs(1),
-        command_processor
-    ).await;
-    
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), event_processor).await;
+    let _ = tokio::time::timeout(tokio::time::Duration::from_secs(1), command_processor).await;
+
     println!("\n✅ Event-driven solution completed successfully!");
     println!("\n=== Key Insights ===");
     println!("1. Events and commands are processed in separate tasks");
@@ -282,6 +294,6 @@ async fn main() -> Result<()> {
     println!("3. Hooks can't directly mutate state, only send commands");
     println!("4. Parallel execution works without issues");
     println!("5. State mutations are centralized and controlled");
-    
+
     Ok(())
 }

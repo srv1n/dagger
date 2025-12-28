@@ -1,5 +1,5 @@
 //! Demonstration of the new Coordinator-based parallel execution
-//! 
+//!
 //! This example shows:
 //! - Parallel node execution without borrow checker issues
 //! - Dynamic DAG growth via hooks
@@ -8,13 +8,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use dagger::coord::{
-    ActionRegistry, Coordinator, EventHook, HookContext,
-    ExecutionEvent, ExecutorCommand, NodeSpec, NodeAction, NodeCtx, NodeOutput,
+    ActionRegistry, Coordinator, EventHook, ExecutionEvent, ExecutorCommand, HookContext,
+    NodeAction, NodeCtx, NodeOutput, NodeSpec,
 };
-use dagger::dag_flow::{DagExecutor, DagConfig, Cache};
+use dagger::dag_flow::{Cache, DagConfig, DagExecutor};
+use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use serde_json::json;
 
 // ============= Example Actions =============
 
@@ -28,19 +28,22 @@ impl NodeAction for ComputeAction {
     fn name(&self) -> &str {
         &self.name
     }
-    
+
     async fn execute(&self, ctx: &NodeCtx) -> Result<NodeOutput> {
-        println!("[ComputeAction] {} executing with inputs: {}", ctx.node_id, ctx.inputs);
-        
+        println!(
+            "[ComputeAction] {} executing with inputs: {}",
+            ctx.node_id, ctx.inputs
+        );
+
         // Simulate some computation
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
+
         // Return computed result
         let result = json!({
             "computed": format!("Result from {}", ctx.node_id),
             "timestamp": chrono::Utc::now().timestamp(),
         });
-        
+
         Ok(NodeOutput::success(result))
     }
 }
@@ -53,13 +56,13 @@ impl NodeAction for TransformAction {
     fn name(&self) -> &str {
         "transform"
     }
-    
+
     async fn execute(&self, ctx: &NodeCtx) -> Result<NodeOutput> {
         println!("[TransformAction] {} transforming data", ctx.node_id);
-        
+
         // Simulate transformation
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
-        
+
         Ok(NodeOutput::success(json!({
             "transformed": true,
             "node": ctx.node_id,
@@ -79,7 +82,7 @@ impl EventHook for CleanupHook {
             ExecutionEvent::NodeCompleted { node, .. } => {
                 if node.node_id.starts_with("compute_") {
                     println!("[CleanupHook] Adding cleanup for {}", node.node_id);
-                    
+
                     // Add a cleanup node
                     vec![ExecutorCommand::AddNode {
                         dag_name: ctx.dag_name.clone(),
@@ -123,31 +126,29 @@ impl EventHook for MonitorHook {
 async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
-    
+
     println!("=== Coordinator-Based Parallel Execution Demo ===\n");
-    
+
     // Create action registry
     let action_registry = ActionRegistry::new();
-    action_registry.register(Arc::new(ComputeAction { name: "compute".to_string() }));
+    action_registry.register(Arc::new(ComputeAction {
+        name: "compute".to_string(),
+    }));
     action_registry.register(Arc::new(TransformAction));
-    
+
     // Create DAG executor with new registry
     let config = DagConfig {
         max_parallel_nodes: 3,
         enable_parallel_execution: true,
         ..Default::default()
     };
-    
+
     // Convert new registry to old format temporarily
     // In production, DagExecutor should use ActionRegistry directly
     let old_registry = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-    
-    let mut executor = DagExecutor::new(
-        Some(config),
-        old_registry,
-        "sqlite::memory:",
-    ).await?;
-    
+
+    let mut executor = DagExecutor::new(Some(config), old_registry, "sqlite::memory:").await?;
+
     // Create a simple DAG
     let yaml_content = r#"
 name: demo_dag
@@ -193,36 +194,30 @@ nodes:
     timeout: 30
     try_count: 1
 "#;
-    
+
     // Write and load the DAG
     std::fs::write("/tmp/demo_dag.yaml", yaml_content)?;
     executor.load_yaml_file("/tmp/demo_dag.yaml")?;
-    
+
     // Create hooks
-    let hooks: Vec<Arc<dyn EventHook>> = vec![
-        Arc::new(MonitorHook),
-        Arc::new(CleanupHook),
-    ];
-    
+    let hooks: Vec<Arc<dyn EventHook>> = vec![Arc::new(MonitorHook), Arc::new(CleanupHook)];
+
     // Create coordinator
     let coordinator = Coordinator::new(hooks, 100, 100);
-    
+
     // Create cache
     let cache = Cache::new();
-    
+
     // Create cancellation channel
     let (_cancel_tx, cancel_rx) = oneshot::channel();
-    
+
     println!("Starting parallel execution with dynamic growth...\n");
-    
+
     // Run the coordinator
-    match coordinator.run_parallel(
-        &mut executor,
-        &cache,
-        "demo_dag",
-        "run_001",
-        cancel_rx,
-    ).await {
+    match coordinator
+        .run_parallel(&mut executor, &cache, "demo_dag", "run_001", cancel_rx)
+        .await
+    {
         Ok(()) => {
             println!("\n✅ Execution completed successfully!");
         }
@@ -230,7 +225,7 @@ nodes:
             println!("\n❌ Execution failed: {}", e);
         }
     }
-    
+
     // Show final DAG state
     println!("\n=== Final DAG State ===");
     if let Ok(dags) = executor.prebuilt_dags.read() {
@@ -241,13 +236,13 @@ nodes:
             }
         }
     }
-    
+
     println!("\n=== Key Insights ===");
     println!("1. Workers executed in parallel without borrow conflicts");
     println!("2. Hooks added nodes dynamically (cleanup nodes)");
     println!("3. All mutations happened through Coordinator");
     println!("4. No &mut DagExecutor in workers or hooks");
     println!("5. Clean separation: compute (workers) vs control (coordinator)");
-    
+
     Ok(())
 }

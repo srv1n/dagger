@@ -1,12 +1,12 @@
 //! NodeActionV2 - compute-only node actions
-//! 
+//!
 //! This replaces the old NodeAction trait that required &mut DagExecutor.
 //! Actions are now pure computation with no direct state mutation.
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
 use std::any::Any;
+use std::sync::Arc;
 
 /// Context for node execution (immutable, clonable)
 #[derive(Clone)]
@@ -39,23 +39,28 @@ impl NodeCtx {
             app_data: None,
         }
     }
-    
+
     /// Set application data
     pub fn with_app_data(mut self, data: Arc<dyn Any + Send + Sync>) -> Self {
         self.app_data = Some(data);
         self
     }
-    
+
     /// Get input value by key
     pub fn get_input<T: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<T> {
-        let value = self.inputs.get(key)
+        let value = self
+            .inputs
+            .get(key)
             .ok_or_else(|| anyhow::anyhow!("Input '{}' not found", key))?;
         serde_json::from_value(value.clone())
             .map_err(|e| anyhow::anyhow!("Failed to deserialize input '{}': {}", key, e))
     }
-    
+
     /// Get optional input value
-    pub fn get_input_opt<T: serde::de::DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<T>> {
+    pub fn get_input_opt<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> anyhow::Result<Option<T>> {
         match self.inputs.get(key) {
             Some(value) if !value.is_null() => {
                 let parsed = serde_json::from_value(value.clone())
@@ -87,7 +92,7 @@ impl NodeOutput {
             metadata: None,
         }
     }
-    
+
     /// Create a successful output with no data
     pub fn success_empty() -> Self {
         Self {
@@ -96,7 +101,7 @@ impl NodeOutput {
             metadata: None,
         }
     }
-    
+
     /// Create a failed output
     pub fn failure() -> Self {
         Self {
@@ -105,7 +110,7 @@ impl NodeOutput {
             metadata: None,
         }
     }
-    
+
     /// Add metadata
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
@@ -114,36 +119,35 @@ impl NodeOutput {
 }
 
 /// NodeAction - compute-only node action
-/// 
+///
 /// Actions are pure computation - they read inputs, perform work,
 /// and return outputs. No direct state mutation allowed.
 #[async_trait]
 pub trait NodeAction: Send + Sync {
     /// Get the name of this action
     fn name(&self) -> &str;
-    
+
     /// Execute the node action
-    /// 
+    ///
     /// This should be pure computation - read inputs, do work, return outputs.
     /// State mutations happen via commands returned by hooks.
     async fn execute(&self, ctx: &NodeCtx) -> anyhow::Result<NodeOutput>;
-    
+
     /// Optional: Validate inputs before execution
     fn validate_inputs(&self, _inputs: &Value) -> anyhow::Result<()> {
         Ok(())
     }
-    
+
     /// Optional: Get input schema for validation
     fn input_schema(&self) -> Option<&str> {
         None
     }
-    
+
     /// Optional: Get output schema for validation
     fn output_schema(&self) -> Option<&str> {
         None
     }
 }
-
 
 /// Example: Echo action that just returns its inputs
 pub struct EchoAction;
@@ -153,7 +157,7 @@ impl NodeAction for EchoAction {
     fn name(&self) -> &str {
         "echo"
     }
-    
+
     async fn execute(&self, ctx: &NodeCtx) -> anyhow::Result<NodeOutput> {
         tracing::info!("Echo action: {} with inputs: {}", ctx.node_id, ctx.inputs);
         Ok(NodeOutput::success(ctx.inputs.clone()))

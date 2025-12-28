@@ -37,12 +37,10 @@ pub trait Storage: Send + Sync {
 
     /// Get shared state value
     async fn get_shared_state(&self, key: &str) -> Result<Option<Bytes>>;
-    
+
     /// Set shared state value
     async fn set_shared_state(&self, key: &str, value: Bytes) -> Result<()>;
-    
+
     /// Delete shared state value
     async fn delete_shared_state(&self, key: &str) -> Result<bool>;
 }
-
-

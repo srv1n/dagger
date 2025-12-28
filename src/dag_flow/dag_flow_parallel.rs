@@ -125,7 +125,7 @@ pub async fn execute_dag_parallel(
             // Call supervisor hooks before node starts
             // Note: We can't call hooks here due to borrow checker constraints
             // The hooks will be called after node completion instead
-            
+
             info!(
                 "Launching node {} (active tasks: {})",
                 node.id, active_tasks
@@ -168,7 +168,7 @@ pub async fn execute_dag_parallel(
                     );
 
                     executed_nodes.insert(outcome.node_id.clone());
-                    
+
                     // Note: Supervisor hooks cannot be called here due to borrow checker constraints
                     // This would require a redesign of the execution flow to properly support hooks
 

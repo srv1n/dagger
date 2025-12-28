@@ -10,8 +10,8 @@ use tracing_subscriber::FmtSubscriber;
 
 use task_core::model::{Task, TaskOutput, TaskStatus, TaskType};
 use task_core::{
-    Agent, AgentMetadata, AgentRegistry, Executor, ExecutorConfig, JsonAgent, SqliteStorage, Storage,
-    TaskContext,
+    Agent, AgentMetadata, AgentRegistry, Executor, ExecutorConfig, JsonAgent, SqliteStorage,
+    Storage, TaskContext,
 };
 
 /// Example agent that processes messages

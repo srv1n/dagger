@@ -1,11 +1,11 @@
 //! Branch state management for DAG Flow
-//! 
+//!
 //! Provides pause/resume/cancel functionality for workflow branches
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tokio::time::{sleep, Duration};
 
 /// Branch execution status
@@ -35,11 +35,11 @@ impl BranchState {
             resumed_at: None,
         }
     }
-    
+
     pub fn running() -> Self {
         Self::new()
     }
-    
+
     pub fn paused(reason: Option<String>) -> Self {
         Self {
             status: BranchStatus::Paused,
@@ -48,7 +48,7 @@ impl BranchState {
             resumed_at: None,
         }
     }
-    
+
     pub fn cancelled(reason: Option<String>) -> Self {
         Self {
             status: BranchStatus::Cancelled,
@@ -71,13 +71,13 @@ impl BranchRegistry {
             branches: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-    
+
     /// Register a new branch
     pub fn register_branch(&self, branch_id: impl Into<String>) {
         let mut branches = self.branches.write();
         branches.insert(branch_id.into(), BranchState::running());
     }
-    
+
     /// Pause a branch
     pub fn pause_branch(&self, branch_id: &str, reason: Option<&str>) {
         let mut branches = self.branches.write();
@@ -87,7 +87,7 @@ impl BranchRegistry {
             state.paused_at = Some(crate::dag_flow::events::now_ms());
         }
     }
-    
+
     /// Resume a branch
     pub fn resume_branch(&self, branch_id: &str) {
         let mut branches = self.branches.write();
@@ -98,7 +98,7 @@ impl BranchRegistry {
             }
         }
     }
-    
+
     /// Cancel a branch
     pub fn cancel_branch(&self, branch_id: &str, reason: Option<&str>) {
         let mut branches = self.branches.write();
@@ -107,7 +107,7 @@ impl BranchRegistry {
             state.reason = reason.map(|s| s.to_string());
         }
     }
-    
+
     /// Complete a branch
     pub fn complete_branch(&self, branch_id: &str) {
         let mut branches = self.branches.write();
@@ -115,48 +115,48 @@ impl BranchRegistry {
             state.status = BranchStatus::Completed;
         }
     }
-    
+
     /// Get branch status
     pub fn get_status(&self, branch_id: &str) -> Option<BranchStatus> {
         let branches = self.branches.read();
         branches.get(branch_id).map(|s| s.status)
     }
-    
+
     /// Get branch state
     pub fn get_state(&self, branch_id: &str) -> Option<BranchState> {
         let branches = self.branches.read();
         branches.get(branch_id).cloned()
     }
-    
+
     /// Check if branch is paused
     pub fn is_paused(&self, branch_id: &str) -> bool {
         self.get_status(branch_id) == Some(BranchStatus::Paused)
     }
-    
+
     /// Check if branch is cancelled
     pub fn is_cancelled(&self, branch_id: &str) -> bool {
         self.get_status(branch_id) == Some(BranchStatus::Cancelled)
     }
-    
+
     /// Check if branch is running
     pub fn is_running(&self, branch_id: &str) -> bool {
         self.get_status(branch_id) == Some(BranchStatus::Running)
     }
-    
+
     /// Wait for branch to be resumed (async)
     pub async fn await_branch_resumed(&self, branch_id: &str, poll_ms: u64) {
         let poll_duration = Duration::from_millis(poll_ms);
-        
+
         while self.is_paused(branch_id) {
             sleep(poll_duration).await;
         }
     }
-    
+
     /// List all branches with their states
     pub fn list_branches(&self) -> HashMap<String, BranchState> {
         self.branches.read().clone()
     }
-    
+
     /// Clear completed or cancelled branches
     pub fn cleanup_finished(&self) {
         let mut branches = self.branches.write();

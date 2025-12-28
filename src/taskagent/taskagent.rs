@@ -504,7 +504,7 @@ impl TaskExecutor {
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<TaskExecutionReport> {
         warn!("resume_job is deprecated - use the newer task-core system for job resumption");
-        
+
         // Update the job ID
         self.job_id = job_id.clone();
 

@@ -5,38 +5,30 @@ pub mod sqlite_cache;
 
 // Support modules
 pub mod any;
-pub mod dag_builder;
-pub mod supervisor;
-pub mod planning;
-pub mod events;
 pub mod branch;
+pub mod dag_builder;
+pub mod events;
+pub mod planning;
+pub mod supervisor;
 
 // Compatibility modules for legacy code
-pub mod legacy_compat;
 pub mod function_action;
+pub mod legacy_compat;
 
 // Main exports
 pub use dag_flow::*;
 
 // Builder exports
 pub use dag_builder::{
-    BackoffStrategy,
-    DagExecutionContext,
-    DagExecutionMetrics,
-    DagExecutionState,
-    DagFlowBuilder,
-    DagStatus,
-    ErrorHandling,
-    NodeBuilder,
-    NodeDefinition,
-    NodeExecutionState,
-    NodeStatus,
-    RetryPolicy,
-    RetryPolicyBuilder,
+    BackoffStrategy, DagExecutionContext, DagExecutionMetrics, DagExecutionState, DagFlowBuilder,
+    DagStatus, ErrorHandling, NodeBuilder, NodeDefinition, NodeExecutionState, NodeStatus,
+    RetryPolicy, RetryPolicyBuilder,
 };
 
 // Module-specific exports
-pub use self::supervisor::{SupervisorHook, LoggingSupervisor, CompositeSupervisor};
-pub use self::planning::{NodeSpec, Plan, plan_from_llm_output};
-pub use self::events::{RuntimeEvent, RuntimeEventEnvelope, EventSink, LoggingEventSink, BufferingEventSink};
-pub use self::branch::{BranchStatus, BranchState, BranchRegistry};
+pub use self::branch::{BranchRegistry, BranchState, BranchStatus};
+pub use self::events::{
+    BufferingEventSink, EventSink, LoggingEventSink, RuntimeEvent, RuntimeEventEnvelope,
+};
+pub use self::planning::{plan_from_llm_output, NodeSpec, Plan};
+pub use self::supervisor::{CompositeSupervisor, LoggingSupervisor, SupervisorHook};

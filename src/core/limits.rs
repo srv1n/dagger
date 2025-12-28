@@ -653,7 +653,7 @@ mod tests {
         let utilization = tracker.get_utilization();
 
         assert!((utilization.memory_utilization - 50.0).abs() < 1.0);
-        
+
         // Allocate more to trigger approaching limits (>80%)
         let _allocation2 = tracker
             .allocate_memory((limits.max_memory_bytes * 35) / 100)

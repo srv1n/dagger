@@ -1,6 +1,6 @@
 use crate::{
     error::{Result, TaskError},
-    model::{Task, TaskId, TaskStatus, TaskType, Durability, AgentId, JobId},
+    model::{AgentId, Durability, JobId, Task, TaskId, TaskStatus, TaskType},
     storage::Storage,
 };
 use async_trait::async_trait;
@@ -27,12 +27,12 @@ impl SqliteStorage {
     /// Open SQLite storage at path
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let database_url = format!("sqlite:{}", path.as_ref().display());
-        
+
         let mut options = SqliteConnectOptions::new()
             .filename(&database_url[7..]) // Remove "sqlite:" prefix
             .journal_mode(SqliteJournalMode::Wal)
             .create_if_missing(true);
-        
+
         options.disable_statement_logging();
 
         let pool = SqlitePoolOptions::new()
@@ -46,13 +46,12 @@ impl SqliteStorage {
         Self::initialize_schema(&pool).await?;
 
         // Initialize next ID from existing tasks
-        let max_id: i64 = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM tasks"
-        )
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to get max task ID: {}", e)))?
-        .unwrap_or(0);
+        let max_id: i64 =
+            sqlx::query_scalar!("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM tasks")
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| TaskError::Storage(format!("Failed to get max task ID: {}", e)))?
+                .unwrap_or(0);
 
         Ok(Self {
             pool,
@@ -155,7 +154,7 @@ impl SqliteStorage {
     fn task_to_db_row(task: &Task) -> Result<TaskRow> {
         let status = match task.status.load(Ordering::Relaxed) {
             0 => "pending",
-            1 => "blocked", 
+            1 => "blocked",
             2 => "ready",
             3 => "running",
             4 => "completed",
@@ -173,15 +172,19 @@ impl SqliteStorage {
 
         let task_type = match task.task_type {
             TaskType::Objective => "Objective",
-            TaskType::Story => "Story", 
+            TaskType::Story => "Story",
             TaskType::Task => "Task",
             TaskType::Subtask => "Subtask",
         };
 
-        let dependencies = serde_json::to_string(&task.dependencies)
-            .map_err(|e| TaskError::Serialization(format!("Failed to serialize dependencies: {}", e)))?;
+        let dependencies = serde_json::to_string(&task.dependencies).map_err(|e| {
+            TaskError::Serialization(format!("Failed to serialize dependencies: {}", e))
+        })?;
 
-        let output_lock = task.payload.output.try_read()
+        let output_lock = task
+            .payload
+            .output
+            .try_read()
             .map_err(|_| TaskError::Concurrency("Failed to read task output".into()))?;
 
         Ok(TaskRow {
@@ -209,15 +212,19 @@ impl SqliteStorage {
     }
 
     fn db_row_to_task(row: TaskRow) -> Result<Task> {
+        use smallvec::SmallVec;
         use std::sync::atomic::AtomicU8;
         use std::sync::Arc;
         use tokio::sync::RwLock;
-        use smallvec::SmallVec;
 
-        let id: TaskId = row.id.parse()
+        let id: TaskId = row
+            .id
+            .parse()
             .map_err(|_| TaskError::InvalidId(row.id.clone()))?;
 
-        let job: JobId = row.job_id.parse()
+        let job: JobId = row
+            .job_id
+            .parse()
             .map_err(|_| TaskError::InvalidId(row.job_id.clone()))?;
 
         let agent: AgentId = row.agent_id as AgentId;
@@ -249,8 +256,10 @@ impl SqliteStorage {
             _ => return Err(TaskError::InvalidStatus),
         };
 
-        let dependencies: SmallVec<[TaskId; 4]> = serde_json::from_str(&row.dependencies)
-            .map_err(|e| TaskError::Serialization(format!("Failed to deserialize dependencies: {}", e)))?;
+        let dependencies: SmallVec<[TaskId; 4]> =
+            serde_json::from_str(&row.dependencies).map_err(|e| {
+                TaskError::Serialization(format!("Failed to deserialize dependencies: {}", e))
+            })?;
 
         let parent = row.parent_id.and_then(|p| p.parse().ok());
 
@@ -445,12 +454,10 @@ impl Storage for SqliteStorage {
     }
 
     async fn list_running(&self) -> Result<Vec<TaskId>> {
-        let rows = sqlx::query!(
-            "SELECT id FROM tasks WHERE status = 'running'"
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to list running tasks: {}", e)))?;
+        let rows = sqlx::query!("SELECT id FROM tasks WHERE status = 'running'")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| TaskError::Storage(format!("Failed to list running tasks: {}", e)))?;
 
         let mut running = Vec::new();
         for row in rows {
@@ -482,19 +489,20 @@ impl Storage for SqliteStorage {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| TaskError::Storage(format!("Failed to update output for task {}: {}", id, e)))?;
+        .map_err(|e| {
+            TaskError::Storage(format!("Failed to update output for task {}: {}", id, e))
+        })?;
 
         Ok(())
     }
 
     async fn get_status(&self, id: TaskId) -> Result<TaskStatus> {
-        let row = sqlx::query!(
-            "SELECT status FROM tasks WHERE id = ?",
-            id.to_string()
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to get status for task {}: {}", id, e)))?;
+        let row = sqlx::query!("SELECT status FROM tasks WHERE id = ?", id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                TaskError::Storage(format!("Failed to get status for task {}: {}", id, e))
+            })?;
 
         match row {
             Some(row) => {
@@ -527,13 +535,12 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_shared_state(&self, key: &str) -> Result<Option<Bytes>> {
-        let row = sqlx::query!(
-            "SELECT value FROM shared_state WHERE key = ?",
-            key
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to get shared state '{}': {}", key, e)))?;
+        let row = sqlx::query!("SELECT value FROM shared_state WHERE key = ?", key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                TaskError::Storage(format!("Failed to get shared state '{}': {}", key, e))
+            })?;
 
         Ok(row.map(|r| Bytes::from(r.value)))
     }
@@ -555,13 +562,12 @@ impl Storage for SqliteStorage {
     }
 
     async fn delete_shared_state(&self, key: &str) -> Result<bool> {
-        let result = sqlx::query!(
-            "DELETE FROM shared_state WHERE key = ?",
-            key
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to delete shared state '{}': {}", key, e)))?;
+        let result = sqlx::query!("DELETE FROM shared_state WHERE key = ?", key)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                TaskError::Storage(format!("Failed to delete shared state '{}': {}", key, e))
+            })?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -590,7 +596,9 @@ impl SqliteSharedTree {
 impl SharedTree for SqliteSharedTree {
     async fn put(&self, scope: &str, key: &str, val: &[u8]) -> Result<()> {
         let full_key = format!("{}/{}", scope, key);
-        self.storage.set_shared_state(&full_key, Bytes::copy_from_slice(val)).await
+        self.storage
+            .set_shared_state(&full_key, Bytes::copy_from_slice(val))
+            .await
     }
 
     async fn get(&self, scope: &str, key: &str) -> Result<Option<Bytes>> {
@@ -662,14 +670,14 @@ mod tests {
         // Shared state operations
         let key = "test_key";
         let value = Bytes::from("test_value");
-        
+
         storage.set_shared_state(key, value.clone()).await?;
         let retrieved_value = storage.get_shared_state(key).await?;
         assert_eq!(retrieved_value, Some(value));
 
         let deleted = storage.delete_shared_state(key).await?;
         assert!(deleted);
-        
+
         let retrieved_after_delete = storage.get_shared_state(key).await?;
         assert_eq!(retrieved_after_delete, None);
 
@@ -695,7 +703,7 @@ mod tests {
         // Test delete
         let deleted = shared_tree.delete(scope, key).await?;
         assert!(deleted);
-        
+
         let retrieved_after_delete = shared_tree.get(scope, key).await?;
         assert_eq!(retrieved_after_delete, None);
 

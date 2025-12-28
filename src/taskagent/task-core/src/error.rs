@@ -10,7 +10,6 @@ pub enum TaskError {
     Storage(String),
 
     // Removed sled::Error - using SQLite now
-
     #[error("SQLite error: {0}")]
     Sqlite(#[from] sqlx::Error),
 

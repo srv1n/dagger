@@ -1,11 +1,11 @@
 //! Event hook system for coordinator-based execution
-//! 
+//!
 //! Hooks process events and return commands, never directly mutating state.
 
-use async_trait::async_trait;
 use super::types::{ExecutionEvent, ExecutorCommand};
-use std::sync::Arc;
+use async_trait::async_trait;
 use std::any::Any;
+use std::sync::Arc;
 
 /// Context provided to hooks for processing events
 pub struct HookContext {
@@ -26,7 +26,7 @@ impl HookContext {
             app_data: None,
         }
     }
-    
+
     /// Set application data
     pub fn with_app_data(mut self, data: Arc<dyn Any + Send + Sync>) -> Self {
         self.app_data = Some(data);
@@ -35,19 +35,19 @@ impl HookContext {
 }
 
 /// Event hook trait - processes events and returns commands
-/// 
+///
 /// This is the key abstraction that enables safe parallel execution.
 /// Hooks cannot mutate state directly, only return commands.
 #[async_trait]
 pub trait EventHook: Send + Sync {
     /// Handle an execution event and return commands to apply
     async fn handle(&self, ctx: &HookContext, event: &ExecutionEvent) -> Vec<ExecutorCommand>;
-    
+
     /// Optional: Called when the DAG execution starts
     async fn on_start(&self, _ctx: &HookContext) -> Vec<ExecutorCommand> {
         Vec::new()
     }
-    
+
     /// Optional: Called when the DAG execution completes
     async fn on_complete(&self, _ctx: &HookContext, _success: bool) -> Vec<ExecutorCommand> {
         Vec::new()
@@ -63,7 +63,7 @@ impl CompositeHook {
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }
-    
+
     pub fn add_hook(&mut self, hook: Arc<dyn EventHook>) {
         self.hooks.push(hook);
     }
@@ -78,7 +78,7 @@ impl EventHook for CompositeHook {
         }
         commands
     }
-    
+
     async fn on_start(&self, ctx: &HookContext) -> Vec<ExecutorCommand> {
         let mut commands = Vec::new();
         for hook in &self.hooks {
@@ -86,7 +86,7 @@ impl EventHook for CompositeHook {
         }
         commands
     }
-    
+
     async fn on_complete(&self, ctx: &HookContext, success: bool) -> Vec<ExecutorCommand> {
         let mut commands = Vec::new();
         for hook in &self.hooks {
@@ -107,10 +107,20 @@ impl EventHook for LoggingHook {
                 tracing::info!("Node started: {}/{}", node.dag_name, node.node_id);
             }
             ExecutionEvent::NodeCompleted { node, outcome } => {
-                tracing::info!("Node completed: {}/{} - {:?}", node.dag_name, node.node_id, outcome);
+                tracing::info!(
+                    "Node completed: {}/{} - {:?}",
+                    node.dag_name,
+                    node.node_id,
+                    outcome
+                );
             }
             ExecutionEvent::NodeFailed { node, error } => {
-                tracing::error!("Node failed: {}/{} - {}", node.dag_name, node.node_id, error);
+                tracing::error!(
+                    "Node failed: {}/{} - {}",
+                    node.dag_name,
+                    node.node_id,
+                    error
+                );
             }
         }
         Vec::new() // Logging hook doesn't produce commands

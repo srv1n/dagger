@@ -27,12 +27,12 @@ impl SqliteCache {
         } else {
             database_url.to_string()
         };
-        
+
         let pool = SqlitePool::connect(&url).await?;
-        
+
         // Initialize database schema
         Self::initialize_schema(&pool).await?;
-        
+
         Ok(Self { pool })
     }
 
@@ -50,7 +50,7 @@ impl SqliteCache {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (dag_id, node_id, key)
             )
-            "#
+            "#,
         )
         .execute(pool)
         .await?;
@@ -64,7 +64,7 @@ impl SqliteCache {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-            "#
+            "#,
         )
         .execute(pool)
         .await?;
@@ -79,7 +79,7 @@ impl SqliteCache {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(dag_id, created_at)
             )
-            "#
+            "#,
         )
         .execute(pool)
         .await?;
@@ -95,7 +95,7 @@ impl SqliteCache {
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (dag_id, state_type)
             )
-            "#
+            "#,
         )
         .execute(pool)
         .await?;
@@ -104,14 +104,16 @@ impl SqliteCache {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_artifacts_dag_id ON artifacts(dag_id)")
             .execute(pool)
             .await?;
-        
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_snapshots_dag_id ON snapshots(dag_id)")
             .execute(pool)
             .await?;
 
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_execution_state_dag_id ON execution_state(dag_id)")
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_execution_state_dag_id ON execution_state(dag_id)",
+        )
+        .execute(pool)
+        .await?;
 
         info!("SQLite schema initialized successfully");
         Ok(())
@@ -139,12 +141,12 @@ impl SqliteCache {
             for entry in node_cache.iter() {
                 let key = entry.key();
                 let value = entry.value();
-                
+
                 let serialized_value = serde_json::to_string(value)
                     .map_err(|e| anyhow!("Failed to serialize cache value: {}", e))?;
 
                 sqlx::query(
-                    "INSERT INTO artifacts (dag_id, node_id, key, value) VALUES (?, ?, ?, ?)"
+                    "INSERT INTO artifacts (dag_id, node_id, key, value) VALUES (?, ?, ?, ?)",
                 )
                 .bind(dag_id)
                 .bind(node_id)
@@ -175,7 +177,7 @@ impl SqliteCache {
         delta: HashMap<String, HashMap<String, SerializableData>>,
     ) -> Result<()> {
         let start = std::time::Instant::now();
-        
+
         let mut tx = self.pool.begin().await?;
         let mut total_updates = 0;
 
@@ -189,7 +191,7 @@ impl SqliteCache {
                     r#"
                     INSERT OR REPLACE INTO artifacts (dag_id, node_id, key, value, updated_at) 
                     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    "#
+                    "#,
                 )
                 .bind(dag_id)
                 .bind(&node_id)
@@ -218,7 +220,7 @@ impl SqliteCache {
         info!("Loading cache for DAG: {}", dag_id);
 
         let rows = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT node_id, key, value FROM artifacts WHERE dag_id = ? ORDER BY node_id, key"
+            "SELECT node_id, key, value FROM artifacts WHERE dag_id = ? ORDER BY node_id, key",
         )
         .bind(dag_id)
         .fetch_all(&self.pool)
@@ -235,12 +237,14 @@ impl SqliteCache {
                 .entry(node_id)
                 .or_insert_with(DashMap::new)
                 .insert(key, value);
-            
+
             total_entries += 1;
         }
 
         info!("Loaded {} entries from cache", total_entries);
-        Ok(Cache { data: Arc::new(cache_data) })
+        Ok(Cache {
+            data: Arc::new(cache_data),
+        })
     }
 
     /// Get a specific node output as JSON from the cache
@@ -248,14 +252,16 @@ impl SqliteCache {
         // Parse path like "node/{node_id}/{key}"
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() < 3 || parts[0] != "node" {
-            return Err(anyhow!("Invalid path format. Expected: node/{{node_id}}/{{key}}"));
+            return Err(anyhow!(
+                "Invalid path format. Expected: node/{{node_id}}/{{key}}"
+            ));
         }
-        
+
         let node_id = parts[1];
         let key = parts[2..].join("/"); // Allow keys with slashes
-        
+
         let row = sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM artifacts WHERE dag_id = ? AND node_id = ? AND key = ?"
+            "SELECT value FROM artifacts WHERE dag_id = ? AND node_id = ? AND key = ?",
         )
         .bind(dag_id)
         .bind(node_id)
@@ -269,7 +275,7 @@ impl SqliteCache {
                     .map_err(|e| anyhow!("Failed to deserialize JSON value: {}", e))?;
                 Ok(Some(value))
             }
-            None => Ok(None)
+            None => Ok(None),
         }
     }
 
@@ -278,12 +284,14 @@ impl SqliteCache {
         // Parse path like "node/{node_id}/{key}"
         let parts: Vec<&str> = path.split('/').collect();
         if parts.len() < 3 || parts[0] != "node" {
-            return Err(anyhow!("Invalid path format. Expected: node/{{node_id}}/{{key}}"));
+            return Err(anyhow!(
+                "Invalid path format. Expected: node/{{node_id}}/{{key}}"
+            ));
         }
-        
+
         let node_id = parts[1];
         let key = parts[2..].join("/"); // Allow keys with slashes
-        
+
         let serialized_value = serde_json::to_string(&value)
             .map_err(|e| anyhow!("Failed to serialize JSON value: {}", e))?;
 
@@ -292,7 +300,7 @@ impl SqliteCache {
             r#"
             INSERT OR REPLACE INTO artifacts (dag_id, node_id, key, value, updated_at) 
             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-            "#
+            "#,
         )
         .bind(dag_id)
         .bind(node_id)
@@ -316,7 +324,7 @@ impl SqliteCache {
             r#"
             INSERT OR REPLACE INTO execution_trees (dag_id, tree_data, updated_at) 
             VALUES (?, ?, CURRENT_TIMESTAMP)
-            "#
+            "#,
         )
         .bind(dag_id)
         .bind(&compressed)
@@ -330,7 +338,7 @@ impl SqliteCache {
     /// Load execution tree from SQLite
     pub async fn load_execution_tree(&self, dag_id: &str) -> Result<Option<ExecutionTree>> {
         let row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT tree_data FROM execution_trees WHERE dag_id = ?"
+            "SELECT tree_data FROM execution_trees WHERE dag_id = ?",
         )
         .bind(dag_id)
         .fetch_optional(&self.pool)
@@ -357,14 +365,14 @@ impl SqliteCache {
             // Use high-precision timestamp to avoid collisions
             let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             let result = sqlx::query(
-                "INSERT INTO snapshots (dag_id, snapshot_data, created_at) VALUES (?, ?, ?)"
+                "INSERT INTO snapshots (dag_id, snapshot_data, created_at) VALUES (?, ?, ?)",
             )
             .bind(dag_id)
             .bind(&compressed)
             .bind(&timestamp)
             .execute(&self.pool)
             .await;
-            
+
             match result {
                 Ok(_) => {
                     debug!("Saved snapshot for DAG: {}", dag_id);
@@ -392,7 +400,7 @@ impl SqliteCache {
     /// Load latest snapshot
     pub async fn load_latest_snapshot(&self, dag_id: &str) -> Result<Option<Vec<u8>>> {
         let row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT snapshot_data FROM snapshots WHERE dag_id = ? ORDER BY created_at DESC LIMIT 1"
+            "SELECT snapshot_data FROM snapshots WHERE dag_id = ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(dag_id)
         .fetch_optional(&self.pool)
@@ -411,7 +419,7 @@ impl SqliteCache {
         &self,
         dag_id: &str,
         state_type: &str,
-        state_data: &[u8]
+        state_data: &[u8],
     ) -> Result<()> {
         let compressed = zstd::encode_all(state_data, 3)
             .map_err(|e| anyhow!("Failed to compress execution state: {}", e))?;
@@ -420,7 +428,7 @@ impl SqliteCache {
             r#"
             INSERT OR REPLACE INTO execution_state (dag_id, state_type, state_data, updated_at) 
             VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            "#
+            "#,
         )
         .bind(dag_id)
         .bind(state_type)
@@ -436,10 +444,10 @@ impl SqliteCache {
     pub async fn load_execution_state(
         &self,
         dag_id: &str,
-        state_type: &str
+        state_type: &str,
     ) -> Result<Option<Vec<u8>>> {
         let row = sqlx::query_as::<_, (Vec<u8>,)>(
-            "SELECT state_data FROM execution_state WHERE dag_id = ? AND state_type = ?"
+            "SELECT state_data FROM execution_state WHERE dag_id = ? AND state_type = ?",
         )
         .bind(dag_id)
         .bind(state_type)
@@ -460,7 +468,7 @@ impl SqliteCache {
 
         // Print artifacts count by DAG
         let artifact_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT dag_id, COUNT(*) FROM artifacts GROUP BY dag_id"
+            "SELECT dag_id, COUNT(*) FROM artifacts GROUP BY dag_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -472,7 +480,7 @@ impl SqliteCache {
 
         // Print execution trees
         let tree_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT dag_id, LENGTH(tree_data) FROM execution_trees"
+            "SELECT dag_id, LENGTH(tree_data) FROM execution_trees",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -484,7 +492,7 @@ impl SqliteCache {
 
         // Print snapshots count
         let snapshot_rows = sqlx::query_as::<_, (String, i64)>(
-            "SELECT dag_id, COUNT(*) FROM snapshots GROUP BY dag_id"
+            "SELECT dag_id, COUNT(*) FROM snapshots GROUP BY dag_id",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -496,7 +504,7 @@ impl SqliteCache {
 
         // Print execution states
         let state_rows = sqlx::query_as::<_, (String, String, i64)>(
-            "SELECT dag_id, state_type, LENGTH(state_data) FROM execution_state"
+            "SELECT dag_id, state_type, LENGTH(state_data) FROM execution_state",
         )
         .fetch_all(&self.pool)
         .await?;

@@ -4,12 +4,12 @@
 //! without getting bogged down in API compatibility issues.
 
 use anyhow::Result;
-use dagger::dag_flow::{Cache, DagExecutor, Node, NodeAction, IField, OField};
-use dagger::insert_value;
 use async_trait::async_trait;
+use dagger::dag_flow::{Cache, DagExecutor, IField, Node, NodeAction, OField};
+use dagger::insert_value;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Test that basic DAG executor can be created
 #[tokio::test]
@@ -19,7 +19,9 @@ async fn test_dag_executor_creation() {
     // Clean up any existing database first
     let _ = std::fs::remove_dir_all("test_dag_db");
 
-    let _executor = DagExecutor::new(None, registry, "test_dag_db").await.unwrap();
+    let _executor = DagExecutor::new(None, registry, "test_dag_db")
+        .await
+        .unwrap();
 
     // Test passed if we get here without panicking
     assert!(true);
@@ -49,7 +51,9 @@ async fn test_yaml_loading() {
     // Clean up any existing database first
     let _ = std::fs::remove_dir_all("test_yaml_db");
 
-    let mut executor = DagExecutor::new(None, registry, "test_yaml_db").await.unwrap();
+    let mut executor = DagExecutor::new(None, registry, "test_yaml_db")
+        .await
+        .unwrap();
 
     // Try to load YAML from examples
     let yaml_path = "examples/dag_flow/pipeline.yaml";
@@ -77,7 +81,9 @@ async fn test_dag_config() {
     // Clean up any existing database first
     let _ = std::fs::remove_dir_all("test_config_db");
 
-    let _executor = DagExecutor::new(Some(config), registry, "test_config_db").await.unwrap();
+    let _executor = DagExecutor::new(Some(config), registry, "test_config_db")
+        .await
+        .unwrap();
 
     assert!(true);
 }
@@ -145,11 +151,9 @@ async fn test_services_accessible_in_nodes() {
 
     // Create test setup
     let registry = Arc::new(RwLock::new(HashMap::new()));
-    
+
     // Use in-memory database for testing
-    let mut executor = DagExecutor::new(None, registry, ":memory:")
-        .await
-        .unwrap();
+    let mut executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
 
     // Create test services
     let services = Arc::new(TestServices {
@@ -181,13 +185,19 @@ async fn test_services_accessible_in_nodes() {
     // Execute the node
     let cache = Cache::new();
     let test_node_action = Arc::new(TestNode);
-    test_node_action.execute(&mut executor, &node, &cache).await.unwrap();
+    test_node_action
+        .execute(&mut executor, &node, &cache)
+        .await
+        .unwrap();
 
     // Verify the service was accessed (counter should be 1)
     assert_eq!(services.value.load(Ordering::Relaxed), 1);
-    
+
     // Execute again to ensure it works multiple times
-    test_node_action.execute(&mut executor, &node, &cache).await.unwrap();
+    test_node_action
+        .execute(&mut executor, &node, &cache)
+        .await
+        .unwrap();
     assert_eq!(services.value.load(Ordering::Relaxed), 2);
 
     // Test that we can also downcast to the correct type

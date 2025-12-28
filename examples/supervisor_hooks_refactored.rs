@@ -1,14 +1,14 @@
 //! Refactored Supervisor Hooks Implementation
-//! 
+//!
 //! This example demonstrates the recommended solution for integrating
 //! supervisor hooks with parallel DAG execution in Dagger.
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use std::collections::HashMap;
-use serde_json::Value;
 
 // ============= Core Types =============
 
@@ -110,19 +110,24 @@ impl HookProcessor {
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }
-    
+
     pub fn add_hook(&mut self, hook: Arc<dyn SupervisorHookV2>) {
         self.hooks.push(hook);
     }
-    
+
     pub async fn process_node_start(&self, ctx: &HookContext, node: &Node) -> Result<()> {
         for hook in &self.hooks {
             hook.on_node_start(ctx, node).await?;
         }
         Ok(())
     }
-    
-    pub async fn process_node_complete(&self, ctx: &HookContext, node: &Node, success: bool) -> Result<()> {
+
+    pub async fn process_node_complete(
+        &self,
+        ctx: &HookContext,
+        node: &Node,
+        success: bool,
+    ) -> Result<()> {
         for hook in &self.hooks {
             hook.on_node_complete(ctx, node, success).await?;
         }
@@ -141,10 +146,13 @@ impl SupervisorHookV2 for CleanupHook {
         println!("CleanupHook: Node {} starting", node.id);
         Ok(())
     }
-    
+
     async fn on_node_complete(&self, ctx: &HookContext, node: &Node, success: bool) -> Result<()> {
-        println!("CleanupHook: Node {} completed (success: {})", node.id, success);
-        
+        println!(
+            "CleanupHook: Node {} completed (success: {})",
+            node.id, success
+        );
+
         // Add cleanup node if this was a data processing node
         if success && node.action.starts_with("process_") {
             let cleanup_node = Node {
@@ -152,18 +160,18 @@ impl SupervisorHookV2 for CleanupHook {
                 action: "cleanup".to_string(),
                 dependencies: vec![node.id.clone()],
             };
-            
+
             ctx.command_tx.send(ExecutorCommand::AddNode {
                 dag_name: ctx.dag_name.clone(),
                 node: cleanup_node,
             })?;
-            
+
             println!("  -> Added cleanup node for {}", node.id);
         }
-        
+
         Ok(())
     }
-    
+
     async fn on_node_failure(&self, _ctx: &HookContext, node: &Node, error: &str) -> Result<()> {
         println!("CleanupHook: Node {} failed: {}", node.id, error);
         Ok(())
@@ -179,7 +187,7 @@ impl SupervisorHookV2 for MetricsHook {
         println!("MetricsHook: Tracking start of {}", node.id);
         Ok(())
     }
-    
+
     async fn on_node_complete(&self, ctx: &HookContext, node: &Node, success: bool) -> Result<()> {
         let mut metrics = ctx.metrics.lock().await;
         if success {
@@ -187,16 +195,20 @@ impl SupervisorHookV2 for MetricsHook {
         } else {
             metrics.nodes_failed += 1;
         }
-        println!("MetricsHook: Updated metrics for {} (total completed: {})", 
-                 node.id, metrics.nodes_completed);
+        println!(
+            "MetricsHook: Updated metrics for {} (total completed: {})",
+            node.id, metrics.nodes_completed
+        );
         Ok(())
     }
-    
+
     async fn on_node_failure(&self, ctx: &HookContext, node: &Node, _error: &str) -> Result<()> {
         let mut metrics = ctx.metrics.lock().await;
         metrics.nodes_failed += 1;
-        println!("MetricsHook: Recorded failure for {} (total failed: {})", 
-                 node.id, metrics.nodes_failed);
+        println!(
+            "MetricsHook: Recorded failure for {} (total failed: {})",
+            node.id, metrics.nodes_failed
+        );
         Ok(())
     }
 }
@@ -211,7 +223,7 @@ pub struct RefactoredDagExecutor {
 impl RefactoredDagExecutor {
     pub fn new() -> Self {
         let hook_processor = Arc::new(HookProcessor::new());
-        
+
         let shared = Arc::new(SharedExecutorState {
             config: DagConfig {
                 enable_parallel_execution: true,
@@ -220,15 +232,15 @@ impl RefactoredDagExecutor {
             registry: Arc::new(RwLock::new(HashMap::new())),
             hook_processor,
         });
-        
+
         let mutable = Arc::new(Mutex::new(MutableExecutorState {
             graphs: HashMap::new(),
             execution_trees: HashMap::new(),
         }));
-        
+
         Self { shared, mutable }
     }
-    
+
     pub fn add_hook(&mut self, hook: Arc<dyn SupervisorHookV2>) {
         Arc::get_mut(&mut self.shared)
             .unwrap()
@@ -238,26 +250,28 @@ impl RefactoredDagExecutor {
             ;
         // In real implementation, hooks would be added before execution starts
     }
-    
+
     pub async fn execute_dag_with_hooks(&self, dag_name: &str) -> Result<ExecutionReport> {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let metrics = Arc::new(Mutex::new(ExecutionMetrics::default()));
-        
+
         // Create hook context
         let hook_context = HookContext {
             dag_name: dag_name.to_string(),
             command_tx: cmd_tx.clone(),
             metrics: metrics.clone(),
         };
-        
+
         // Get nodes to execute
         let nodes = {
             let mutable = self.mutable.lock().await;
-            mutable.graphs.get(dag_name)
+            mutable
+                .graphs
+                .get(dag_name)
                 .map(|g| g.nodes.clone())
                 .unwrap_or_default()
         };
-        
+
         // Spawn command processor
         let mutable_clone = self.mutable.clone();
         let dag_name_clone = dag_name.to_string();
@@ -271,13 +285,23 @@ impl RefactoredDagExecutor {
                             graph.nodes.push(node);
                         }
                     }
-                    ExecutorCommand::RecordCompletion { dag_name, node_id, success } => {
-                        println!("Command processor: Recording completion of {} (success: {})", 
-                                 node_id, success);
-                        mutable.execution_trees
+                    ExecutorCommand::RecordCompletion {
+                        dag_name,
+                        node_id,
+                        success,
+                    } => {
+                        println!(
+                            "Command processor: Recording completion of {} (success: {})",
+                            node_id, success
+                        );
+                        mutable
+                            .execution_trees
                             .entry(dag_name)
-                            .or_insert_with(|| ExecutionTree { nodes_executed: Vec::new() })
-                            .nodes_executed.push(node_id);
+                            .or_insert_with(|| ExecutionTree {
+                                nodes_executed: Vec::new(),
+                            })
+                            .nodes_executed
+                            .push(node_id);
                     }
                     _ => {
                         println!("Command processor: Handling {:?}", cmd);
@@ -285,11 +309,11 @@ impl RefactoredDagExecutor {
                 }
             }
         });
-        
+
         // Execute nodes in parallel
         let shared = self.shared.clone();
         let mut handles = Vec::new();
-        
+
         for node in nodes {
             let shared = shared.clone();
             let hook_context = HookContext {
@@ -297,45 +321,53 @@ impl RefactoredDagExecutor {
                 command_tx: cmd_tx.clone(),
                 metrics: metrics.clone(),
             };
-            
+
             let handle = tokio::spawn(async move {
                 // Notify hooks of node start
-                shared.hook_processor.process_node_start(&hook_context, &node).await?;
-                
+                shared
+                    .hook_processor
+                    .process_node_start(&hook_context, &node)
+                    .await?;
+
                 // Simulate node execution
                 println!("Executing node: {}", node.id);
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                
+
                 // Simulate success/failure (always success for demo)
                 let success = true;
-                
+
                 // Notify hooks of completion
-                shared.hook_processor.process_node_complete(&hook_context, &node, success).await?;
-                
+                shared
+                    .hook_processor
+                    .process_node_complete(&hook_context, &node, success)
+                    .await?;
+
                 // Record completion
-                hook_context.command_tx.send(ExecutorCommand::RecordCompletion {
-                    dag_name: hook_context.dag_name.clone(),
-                    node_id: node.id.clone(),
-                    success,
-                })?;
-                
+                hook_context
+                    .command_tx
+                    .send(ExecutorCommand::RecordCompletion {
+                        dag_name: hook_context.dag_name.clone(),
+                        node_id: node.id.clone(),
+                        success,
+                    })?;
+
                 Ok::<(), anyhow::Error>(())
             });
-            
+
             handles.push(handle);
         }
-        
+
         // Wait for all nodes to complete
         for handle in handles {
             handle.await??;
         }
-        
+
         // Signal command processor to stop
         drop(cmd_tx);
-        
+
         // Wait for command processor
         let _ = command_processor.await;
-        
+
         // Prepare report
         let final_metrics = metrics.lock().await;
         Ok(ExecutionReport {
@@ -357,18 +389,18 @@ pub struct ExecutionReport {
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("=== Refactored Supervisor Hooks Demo ===\n");
-    
+
     // Create executor
     let mut executor = RefactoredDagExecutor::new();
-    
+
     // Add hooks (in real implementation, this would be done differently)
     let mut hook_processor = HookProcessor::new();
     hook_processor.add_hook(Arc::new(CleanupHook));
     hook_processor.add_hook(Arc::new(MetricsHook));
-    
+
     // Note: For demo purposes, we're directly modifying the shared state
     // In production, hooks would be added during executor construction
-    
+
     // Add a test DAG
     {
         let mut mutable = executor.mutable.lock().await;
@@ -396,16 +428,16 @@ async fn main() -> Result<()> {
             },
         );
     }
-    
+
     // Execute with hooks
     println!("Executing DAG with supervisor hooks...\n");
     let report = executor.execute_dag_with_hooks("test_dag").await?;
-    
+
     println!("\n=== Execution Report ===");
     println!("DAG: {}", report.dag_name);
     println!("Nodes completed: {}", report.nodes_completed);
     println!("Nodes failed: {}", report.nodes_failed);
-    
+
     // Check if cleanup nodes were added
     {
         let mutable = executor.mutable.lock().await;
@@ -416,9 +448,9 @@ async fn main() -> Result<()> {
             }
         }
     }
-    
+
     println!("\n✅ Refactored hooks demonstration completed successfully!");
-    
+
     Ok(())
 }
 

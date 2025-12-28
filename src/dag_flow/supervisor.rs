@@ -1,5 +1,5 @@
 //! Supervisor hook system for DAG Flow
-//! 
+//!
 //! Provides a formalized hook system for handling node completions
 //! and orchestrating dynamic workflow growth.
 
@@ -9,13 +9,13 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Supervisor hook trait for handling node completions
-/// 
+///
 /// This trait allows external code to react to node completions
 /// and potentially add new nodes to the DAG dynamically.
 #[async_trait]
 pub trait SupervisorHook: Send + Sync {
     /// Called after a node completes successfully
-    /// 
+    ///
     /// # Arguments
     /// * `executor` - The DAG executor (mutable for adding nodes)
     /// * `node` - The node that just completed
@@ -26,9 +26,9 @@ pub trait SupervisorHook: Send + Sync {
         node: &Node,
         cache: &Cache,
     ) -> Result<()>;
-    
+
     /// Optional: Called when a node fails
-    /// 
+    ///
     /// Default implementation does nothing
     async fn on_node_failure(
         &self,
@@ -39,9 +39,9 @@ pub trait SupervisorHook: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    
+
     /// Optional: Called before a node starts execution
-    /// 
+    ///
     /// Default implementation does nothing
     async fn before_node_start(
         &self,
@@ -67,7 +67,7 @@ impl SupervisorHook for LoggingSupervisor {
         tracing::info!("Node {} completed successfully", node.id);
         Ok(())
     }
-    
+
     async fn on_node_failure(
         &self,
         _executor: &mut DagExecutor,
@@ -89,7 +89,7 @@ impl CompositeSupervisor {
     pub fn new() -> Self {
         Self { hooks: Vec::new() }
     }
-    
+
     pub fn add_hook(&mut self, hook: Arc<dyn SupervisorHook>) {
         self.hooks.push(hook);
     }
@@ -108,7 +108,7 @@ impl SupervisorHook for CompositeSupervisor {
         }
         Ok(())
     }
-    
+
     async fn on_node_failure(
         &self,
         executor: &mut DagExecutor,
@@ -121,7 +121,7 @@ impl SupervisorHook for CompositeSupervisor {
         }
         Ok(())
     }
-    
+
     async fn before_node_start(
         &self,
         executor: &mut DagExecutor,

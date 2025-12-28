@@ -1,10 +1,10 @@
-use dagger::{Cache, DagExecutor, DagConfig, insert_value};
-use dagger::dag_flow::ExecutionContext;
-use dagger::dag_flow::{Graph, Node, IField, OField};
-use dagger::coord::{Coordinator, ActionRegistry, NodeAction, NodeCtx, NodeOutput};
 use async_trait::async_trait;
-use std::sync::Arc;
+use dagger::coord::{ActionRegistry, Coordinator, NodeAction, NodeCtx, NodeOutput};
+use dagger::dag_flow::ExecutionContext;
+use dagger::dag_flow::{Graph, IField, Node, OField};
+use dagger::{insert_value, Cache, DagConfig, DagExecutor};
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock, Semaphore};
 use tokio::time::Instant;
 
@@ -16,22 +16,27 @@ impl NodeAction for PrintMessageAction {
     fn name(&self) -> &str {
         "print_message"
     }
-    
+
     async fn execute(&self, ctx: &NodeCtx) -> anyhow::Result<NodeOutput> {
         println!("=== Executing node: {} ===", ctx.node_id);
         println!("  Inputs: {:?}", ctx.inputs);
-        
+
         // Store output in cache for dependent nodes
-        insert_value(&ctx.cache, &ctx.node_id, "output", json!({
-            "message": format!("Processed by {}", ctx.node_id),
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        }))?;
-        
+        insert_value(
+            &ctx.cache,
+            &ctx.node_id,
+            "output",
+            json!({
+                "message": format!("Processed by {}", ctx.node_id),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }),
+        )?;
+
         // Simulate some work
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        
+
         println!("  Node {} completed", ctx.node_id);
-        
+
         Ok(NodeOutput::success(json!({
             "status": "completed",
             "node": ctx.node_id.clone(),
@@ -45,26 +50,23 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
-    
+
     println!("\n=== Testing Fixed DAG Flow ===\n");
-    
+
     // Create registry and register the print_message action
     let registry = ActionRegistry::new();
     registry.register(Arc::new(PrintMessageAction));
-    
+
     // Create executor with parallel execution enabled
     let config = DagConfig {
         enable_parallel_execution: true,
         max_parallel_nodes: 4,
         ..Default::default()
     };
-    
-    let mut executor = DagExecutor::new(
-        Some(config.clone()),
-        registry.clone(),
-        "sqlite::memory:"
-    ).await?;
-    
+
+    let mut executor =
+        DagExecutor::new(Some(config.clone()), registry.clone(), "sqlite::memory:").await?;
+
     // Set up execution context for parallel execution
     executor.execution_context = Some(ExecutionContext {
         max_parallel_nodes: config.max_parallel_nodes,
@@ -72,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         cache_last_snapshot: Arc::new(RwLock::new(Instant::now())),
         cache_delta_size: Arc::new(RwLock::new(0)),
     });
-    
+
     // Create a simple sequential DAG: node1 -> node2 -> node3
     let graph = Graph {
         name: "test_sequential".to_string(),
@@ -87,7 +89,10 @@ async fn main() -> anyhow::Result<()> {
                 id: "node1".to_string(),
                 dependencies: vec![],
                 inputs: vec![],
-                outputs: vec![OField { name: "output".to_string(), description: None }],
+                outputs: vec![OField {
+                    name: "output".to_string(),
+                    description: None,
+                }],
                 action: "print_message".to_string(),
                 failure: "".to_string(),
                 onfailure: false,
@@ -104,7 +109,10 @@ async fn main() -> anyhow::Result<()> {
                     description: None,
                     reference: "node1.output".to_string(),
                 }],
-                outputs: vec![OField { name: "output".to_string(), description: None }],
+                outputs: vec![OField {
+                    name: "output".to_string(),
+                    description: None,
+                }],
                 action: "print_message".to_string(),
                 failure: "".to_string(),
                 onfailure: false,
@@ -121,7 +129,10 @@ async fn main() -> anyhow::Result<()> {
                     description: None,
                     reference: "node2.output".to_string(),
                 }],
-                outputs: vec![OField { name: "output".to_string(), description: None }],
+                outputs: vec![OField {
+                    name: "output".to_string(),
+                    description: None,
+                }],
                 action: "print_message".to_string(),
                 failure: "".to_string(),
                 onfailure: false,
@@ -132,34 +143,36 @@ async fn main() -> anyhow::Result<()> {
             },
         ],
     };
-    
+
     // Load the graph
     executor.build_dag_from_graph(graph).await?;
-    
+
     // Create cache and run the DAG
     let cache = Cache::new();
     let (_cancel_tx, cancel_rx) = oneshot::channel();
-    
+
     println!("Starting DAG execution...\n");
     let start_time = std::time::Instant::now();
-    
-    let report = executor.execute_static_dag("test_sequential", &cache, cancel_rx).await?;
-    
+
+    let report = executor
+        .execute_static_dag("test_sequential", &cache, cancel_rx)
+        .await?;
+
     let elapsed = start_time.elapsed();
-    
+
     println!("\n=== Execution Complete ===");
     println!("Success: {}", report.overall_success);
     println!("Nodes executed: {}", report.node_outcomes.len());
     println!("Time taken: {:?}", elapsed);
-    
+
     if let Some(error) = report.error {
         println!("Error: {}", error);
     }
-    
+
     // Print cache contents to verify data flow
     println!("\n=== Cache Contents ===");
     let cache_json = dagger::serialize_cache_to_prettyjson(&cache)?;
     println!("{}", cache_json);
-    
+
     Ok(())
 }

@@ -1,10 +1,10 @@
 //! Event system for DAG Flow
-//! 
+//!
 //! Provides typed event emission for runtime events
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Runtime event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,11 +76,11 @@ impl BufferingEventSink {
             events: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }
     }
-    
+
     pub fn get_events(&self) -> Vec<RuntimeEventEnvelope> {
         self.events.read().clone()
     }
-    
+
     pub fn clear(&self) {
         self.events.write().clear();
     }

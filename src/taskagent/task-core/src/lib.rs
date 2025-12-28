@@ -53,6 +53,7 @@ pub use scheduler::Scheduler;
 pub use sqlite_storage::{SharedTree, SqliteSharedTree, SqliteStorage};
 pub use storage::Storage;
 
+use recovery::Recovery;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -60,7 +61,6 @@ use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-use recovery::Recovery;
 
 // Global agent registration using linkme
 #[linkme::distributed_slice]
@@ -103,7 +103,7 @@ impl TaskSystem {
         // Initialize scheduler from storage
         scheduler.initialize_from_storage().await?;
 
-        // Create shared state  
+        // Create shared state
         let shared_tree = Arc::new(SqliteSharedTree::new(storage.clone()));
         let shared_state = Arc::new(SharedState::new_from_trait(shared_tree));
 
@@ -287,4 +287,3 @@ impl TaskSystemBuilder {
         self.build(Arc::new(registry)).await
     }
 }
-
