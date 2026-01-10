@@ -150,11 +150,7 @@ The DAG Flow system executes workflows defined in YAML files with automatic depe
 
 ```rust
 pub struct DagExecutor {
-    pub registry: Arc<RwLock<HashMap<String, Arc<dyn NodeAction>>>>,
-    pub dags: HashMap<String, GraphDefinition>,
-    pub sqlite_cache: Arc<SqliteCache>,
-    pub config: DagConfig,
-    pub execution_context: Option<ExecutionContext>,
+    /* ActionRegistry + DAG definitions + sqlite cache + config */
 }
 ```
 
@@ -220,17 +216,26 @@ Enables loosely-coupled agent communication through channels.
 
 ```rust
 pub struct PubSubExecutor {
-    agents: Vec<Box<dyn PubSubAgent>>,
-    channels: Arc<RwLock<HashMap<String, Sender<Message>>>>,
+    agents: Arc<RwLock<HashMap<String, AgentEntry>>>,
+    channels: Arc<RwLock<HashMap<String, ChannelInfo>>>,
 }
 
 #[async_trait]
 pub trait PubSubAgent {
     fn subscriptions(&self) -> Vec<String>;
     fn publications(&self) -> Vec<String>;
-    async fn handle_message(&mut self, message: Message) -> Result<()>;
+    async fn process_message(
+        &self,
+        node_id: &str,
+        channel: &str,
+        message: &Message,
+        executor: &mut PubSubExecutor,
+        cache: &Cache,
+    ) -> Result<()>;
 }
 ```
+
+Pub/Sub execution is in-memory and ephemeral; persistence is handled by DAG Flow and Task-Core.
 
 ## Parallel Execution
 
@@ -298,40 +303,30 @@ From the dag_flow example:
 ### Creating a Custom Action
 
 ```rust
-use dagger::{DagExecutor, Node, Cache, register_action};
+use dagger::action;
+use serde_json::json;
 
-async fn process_data(
-    _executor: &mut DagExecutor,
-    node: &Node,
-    cache: &Cache
-) -> Result<()> {
-    // Get inputs
-    let input: String = parse_input_from_name(cache, "data", &node.inputs)?;
-    
-    // Process
-    let result = input.to_uppercase();
-    
-    // Store output
-    insert_value(cache, &node.id, "result", result)?;
-    
-    Ok(())
+#[action(name = "process_data")]
+async fn process_data(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    let data = input["data"].as_str().unwrap_or_default();
+    Ok(json!({ "result": data.to_uppercase() }))
 }
 
-// Register with executor
-register_action!(executor, "process_data", process_data);
+// Actions are auto-registered when you construct a DagExecutor.
 ```
 
 ### Using the Macro System
 
 ```rust
-use dagger_macros::action;
+use dagger::action;
+use serde_json::{json, Value};
 
 #[action(
     input_schema = r#"{"type": "object", "properties": {"text": {"type": "string"}}}"#,
     output_schema = r#"{"type": "object", "properties": {"result": {"type": "string"}}}"#
 )]
-async fn transform_text(input: Value) -> Result<Value> {
-    let text = input["text"].as_str().unwrap();
+async fn transform_text(input: Value) -> anyhow::Result<Value> {
+    let text = input["text"].as_str().unwrap_or_default();
     Ok(json!({"result": text.to_uppercase()}))
 }
 ```

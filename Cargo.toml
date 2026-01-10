@@ -50,6 +50,7 @@ tracing-subscriber = "0.3"
 fastrand = "2.0"
 parking_lot = "0.12"
 bytes = "1.0"
+task-core = { path = "src/taskagent/task-core" }
 
 [dev-dependencies]
 pretty_assertions = "1.2.1"
@@ -60,4 +61,3 @@ tracing-subscriber = "0.3"
 [[example]]
 name = "dynamic_nodes_demo"
 path = "examples/dynamic_nodes_demo.rs"
-

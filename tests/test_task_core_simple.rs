@@ -102,6 +102,16 @@ async fn test_error_patterns() {
     let system_error = MockAgentError::System("db connection failed".into());
     let timeout_error = MockAgentError::Timeout(Duration::from_secs(30));
 
+    if let MockAgentError::User(msg) = &user_error {
+        assert_eq!(msg, "bad input");
+    }
+    if let MockAgentError::System(msg) = &system_error {
+        assert_eq!(msg, "db connection failed");
+    }
+    if let MockAgentError::Timeout(duration) = &timeout_error {
+        assert_eq!(*duration, Duration::from_secs(30));
+    }
+
     assert!(!user_error.is_retryable());
     assert!(system_error.is_retryable());
     assert!(timeout_error.is_retryable());
@@ -110,7 +120,7 @@ async fn test_error_patterns() {
 // Test JSON serialization patterns commonly used in task agents
 #[tokio::test]
 async fn test_json_patterns() {
-    use serde_json::{json, Value};
+    use serde_json::json;
 
     let input_data = json!({
         "action": "process",

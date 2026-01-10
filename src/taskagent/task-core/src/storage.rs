@@ -1,6 +1,6 @@
 use crate::{
-    error::{Result, TaskError},
-    model::{Task, TaskId, TaskStatus},
+    error::Result,
+    model::{JobId, Task, TaskId, TaskStatus},
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,6 +19,12 @@ pub trait Storage: Send + Sync {
 
     /// List all running tasks
     async fn list_running(&self) -> Result<Vec<TaskId>>;
+
+    /// List all tasks
+    async fn list_tasks(&self) -> Result<Vec<Task>>;
+
+    /// List tasks for a specific job
+    async fn list_tasks_by_job(&self, job_id: JobId) -> Result<Vec<Task>>;
 
     /// Get task output
     async fn get_output(&self, id: TaskId) -> Result<Option<Bytes>>;

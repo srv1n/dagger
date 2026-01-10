@@ -1,0 +1,103 @@
+name: order_pipeline
+description: "Simple order processing pipeline"
+instructions: null
+tags: ["orders", "demo"]
+author: "example"
+version: "1.0.0"
+signature: "demo"
+
+nodes:
+  - id: seed_orders
+    description: Seed sample orders
+    dependencies: []
+    inputs: []
+    outputs:
+      - name: orders
+        description: Sample order list
+    action: seed_orders
+    failure: seed_orders
+    onfailure: false
+    timeout: 30
+    try_count: 1
+    instructions: null
+
+  - id: validate_orders
+    description: Filter invalid orders
+    dependencies: [seed_orders]
+    inputs:
+      - name: orders
+        description: Orders list
+        reference: seed_orders.orders
+    outputs:
+      - name: valid_orders
+        description: Valid orders
+      - name: invalid_count
+        description: Count of invalid orders
+    action: validate_orders
+    failure: validate_orders
+    onfailure: false
+    timeout: 30
+    try_count: 1
+    instructions: null
+
+  - id: geo_breakdown
+    description: Orders per country
+    dependencies: [validate_orders]
+    inputs:
+      - name: orders
+        description: Valid orders
+        reference: validate_orders.valid_orders
+    outputs:
+      - name: by_country
+        description: Orders by country
+    action: geo_breakdown
+    failure: geo_breakdown
+    onfailure: false
+    timeout: 30
+    try_count: 1
+    instructions: null
+
+  - id: risk_score
+    description: Risk scoring for high-value orders
+    dependencies: [validate_orders]
+    inputs:
+      - name: orders
+        description: Valid orders
+        reference: validate_orders.valid_orders
+    outputs:
+      - name: high_risk_count
+        description: Count of high risk orders
+      - name: scores
+        description: Risk scores by order id
+    action: risk_score
+    failure: risk_score
+    onfailure: false
+    timeout: 30
+    try_count: 1
+    instructions: null
+
+  - id: summarize
+    description: Summarize pipeline results
+    dependencies: [geo_breakdown, risk_score]
+    inputs:
+      - name: orders
+        description: Valid orders
+        reference: validate_orders.valid_orders
+      - name: invalid_count
+        description: Invalid order count
+        reference: validate_orders.invalid_count
+      - name: by_country
+        description: Orders by country
+        reference: geo_breakdown.by_country
+      - name: high_risk_count
+        description: High risk order count
+        reference: risk_score.high_risk_count
+    outputs:
+      - name: summary
+        description: Summary report
+    action: summarize
+    failure: summarize
+    onfailure: false
+    timeout: 30
+    try_count: 1
+    instructions: null

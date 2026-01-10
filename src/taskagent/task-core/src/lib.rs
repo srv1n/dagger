@@ -41,6 +41,7 @@ pub mod storage;
 pub mod util;
 
 // Re-exports for convenience
+pub use bytes::Bytes;
 pub use config::{TaskConfig, TaskConfigBuilder};
 pub use error::{Result, TaskError};
 pub use executor::{Agent, AgentRegistry, SharedState, TaskContext, TaskHandle};
@@ -52,15 +53,15 @@ pub use recovery::{Recovery, RecoveryConfig};
 pub use scheduler::Scheduler;
 pub use sqlite_storage::{SharedTree, SqliteSharedTree, SqliteStorage};
 pub use storage::Storage;
+pub use util::IntoBytes;
 
-use recovery::Recovery;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 // Global agent registration using linkme
 #[linkme::distributed_slice]
@@ -116,7 +117,7 @@ impl TaskSystem {
         let executor = Arc::new(executor::Executor::new(
             storage.clone(),
             ready_queue.clone(),
-            config.max_parallel,
+            config.max_workers,
             Arc::new(agent_registry),
             scheduler.clone(),
             shared_state.clone(),
@@ -124,12 +125,7 @@ impl TaskSystem {
 
         // Run recovery
         let recovery_config = RecoveryConfig::default();
-        let recovery = Recovery::new(
-            storage.clone(),
-            ready_queue.clone(),
-            scheduler.clone(),
-            recovery_config,
-        );
+        let recovery = Recovery::new(storage.clone(), ready_queue.clone(), recovery_config);
         let recovery_stats = recovery.recover().await?;
 
         info!("Recovery complete: {:?}", recovery_stats);
@@ -149,7 +145,6 @@ impl TaskSystem {
 
         // Start executor
         let executor_clone = system.executor.clone();
-        let shutdown_flag = system.shutdown_flag.clone();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(async move {
@@ -161,6 +156,7 @@ impl TaskSystem {
         *system.executor_handle.lock().await = Some(handle);
 
         // Note: shutdown_tx will be handled differently in the new architecture
+        let _ = shutdown_tx;
 
         Ok(system)
     }
@@ -178,7 +174,7 @@ impl TaskSystem {
         self.storage.put(&task).await?;
 
         // Add to scheduler
-        self.scheduler.add_task(task).await?;
+        self.scheduler.add_task(&task).await?;
 
         Ok(task_id)
     }
@@ -223,6 +219,21 @@ impl TaskSystem {
     /// Get recovery statistics
     pub async fn recovery_stats(&self) -> Result<recovery::RecoveryStats> {
         Ok(self.recovery_stats.read().await.clone())
+    }
+
+    /// Access the shared state store
+    pub fn shared_state(&self) -> Arc<SharedState> {
+        self.shared_state.clone()
+    }
+
+    /// Access the task system configuration
+    pub fn config(&self) -> &TaskConfig {
+        &self.config
+    }
+
+    /// Resolve an agent ID by its registered name
+    pub fn agent_id(&self, name: &str) -> Option<AgentId> {
+        self.executor.agent_id(name)
     }
 
     /// Get a task by ID

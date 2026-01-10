@@ -16,20 +16,14 @@ sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
 ## Quick Start
 
 ```rust
-use dagger::{DagExecutor, Cache, register_action, Node};
-use tokio::sync::RwLock;
-use std::sync::Arc;
-use std::collections::HashMap;
-use anyhow::Result;
+use dagger::{action, coord::ActionRegistry, Cache, DagExecutor};
+use serde_json::json;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize
-    let registry = Arc::new(RwLock::new(HashMap::new()));
+async fn main() -> anyhow::Result<()> {
+    // Initialize (macro-registered actions are loaded here)
+    let registry = ActionRegistry::new();
     let mut executor = DagExecutor::new(None, registry, "sqlite::memory:").await?;
-    
-    // Register action
-    register_action!(executor, "process", process_data).await?;
     
     // Load workflow
     executor.load_yaml_file("workflow.yaml").await?;
@@ -43,9 +37,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn process_data(_: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    // Implementation
-    Ok(())
+#[action(name = "process")]
+async fn process_data(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    Ok(json!({ "status": "ok", "input": input }))
 }
 ```
 
@@ -68,8 +62,8 @@ nodes:
 Dynamic task graphs with runtime dependency creation and agent-based execution.
 
 ```rust
-#[task_agent]
-async fn analyze(task: Task) -> Result<Value> {
+#[dagger::task_agent]
+async fn analyze(task: Task) -> anyhow::Result<serde_json::Value> {
     // Create subtasks dynamically based on input
     Ok(json!({ "status": "processing" }))
 }
@@ -79,8 +73,8 @@ async fn analyze(task: Task) -> Result<Value> {
 Event-driven communication between decoupled agents.
 
 ```rust
-#[pubsub_agent(subscribe = "events", publish = "results")]
-async fn handler(msg: Message) -> Result<()> {
+#[dagger::pubsub_agent(subscribe = "events", publish = "results")]
+async fn handler(msg: Message) -> anyhow::Result<()> {
     // Process and publish
     Ok(())
 }
@@ -107,27 +101,33 @@ Storage uses SQLite with zstd compression for 3-10x size reduction.
 ## Examples
 
 Working examples in `examples/`:
-- `dag_flow/` - YAML workflow execution
-- `simple_task/` - Basic task demonstration
-- `agent_simple/` - Agent-based execution
-- `taskmanager_toy/` - Task manager patterns
+- `dag_flow_basic.rs` - YAML workflow execution with `#[action]` (`examples/fixtures/basic_pipeline.yaml`)
+- `dag_flow_pipeline.rs` - End-to-end order processing pipeline (`examples/fixtures/order_pipeline.yaml`)
+- `dag_flow_cli.rs` - CLI runner for multiple YAML DAGs (`examples/fixtures/pipeline*.yaml`)
+- `dag_flow_dot.rs` - Generate DOT graph for visualization (Graphviz)
+- `task_agent_basic.rs` - Task Agent mode with `#[task_agent]`
+- `pubsub_basic.rs` - Pub/Sub mode with `#[pubsub_agent]`
+- `dynamic_nodes_demo.rs` - Dynamic DAG growth
+- `coordinator_demo.rs` - Coordinator-based execution
 
 Run with:
 ```bash
-cargo run --bin simple_task
+cargo run --example dag_flow_basic
 ```
+
+Sample outputs and notes on nondeterminism: `examples/README.md`.
 
 ## Documentation
 
-- [Quick Reference](docs/QUICK_REFERENCE.md) - Common patterns and snippets
 - [Architecture](docs/ARCHITECTURE.md) - System design and components
-- [DAG Flow Guide](docs/DAG_FLOW_IMPLEMENTATION_GUIDE.md) - YAML workflows
+- [DAG Flow Guide](docs/DAG_FLOW_COMPLETE_GUIDE.md) - YAML workflows
 - [Task Agent Guide](docs/TASK_AGENT_ARCHITECTURE.md) - Dynamic tasks
-- [Storage Guide](docs/SQLITE_DAG_STORAGE_GUIDE.md) - Persistence layer
+- [Pub/Sub Guide](docs/PUBSUB_ARCHITECTURE.md) - Event-driven agents
+- [Upgrading / Adoption Notes](docs/UPGRADING.md) - Downstream migration checklist
 
 ## Recent Changes
 
-The codebase recently migrated from `std::sync::RwLock` to `tokio::sync::RwLock` for Send-compatible futures. Many APIs are now async. See migration guide in docs/archive/ if upgrading.
+This snapshot standardizes on macro-based registration for all three modes. If you are upgrading from earlier versions, read the adoption notes in `docs/UPGRADING.md`.
 
 ## License
 

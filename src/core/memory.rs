@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep};
+use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 /// Configuration for cache behavior

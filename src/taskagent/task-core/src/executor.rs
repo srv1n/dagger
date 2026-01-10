@@ -1,6 +1,6 @@
 use crate::{
     error::TaskError,
-    model::{AgentError, AgentId, Durability, NewTaskSpec, Task, TaskId, TaskStatus},
+    model::{AgentError, AgentId, Durability, JobId, NewTaskSpec, Task, TaskId, TaskStatus},
     ready_queue::ReadyQueue,
     scheduler::Scheduler,
     storage::Storage,
@@ -8,24 +8,27 @@ use crate::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Agent trait for task execution
 #[async_trait]
 pub trait Agent: Send + Sync + 'static {
     /// Execute the task with given input and context
-    async fn execute(&self, input: Bytes, ctx: Arc<TaskContext>) -> Result<Bytes, AgentError>;
+    async fn execute(&self, task: Task, ctx: Arc<TaskContext>) -> Result<Bytes, AgentError>;
 }
 
 /// Task execution context
 pub struct TaskContext {
+    pub task_id: TaskId,
+    pub job_id: JobId,
+    pub agent_id: AgentId,
     pub handle: Arc<dyn TaskHandle>,
     pub shared: Arc<SharedState>,
-    pub system: Weak<TaskSystem>,
+    pub storage: Arc<dyn Storage>,
     pub parent: Option<TaskId>,
     pub dependencies: Arc<[TaskId]>,
 }
@@ -33,11 +36,7 @@ pub struct TaskContext {
 impl TaskContext {
     /// Get dependency outputs
     pub async fn dependency_output(&self, dep_id: TaskId) -> Result<Option<Bytes>, TaskError> {
-        if let Some(system) = self.system.upgrade() {
-            system.storage.get_output(dep_id).await
-        } else {
-            Err(TaskError::SystemShutdown)
-        }
+        self.storage.get_output(dep_id).await
     }
 }
 
@@ -108,6 +107,21 @@ impl AgentRegistry {
         let id = *self.by_name.get(name)?;
         self.get(id)
     }
+
+    pub fn id_for_name(&self, name: &str) -> Option<AgentId> {
+        self.by_name.get(name).map(|id| *id)
+    }
+}
+
+impl Clone for AgentRegistry {
+    fn clone(&self) -> Self {
+        let by_id = self.by_id.clone();
+        let by_name = DashMap::new();
+        for entry in self.by_name.iter() {
+            by_name.insert(*entry.key(), *entry.value());
+        }
+        Self { by_id, by_name }
+    }
 }
 
 /// Worker pool executor
@@ -139,7 +153,10 @@ impl Executor {
         }
     }
 
-    pub async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<(), TaskError> {
+    pub async fn run(
+        self: Arc<Self>,
+        mut shutdown_rx: oneshot::Receiver<()>,
+    ) -> Result<(), TaskError> {
         let semaphore = Arc::new(Semaphore::new(self.workers));
 
         loop {
@@ -157,6 +174,10 @@ impl Executor {
         // Ensure storage is flushed
         self.storage.flush().await?;
         Ok(())
+    }
+
+    pub fn agent_id(&self, name: &str) -> Option<AgentId> {
+        self.agent_registry.id_for_name(name)
     }
 
     async fn run_iteration(&self, semaphore: &Arc<Semaphore>) {
@@ -216,25 +237,24 @@ async fn run_one(
 
     // Create context
     let context = Arc::new(TaskContext {
+        task_id: task.id,
+        job_id: task.job,
+        agent_id: task.agent,
         handle: Arc::new(TaskHandleImpl {
             storage: storage.clone(),
             scheduler: scheduler.clone(),
         }),
         shared: shared_state,
-        system: Weak::new(), // Will be set by TaskSystem
+        storage: storage.clone(),
         parent: task.parent,
-        dependencies: task.dependencies.clone().into(),
+        dependencies: Arc::from(task.dependencies.as_slice()),
     });
 
     // Set timeout
     let timeout_duration = task.timeout.unwrap_or(Duration::from_secs(300));
 
     // Execute with timeout
-    let result = timeout(
-        timeout_duration,
-        agent.execute(task.payload.input.clone(), context),
-    )
-    .await;
+    let result = timeout(timeout_duration, agent.execute(task.clone(), context)).await;
 
     match result {
         Ok(Ok(output)) => {
@@ -250,19 +270,26 @@ async fn run_one(
         Ok(Err(e)) => {
             // Agent error
             let should_retry = e.is_retryable()
+                && task.durability == Durability::BestEffort
                 && task.retry_count.load(std::sync::atomic::Ordering::Relaxed) < task.max_retries;
 
             if should_retry {
                 // Increment retry count and re-queue
+                let task = task.clone();
                 task.retry_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                storage.put(&task).await?;
                 storage
                     .update_status(id, TaskStatus::Running, TaskStatus::Pending)
                     .await?;
-                scheduler.ready.push(id);
+                if !scheduler.push_ready(id) {
+                    warn!(task_id = %id, "Retry enqueue failed (ready queue full)");
+                }
             } else {
                 // Final failure
+                let mut task = task.clone();
                 task.record_error(&e);
+                storage.put(&task).await?;
                 storage
                     .update_status(id, TaskStatus::Running, TaskStatus::Failed)
                     .await?;
@@ -272,7 +299,9 @@ async fn run_one(
         Err(_) => {
             // Timeout
             let e = AgentError::Timeout(timeout_duration);
+            let mut task = task.clone();
             task.record_error(&e);
+            storage.put(&task).await?;
             storage
                 .update_status(id, TaskStatus::Running, TaskStatus::Failed)
                 .await?;
@@ -296,7 +325,7 @@ impl TaskHandle for TaskHandleImpl {
         let task = Task::from_spec(task_id, spec);
 
         self.storage.put(&task).await?;
-        self.scheduler.add_task(task).await?;
+        self.scheduler.add_task(&task).await?;
 
         Ok(task_id)
     }
@@ -310,6 +339,3 @@ impl TaskHandle for TaskHandleImpl {
         self.spawn_task(spec).await
     }
 }
-
-// Forward declaration - will be defined in lib.rs
-pub struct TaskSystem;

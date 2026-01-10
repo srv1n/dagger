@@ -181,7 +181,7 @@ use dagger::{
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Create action registry
-    let mut registry = ActionRegistry::new();
+    let registry = ActionRegistry::new();
     registry.register(Arc::new(MyAction));
     
     // 2. Configure executor
@@ -262,9 +262,20 @@ nodes:
 
 ### Creating Custom Actions
 
-Actions are the building blocks of DAG nodes. There are two ways to create them:
+Actions are the building blocks of DAG nodes. There are two supported ways to create them:
 
-#### Method 1: Implement NodeAction Trait
+#### Method 1: `#[dagger::action]` macro (recommended)
+
+```rust
+#[dagger::action(name = "transform")]
+async fn transform(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::json!({ "ok": true, "input": input }))
+}
+```
+
+The macro auto-registers the action via `linkme`, and `DagExecutor::new(...)` registers all global actions into the provided `ActionRegistry`.
+
+#### Method 2: Implement `NodeAction` manually
 
 ```rust
 use dagger::coord::{NodeAction, NodeCtx, NodeOutput};
@@ -299,36 +310,14 @@ impl NodeAction for MyCustomAction {
 }
 ```
 
-#### Method 2: Function-based Actions (Legacy)
-
-```rust
-async fn simple_action(
-    executor: &mut DagExecutor,
-    node: &Node,
-    cache: &Cache,
-) -> Result<()> {
-    // Get inputs from cache
-    let input = get_input::<String>(cache, &node.id, "input")?;
-    
-    // Process
-    let output = input.to_uppercase();
-    
-    // Store outputs
-    insert_value(cache, &node.id, "output", output)?;
-    
-    Ok(())
-}
-```
-
 ### Registering Actions
 
 ```rust
-// For trait-based actions
+// For manually constructed actions
 registry.register(Arc::new(MyCustomAction));
-
-// For function-based actions (legacy)
-registry.register_fn("simple_action", simple_action);
 ```
+
+`DagExecutor::new(...)` calls `register_global_actions(&registry)` internally, so all `#[dagger::action]` functions compiled into the binary are automatically registered.
 
 ### Input/Output Resolution
 
@@ -754,7 +743,7 @@ impl DagExecutor {
     pub async fn load_yaml_file(&mut self, file_path: &str) -> Result<()>;
     
     /// Load all YAML files from directory
-    pub fn load_yaml_dir(&mut self, dir_path: &str);
+    pub async fn load_yaml_dir(&mut self, dir_path: &str) -> Result<(), anyhow::Error>;
     
     /// Add node to DAG
     pub async fn add_node(
@@ -1037,25 +1026,27 @@ let coordinator = Coordinator::new(vec![], 100, 100);
 coordinator.run_parallel(&mut executor, &cache, dag_name, run_id, cancel_rx).await?;
 ```
 
-### From Function Actions to Trait Actions
+### From Function Actions to Macro / Trait Actions
 
-Replace:
+Function-based actions are removed. Replace them with either the macro or a `NodeAction`.
+
 ```rust
-async fn my_action(exec: &mut DagExecutor, node: &Node, cache: &Cache) -> Result<()> {
-    // ...
+#[dagger::action(name = \"my_action\")]
+async fn my_action(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    Ok(input)
 }
-registry.register_fn("my_action", my_action);
 ```
 
-With:
+Or manual trait implementation:
+
 ```rust
 struct MyAction;
 
 #[async_trait]
 impl NodeAction for MyAction {
-    fn name(&self) -> &str { "my_action" }
+    fn name(&self) -> &str { \"my_action\" }
     async fn execute(&self, ctx: &NodeCtx) -> Result<NodeOutput> {
-        // ...
+        Ok(NodeOutput::success(ctx.inputs.clone()))
     }
 }
 registry.register(Arc::new(MyAction));

@@ -2,7 +2,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,15 +61,13 @@ pub enum TaskType {
 }
 
 /// Core task structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Task {
     pub id: TaskId,
     pub job: JobId,
     pub agent: AgentId,
-    #[serde(with = "atomic_u8")]
     pub status: AtomicU8,
     pub durability: Durability,
-    #[serde(with = "atomic_u8")]
     pub retry_count: AtomicU8,
     pub dependencies: SmallVec<[TaskId; 4]>,
     pub payload: Arc<TaskPayload>,
@@ -92,7 +90,7 @@ pub struct Task {
 }
 
 /// Task payload - rarely accessed fields
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct TaskPayload {
     pub input: Bytes,
     pub output: tokio::sync::RwLock<Option<Bytes>>,
@@ -114,11 +112,10 @@ pub struct NewTaskSpec {
 }
 
 /// Job metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Job {
     pub id: JobId,
     pub root_task: TaskId,
-    #[serde(with = "atomic_u8")]
     pub status: AtomicU8,
     pub summary: tokio::sync::RwLock<Option<String>>,
 }
@@ -187,34 +184,37 @@ impl Task {
     }
 
     /// Record an error
-    pub fn record_error(&self, err: &AgentError) {
+    pub fn record_error(&mut self, err: &AgentError) {
         let error_bytes = match err {
-            AgentError::User(s) => s.as_bytes(),
-            AgentError::System(e) => e.as_bytes(),
-            AgentError::Timeout(d) => format!("Timeout: {:?}", d).as_bytes(),
+            AgentError::User(s) => Bytes::from(s.clone()),
+            AgentError::System(e) => Bytes::from(e.clone()),
+            AgentError::Timeout(d) => Bytes::from(format!("Timeout: {:?}", d)),
         };
-        // Note: In real implementation, this would need mutable access
-        // self.error = Some(Bytes::copy_from_slice(error_bytes));
+        self.error = Some(error_bytes);
     }
 }
 
-// Serialization helpers for atomic types
-mod atomic_u8 {
-    use super::*;
-    use serde::{Deserializer, Serializer};
-
-    pub fn serialize<S>(atomic: &AtomicU8, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_u8(atomic.load(Ordering::Relaxed))
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<AtomicU8, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = u8::deserialize(deserializer)?;
-        Ok(AtomicU8::new(value))
+impl Clone for Task {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            job: self.job,
+            agent: self.agent,
+            status: AtomicU8::new(self.status.load(Ordering::Relaxed)),
+            durability: self.durability,
+            retry_count: AtomicU8::new(self.retry_count.load(Ordering::Relaxed)),
+            dependencies: self.dependencies.clone(),
+            payload: Arc::clone(&self.payload),
+            parent: self.parent,
+            task_type: self.task_type,
+            max_retries: self.max_retries,
+            timeout: self.timeout,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            acceptance_criteria: self.acceptance_criteria.clone(),
+            status_reason: self.status_reason.clone(),
+            summary: self.summary.clone(),
+            error: self.error.clone(),
+        }
     }
 }

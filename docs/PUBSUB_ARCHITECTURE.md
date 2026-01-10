@@ -100,6 +100,18 @@ Key design decisions:
 - **Self-message filtering**: Prevents infinite loops
 - **Graceful shutdown**: Through stopped flag checking
 
+## Macro-Friendly Context
+
+When using `#[dagger::pubsub_agent]`, you can optionally accept a mutable `PubSubContext` for publishing helpers and cache access:
+
+```rust
+#[dagger::pubsub_agent(subscribe = "events", publish = "results")]
+async fn handler(msg: Message, ctx: &mut dagger::PubSubContext) -> anyhow::Result<()> {
+    ctx.publish_payload("results", serde_json::json!({ "ok": true })).await?;
+    Ok(())
+}
+```
+
 ## Concurrency Model
 
 ### Lock Hierarchy
@@ -183,8 +195,8 @@ pub struct Cache {
 }
 
 // Usage in agent
-cache.insert_value(&node_id, "processed_count", &count)?;
-let previous = cache.get_value(&node_id, "processed_count");
+dagger::insert_value(cache, node_id, "processed_count", count)?;
+let previous: u64 = dagger::get_input(cache, node_id, "processed_count").unwrap_or(0);
 ```
 
 Cache patterns:
@@ -271,10 +283,8 @@ impl PubSubAgent for Ingester {
             .collect::<Vec<_>>();
         
         // Track in cache
-        let count = cache.get_value(node_id, "processed_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) + 1;
-        cache.insert_value(node_id, "processed_count", &count)?;
+        let count: u64 = dagger::get_input(cache, node_id, "processed_count").unwrap_or(0) + 1;
+        dagger::insert_value(cache, node_id, "processed_count", count)?;
         
         // Publish to next stage
         let output = Message::new(
@@ -326,13 +336,11 @@ impl PubSubAgent for Analyzer {
             .sum::<f64>() / data.len() as f64;
         
         // Check cache for running statistics
-        let prev_mean = cache.get_value(node_id, "running_mean")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let prev_mean: f64 = dagger::get_input(cache, node_id, "running_mean").unwrap_or(0.0);
         
         let alpha = 0.1;  // Exponential moving average
         let new_mean = alpha * mean + (1.0 - alpha) * prev_mean;
-        cache.insert_value(node_id, "running_mean", &new_mean)?;
+        dagger::insert_value(cache, node_id, "running_mean", new_mean)?;
         
         // Publish results
         let output = Message::new(

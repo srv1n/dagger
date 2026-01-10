@@ -1,19 +1,18 @@
 use super::dag_flow::{
     create_execution_report, execute_node_with_context, parse_input_from_name, Cache,
-    DagExecutionReport, DagExecutor, ExecutionContext, Node, NodeExecutionOutcome, OnFailure,
+    DagExecutionReport, DagExecutor, Node, OnFailure,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 use petgraph::graph::DiGraph;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tokio::time::Instant;
+use tracing::{error, info, warn};
 
 /// Executes the DAG asynchronously with parallel node execution support
 pub async fn execute_dag_parallel(
     executor: &mut DagExecutor,
-    dag: &DiGraph<Node, ()>,
+    _dag: &DiGraph<Node, ()>,
     cache: &Cache,
     dag_name: &str,
 ) -> (DagExecutionReport, bool) {
@@ -175,7 +174,6 @@ pub async fn execute_dag_parallel(
                     if !outcome.success {
                         match executor.config.on_failure {
                             OnFailure::Stop => {
-                                overall_success = false;
                                 node_outcomes.push(outcome);
                                 return (
                                     create_execution_report(node_outcomes, false, None),
@@ -186,7 +184,6 @@ pub async fn execute_dag_parallel(
                                 if let Err(e) = executor.save_cache(&outcome.node_id, cache).await {
                                     error!("Failed to save cache before pause: {}", e);
                                 }
-                                overall_success = false;
                                 node_outcomes.push(outcome);
                                 return (
                                     create_execution_report(node_outcomes, false, None),

@@ -1,7 +1,6 @@
 use crate::core::errors::{DaggerError, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -206,7 +205,7 @@ impl ResourceTracker {
     }
 
     /// Allocate memory and check limits
-    pub fn allocate_memory(&self, bytes: u64) -> Result<MemoryAllocation> {
+    pub fn allocate_memory(&self, bytes: u64) -> Result<MemoryAllocation<'_>> {
         let current = self.memory_usage.load(Ordering::Relaxed);
         let new_total = current + bytes;
 
@@ -243,7 +242,7 @@ impl ResourceTracker {
     }
 
     /// Start a task and check concurrent task limits
-    pub fn start_task(&self) -> Result<TaskExecution> {
+    pub fn start_task(&self) -> Result<TaskExecution<'_>> {
         let current = self.concurrent_tasks.load(Ordering::Relaxed);
         let new_total = current + 1;
 
@@ -352,7 +351,7 @@ impl ResourceTracker {
     }
 
     /// Open file handle
-    pub fn open_file_handle(&self) -> Result<FileHandle> {
+    pub fn open_file_handle(&self) -> Result<FileHandle<'_>> {
         let current = self.file_handles.load(Ordering::Relaxed);
         let new_total = current + 1;
 
@@ -379,7 +378,7 @@ impl ResourceTracker {
     }
 
     /// Open network connection
-    pub fn open_network_connection(&self) -> Result<NetworkConnection> {
+    pub fn open_network_connection(&self) -> Result<NetworkConnection<'_>> {
         let current = self.network_connections.load(Ordering::Relaxed);
         let new_total = current + 1;
 

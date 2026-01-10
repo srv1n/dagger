@@ -4,15 +4,14 @@
 //! ensuring no borrow checker conflicts while maintaining high parallelism.
 
 use anyhow::Result;
-use petgraph::graph::NodeIndex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::coord::action::{NodeAction, NodeCtx};
+use crate::coord::action::NodeCtx;
 use crate::coord::hooks::{EventHook, HookContext};
-use crate::coord::types::{ExecutionEvent, ExecutorCommand, NodeOutcome, NodeRef, NodeSpec};
-use crate::dag_flow::{Cache, DagExecutor, ExecutionObserver};
+use crate::coord::types::{ExecutionEvent, ExecutorCommand, NodeOutcome, NodeRef};
+use crate::dag_flow::{Cache, DagExecutor};
 
 /// Coordinator for parallel DAG execution
 pub struct Coordinator {
@@ -23,8 +22,6 @@ pub struct Coordinator {
     cmd_rx: mpsc::Receiver<ExecutorCommand>,
     // Hooks that process events
     hooks: Vec<Arc<dyn EventHook>>,
-    // Maximum in-flight events for backpressure
-    max_inflight_events: usize,
 }
 
 impl Coordinator {
@@ -38,7 +35,6 @@ impl Coordinator {
             cmd_tx,
             cmd_rx,
             hooks,
-            max_inflight_events: cap_events,
         }
     }
 
@@ -62,7 +58,7 @@ impl Coordinator {
     /// - Applying commands to mutate the DAG (only place with &mut DagExecutor)
     /// - Backpressure and graceful shutdown
     pub async fn run_parallel(
-        mut self,
+        self,
         exec: &mut DagExecutor,
         cache: &Cache,
         dag_name: &str,
@@ -199,7 +195,6 @@ impl Coordinator {
                                 tracing::info!("DAG execution complete after node failure: {}", node.node_id);
                             }
                         }
-                        _ => {}
                     }
                 }
 
@@ -314,7 +309,7 @@ async fn apply_command(
         }
         EmitEvent { event } => {
             // Route to EventStore if configured
-            if let Some(ref sink) = exec.event_sink {
+            if let Some(ref _sink) = exec.event_sink {
                 // Convert to the right event type
                 // This is a placeholder - adapt to your event system
                 tracing::debug!("Emitting event: {:?}", event);

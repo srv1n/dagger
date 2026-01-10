@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fmt;
 use thiserror::Error;
 
 /// Unified error type for the entire Dagger library

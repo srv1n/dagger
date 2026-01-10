@@ -15,8 +15,14 @@ pub mod taskagent; // Task-based agent execution
 pub mod storage; // SQLite storage backend
 
 // Core exports
+pub use anyhow;
 pub use core::errors::{DaggerError, Result};
 pub use core::limits::{ResourceLimits, ResourceTracker};
+pub use dagger_macros::{action, pubsub_agent, task_agent};
+pub use serde_json;
+
+// Re-export task-core for macro expansion convenience
+pub use task_core;
 
 // DAG Flow exports
 pub use dag_flow::{
@@ -31,12 +37,15 @@ pub use coord::{Coordinator, ExecutorCommand, NodeAction};
 
 // Task Agent exports
 pub use taskagent::{
-    JobHandle, JobStatus, Task, TaskAgent, TaskExecutionReport, TaskManager, TaskOutcome,
-    TaskStatus,
+    Agent, AgentError, AgentId, AgentRegistry, Durability, JobId, NewTaskSpec, Task, TaskConfig,
+    TaskConfigBuilder, TaskContext, TaskHandle, TaskId, TaskStatus, TaskSystem, TaskSystemBuilder,
+    TaskType,
 };
 
 // Pub/Sub exports
-pub use pubsub::{Message, PubSubAgent, PubSubConfig, PubSubExecutor};
+pub use pubsub::{
+    Message, PubSubAgent, PubSubConfig, PubSubContext, PubSubExecutor, PubSubWorkflowSpec,
+};
 
 // Export storage functionality
 pub use storage::{

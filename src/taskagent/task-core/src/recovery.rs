@@ -1,10 +1,9 @@
-use anyhow::Result;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use crate::error::{Result, TaskError};
 use crate::model::{Task, TaskStatus};
 use crate::ready_queue::ReadyQueue;
-use crate::scheduler::Scheduler;
 use crate::storage::Storage;
 
 /// Durability mode for task recovery
@@ -36,8 +35,7 @@ impl Default for RecoveryConfig {
 /// Handles recovery of tasks after a restart or crash
 pub struct Recovery {
     storage: Arc<dyn Storage>,
-    ready_queue: Arc<ReadyQueue<String>>,
-    scheduler: Arc<Scheduler>,
+    ready_queue: Arc<ReadyQueue<crate::model::TaskId>>,
     config: RecoveryConfig,
 }
 
@@ -45,14 +43,12 @@ impl Recovery {
     /// Create a new Recovery instance
     pub fn new(
         storage: Arc<dyn Storage>,
-        ready_queue: Arc<ReadyQueue<String>>,
-        scheduler: Arc<Scheduler>,
+        ready_queue: Arc<ReadyQueue<crate::model::TaskId>>,
         config: RecoveryConfig,
     ) -> Self {
         Self {
             storage,
             ready_queue,
-            scheduler,
             config,
         }
     }
@@ -60,7 +56,7 @@ impl Recovery {
     /// Recover tasks that were running when the system stopped
     ///
     /// This function:
-    /// 1. Scans for all tasks with InProgress status
+    /// 1. Scans for all tasks with Running status
     /// 2. Based on durability mode:
     ///    - BestEffort: Resets status to Pending and re-enqueues
     ///    - AtMostOnce: Updates status to Blocked with reason
@@ -69,19 +65,24 @@ impl Recovery {
         info!("Starting task recovery process");
         let mut stats = RecoveryStats::default();
 
-        // Get all running tasks
-        let running_tasks = self.storage.list_running().await?;
-        stats.total_running = running_tasks.len();
+        // Get all running task IDs
+        let running_task_ids = self.storage.list_running().await?;
+        stats.total_running = running_task_ids.len();
 
-        info!("Found {} tasks in InProgress state", running_tasks.len());
+        info!("Found {} tasks in Running state", running_task_ids.len());
 
-        for task in running_tasks {
-            let task_id = task.task_id.clone();
+        for task_id in running_task_ids {
+            let task = match self.storage.get(task_id).await? {
+                Some(task) => task,
+                None => {
+                    stats.failed += 1;
+                    continue;
+                }
+            };
             match self.recover_task(task).await {
                 Ok(outcome) => match outcome {
                     RecoveryOutcome::Retried => stats.retried += 1,
                     RecoveryOutcome::Paused => stats.paused += 1,
-                    RecoveryOutcome::Failed => stats.failed += 1,
                 },
                 Err(e) => {
                     error!("Failed to recover task {}: {}", task_id, e);
@@ -100,7 +101,7 @@ impl Recovery {
 
     /// Recover a single task based on its durability mode
     async fn recover_task(&self, task: Task) -> Result<RecoveryOutcome> {
-        let task_id = &task.task_id;
+        let task_id = task.id;
         let durability = self.get_task_durability(&task);
 
         info!(
@@ -116,7 +117,7 @@ impl Recovery {
 
     /// Recover a task with BestEffort durability - retry automatically
     async fn recover_best_effort(&self, task: Task) -> Result<RecoveryOutcome> {
-        let task_id = task.task_id.clone();
+        let task_id = task.id;
 
         debug!(
             "Recovering task {} with BestEffort mode - will retry",
@@ -125,14 +126,14 @@ impl Recovery {
 
         // Update task status back to Pending
         self.storage
-            .update_status(&task_id, TaskStatus::Pending)
+            .update_status(task_id, TaskStatus::Running, TaskStatus::Pending)
             .await?;
 
-        info!("Reset task {} status from InProgress to Pending", task_id);
+        info!("Reset task {} status from Running to Pending", task_id);
 
         // Check if dependencies are met and enqueue if ready
         if self.should_enqueue_task(&task).await? {
-            if self.ready_queue.push(task_id.clone()) {
+            if self.ready_queue.push(task_id) {
                 info!("Successfully enqueued task {} for retry", task_id);
             } else {
                 warn!("Failed to enqueue task {} - ready queue is full", task_id);
@@ -147,7 +148,7 @@ impl Recovery {
 
     /// Recover a task with AtMostOnce durability - pause and require manual intervention
     async fn recover_at_most_once(&self, task: Task) -> Result<RecoveryOutcome> {
-        let task_id = task.task_id.clone();
+        let task_id = task.id;
 
         debug!(
             "Recovering task {} with AtMostOnce mode - will pause",
@@ -156,16 +157,16 @@ impl Recovery {
 
         // Update task status to Blocked with recovery reason
         self.storage
-            .update_status(&task_id, TaskStatus::Blocked)
+            .update_status(task_id, TaskStatus::Running, TaskStatus::Blocked)
             .await?;
 
         // Update the task with a status reason
         // Note: This would ideally be done atomically with the status update
         // For now, we'll do a separate update
-        if let Some(mut updated_task) = self.storage.get(&task_id).await? {
-            updated_task.status_reason = Some(
-                "Task was in progress during system restart. Manual intervention required due to AtMostOnce durability.".to_string()
-            );
+        if let Some(mut updated_task) = self.storage.get(task_id).await? {
+            updated_task.status_reason = Some(Arc::from(
+                "Task was in progress during system restart. Manual intervention required due to AtMostOnce durability.",
+            ));
             self.storage.put(&updated_task).await?;
         }
 
@@ -193,22 +194,23 @@ impl Recovery {
 
         // Check if all dependencies are completed
         for dep_id in &task.dependencies {
-            match self.storage.get_status(dep_id).await? {
-                Some(TaskStatus::Completed) => continue,
-                Some(status) => {
+            match self.storage.get_status(*dep_id).await {
+                Ok(TaskStatus::Completed) => continue,
+                Ok(status) => {
                     debug!(
                         "Task {} dependency {} is not completed (status: {:?})",
-                        task.task_id, dep_id, status
+                        task.id, dep_id, status
                     );
                     return Ok(false);
                 }
-                None => {
+                Err(TaskError::TaskNotFound(_)) => {
                     warn!(
                         "Task {} dependency {} not found in storage",
-                        task.task_id, dep_id
+                        task.id, dep_id
                     );
                     return Ok(false);
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -217,7 +219,7 @@ impl Recovery {
 }
 
 /// Statistics from the recovery process
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RecoveryStats {
     /// Total number of tasks that were running
     pub total_running: usize,
@@ -236,17 +238,16 @@ enum RecoveryOutcome {
     Retried,
     /// Task was paused (AtMostOnce)
     Paused,
-    /// Recovery failed
-    Failed,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TaskOutput, TaskType};
+    use crate::model::{Durability, NewTaskSpec, Task, TaskId, TaskStatus, TaskType};
     use crate::sqlite_storage::SqliteStorage;
-    use chrono::Utc;
-    use serde_json::json;
+    use bytes::Bytes;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     async fn create_test_recovery() -> (Recovery, Arc<dyn Storage>, TempDir) {
@@ -254,43 +255,33 @@ mod tests {
         let db_path = temp_dir.path().join("test.db");
         let storage = Arc::new(SqliteStorage::open(db_path).await.unwrap()) as Arc<dyn Storage>;
         let ready_queue = Arc::new(ReadyQueue::new(100));
-        let scheduler = Arc::new(Scheduler::new(storage.clone(), ready_queue.clone()));
-
-        let recovery = Recovery::new(
-            storage.clone(),
-            ready_queue,
-            scheduler,
-            RecoveryConfig::default(),
-        );
+        let recovery = Recovery::new(storage.clone(), ready_queue, RecoveryConfig::default());
 
         (recovery, storage, temp_dir)
     }
 
-    fn create_running_task(task_id: &str, job_id: &str) -> Task {
-        Task {
-            job_id: job_id.to_string(),
-            task_id: task_id.to_string(),
-            parent_task_id: None,
-            acceptance_criteria: None,
-            description: "Test task".to_string(),
-            status: TaskStatus::InProgress,
-            status_reason: None,
-            agent: "test_agent".to_string(),
-            dependencies: vec![],
-            input: json!({}),
-            output: TaskOutput {
-                success: false,
-                data: None,
-                error: None,
-            },
-            created_at: Utc::now().naive_utc(),
-            updated_at: Utc::now().naive_utc(),
-            timeout: None,
-            max_retries: 3,
-            retry_count: 0,
+    fn create_running_task(task_id: TaskId) -> Task {
+        let spec = NewTaskSpec {
+            agent: 1,
+            input: Bytes::from_static(b"{}"),
+            dependencies: vec![].into(),
+            durability: Durability::BestEffort,
             task_type: TaskType::Task,
-            summary: None,
-        }
+            description: Arc::from("Test task"),
+            timeout: None,
+            max_retries: Some(3),
+            parent: None,
+        };
+
+        let mut task = Task::from_spec(task_id, spec);
+        task.job = 1;
+        task.status
+            .store(TaskStatus::Running as u8, Ordering::Relaxed);
+        task
+    }
+
+    fn task_status(task: &Task) -> TaskStatus {
+        TaskStatus::from_u8(task.status.load(Ordering::Relaxed)).unwrap()
     }
 
     #[tokio::test]
@@ -298,7 +289,7 @@ mod tests {
         let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create and store a running task
-        let task = create_running_task("task1", "job1");
+        let task = create_running_task(1);
         storage.put(&task).await.unwrap();
 
         // Run recovery
@@ -311,8 +302,8 @@ mod tests {
         assert_eq!(stats.failed, 0);
 
         // Verify task status was reset to Pending
-        let recovered_task = storage.get("task1").await.unwrap().unwrap();
-        assert_eq!(recovered_task.status, TaskStatus::Pending);
+        let recovered_task = storage.get(1).await.unwrap().unwrap();
+        assert_eq!(task_status(&recovered_task), TaskStatus::Pending);
 
         // Verify task was enqueued
         assert_eq!(recovery.ready_queue.len(), 1);
@@ -326,7 +317,7 @@ mod tests {
         recovery.config.default_durability = DurabilityMode::AtMostOnce;
 
         // Create and store a running task
-        let task = create_running_task("task1", "job1");
+        let task = create_running_task(1);
         storage.put(&task).await.unwrap();
 
         // Run recovery
@@ -339,8 +330,8 @@ mod tests {
         assert_eq!(stats.failed, 0);
 
         // Verify task status was set to Blocked
-        let recovered_task = storage.get("task1").await.unwrap().unwrap();
-        assert_eq!(recovered_task.status, TaskStatus::Blocked);
+        let recovered_task = storage.get(1).await.unwrap().unwrap();
+        assert_eq!(task_status(&recovered_task), TaskStatus::Blocked);
         assert!(recovered_task.status_reason.is_some());
 
         // Verify task was NOT enqueued
@@ -352,13 +343,15 @@ mod tests {
         let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create a completed dependency
-        let mut dep_task = create_running_task("dep1", "job1");
-        dep_task.status = TaskStatus::Completed;
+        let mut dep_task = create_running_task(1);
+        dep_task
+            .status
+            .store(TaskStatus::Completed as u8, Ordering::Relaxed);
         storage.put(&dep_task).await.unwrap();
 
         // Create a running task with dependency
-        let mut task = create_running_task("task1", "job1");
-        task.dependencies = vec!["dep1".to_string()];
+        let mut task = create_running_task(2);
+        task.dependencies = vec![dep_task.id].into();
         storage.put(&task).await.unwrap();
 
         // Run recovery
@@ -374,13 +367,15 @@ mod tests {
         let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create a pending dependency
-        let mut dep_task = create_running_task("dep1", "job1");
-        dep_task.status = TaskStatus::Pending;
+        let mut dep_task = create_running_task(1);
+        dep_task
+            .status
+            .store(TaskStatus::Pending as u8, Ordering::Relaxed);
         storage.put(&dep_task).await.unwrap();
 
         // Create a running task with dependency
-        let mut task = create_running_task("task1", "job1");
-        task.dependencies = vec!["dep1".to_string()];
+        let mut task = create_running_task(2);
+        task.dependencies = vec![dep_task.id].into();
         storage.put(&task).await.unwrap();
 
         // Run recovery
@@ -391,8 +386,8 @@ mod tests {
         assert_eq!(recovery.ready_queue.len(), 0);
 
         // Task should be Pending
-        let recovered_task = storage.get("task1").await.unwrap().unwrap();
-        assert_eq!(recovered_task.status, TaskStatus::Pending);
+        let recovered_task = storage.get(2).await.unwrap().unwrap();
+        assert_eq!(task_status(&recovered_task), TaskStatus::Pending);
     }
 
     #[tokio::test]
@@ -401,7 +396,7 @@ mod tests {
 
         // Create multiple running tasks
         for i in 1..=5 {
-            let task = create_running_task(&format!("task{}", i), "job1");
+            let task = create_running_task(i);
             storage.put(&task).await.unwrap();
         }
 

@@ -5,7 +5,6 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -242,25 +241,16 @@ impl RefactoredDagExecutor {
     }
 
     pub fn add_hook(&mut self, hook: Arc<dyn SupervisorHookV2>) {
-        Arc::get_mut(&mut self.shared)
-            .unwrap()
-            .hook_processor
-            .as_ref()
-            .clone() // This is a hack for the demo
-            ;
-        // In real implementation, hooks would be added before execution starts
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("hooks can only be added before executor is shared");
+        let processor = Arc::get_mut(&mut shared.hook_processor)
+            .expect("hooks can only be added before executor is shared");
+        processor.add_hook(hook);
     }
 
     pub async fn execute_dag_with_hooks(&self, dag_name: &str) -> Result<ExecutionReport> {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let metrics = Arc::new(Mutex::new(ExecutionMetrics::default()));
-
-        // Create hook context
-        let hook_context = HookContext {
-            dag_name: dag_name.to_string(),
-            command_tx: cmd_tx.clone(),
-            metrics: metrics.clone(),
-        };
 
         // Get nodes to execute
         let nodes = {
@@ -274,7 +264,6 @@ impl RefactoredDagExecutor {
 
         // Spawn command processor
         let mutable_clone = self.mutable.clone();
-        let dag_name_clone = dag_name.to_string();
         let command_processor = tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 let mut mutable = mutable_clone.lock().await;
@@ -393,13 +382,9 @@ async fn main() -> Result<()> {
     // Create executor
     let mut executor = RefactoredDagExecutor::new();
 
-    // Add hooks (in real implementation, this would be done differently)
-    let mut hook_processor = HookProcessor::new();
-    hook_processor.add_hook(Arc::new(CleanupHook));
-    hook_processor.add_hook(Arc::new(MetricsHook));
-
-    // Note: For demo purposes, we're directly modifying the shared state
-    // In production, hooks would be added during executor construction
+    // Add hooks (in real implementation, this would be done during construction)
+    executor.add_hook(Arc::new(CleanupHook));
+    executor.add_hook(Arc::new(MetricsHook));
 
     // Add a test DAG
     {

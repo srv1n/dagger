@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace};
 
 /// SQLite-based storage implementation
 pub struct SqliteStorage {
@@ -28,12 +28,11 @@ impl SqliteStorage {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let database_url = format!("sqlite:{}", path.as_ref().display());
 
-        let mut options = SqliteConnectOptions::new()
+        let options = SqliteConnectOptions::new()
             .filename(&database_url[7..]) // Remove "sqlite:" prefix
             .journal_mode(SqliteJournalMode::Wal)
-            .create_if_missing(true);
-
-        options.disable_statement_logging();
+            .create_if_missing(true)
+            .disable_statement_logging();
 
         let pool = SqlitePoolOptions::new()
             .max_connections(20)
@@ -47,11 +46,10 @@ impl SqliteStorage {
 
         // Initialize next ID from existing tasks
         let max_id: i64 =
-            sqlx::query_scalar!("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM tasks")
+            sqlx::query_scalar("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) FROM tasks")
                 .fetch_one(&pool)
                 .await
-                .map_err(|e| TaskError::Storage(format!("Failed to get max task ID: {}", e)))?
-                .unwrap_or(0);
+                .map_err(|e| TaskError::Storage(format!("Failed to get max task ID: {}", e)))?;
 
         Ok(Self {
             pool,
@@ -61,7 +59,7 @@ impl SqliteStorage {
 
     async fn initialize_schema(pool: &Pool<Sqlite>) -> Result<()> {
         // Create tasks table compatible with the existing schema
-        sqlx::query!(
+        sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
@@ -92,7 +90,7 @@ impl SqliteStorage {
         .map_err(|e| TaskError::Storage(format!("Failed to create tasks table: {}", e)))?;
 
         // Create shared_state table
-        sqlx::query!(
+        sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS shared_state (
                 key TEXT PRIMARY KEY,
@@ -100,53 +98,55 @@ impl SqliteStorage {
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'utc')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now', 'utc'))
             )
-            "#
+            "#,
         )
         .execute(pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to create shared_state table: {}", e)))?;
 
         // Create updated_at trigger for tasks
-        sqlx::query!(
+        sqlx::query(
             r#"
             CREATE TRIGGER IF NOT EXISTS update_tasks_updated_at
                 AFTER UPDATE ON tasks
                 BEGIN
                     UPDATE tasks SET updated_at = datetime('now', 'utc') WHERE id = NEW.id;
                 END
-            "#
+            "#,
         )
         .execute(pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to create tasks trigger: {}", e)))?;
 
         // Create updated_at trigger for shared_state
-        sqlx::query!(
+        sqlx::query(
             r#"
             CREATE TRIGGER IF NOT EXISTS update_shared_state_updated_at
                 AFTER UPDATE ON shared_state
                 BEGIN
                     UPDATE shared_state SET updated_at = datetime('now', 'utc') WHERE key = NEW.key;
                 END
-            "#
+            "#,
         )
         .execute(pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to create shared_state trigger: {}", e)))?;
 
         // Create indexes for performance
-        sqlx::query!(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(job_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_agent_id ON tasks(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
-            "#
-        )
-        .execute(pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to create indexes: {}", e)))?;
+        let index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(job_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_agent_id ON tasks(agent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_parent_id ON tasks(parent_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)",
+        ];
+
+        for statement in index_statements {
+            sqlx::query(statement)
+                .execute(pool)
+                .await
+                .map_err(|e| TaskError::Storage(format!("Failed to create indexes: {}", e)))?;
+        }
 
         Ok(())
     }
@@ -177,7 +177,7 @@ impl SqliteStorage {
             TaskType::Subtask => "Subtask",
         };
 
-        let dependencies = serde_json::to_string(&task.dependencies).map_err(|e| {
+        let dependencies = serde_json::to_string(task.dependencies.as_slice()).map_err(|e| {
             TaskError::Serialization(format!("Failed to serialize dependencies: {}", e))
         })?;
 
@@ -256,10 +256,12 @@ impl SqliteStorage {
             _ => return Err(TaskError::InvalidStatus),
         };
 
-        let dependencies: SmallVec<[TaskId; 4]> =
-            serde_json::from_str(&row.dependencies).map_err(|e| {
+        let dependencies = {
+            let deps: Vec<TaskId> = serde_json::from_str(&row.dependencies).map_err(|e| {
                 TaskError::Serialization(format!("Failed to deserialize dependencies: {}", e))
             })?;
+            SmallVec::from_vec(deps)
+        };
 
         let parent = row.parent_id.and_then(|p| p.parse().ok());
 
@@ -304,7 +306,7 @@ impl SqliteStorage {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 struct TaskRow {
     id: String,
     job_id: String,
@@ -333,7 +335,7 @@ impl Storage for SqliteStorage {
     async fn put(&self, task: &Task) -> Result<()> {
         let row = Self::task_to_db_row(task)?;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT OR REPLACE INTO tasks (
                 id, job_id, agent_id, status, durability, retry_count, max_retries,
@@ -342,27 +344,27 @@ impl Storage for SqliteStorage {
                 status_reason, summary, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
-            row.id,
-            row.job_id,
-            row.agent_id,
-            row.status,
-            row.durability,
-            row.retry_count,
-            row.max_retries,
-            row.task_type,
-            row.parent_id,
-            row.dependencies,
-            row.payload_input,
-            row.payload_output,
-            row.payload_description,
-            row.timeout_secs,
-            row.error_data,
-            row.acceptance_criteria,
-            row.status_reason,
-            row.summary,
-            row.created_at,
-            row.updated_at
         )
+        .bind(row.id)
+        .bind(row.job_id)
+        .bind(row.agent_id)
+        .bind(row.status)
+        .bind(row.durability)
+        .bind(row.retry_count)
+        .bind(row.max_retries)
+        .bind(row.task_type)
+        .bind(row.parent_id)
+        .bind(row.dependencies)
+        .bind(row.payload_input)
+        .bind(row.payload_output)
+        .bind(row.payload_description)
+        .bind(row.timeout_secs)
+        .bind(row.error_data)
+        .bind(row.acceptance_criteria)
+        .bind(row.status_reason)
+        .bind(row.summary)
+        .bind(row.created_at)
+        .bind(row.updated_at)
         .execute(&self.pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to store task {}: {}", task.id, e)))?;
@@ -372,8 +374,7 @@ impl Storage for SqliteStorage {
     }
 
     async fn get(&self, id: TaskId) -> Result<Option<Task>> {
-        let row = sqlx::query_as!(
-            TaskRow,
+        let row = sqlx::query_as::<_, TaskRow>(
             r#"
             SELECT 
                 id, job_id, agent_id, status, durability, retry_count, max_retries,
@@ -382,8 +383,8 @@ impl Storage for SqliteStorage {
                 status_reason, summary, created_at, updated_at
             FROM tasks WHERE id = ?
             "#,
-            id.to_string()
         )
+        .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to get task {}: {}", id, e)))?;
@@ -419,16 +420,16 @@ impl Storage for SqliteStorage {
             TaskStatus::Accepted => "accepted",
         };
 
-        let result = sqlx::query!(
+        let result = sqlx::query(
             r#"
             UPDATE tasks 
             SET status = ?
             WHERE id = ? AND status = ?
             "#,
-            new_str,
-            id.to_string(),
-            old_str
         )
+        .bind(new_str)
+        .bind(id.to_string())
+        .bind(old_str)
         .execute(&self.pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to update task {} status: {}", id, e)))?;
@@ -454,74 +455,111 @@ impl Storage for SqliteStorage {
     }
 
     async fn list_running(&self) -> Result<Vec<TaskId>> {
-        let rows = sqlx::query!("SELECT id FROM tasks WHERE status = 'running'")
+        let rows: Vec<String> = sqlx::query_scalar("SELECT id FROM tasks WHERE status = 'running'")
             .fetch_all(&self.pool)
             .await
             .map_err(|e| TaskError::Storage(format!("Failed to list running tasks: {}", e)))?;
 
-        let mut running = Vec::new();
-        for row in rows {
-            if let Ok(id) = row.id.parse::<TaskId>() {
-                running.push(id);
-            }
-        }
+        Ok(rows
+            .into_iter()
+            .filter_map(|id| id.parse::<TaskId>().ok())
+            .collect())
+    }
 
-        Ok(running)
+    async fn list_tasks(&self) -> Result<Vec<Task>> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            r#"
+            SELECT 
+                id, job_id, agent_id, status, durability, retry_count, max_retries,
+                task_type, parent_id, dependencies, payload_input, payload_output,
+                payload_description, timeout_secs, error_data, acceptance_criteria,
+                status_reason, summary, created_at, updated_at
+            FROM tasks
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| TaskError::Storage(format!("Failed to list tasks: {}", e)))?;
+
+        rows.into_iter().map(Self::db_row_to_task).collect()
+    }
+
+    async fn list_tasks_by_job(&self, job_id: JobId) -> Result<Vec<Task>> {
+        let rows = sqlx::query_as::<_, TaskRow>(
+            r#"
+            SELECT 
+                id, job_id, agent_id, status, durability, retry_count, max_retries,
+                task_type, parent_id, dependencies, payload_input, payload_output,
+                payload_description, timeout_secs, error_data, acceptance_criteria,
+                status_reason, summary, created_at, updated_at
+            FROM tasks WHERE job_id = ?
+            "#,
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            TaskError::Storage(format!("Failed to list tasks for job {}: {}", job_id, e))
+        })?;
+
+        rows.into_iter().map(Self::db_row_to_task).collect()
     }
 
     async fn get_output(&self, id: TaskId) -> Result<Option<Bytes>> {
-        let row = sqlx::query!(
-            "SELECT payload_output FROM tasks WHERE id = ?",
-            id.to_string()
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| TaskError::Storage(format!("Failed to get output for task {}: {}", id, e)))?;
+        let row = sqlx::query("SELECT payload_output FROM tasks WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                TaskError::Storage(format!("Failed to get output for task {}: {}", id, e))
+            })?;
 
-        Ok(row.and_then(|r| r.payload_output.map(Bytes::from)))
+        Ok(row
+            .and_then(|r| r.try_get::<Option<Vec<u8>>, _>("payload_output").ok())
+            .flatten()
+            .map(Bytes::from))
     }
 
     async fn update_output(&self, id: TaskId, output: Bytes) -> Result<()> {
-        sqlx::query!(
-            "UPDATE tasks SET payload_output = ? WHERE id = ?",
-            output.to_vec(),
-            id.to_string()
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            TaskError::Storage(format!("Failed to update output for task {}: {}", id, e))
-        })?;
+        sqlx::query("UPDATE tasks SET payload_output = ? WHERE id = ?")
+            .bind(output.to_vec())
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                TaskError::Storage(format!("Failed to update output for task {}: {}", id, e))
+            })?;
 
         Ok(())
     }
 
     async fn get_status(&self, id: TaskId) -> Result<TaskStatus> {
-        let row = sqlx::query!("SELECT status FROM tasks WHERE id = ?", id.to_string())
+        let row = sqlx::query("SELECT status FROM tasks WHERE id = ?")
+            .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| {
                 TaskError::Storage(format!("Failed to get status for task {}: {}", id, e))
             })?;
 
-        match row {
-            Some(row) => {
-                let status = match row.status.as_str() {
-                    "pending" => TaskStatus::Pending,
-                    "blocked" => TaskStatus::Blocked,
-                    "ready" => TaskStatus::Ready,
-                    "running" => TaskStatus::Running,
-                    "completed" => TaskStatus::Completed,
-                    "failed" => TaskStatus::Failed,
-                    "paused" => TaskStatus::Paused,
-                    "rejected" => TaskStatus::Rejected,
-                    "accepted" => TaskStatus::Accepted,
-                    _ => return Err(TaskError::InvalidStatus),
-                };
-                Ok(status)
-            }
-            None => Err(TaskError::TaskNotFound(id)),
-        }
+        let status = match row
+            .and_then(|r| r.try_get::<String, _>("status").ok())
+            .as_deref()
+        {
+            Some("pending") => TaskStatus::Pending,
+            Some("blocked") => TaskStatus::Blocked,
+            Some("ready") => TaskStatus::Ready,
+            Some("running") => TaskStatus::Running,
+            Some("completed") => TaskStatus::Completed,
+            Some("failed") => TaskStatus::Failed,
+            Some("paused") => TaskStatus::Paused,
+            Some("rejected") => TaskStatus::Rejected,
+            Some("accepted") => TaskStatus::Accepted,
+            Some(_) => return Err(TaskError::InvalidStatus),
+            None => return Err(TaskError::TaskNotFound(id)),
+        };
+
+        Ok(status)
     }
 
     async fn flush(&self) -> Result<()> {
@@ -535,25 +573,28 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_shared_state(&self, key: &str) -> Result<Option<Bytes>> {
-        let row = sqlx::query!("SELECT value FROM shared_state WHERE key = ?", key)
+        let row = sqlx::query("SELECT value FROM shared_state WHERE key = ?")
+            .bind(key)
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| {
                 TaskError::Storage(format!("Failed to get shared state '{}': {}", key, e))
             })?;
 
-        Ok(row.map(|r| Bytes::from(r.value)))
+        Ok(row
+            .and_then(|r| r.try_get::<Vec<u8>, _>("value").ok())
+            .map(Bytes::from))
     }
 
     async fn set_shared_state(&self, key: &str, value: Bytes) -> Result<()> {
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT OR REPLACE INTO shared_state (key, value)
             VALUES (?, ?)
             "#,
-            key,
-            value.to_vec()
         )
+        .bind(key)
+        .bind(value.to_vec())
         .execute(&self.pool)
         .await
         .map_err(|e| TaskError::Storage(format!("Failed to set shared state '{}': {}", key, e)))?;
@@ -562,7 +603,8 @@ impl Storage for SqliteStorage {
     }
 
     async fn delete_shared_state(&self, key: &str) -> Result<bool> {
-        let result = sqlx::query!("DELETE FROM shared_state WHERE key = ?", key)
+        let result = sqlx::query("DELETE FROM shared_state WHERE key = ?")
+            .bind(key)
             .execute(&self.pool)
             .await
             .map_err(|e| {

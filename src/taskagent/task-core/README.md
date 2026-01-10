@@ -1,90 +1,63 @@
 # Task Core
 
-This crate provides the core components for the task execution system in Dagger.
+Task-core is the high-performance task execution engine behind Dagger's Task Agent mode. It provides persistent storage, dependency scheduling, crash recovery, and a worker pool for concurrent task execution.
 
 ## Key Components
 
-### Executor
-The `Executor` struct manages a pool of workers that process tasks from a ready queue. It implements the persist-then-run pattern for reliable task execution.
+- **TaskSystem**: Orchestrates storage, scheduler, executor, and recovery.
+- **Storage**: `SqliteStorage` persists tasks and outputs with CAS-style updates.
+- **Scheduler**: Tracks dependencies and moves ready tasks into the queue.
+- **Executor**: Worker pool that runs agents and records outputs.
+- **AgentRegistry / Agent**: Pluggable task execution.
 
-Key features:
-- Worker pool with configurable concurrency using semaphores
-- Lock-free ready queue with backpressure support
-- Persist-then-run pattern for crash recovery
-- Automatic retry with configurable delays
-- Task timeout support
-
-### Storage
-The `Storage` trait defines the interface for task persistence, with `SqliteStorage` providing an embedded database implementation.
-
-Features:
-- Task and job persistence
-- Efficient indexing by job, agent, status, and parent
-- Atomic updates using compare-and-swap
-- Support for querying tasks by various criteria
-
-### Ready Queue
-A lock-free queue implementation using crossbeam's `SegQueue` with capacity control for backpressure.
-
-### Agent System
-Two trait hierarchies for implementing task agents:
-
-1. **Agent trait**: Core interface for task execution
-   - `name()`: Unique agent identifier
-   - `description()`: Human-readable description
-   - `execute()`: Async task execution
-
-2. **JsonAgent trait**: Extended interface with JSON schema validation
-   - `input_schema()`: JSON schema for input validation
-   - `output_schema()`: JSON schema for output validation
-   - Automatic validation in the blanket Agent implementation
-
-### Task Context
-Provides all necessary information and utilities for task execution:
-- Task metadata (ID, job ID, parent, dependencies)
-- Cache access for storing intermediate results
-- Storage access for querying other tasks
-- TaskHandle for creating child tasks dynamically
-- Shared state for inter-task communication
-
-### Agent Registry
-Manages available agents with optional metadata:
-- Register agents with name, description, version, author, and tags
-- Look up agents by name
-- List all registered agents
-
-## Usage Example
+## Minimal Usage
 
 ```rust
-use task_core::{Executor, ExecutorConfig, AgentRegistry, SqliteStorage};
-use dagger::taskagent::{Task, TaskStatus, Cache};
+use async_trait::async_trait;
+use bytes::Bytes;
+use std::sync::Arc;
+use task_core::{Agent, AgentError, AgentRegistry, NewTaskSpec, Task, TaskContext, TaskSystemBuilder};
 
-// Create storage
-let storage = Arc::new(SqliteStorage::open("./task_db/tasks.db").await?);
+struct EchoAgent;
 
-// Create agent registry and register agents
-let registry = Arc::new(AgentRegistry::new());
-registry.register(Arc::new(MyAgent::new()));
+#[async_trait]
+impl Agent for EchoAgent {
+    async fn execute(
+        &self,
+        task: Task,
+        _ctx: Arc<TaskContext>,
+    ) -> Result<Bytes, AgentError> {
+        Ok(task.payload.input.clone())
+    }
+}
 
-// Configure executor
-let config = ExecutorConfig {
-    max_workers: 10,
-    queue_capacity: 1000,
-    task_timeout: Some(Duration::from_secs(300)),
-    retry_delay: Duration::from_secs(1),
-};
+#[tokio::main]
+async fn main() -> Result<(), task_core::TaskError> {
+    let mut registry = AgentRegistry::new();
+    registry.register(1, "echo", Arc::new(EchoAgent))?;
 
-// Create and run executor
-let executor = Executor::new(storage, registry, cache, config);
-let (shutdown_tx, shutdown_rx) = oneshot::channel();
-executor.run(shutdown_rx).await?;
+    let system = TaskSystemBuilder::new().build(Arc::new(registry)).await?;
+
+    let _task_id = system
+        .submit_task(NewTaskSpec {
+            agent: 1,
+            input: Bytes::from("hello"),
+            dependencies: Vec::new().into(),
+            durability: task_core::Durability::BestEffort,
+            task_type: task_core::TaskType::Task,
+            description: Arc::from("echo"),
+            timeout: None,
+            max_retries: Some(3),
+            parent: None,
+        })
+        .await?;
+
+    system.run().await
+}
 ```
 
-## Integration with Scheduler
+## Notes
 
-The executor is designed to work with the Scheduler component, which:
-1. Monitors task dependencies
-2. Enqueues ready tasks to the executor
-3. Handles job-level orchestration
-
-The separation of concerns allows the executor to focus on reliable task execution while the scheduler handles workflow orchestration.
+- Use `TaskContext` to access dependency outputs and shared state.
+- The scheduler automatically evaluates dependencies and enqueues tasks.
+- Recovery runs at startup to requeue running tasks (BestEffort) or pause them (AtMostOnce).

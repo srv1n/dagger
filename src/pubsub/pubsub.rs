@@ -48,6 +48,53 @@ impl Message {
     }
 }
 
+/// Context passed to pub/sub handlers for publishing and cache access
+pub struct PubSubContext<'a> {
+    node_id: &'a str,
+    channel: &'a str,
+    executor: &'a mut PubSubExecutor,
+    cache: &'a Cache,
+}
+
+impl<'a> PubSubContext<'a> {
+    pub fn new(
+        node_id: &'a str,
+        channel: &'a str,
+        executor: &'a mut PubSubExecutor,
+        cache: &'a Cache,
+    ) -> Self {
+        Self {
+            node_id,
+            channel,
+            executor,
+            cache,
+        }
+    }
+
+    pub fn node_id(&self) -> &str {
+        self.node_id
+    }
+
+    pub fn channel(&self) -> &str {
+        self.channel
+    }
+
+    pub fn cache(&self) -> &Cache {
+        self.cache
+    }
+
+    pub async fn publish(&mut self, channel: &str, message: Message) -> Result<()> {
+        self.executor
+            .publish(channel, message, self.cache, None)
+            .await
+    }
+
+    pub async fn publish_payload(&mut self, channel: &str, payload: Value) -> Result<()> {
+        let message = Message::new(self.node_id.to_string(), payload);
+        self.publish(channel, message).await
+    }
+}
+
 /// Trait defining the behavior of a Pub/Sub agent
 #[async_trait]
 pub trait PubSubAgent: Send + Sync + 'static {
@@ -119,7 +166,6 @@ pub struct AgentMetadata {
 struct AgentEntry {
     pub agent: Arc<dyn PubSubAgent>,
     pub metadata: AgentMetadata,
-    pub node_id: String,
 }
 
 /// Channel information
@@ -194,6 +240,10 @@ impl PubSubExecutor {
         }
     }
 
+    pub fn config(&self) -> &PubSubConfig {
+        &self.config
+    }
+
     /// Register an agent with the executor
     pub async fn register_agent(&mut self, agent: Arc<dyn PubSubAgent>) -> Result<()> {
         let name = agent.name();
@@ -209,11 +259,7 @@ impl PubSubExecutor {
             registered_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let entry = AgentEntry {
-            agent,
-            metadata,
-            node_id: node_id.clone(),
-        };
+        let entry = AgentEntry { agent, metadata };
 
         // Create channels for agent subscriptions
         for channel in &entry.metadata.subscriptions {
@@ -289,12 +335,14 @@ impl PubSubExecutor {
         let agents = self.agents.read().await;
         for (node_id, entry) in agents.iter() {
             for subscription in &entry.metadata.subscriptions {
-                let task = self.start_agent_listener(
-                    node_id.clone(),
-                    subscription.clone(),
-                    entry.agent.clone(),
-                    cache.clone(),
-                );
+                let task = self
+                    .start_agent_listener(
+                        node_id.clone(),
+                        subscription.clone(),
+                        entry.agent.clone(),
+                        cache.clone(),
+                    )
+                    .await;
                 tasks.push(task);
             }
         }
@@ -331,7 +379,7 @@ impl PubSubExecutor {
     }
 
     /// Start a listener for an agent on a specific channel
-    fn start_agent_listener(
+    async fn start_agent_listener(
         &self,
         node_id: String,
         channel: String,
@@ -340,18 +388,18 @@ impl PubSubExecutor {
     ) -> tokio::task::JoinHandle<()> {
         let channels = self.channels.clone();
         let stopped = self.stopped.clone();
+        let receiver = {
+            let channels_read = channels.read().await;
+            if let Some(channel_info) = channels_read.get(&channel) {
+                channel_info.sender.new_receiver()
+            } else {
+                error!("Channel not found: {}", channel);
+                return tokio::spawn(async move {});
+            }
+        };
 
         tokio::spawn(async move {
-            let mut receiver = {
-                let channels_read = channels.read().await;
-                if let Some(channel_info) = channels_read.get(&channel) {
-                    channel_info.sender.new_receiver()
-                } else {
-                    error!("Channel not found: {}", channel);
-                    return;
-                }
-            };
-
+            let mut receiver = receiver;
             info!("Agent {} listening on channel {}", node_id, channel);
 
             loop {

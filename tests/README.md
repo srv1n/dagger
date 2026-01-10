@@ -4,7 +4,7 @@ This directory contains comprehensive test suites for the Dagger project, coveri
 
 ## Test Files
 
-### `test_dag_flow.rs`
+### `test_dag_flow_simple.rs`
 Tests for the DAG Flow execution engine:
 - Simple DAG execution with dependencies
 - Parallel node execution
@@ -13,7 +13,7 @@ Tests for the DAG Flow execution engine:
 - Cache persistence
 - Timeout handling
 
-### `test_task_core.rs`
+### `test_task_core_simple.rs`
 Tests for the Task-Core agent system:
 - Agent registration and execution
 - Task lifecycle management
@@ -24,9 +24,6 @@ Tests for the Task-Core agent system:
 - System persistence and recovery
 - Timeout handling
 
-### `integration_runner.rs`
-A comprehensive test runner that executes all test suites and provides a summary.
-
 ## Running Tests
 
 ### Quick Start
@@ -34,17 +31,13 @@ A comprehensive test runner that executes all test suites and provides a summary
 # Run all tests with the shell script
 ./run_tests.sh
 
-# Or use the integration runner
-cargo run --bin integration_runner
-```
-
-### Individual Test Suites
+# Individual Test Suites
 ```bash
 # Run DAG Flow tests only
-cargo test --test test_dag_flow
+cargo test --test test_dag_flow_simple
 
 # Run Task-Core tests only
-cargo test --test test_task_core
+cargo test --test test_task_core_simple
 
 # Run a specific test
 cargo test --test test_dag_flow test_simple_dag_execution
@@ -64,10 +57,10 @@ cargo test --lib dag_flow::
 
 ### Example Tests
 ```bash
-# Check all examples compile
-for example in simple_task dag_flow agent_simple; do
-    (cd examples/$example && cargo check)
-done
+# Check example compilation
+cargo check --example dag_flow_basic
+cargo check --example task_agent_basic
+cargo check --example pubsub_basic
 ```
 
 ## Test Database Cleanup
@@ -82,8 +75,8 @@ rm -rf test_*_db/
 
 When adding new functionality:
 
-1. **For DAG Flow features**: Add tests to `test_dag_flow.rs`
-2. **For Task-Core features**: Add tests to `test_task_core.rs`
+1. **For DAG Flow features**: Add tests to `test_dag_flow_simple.rs`
+2. **For Task-Core features**: Add tests to `test_task_core_simple.rs`
 3. **Follow the pattern**:
    - Use descriptive test names
    - Clean up resources (databases)
@@ -136,7 +129,7 @@ For CI/CD pipelines, use:
 
 2. **Run single test**:
    ```bash
-   cargo test --test test_dag_flow test_simple_dag_execution -- --exact
+    cargo test --test test_dag_flow_simple test_simple_dag_execution -- --exact
    ```
 
 3. **Check test databases**:

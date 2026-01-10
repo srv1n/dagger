@@ -156,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== Dynamic Node Addition Demo ===\n");
 
     // Create action registry
-    let mut registry = ActionRegistry::new();
+    let registry = ActionRegistry::new();
     registry.register(Arc::new(AddAction));
     registry.register(Arc::new(MultiplyAction));
 

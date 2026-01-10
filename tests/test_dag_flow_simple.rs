@@ -5,23 +5,18 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use dagger::dag_flow::{Cache, DagExecutor, IField, Node, NodeAction, OField};
+use dagger::coord::{ActionRegistry, NodeAction, NodeCtx, NodeOutput};
+use dagger::dag_flow::{Cache, DagExecutor, DagNodeContextData, Node};
 use dagger::insert_value;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Test that basic DAG executor can be created
 #[tokio::test]
 async fn test_dag_executor_creation() {
-    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let registry = ActionRegistry::new();
 
-    // Clean up any existing database first
-    let _ = std::fs::remove_dir_all("test_dag_db");
-
-    let _executor = DagExecutor::new(None, registry, "test_dag_db")
-        .await
-        .unwrap();
+    let _executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
 
     // Test passed if we get here without panicking
     assert!(true);
@@ -46,19 +41,14 @@ async fn test_cache_operations() {
 /// Test YAML loading (if files exist)
 #[tokio::test]
 async fn test_yaml_loading() {
-    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let registry = ActionRegistry::new();
 
-    // Clean up any existing database first
-    let _ = std::fs::remove_dir_all("test_yaml_db");
-
-    let mut executor = DagExecutor::new(None, registry, "test_yaml_db")
-        .await
-        .unwrap();
+    let mut executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
 
     // Try to load YAML from examples
-    let yaml_path = "examples/dag_flow/pipeline.yaml";
+    let yaml_path = "examples/fixtures/pipeline.yaml";
     if std::path::Path::new(yaml_path).exists() {
-        let result = executor.load_yaml_file(yaml_path);
+        let result = executor.load_yaml_file(yaml_path).await;
         // Should not panic, whether it succeeds or fails
         match result {
             Ok(_) => println!("YAML loaded successfully"),
@@ -76,12 +66,9 @@ async fn test_dag_config() {
     config.enable_parallel_execution = true;
     config.max_parallel_nodes = 5;
 
-    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let registry = ActionRegistry::new();
 
-    // Clean up any existing database first
-    let _ = std::fs::remove_dir_all("test_config_db");
-
-    let _executor = DagExecutor::new(Some(config), registry, "test_config_db")
+    let _executor = DagExecutor::new(Some(config), registry, ":memory:")
         .await
         .unwrap();
 
@@ -89,17 +76,8 @@ async fn test_dag_config() {
 }
 
 /// Cleanup function
-fn cleanup_test_dbs() {
-    let test_dbs = ["test_dag_db", "test_yaml_db", "test_config_db"];
-
-    for db in &test_dbs {
-        let _ = std::fs::remove_dir_all(db);
-    }
-}
-
 #[tokio::test]
 async fn test_cleanup() {
-    cleanup_test_dbs();
     assert!(true);
 }
 
@@ -118,39 +96,27 @@ async fn test_services_accessible_in_nodes() {
 
     #[async_trait]
     impl NodeAction for TestNode {
-        fn name(&self) -> String {
-            "TestNode".to_string()
+        fn name(&self) -> &str {
+            "TestNode"
         }
 
-        async fn execute(
-            &self,
-            executor: &mut DagExecutor,
-            _node: &Node,
-            _cache: &Cache,
-        ) -> Result<()> {
-            // Access the services through the executor
-            if let Some(services) = executor.get_services::<TestServices>() {
-                // Increment the counter to prove we accessed the services
-                services.value.fetch_add(1, Ordering::Relaxed);
-                println!("Accessed service with name: {}", services.name);
-            } else {
-                panic!("Could not access services!");
-            }
-            Ok(())
-        }
+        async fn execute(&self, ctx: &NodeCtx) -> Result<NodeOutput> {
+            let data =
+                DagNodeContextData::from_ctx(ctx).expect("DagNodeContextData missing from NodeCtx");
+            let services = data
+                .services::<TestServices>()
+                .expect("Could not access services");
 
-        fn schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "name": "TestNode",
-                "description": "Test node for service access",
-                "parameters": { "type": "object", "properties": {} },
-                "returns": { "type": "object" }
-            })
+            // Increment the counter to prove we accessed the services
+            services.value.fetch_add(1, Ordering::Relaxed);
+            println!("Accessed service with name: {}", services.name);
+
+            Ok(NodeOutput::success_empty())
         }
     }
 
     // Create test setup
-    let registry = Arc::new(RwLock::new(HashMap::new()));
+    let registry = ActionRegistry::new();
 
     // Use in-memory database for testing
     let mut executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
@@ -165,7 +131,7 @@ async fn test_services_accessible_in_nodes() {
     executor.set_services(services.clone());
 
     // Register the test node
-    executor.register_action(Arc::new(TestNode)).unwrap();
+    executor.register_action(Arc::new(TestNode)).await.unwrap();
 
     // Create a simple node
     let node = Node {
@@ -184,20 +150,20 @@ async fn test_services_accessible_in_nodes() {
 
     // Execute the node
     let cache = Cache::new();
+    let ctx = NodeCtx::new("dag", node.id.clone(), serde_json::json!({}), cache.clone())
+        .with_app_data(Arc::new(DagNodeContextData {
+            node: node.clone(),
+            services: Some(services.clone() as Arc<dyn std::any::Any + Send + Sync>),
+            app_state: None,
+        }));
     let test_node_action = Arc::new(TestNode);
-    test_node_action
-        .execute(&mut executor, &node, &cache)
-        .await
-        .unwrap();
+    test_node_action.execute(&ctx).await.unwrap();
 
     // Verify the service was accessed (counter should be 1)
     assert_eq!(services.value.load(Ordering::Relaxed), 1);
 
     // Execute again to ensure it works multiple times
-    test_node_action
-        .execute(&mut executor, &node, &cache)
-        .await
-        .unwrap();
+    test_node_action.execute(&ctx).await.unwrap();
     assert_eq!(services.value.load(Ordering::Relaxed), 2);
 
     // Test that we can also downcast to the correct type

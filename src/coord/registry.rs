@@ -3,6 +3,7 @@
 //! This replaces the old function-based registry with a trait-based one.
 
 use crate::coord::action::NodeAction;
+use linkme::distributed_slice;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,6 +12,17 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ActionRegistry {
     actions: Arc<RwLock<HashMap<String, Arc<dyn NodeAction>>>>,
+}
+
+/// Global action registrars for compile-time registration
+#[distributed_slice]
+pub static ACTION_REGISTRARS: [fn(&ActionRegistry)] = [..];
+
+/// Register all globally linked actions into a registry
+pub fn register_global_actions(registry: &ActionRegistry) {
+    for register in ACTION_REGISTRARS {
+        register(registry);
+    }
 }
 
 impl ActionRegistry {

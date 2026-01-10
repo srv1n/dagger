@@ -143,11 +143,8 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Convert new registry to old format temporarily
-    // In production, DagExecutor should use ActionRegistry directly
-    let old_registry = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-
-    let mut executor = DagExecutor::new(Some(config), old_registry, "sqlite::memory:").await?;
+    let mut executor =
+        DagExecutor::new(Some(config), action_registry.clone(), "sqlite::memory:").await?;
 
     // Create a simple DAG
     let yaml_content = r#"
@@ -197,7 +194,7 @@ nodes:
 
     // Write and load the DAG
     std::fs::write("/tmp/demo_dag.yaml", yaml_content)?;
-    executor.load_yaml_file("/tmp/demo_dag.yaml")?;
+    executor.load_yaml_file("/tmp/demo_dag.yaml").await?;
 
     // Create hooks
     let hooks: Vec<Arc<dyn EventHook>> = vec![Arc::new(MonitorHook), Arc::new(CleanupHook)];
@@ -228,12 +225,11 @@ nodes:
 
     // Show final DAG state
     println!("\n=== Final DAG State ===");
-    if let Ok(dags) = executor.prebuilt_dags.read() {
-        if let Some((graph, node_map)) = dags.get("demo_dag") {
-            println!("Total nodes: {}", node_map.len());
-            for node_id in node_map.keys() {
-                println!("  - {}", node_id);
-            }
+    let dags = executor.prebuilt_dags.read().await;
+    if let Some((_graph, node_map)) = dags.get("demo_dag") {
+        println!("Total nodes: {}", node_map.len());
+        for node_id in node_map.keys() {
+            println!("  - {}", node_id);
         }
     }
 

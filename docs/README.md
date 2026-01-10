@@ -8,6 +8,7 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
 
 - **[Getting Started](../README.md)** - Installation and basic usage
 - **[Examples](../examples/)** - Working examples for each paradigm
+- **[Example Outputs](../examples/README.md)** - Sample outputs and expected markers
 
 ## Core Documentation
 
@@ -48,41 +49,20 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
 
 ## API Reference
 
-### Core Types
+### Core Types (High-level)
 
 ```rust
 // Main executor for DAG workflows
-pub struct DagExecutor {
-    pub config: DagConfig,
-    pub function_registry: Arc<RwLock<HashMap<String, Arc<dyn NodeAction>>>>,
-    // ... internal fields
-}
+pub struct DagExecutor { /* internal fields */ }
 
 // Configuration for DAG execution
-pub struct DagConfig {
-    pub enable_parallel_execution: bool,
-    pub max_parallel_nodes: usize,
-    pub timeout_seconds: Option<u64>,
-    pub max_iterations: Option<u32>,
-    pub enable_incremental_cache: bool,
-    // ... other options
-}
+pub struct DagConfig { /* parallelism, retries, timeouts, cache */ }
 
-// Node in a DAG workflow
-pub struct Node {
-    pub id: String,
-    pub action: String,
-    pub dependencies: Vec<String>,
-    pub inputs: Vec<IField>,
-    pub outputs: Vec<OField>,
-    pub timeout: u64,
-    pub try_count: u32,
-}
+// Node execution context (immutable)
+pub struct NodeCtx { /* inputs, cache, node_id, dag_name, app_data */ }
 
 // Cache for sharing data between nodes
-pub struct Cache {
-    pub data: Arc<DashMap<String, Value>>,
-}
+pub struct Cache { /* DashMap-backed */ }
 ```
 
 ### Key APIs
@@ -90,19 +70,27 @@ pub struct Cache {
 #### Creating an Executor
 
 ```rust
-let registry = Arc::new(RwLock::new(HashMap::new()));
+use dagger::coord::ActionRegistry;
+
+let registry = ActionRegistry::new();
 let config = DagConfig::default();
 let executor = DagExecutor::new(Some(config), registry, "sqlite::memory:").await?;
 ```
 
 #### Registering Actions
 
-```rust
-// Using the macro (recommended)
-register_action!(executor, "action_name", action_function).await?;
+`DagExecutor::new(...)` automatically registers all `#[dagger::action]` functions compiled into the binary (via `linkme`). Use manual registration only when you need to control the registry contents.
 
-// Manual registration
-executor.register_action(Arc::new(MyAction)).await?;
+```rust
+// Using the macro (recommended) - auto-registered on executor creation
+#[dagger::action(name = "action_name")]
+async fn action_function(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    Ok(input)
+}
+
+// Manual registration (explicit control)
+let registry = ActionRegistry::new();
+registry.register(Arc::new(MyAction));
 ```
 
 #### Loading and Executing Workflows
@@ -114,7 +102,7 @@ executor.load_yaml_file("workflow.yaml").await?;
 // Execute static DAG
 let report = executor.execute_static_dag("workflow_name", &cache, cancel_rx).await?;
 
-// Execute agent-driven flow
+// Execute agent-driven flow (dynamic DAG)
 let report = executor.execute_agent_dag("task_description", &cache, cancel_rx).await?;
 ```
 
@@ -131,10 +119,9 @@ let value: T = parse_input_from_name(&cache, "key", &node.inputs)?;
 let value: T = get_global_input(&cache, "namespace", "key")?;
 ```
 
-## Migration Guides
+## Migration Notes
 
-For historical context and migration information:
-- [Archived Migration Docs](archive/migrations/) - Previous migration guides
+- [Upgrading / Adoption Notes](UPGRADING.md) - Downstream migration checklist
 
 ## Examples
 
@@ -181,7 +168,6 @@ async fn process_events(message: Message) -> Result<()> {
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/dagger/issues)
 - **Examples**: [examples/](../examples/)
 - **Tests**: [tests/](../tests/)
 

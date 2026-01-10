@@ -11,10 +11,6 @@ pub mod events;
 pub mod planning;
 pub mod supervisor;
 
-// Compatibility modules for legacy code
-pub mod function_action;
-pub mod legacy_compat;
-
 // Main exports
 pub use dag_flow::*;
 

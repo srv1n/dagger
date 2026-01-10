@@ -10,7 +10,6 @@ pub use sqlite_storage::{ArtifactStorage, DatabaseStats, SqliteStorage, StorageE
 use chrono::{DateTime, Utc};
 /// Common storage traits and types
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Represents the status of a flow run
 #[derive(Debug, Clone, PartialEq)]

@@ -1,6 +1,10 @@
 //! Utility functions for the task-core system
 
+use bytes::Bytes;
+use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::model::AgentError;
 
 /// Get current timestamp in milliseconds
 pub fn timestamp_millis() -> u64 {
@@ -19,6 +23,43 @@ pub fn format_duration(duration: std::time::Duration) -> String {
         format!("{}m {}s", secs / 60, secs % 60)
     } else {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// Convert common output types into bytes for task-core agents.
+pub trait IntoBytes {
+    fn into_bytes(self) -> Result<Bytes, AgentError>;
+}
+
+impl IntoBytes for Bytes {
+    fn into_bytes(self) -> Result<Bytes, AgentError> {
+        Ok(self)
+    }
+}
+
+impl IntoBytes for Vec<u8> {
+    fn into_bytes(self) -> Result<Bytes, AgentError> {
+        Ok(Bytes::from(self))
+    }
+}
+
+impl IntoBytes for String {
+    fn into_bytes(self) -> Result<Bytes, AgentError> {
+        Ok(Bytes::from(self))
+    }
+}
+
+impl IntoBytes for &str {
+    fn into_bytes(self) -> Result<Bytes, AgentError> {
+        Ok(Bytes::from(self.to_string()))
+    }
+}
+
+impl IntoBytes for Value {
+    fn into_bytes(self) -> Result<Bytes, AgentError> {
+        serde_json::to_vec(&self)
+            .map(Bytes::from)
+            .map_err(|e| AgentError::System(e.to_string()))
     }
 }
 

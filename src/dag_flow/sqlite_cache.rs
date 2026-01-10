@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::dag_flow::{Cache, ExecutionTree, SerializableData, SerializableExecutionTree};
 
