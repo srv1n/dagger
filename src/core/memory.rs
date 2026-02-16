@@ -365,30 +365,40 @@ impl Cache {
             }
         }
 
-        let cache_entry = self
-            .data
-            .entry(node_id.to_string())
-            .or_insert_with(CacheEntry::new);
+        let (size_delta, inserted_new_entry) = {
+            let cache_entry = self
+                .data
+                .entry(node_id.to_string())
+                .or_insert_with(CacheEntry::new);
 
-        cache_entry.access().await;
+            cache_entry.access().await;
 
-        let old_size = cache_entry
-            .data
-            .get(key)
-            .map(|v| v.estimate_size())
-            .unwrap_or(0);
-        cache_entry.data.insert(key.to_string(), serializable_data);
+            let old_size = cache_entry
+                .data
+                .get(key)
+                .map(|v| v.estimate_size())
+                .unwrap_or(0);
+            let inserted_new_entry = old_size == 0;
 
-        let size_delta = data_size as isize - old_size as isize;
-        cache_entry.update_size(size_delta);
+            cache_entry.data.insert(key.to_string(), serializable_data);
+
+            let size_delta = data_size as isize - old_size as isize;
+            cache_entry.update_size(size_delta);
+            (size_delta, inserted_new_entry)
+        }; // IMPORTANT: drop DashMap entry guard before calling self.data.len()
+
+        let total_nodes = if inserted_new_entry {
+            Some(self.data.len())
+        } else {
+            None
+        };
 
         // Update global stats
         {
             let mut stats = self.stats.write().await;
             stats.total_size_bytes = (stats.total_size_bytes as isize + size_delta) as usize;
-            if old_size == 0 {
-                // New entry
-                stats.total_entries = self.data.len();
+            if let Some(total_nodes) = total_nodes {
+                stats.total_entries = total_nodes;
             }
         }
 
@@ -424,12 +434,13 @@ impl Cache {
     pub async fn remove_node(&self, node_id: &str) -> Option<usize> {
         if let Some((_, cache_entry)) = self.data.remove(node_id) {
             let size = cache_entry.size();
+            let total_nodes = self.data.len();
 
             // Update stats
             {
                 let mut stats = self.stats.write().await;
                 stats.total_size_bytes = stats.total_size_bytes.saturating_sub(size);
-                stats.total_entries = self.data.len();
+                stats.total_entries = total_nodes;
             }
 
             Some(size)

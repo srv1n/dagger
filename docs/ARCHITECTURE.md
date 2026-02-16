@@ -445,6 +445,18 @@ async fn execute_node(node: &Node, cache: &Cache) -> Result<()> {
 }
 ```
 
+## Runtime Events (V2)
+
+Dagger can emit **typed runtime events** via `dag_flow::events::EventSink`. These events are designed for host apps (like RZN) to build **UI timelines** and **audit logs**.
+
+Key semantics:
+- `RuntimeEventEnvelope.run_id` is the *flow/run identifier* (one per user action / orchestration run).
+- `RuntimeEvent::BranchStateUpdated.branch_id` is a *sub-run identifier* (e.g. a per-item branch in a batch fanout).
+- `RuntimeEvent::*step_id*` fields should be deterministic and stable where possible to enable idempotency + clean timelines.
+
+Host-defined domain events:
+- Use `DagExecutor::emit_domain_event(run_id, name, payload)` to emit audited, application-specific events (e.g. `work_item.state_changed`) without overloading `ToolInvoked`/`StepCompleted`.
+
 ## Migration from Sled
 
 The library recently migrated from Sled to SQLite for better queryability and ACID compliance. Key changes:

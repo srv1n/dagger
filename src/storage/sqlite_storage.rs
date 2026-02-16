@@ -7,9 +7,11 @@
 use super::{Artifact, FlowRun, FlowRunStatus, NodeRun};
 use chrono::{DateTime, ParseError, Utc};
 use serde_json::{from_str as json_from_str, to_string as json_to_string, Value};
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Error as SqlxError, Row, SqlitePool};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,7 +78,9 @@ impl SqliteStorage {
         database_url: &str,
         artifact_config: Option<ArtifactStorage>,
     ) -> Result<Self, StorageError> {
-        let pool = SqlitePool::connect(database_url).await?;
+        let connect_options =
+            SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+        let pool = SqlitePool::connect_with(connect_options).await?;
         let artifact_config = artifact_config.unwrap_or_default();
 
         // Create artifact directory if it doesn't exist
@@ -102,12 +106,13 @@ impl SqliteStorage {
         // Execute the schema in a transaction
         let mut tx = self.pool.begin().await?;
 
-        // Split and execute each statement
-        for statement in schema_sql.split(';') {
-            let statement = statement.trim();
-            if !statement.is_empty() {
-                sqlx::query(statement).execute(&mut *tx).await?;
-            }
+        // Split and execute each statement.
+        //
+        // NOTE: `schema.sql` contains multi-statement trigger bodies with
+        // embedded semicolons. A naive `split(';')` will break those triggers
+        // into invalid fragments ("incomplete input").
+        for statement in split_schema_statements(schema_sql) {
+            sqlx::query(&statement).execute(&mut *tx).await?;
         }
 
         tx.commit().await?;
@@ -529,6 +534,51 @@ impl SqliteStorage {
     }
 }
 
+fn split_schema_statements(schema_sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_trigger = false;
+
+    for line in schema_sql.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("CREATE TRIGGER") {
+            in_trigger = true;
+        }
+
+        current.push_str(trimmed);
+        current.push('\n');
+
+        if in_trigger {
+            if upper.starts_with("END") && trimmed.ends_with(';') {
+                let stmt = current.trim().trim_end_matches(';').trim().to_string();
+                if !stmt.is_empty() {
+                    statements.push(stmt);
+                }
+                current.clear();
+                in_trigger = false;
+            }
+        } else if trimmed.ends_with(';') {
+            let stmt = current.trim().trim_end_matches(';').trim().to_string();
+            if !stmt.is_empty() {
+                statements.push(stmt);
+            }
+            current.clear();
+        }
+    }
+
+    let remainder = current.trim().trim_end_matches(';').trim();
+    if !remainder.is_empty() {
+        statements.push(remainder.to_string());
+    }
+
+    statements
+}
+
 /// Database statistics
 #[derive(Debug, Clone)]
 pub struct DatabaseStats {
@@ -545,13 +595,13 @@ mod tests {
     use tempfile::TempDir;
     use tokio;
 
-    #[tokio::test]
-    async fn test_storage_initialization() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db_url = format!("sqlite:{}", db_path.to_string_lossy());
+	    #[tokio::test]
+	    async fn test_storage_initialization() {
+	        let temp_dir = TempDir::new().unwrap();
+	        let db_path = temp_dir.path().join("test.db");
+	        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
 
-        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
+	        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
 
         // Verify tables exist by getting stats
         let stats = storage.get_stats().await.unwrap();
@@ -560,13 +610,13 @@ mod tests {
         storage.close().await;
     }
 
-    #[tokio::test]
-    async fn test_shared_state() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-        let db_url = format!("sqlite:{}", db_path.to_string_lossy());
+	    #[tokio::test]
+	    async fn test_shared_state() {
+	        let temp_dir = TempDir::new().unwrap();
+	        let db_path = temp_dir.path().join("test.db");
+	        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
 
-        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
+	        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
 
         let test_value = serde_json::json!({"test": "value", "number": 42});
 

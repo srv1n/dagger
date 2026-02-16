@@ -114,7 +114,7 @@ impl Coordinator {
             tokio::select! {
                 // Process commands from hooks
                 Some(cmd) = cmd_rx.recv() => {
-                    apply_command(exec, dag_name, cache, cmd).await?;
+                    apply_command(exec, run_id, dag_name, cache, cmd).await?;
 
                     // Schedule any newly ready nodes
                     let ready = get_ready_nodes(exec, dag_name, &completed).await?;
@@ -140,7 +140,7 @@ impl Coordinator {
                         let cmds = hook.handle(&hook_ctx, &event).await;
                         for cmd in cmds {
                             // Apply commands immediately
-                            apply_command(exec, dag_name, cache, cmd).await?;
+                            apply_command(exec, run_id, dag_name, cache, cmd).await?;
                         }
                     }
 
@@ -216,7 +216,7 @@ impl Coordinator {
         for hook in &self.hooks {
             let cmds = hook.on_complete(&hook_ctx, true).await;
             for cmd in cmds {
-                let _ = apply_command(exec, dag_name, cache, cmd).await;
+                let _ = apply_command(exec, run_id, dag_name, cache, cmd).await;
             }
         }
 
@@ -232,6 +232,7 @@ impl Coordinator {
 /// This is the ONLY place where we have &mut DagExecutor
 async fn apply_command(
     exec: &mut DagExecutor,
+    run_id: &str,
     dag_name: &str,
     cache: &Cache,
     cmd: ExecutorCommand,
@@ -256,7 +257,7 @@ async fn apply_command(
             }
             // Notify observers about added node
             for observer in &exec.observers {
-                observer.on_nodes_added("", dag_name, &[id.clone()]).await;
+                observer.on_nodes_added(run_id, dag_name, &[id.clone()]).await;
             }
         }
         AddNodes {
@@ -283,7 +284,7 @@ async fn apply_command(
             // Notify observers about added nodes
             if !node_ids.is_empty() {
                 for observer in &exec.observers {
-                    observer.on_nodes_added("", dag_name, &node_ids).await;
+                    observer.on_nodes_added(run_id, dag_name, &node_ids).await;
                 }
             }
         }
@@ -299,13 +300,13 @@ async fn apply_command(
                 .await?;
         }
         PauseBranch { branch_id, reason } => {
-            exec.pause_branch(&branch_id, reason.as_deref());
+            exec.pause_branch(run_id, &branch_id, reason.as_deref());
         }
         ResumeBranch { branch_id } => {
-            exec.resume_branch(&branch_id);
+            exec.resume_branch(run_id, &branch_id);
         }
         CancelBranch { branch_id } => {
-            exec.cancel_branch(&branch_id, None);
+            exec.cancel_branch(run_id, &branch_id, None);
         }
         EmitEvent { event } => {
             // Route to EventStore if configured

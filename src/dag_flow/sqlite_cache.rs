@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::dag_flow::{Cache, ExecutionTree, SerializableData, SerializableExecutionTree};
@@ -242,9 +241,7 @@ impl SqliteCache {
         }
 
         info!("Loaded {} entries from cache", total_entries);
-        Ok(Cache {
-            data: Arc::new(cache_data),
-        })
+        Ok(Cache::from_data(cache_data))
     }
 
     /// Get a specific node output as JSON from the cache

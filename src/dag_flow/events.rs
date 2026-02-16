@@ -38,6 +38,13 @@ pub enum RuntimeEvent {
         status: String,
         reason: Option<String>,
     },
+    /// Host-defined, audited domain event.
+    ///
+    /// Intended for UI timelines / enterprise audit logs (e.g. "work_item.state_changed").
+    DomainEvent {
+        name: String,
+        payload: serde_json::Value,
+    },
 }
 
 /// Event envelope with metadata

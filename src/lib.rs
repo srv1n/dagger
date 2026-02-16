@@ -10,6 +10,7 @@ pub mod coord; // Coordinator-based parallel execution (NEW)
 pub mod dag_flow; // DAG-based workflow execution
 pub mod pubsub; // Pub/Sub messaging execution
 pub mod taskagent; // Task-based agent execution
+pub mod work_queue; // Work Queue primitives (Lobster-like)
 
 // Storage layer
 pub mod storage; // SQLite storage backend
@@ -45,6 +46,15 @@ pub use taskagent::{
 // Pub/Sub exports
 pub use pubsub::{
     Message, PubSubAgent, PubSubConfig, PubSubContext, PubSubExecutor, PubSubWorkflowSpec,
+};
+
+// Work Queue exports
+pub use work_queue::{
+    ExecAction, ExecError, ExecHost, ExecKind, ExecResult, ExecServices, ExecSpec, LocalExecHost,
+};
+pub use work_queue::{
+    build_batch_plan, execute_batch, BatchExecution, BatchFanoutSpec, BatchInput, BatchPlan,
+    BatchStepRef, PerItemStepTemplate,
 };
 
 // Export storage functionality

@@ -331,12 +331,86 @@ pub struct SerializableData {
 #[derive(Debug, Default)]
 pub struct Cache {
     pub data: Arc<DashMap<String, DashMap<String, SerializableData>>>,
+    dirty: Arc<DashMap<String, DashMap<String, ()>>>,
 }
 
 impl Cache {
     pub fn new() -> Self {
         Cache {
             data: Arc::new(DashMap::new()),
+            dirty: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn from_data(data: DashMap<String, DashMap<String, SerializableData>>) -> Self {
+        Cache {
+            data: Arc::new(data),
+            dirty: Arc::new(DashMap::new()),
+        }
+    }
+
+    fn mark_dirty(&self, node_id: &str, key: &str) {
+        let keys = self
+            .dirty
+            .entry(node_id.to_string())
+            .or_insert_with(DashMap::new);
+        keys.insert(key.to_string(), ());
+    }
+
+    /// Drain dirty keys and return a delta snapshot suitable for persistence.
+    ///
+    /// This is designed for the executor/supervisor thread. It is safe under
+    /// concurrent cache writes: new writes that race with the drain will re-create
+    /// dirty entries and be captured on the next drain.
+    pub fn take_delta(&self) -> HashMap<String, HashMap<String, SerializableData>> {
+        let mut out: HashMap<String, HashMap<String, SerializableData>> = HashMap::new();
+        let node_ids: Vec<String> = self.dirty.iter().map(|e| e.key().clone()).collect();
+
+        for node_id in node_ids {
+            let Some((_, keys_map)) = self.dirty.remove(&node_id) else {
+                continue;
+            };
+
+            let mut node_delta: HashMap<String, SerializableData> = HashMap::new();
+            if let Some(node_cache) = self.data.get(&node_id) {
+                for key_ref in keys_map.iter() {
+                    let k = key_ref.key();
+                    if let Some(v) = node_cache.get(k) {
+                        node_delta.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+
+            if !node_delta.is_empty() {
+                out.insert(node_id, node_delta);
+            }
+        }
+
+        out
+    }
+
+    /// Re-mark the keys from a delta as dirty (used when persistence fails).
+    pub fn restore_delta(&self, delta: &HashMap<String, HashMap<String, SerializableData>>) {
+        for (node_id, node_delta) in delta {
+            let keys = self
+                .dirty
+                .entry(node_id.to_string())
+                .or_insert_with(DashMap::new);
+            for k in node_delta.keys() {
+                keys.insert(k.to_string(), ());
+            }
+        }
+    }
+
+    pub fn restore_dirty_keys(&self, keys_by_node: &HashMap<String, Vec<String>>) {
+        for (node_id, keys) in keys_by_node {
+            let dirty_keys = self
+                .dirty
+                .entry(node_id.to_string())
+                .or_insert_with(DashMap::new);
+            for k in keys {
+                dirty_keys.insert(k.to_string(), ());
+            }
         }
     }
 
@@ -352,8 +426,8 @@ impl Cache {
         // Get or insert the inner DashMap for the global key.
         let inner_map = self
             .data
-            .entry(global_key)
-            .or_insert_with(|| DashMap::new());
+            .entry(global_key.clone())
+            .or_insert_with(DashMap::new);
 
         // Use `entry` API for efficient updates.
         inner_map
@@ -370,7 +444,13 @@ impl Cache {
                 value: Value::Array(vec![json_value]),
             }); // No clone needed here
 
+        self.mark_dirty(&global_key, key);
         Ok(())
+    }
+
+    pub fn insert_global_value<T: Serialize>(&self, dag_name: &str, key: &str, value: &T) -> Result<()> {
+        let global_key = format!("global:{}", dag_name);
+        self.insert_value(&global_key, key, value)
     }
 
     pub fn get_global_value<T: for<'de> Deserialize<'de>>(
@@ -399,6 +479,7 @@ impl Cache {
             .entry(node_id.to_string())
             .or_insert_with(|| DashMap::new());
         map.insert(key.to_string(), SerializableData { value });
+        self.mark_dirty(node_id, key);
         Ok(())
     }
 }
@@ -408,6 +489,7 @@ impl Clone for Cache {
     fn clone(&self) -> Self {
         Cache {
             data: self.data.clone(),
+            dirty: self.dirty.clone(),
         }
     }
 }
@@ -453,6 +535,7 @@ pub fn load_cache_from_json(json_data: &str) -> Result<Cache> {
 
     Ok(Cache {
         data: Arc::new(DashMap::from_iter(cache)),
+        dirty: Arc::new(DashMap::new()),
     })
 }
 // pub fn insert_value<T: IntoAny + 'static>(cache: &Cache, category: String, key: String, value: T) {
@@ -465,19 +548,7 @@ pub fn insert_value<T>(cache: &Cache, node_id: &str, output_name: &str, value: T
 where
     T: Serialize + std::fmt::Debug,
 {
-    let cache_data = &cache.data; // Get a reference to the DashMap
-
-    let json_value = serde_json::to_value(value)?; // Serialize to serde_json::Value
-
-    let serializable_data = SerializableData { value: json_value }; // Use Value
-
-    // Use entry API for efficient insertion/modification.
-    let inner_map = cache_data
-        .entry(node_id.to_string())
-        .or_insert_with(|| DashMap::new());
-    inner_map.insert(output_name.to_string(), serializable_data);
-
-    Ok(())
+    cache.insert_value(node_id, output_name, &value)
 }
 
 pub fn generate_node_id(action_name: &str) -> String {
@@ -562,21 +633,7 @@ pub fn insert_global_value<T: Serialize>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let cache_write = &cache.data;
-
-    let global_key = format!("global:{}", dag_name); // Consistent global key
-    let json_value = serde_json::to_value(value)?; // Serialize to Value
-    let serializable_data = SerializableData { value: json_value }; // Use Value
-
-    if let Some(global_map) = cache_write.get_mut(&global_key) {
-        global_map.insert(key.to_string(), serializable_data);
-    } else {
-        let new_global_map = DashMap::new();
-        new_global_map.insert(key.to_string(), serializable_data);
-        cache_write.insert(global_key, new_global_map);
-    }
-
-    Ok(())
+    cache.insert_global_value(dag_name, key, &value)
 }
 
 pub fn append_global_value<T: Serialize + for<'de> Deserialize<'de>>(
@@ -585,31 +642,7 @@ pub fn append_global_value<T: Serialize + for<'de> Deserialize<'de>>(
     key: &str,
     value: T,
 ) -> Result<()> {
-    let global_key = format!("global:{}", dag_name);
-    let json_value = serde_json::to_value(value)?;
-
-    // Get or insert the inner DashMap for the global key.
-    let inner_map = cache
-        .data
-        .entry(global_key)
-        .or_insert_with(|| DashMap::new());
-
-    // Use `entry` API for efficient updates.
-    inner_map
-        .entry(key.to_string())
-        .and_modify(|existing_data| {
-            if let Some(existing_vec) = existing_data.value.as_array_mut() {
-                existing_vec.push(json_value.clone()); // Clone for the modify closure.
-            } else {
-                existing_data.value =
-                    Value::Array(vec![existing_data.value.clone(), json_value.clone()]);
-            }
-        })
-        .or_insert(SerializableData {
-            value: Value::Array(vec![json_value]),
-        }); // No clone needed here
-
-    Ok(())
+    cache.append_global_value(dag_name, key, value)
 }
 // NodeAction trait moved to coord/action.rs
 // Using the new compute-only NodeAction from coord module
@@ -944,9 +977,15 @@ impl DagExecutor {
         file.read_to_string(&mut yaml_content)
             .map_err(|e| anyhow!("Failed to read file {}: {}", file_path, e))?;
 
-        let mut graph: Graph = serde_yaml::from_str(&yaml_content)
+        let graph: Graph = serde_yaml::from_str(&yaml_content)
             .map_err(|e| anyhow!("Failed to parse YAML file {}: {}", file_path, e))?;
+        self.load_graph(graph).await
+    }
 
+    /// Loads a graph definition programmatically.
+    ///
+    /// This is the same as `load_yaml_file`, but takes a `Graph` value directly.
+    pub async fn load_graph(&mut self, mut graph: Graph) -> Result<(), Error> {
         // Merge and validate configurations
         if let Some(graph_config) = &graph.config {
             let merged_config = DagConfig::merge(&self.config, graph_config)?;
@@ -1831,6 +1870,26 @@ impl DagExecutor {
         self.event_sink = Some(sink);
     }
 
+    /// Emit a domain event to the typed event sink (v2 envelopes).
+    ///
+    /// This is a host-extension point for audited, application-specific events
+    /// without overloading ToolInvoked / StepCompleted.
+    pub fn emit_domain_event(&self, run_id: &str, name: impl Into<String>, payload: Value) {
+        if let Some(sink) = &self.event_sink {
+            let envelope = super::events::RuntimeEventEnvelope {
+                version: 2,
+                sequence: super::events::next_sequence(),
+                run_id: run_id.to_string(),
+                timestamp: super::events::now_ms(),
+                event: super::events::RuntimeEvent::DomainEvent {
+                    name: name.into(),
+                    payload,
+                },
+            };
+            sink.emit(&envelope);
+        }
+    }
+
     /// Add an execution observer
     pub fn add_observer(&mut self, observer: Arc<dyn ExecutionObserver>) {
         self.observers.push(observer);
@@ -1970,7 +2029,7 @@ impl DagExecutor {
     }
 
     /// Pause a branch
-    pub fn pause_branch(&self, branch_id: &str, reason: Option<&str>) {
+    pub fn pause_branch(&self, run_id: &str, branch_id: &str, reason: Option<&str>) {
         self.branches.pause_branch(branch_id, reason);
 
         // Emit event if sink is configured
@@ -1978,7 +2037,7 @@ impl DagExecutor {
             let envelope = super::events::RuntimeEventEnvelope {
                 version: 2,
                 sequence: super::events::next_sequence(),
-                run_id: branch_id.to_string(),
+                run_id: run_id.to_string(),
                 timestamp: super::events::now_ms(),
                 event: super::events::RuntimeEvent::BranchStateUpdated {
                     branch_id: branch_id.to_string(),
@@ -1991,7 +2050,7 @@ impl DagExecutor {
     }
 
     /// Resume a branch
-    pub fn resume_branch(&self, branch_id: &str) {
+    pub fn resume_branch(&self, run_id: &str, branch_id: &str) {
         self.branches.resume_branch(branch_id);
 
         // Emit event if sink is configured
@@ -1999,7 +2058,7 @@ impl DagExecutor {
             let envelope = super::events::RuntimeEventEnvelope {
                 version: 2,
                 sequence: super::events::next_sequence(),
-                run_id: branch_id.to_string(),
+                run_id: run_id.to_string(),
                 timestamp: super::events::now_ms(),
                 event: super::events::RuntimeEvent::BranchStateUpdated {
                     branch_id: branch_id.to_string(),
@@ -2012,7 +2071,7 @@ impl DagExecutor {
     }
 
     /// Cancel a branch
-    pub fn cancel_branch(&self, branch_id: &str, reason: Option<&str>) {
+    pub fn cancel_branch(&self, run_id: &str, branch_id: &str, reason: Option<&str>) {
         self.branches.cancel_branch(branch_id, reason);
 
         // Emit event if sink is configured
@@ -2020,7 +2079,7 @@ impl DagExecutor {
             let envelope = super::events::RuntimeEventEnvelope {
                 version: 2,
                 sequence: super::events::next_sequence(),
-                run_id: branch_id.to_string(),
+                run_id: run_id.to_string(),
                 timestamp: super::events::now_ms(),
                 event: super::events::RuntimeEvent::BranchStateUpdated {
                     branch_id: branch_id.to_string(),
@@ -2822,7 +2881,9 @@ async fn execute_dag_parallel_old(
                                 );
                             }
                             OnFailure::Pause => {
-                                if let Err(e) = executor.save_cache(&outcome.node_id, cache).await {
+                                // Checkpoint the DAG cache under the DAG id (not the node id).
+                                // Using `node_id` here causes cache duplication + write amplification.
+                                if let Err(e) = executor.save_cache(dag_name, cache).await {
                                     error!("Failed to save cache before pause: {}", e);
                                 }
                                 node_outcomes.push(outcome);
@@ -2844,21 +2905,36 @@ async fn execute_dag_parallel_old(
                     if executor.config.enable_incremental_cache {
                         let should_snapshot = {
                             let last_snapshot = *context.cache_last_snapshot.read().await;
-                            let delta_size = *context.cache_delta_size.read().await;
-
                             last_snapshot.elapsed().as_secs()
                                 > executor.config.cache_snapshot_interval
-                                || delta_size > 1000 // Threshold for delta size
                         };
 
                         if should_snapshot {
                             if let Err(e) = executor.save_cache(dag_name, cache).await {
-                                warn!("Failed to save incremental cache: {}", e);
+                                warn!("Failed to save cache snapshot: {}", e);
+                            } else {
+                                *context.cache_last_snapshot.write().await = Instant::now();
                             }
-                            *context.cache_last_snapshot.write().await = Instant::now();
-                            *context.cache_delta_size.write().await = 0;
-                        } else {
-                            *context.cache_delta_size.write().await += 1;
+                        }
+
+                        // Persist incremental deltas (best-effort). This dramatically reduces
+                        // write amplification compared to frequent full snapshots.
+                        let delta = cache.take_delta();
+                        if !delta.is_empty() {
+                            let keys_by_node: HashMap<String, Vec<String>> = delta
+                                .iter()
+                                .map(|(node_id, node_delta)| {
+                                    (
+                                        node_id.clone(),
+                                        node_delta.keys().cloned().collect::<Vec<String>>(),
+                                    )
+                                })
+                                .collect();
+
+                            if let Err(e) = executor.save_cache_delta(dag_name, delta).await {
+                                warn!("Failed to save cache delta: {}", e);
+                                cache.restore_dirty_keys(&keys_by_node);
+                            }
                         }
                     }
                 }
