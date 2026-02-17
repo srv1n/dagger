@@ -1,0 +1,25 @@
+dag_name: work_queue_batch_send_retry
+input:
+  container_id: container_1
+  selected_item_ids:
+    - item_ok
+    - item_with_a_very_very_long_id_that_will_overflow_stdout_cap
+  approved_revision_ids:
+    - rev_001
+steps:
+  - name: send
+    action: exec
+    inputs:
+      kind: system
+      executable: /bin/echo
+      args:
+        - '{"ok":true,"item_id":"{{item_id}}","note":"demo payload for retry"}'
+      parse_stdout_as_json: true
+      timeout_ms: 5000
+      # Intentionally small to demonstrate partial failure (long item_id truncates JSON).
+      max_stdout_bytes: 72
+      max_stderr_bytes: 4096
+    timeout_s: 10
+    try_count: 1
+continue_on_error: true
+

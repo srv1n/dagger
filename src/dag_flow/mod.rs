@@ -9,6 +9,7 @@ pub mod branch;
 pub mod dag_builder;
 pub mod events;
 pub mod planning;
+pub mod services;
 pub mod supervisor;
 
 // Main exports
@@ -27,4 +28,5 @@ pub use self::events::{
     BufferingEventSink, EventSink, LoggingEventSink, RuntimeEvent, RuntimeEventEnvelope,
 };
 pub use self::planning::{plan_from_llm_output, NodeSpec, Plan};
+pub use self::services::ServiceRegistry;
 pub use self::supervisor::{CompositeSupervisor, LoggingSupervisor, SupervisorHook};

@@ -16,7 +16,9 @@ async fn test_work_queue_batch_exec_fanout() {
 
     // This test assumes a Unix-like environment.
     let host = LocalExecHost::new().allow_system("/bin/echo");
-    executor.set_services(Arc::new(ExecServices { host: Arc::new(host) }));
+    executor.set_services(Arc::new(ExecServices {
+        host: Arc::new(host),
+    }));
 
     let cache = Cache::new();
     let (_tx, rx) = tokio::sync::oneshot::channel();
@@ -46,7 +48,9 @@ async fn test_work_queue_batch_exec_fanout() {
         continue_on_error: true,
     };
 
-    let result = execute_batch(&mut executor, &cache, spec, rx).await.unwrap();
+    let result = execute_batch(&mut executor, &cache, spec, rx)
+        .await
+        .unwrap();
     assert!(result.report.overall_success);
 
     // Verify mapping and that each item produced JSON output.

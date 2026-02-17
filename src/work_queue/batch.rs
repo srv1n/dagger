@@ -116,7 +116,10 @@ pub fn build_batch_plan(spec: &BatchFanoutSpec) -> anyhow::Result<(Graph, BatchP
 
     let graph = Graph {
         name: spec.dag_name.clone(),
-        description: format!("Work queue batch fanout for container {}", spec.input.container_id),
+        description: format!(
+            "Work queue batch fanout for container {}",
+            spec.input.container_id
+        ),
         author: "dagger".to_string(),
         version: "1.0".to_string(),
         signature: "generated".to_string(),

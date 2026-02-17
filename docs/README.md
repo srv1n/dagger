@@ -18,6 +18,12 @@ Dagger is a production-ready Rust library for workflow orchestration, offering t
   - Storage layer (SQLite with compression)
   - Execution paradigms overview
   - Performance considerations
+- **[WORK_QUEUE_CONTRACT.md](WORK_QUEUE_CONTRACT.md)** - Dagger ↔ host integration contract for Work Queue execution
+  - Batch fanout + deterministic IDs
+  - ExecSpec/ExecResult + host policy hooks
+  - Runtime events semantics + domain events
+  - HITL checkpoints + resume tokens (contract)
+- **[WORK_QUEUE_BATCH_SEND_RETRY.md](WORK_QUEUE_BATCH_SEND_RETRY.md)** - Worked example: batch send, partial failure, retry-only-failed
 
 ### Execution Paradigms
 

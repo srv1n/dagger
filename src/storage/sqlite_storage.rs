@@ -78,8 +78,7 @@ impl SqliteStorage {
         database_url: &str,
         artifact_config: Option<ArtifactStorage>,
     ) -> Result<Self, StorageError> {
-        let connect_options =
-            SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+        let connect_options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
         let pool = SqlitePool::connect_with(connect_options).await?;
         let artifact_config = artifact_config.unwrap_or_default();
 
@@ -595,13 +594,13 @@ mod tests {
     use tempfile::TempDir;
     use tokio;
 
-	    #[tokio::test]
-	    async fn test_storage_initialization() {
-	        let temp_dir = TempDir::new().unwrap();
-	        let db_path = temp_dir.path().join("test.db");
-	        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
+    #[tokio::test]
+    async fn test_storage_initialization() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
 
-	        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
+        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
 
         // Verify tables exist by getting stats
         let stats = storage.get_stats().await.unwrap();
@@ -610,13 +609,13 @@ mod tests {
         storage.close().await;
     }
 
-	    #[tokio::test]
-	    async fn test_shared_state() {
-	        let temp_dir = TempDir::new().unwrap();
-	        let db_path = temp_dir.path().join("test.db");
-	        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
+    #[tokio::test]
+    async fn test_shared_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_url = format!("sqlite://{}", db_path.to_string_lossy());
 
-	        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
+        let storage = SqliteStorage::new(&db_url, None).await.unwrap();
 
         let test_value = serde_json::json!({"test": "value", "number": 42});
 

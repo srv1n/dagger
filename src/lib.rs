@@ -30,7 +30,7 @@ pub use dag_flow::{
     append_global_value, get_global_input, get_input, insert_global_value, insert_value,
     parse_input_from_name, serialize_cache_to_json, serialize_cache_to_prettyjson, Cache,
     DagConfig, DagExecutionReport, DagExecutor, ExecutionObserver, Graph, Node,
-    NodeExecutionOutcome, NodeSpec,
+    NodeExecutionOutcome, NodeSpec, ServiceRegistry,
 };
 
 // Coordinator exports
@@ -50,11 +50,19 @@ pub use pubsub::{
 
 // Work Queue exports
 pub use work_queue::{
+    build_batch_plan, execute_batch, BatchExecution, BatchFanoutSpec, BatchInput, BatchPlan,
+    BatchStepRef, PerItemStepTemplate,
+};
+pub use work_queue::{
+    build_pipeline_plan, execute_pipeline, PipeMode, PipeSpec, PipelineExecution, PipelinePlan,
+    PipelineSpec, PipelineStep, PipelineStepRef,
+};
+pub use work_queue::{
     ExecAction, ExecError, ExecHost, ExecKind, ExecResult, ExecServices, ExecSpec, LocalExecHost,
 };
 pub use work_queue::{
-    build_batch_plan, execute_batch, BatchExecution, BatchFanoutSpec, BatchInput, BatchPlan,
-    BatchStepRef, PerItemStepTemplate,
+    HitlApprovalRequest, HitlCheckpointAction, HitlCheckpointSpec, HitlDecision, HitlError,
+    HitlResumeToken, HitlRuntime,
 };
 
 // Export storage functionality

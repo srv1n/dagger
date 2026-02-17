@@ -448,7 +448,12 @@ impl Cache {
         Ok(())
     }
 
-    pub fn insert_global_value<T: Serialize>(&self, dag_name: &str, key: &str, value: &T) -> Result<()> {
+    pub fn insert_global_value<T: Serialize>(
+        &self,
+        dag_name: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
         let global_key = format!("global:{}", dag_name);
         self.insert_value(&global_key, key, value)
     }
@@ -756,9 +761,19 @@ impl DagNodeContextData {
     }
 
     pub fn services<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.services
-            .as_ref()
-            .and_then(|s| s.clone().downcast::<T>().ok())
+        let services = self.services.as_ref()?.clone();
+
+        // Backwards-compat: allow setting a single typed service directly.
+        if let Ok(direct) = services.clone().downcast::<T>() {
+            return Some(direct);
+        }
+
+        // Preferred: a `ServiceRegistry` can hold multiple typed services.
+        if let Ok(reg) = services.downcast::<super::services::ServiceRegistry>() {
+            return reg.get::<T>();
+        }
+
+        None
     }
 }
 
@@ -908,9 +923,19 @@ impl DagExecutor {
 
     /// Get the service registry with type checking
     pub fn get_services<T: Any + Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.services
-            .as_ref()
-            .and_then(|s| s.clone().downcast::<T>().ok())
+        self.services.as_ref().and_then(|s| {
+            // Direct typed service.
+            if let Ok(direct) = s.clone().downcast::<T>() {
+                return Some(direct);
+            }
+
+            // Registry of multiple services.
+            if let Ok(reg) = s.clone().downcast::<super::services::ServiceRegistry>() {
+                return reg.get::<T>();
+            }
+
+            None
+        })
     }
 
     /// Set the event channel
@@ -1990,6 +2015,39 @@ impl DagExecutor {
             if let Some(&node_idx) = node_map.get(node_id) {
                 // Update the node's inputs with the IFields
                 graph[node_idx].inputs = ifields;
+                return Ok(());
+            }
+        }
+
+        Err(DagError::NodeNotFound(node_id.to_string()))
+    }
+
+    /// Set (or add) a single node input reference.
+    ///
+    /// This is useful for wiring nodes together programmatically (e.g. pipelines)
+    /// without storing a literal value in the node's own cache namespace.
+    pub async fn set_node_input_ref(
+        &mut self,
+        dag_name: &str,
+        node_id: &str,
+        input_name: &str,
+        reference: impl Into<String>,
+    ) -> Result<(), DagError> {
+        let reference = reference.into();
+
+        let mut dags = self.prebuilt_dags.write().await;
+        if let Some((graph, node_map)) = dags.get_mut(dag_name) {
+            if let Some(&node_idx) = node_map.get(node_id) {
+                let inputs = &mut graph[node_idx].inputs;
+                if let Some(existing) = inputs.iter_mut().find(|f| f.name == input_name) {
+                    existing.reference = reference;
+                } else {
+                    inputs.push(IField {
+                        name: input_name.to_string(),
+                        description: None,
+                        reference,
+                    });
+                }
                 return Ok(());
             }
         }

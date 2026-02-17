@@ -75,7 +75,10 @@ impl BranchRegistry {
     /// Register a new branch
     pub fn register_branch(&self, branch_id: impl Into<String>) {
         let mut branches = self.branches.write();
-        branches.insert(branch_id.into(), BranchState::running());
+        let branch_id = branch_id.into();
+        branches
+            .entry(branch_id)
+            .or_insert_with(BranchState::running);
     }
 
     /// Pause a branch

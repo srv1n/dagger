@@ -52,6 +52,12 @@ pub struct ExecSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub stdin: Option<String>,
+    /// JSON stdin convenience for pipeline wiring.
+    ///
+    /// If set, this value is serialized as JSON and provided to the process stdin.
+    /// Mutually exclusive with `stdin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin_json: Option<serde_json::Value>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     #[serde(default = "default_max_stdout_bytes")]
@@ -66,6 +72,11 @@ impl ExecSpec {
     pub fn validate(&self) -> Result<(), ExecError> {
         if self.executable.trim().is_empty() {
             return Err(ExecError::InvalidSpec("executable is required".into()));
+        }
+        if self.stdin.is_some() && self.stdin_json.is_some() {
+            return Err(ExecError::InvalidSpec(
+                "stdin and stdin_json are mutually exclusive".into(),
+            ));
         }
         if self.timeout_ms == 0 {
             return Err(ExecError::InvalidSpec("timeout_ms must be > 0".into()));
@@ -224,6 +235,38 @@ fn effective_timeout_ms(spec: &ExecSpec, ctx: &NodeCtx) -> u64 {
 async fn run_exec(host: &dyn ExecHost, spec: &ExecSpec, ctx: &NodeCtx) -> ExecResult {
     let started_at = Instant::now();
 
+    let stdin_bytes = match (spec.stdin.as_ref(), spec.stdin_json.as_ref()) {
+        (Some(s), None) => Some(s.as_bytes().to_vec()),
+        (None, Some(v)) => match serde_json::to_vec(v) {
+            Ok(mut bytes) => {
+                // Newline is a convenience for many CLI tools and makes logs nicer.
+                bytes.push(b'\n');
+                Some(bytes)
+            }
+            Err(e) => {
+                return ExecResult {
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: format!("stdin_json serialize failed: {}", e),
+                    stdout_json: None,
+                    truncated: false,
+                    duration_ms: started_at.elapsed().as_millis() as u64,
+                };
+            }
+        },
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "invalid ExecSpec: stdin and stdin_json are mutually exclusive".to_string(),
+                stdout_json: None,
+                truncated: false,
+                duration_ms: started_at.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
     let resolved = match host.resolve(spec) {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -253,7 +296,7 @@ async fn run_exec(host: &dyn ExecHost, spec: &ExecSpec, ctx: &NodeCtx) -> ExecRe
         cmd.env(k, v);
     }
 
-    if spec.stdin.is_some() {
+    if stdin_bytes.is_some() {
         cmd.stdin(std::process::Stdio::piped());
     } else {
         cmd.stdin(std::process::Stdio::null());
@@ -276,9 +319,8 @@ async fn run_exec(host: &dyn ExecHost, spec: &ExecSpec, ctx: &NodeCtx) -> ExecRe
     };
 
     // Write stdin, if provided.
-    if let Some(stdin_str) = spec.stdin.as_ref() {
+    if let Some(stdin_bytes) = stdin_bytes {
         if let Some(mut stdin) = child.stdin.take() {
-            let stdin_bytes = stdin_str.as_bytes().to_vec();
             tokio::spawn(async move {
                 let _ = stdin.write_all(&stdin_bytes).await;
                 let _ = stdin.shutdown().await;
@@ -286,14 +328,14 @@ async fn run_exec(host: &dyn ExecHost, spec: &ExecSpec, ctx: &NodeCtx) -> ExecRe
         }
     }
 
-    let stdout_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> =
-        child.stdout.take().map(|stdout| {
-            tokio::spawn(read_stream_limited(stdout, max_stdout_bytes))
-        });
-    let stderr_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> =
-        child.stderr.take().map(|stderr| {
-            tokio::spawn(read_stream_limited(stderr, max_stderr_bytes))
-        });
+    let stdout_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> = child
+        .stdout
+        .take()
+        .map(|stdout| tokio::spawn(read_stream_limited(stdout, max_stdout_bytes)));
+    let stderr_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(read_stream_limited(stderr, max_stderr_bytes)));
 
     let wait_result = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
 
@@ -395,7 +437,8 @@ impl NodeAction for ExecAction {
             .ok_or_else(|| anyhow::anyhow!("ExecServices missing from DagExecutor services"))?;
 
         let result = run_exec(services.host.as_ref(), &spec, ctx).await;
-        let ok = result.exit_code == 0 && (!spec.parse_stdout_as_json || result.stdout_json.is_some());
+        let ok =
+            result.exit_code == 0 && (!spec.parse_stdout_as_json || result.stdout_json.is_some());
 
         let outputs = serde_json::to_value(&result)
             .map_err(|e| anyhow::anyhow!("failed to serialize ExecResult: {}", e))?;

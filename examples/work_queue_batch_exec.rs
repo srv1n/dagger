@@ -21,7 +21,9 @@ async fn main() -> anyhow::Result<()> {
     // Provide an ExecHost via services. In a real host app, this is where you
     // would enforce allowlists / approvals and resolve sidecars.
     let host = LocalExecHost::new().allow_system("/bin/echo");
-    executor.set_services(Arc::new(ExecServices { host: Arc::new(host) }));
+    executor.set_services(Arc::new(ExecServices {
+        host: Arc::new(host),
+    }));
 
     let cache = Cache::new();
     let (_tx, rx) = tokio::sync::oneshot::channel();
@@ -61,4 +63,3 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-

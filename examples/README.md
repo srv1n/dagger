@@ -49,3 +49,10 @@ Note: timestamps and ordering can vary due to parallel execution. The lines belo
   - Prints:
     - `=== Refactored Supervisor Hooks Demo ===`
     - `✅ Refactored hooks demonstration completed successfully!`
+
+- `work_queue_batch_exec`
+  - Demonstrates Work Queue batch fanout + `exec` JSON-in/JSON-out
+
+- `work_queue_batch_send_retry`
+  - Spec: `examples/work_queue_batch_send_retry_spec.yaml`
+  - Demonstrates partial failure + retry-only-failed workflow
