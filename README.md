@@ -156,6 +156,8 @@ let system = dagger::TaskSystemBuilder::new()
     .await?;
 ```
 
+The embedded schema matches the host-side RZN migration contract: millisecond timestamps, `input_blob` / `output_blob`, `output_summary`, relational dependency edges, ordered output rows with `seq`, and lifecycle events with `from_status` / `to_status`.
+
 Task storage now distinguishes engine/runtime fields from host/public fields:
 
 - Engine/runtime: execution status, retries, dependency edges, payload input/output

@@ -113,9 +113,9 @@ impl Recovery {
             task_id, durability
         );
 
-        if task.status() == TaskStatus::Cancelling {
+        if task.stop_requested_at.is_some() && task.status() == TaskStatus::Running {
             self.storage
-                .update_status(task_id, TaskStatus::Cancelling, TaskStatus::Cancelled)
+                .update_status(task_id, TaskStatus::Running, TaskStatus::Cancelled)
                 .await?;
             return Ok(RecoveryOutcome::Paused);
         }

@@ -73,7 +73,7 @@ async fn main() -> Result<(), task_core::TaskError> {
 ## Storage Modes
 
 - `with_storage_path(...)` keeps task-core standalone and is the right fit for tests, examples, and isolated tooling.
-- `with_sqlite_pool(...)` embeds task-core into a caller-owned app database and initializes the `dagger_*` tables idempotently.
+- `with_sqlite_pool(...)` embeds task-core into a caller-owned app database and initializes the canonical host-facing `dagger_*` tables idempotently.
 
 ## Durable Task Surface
 
@@ -113,6 +113,6 @@ Public/host status projection is derived from engine state:
 | `Completed` | `Succeeded` |
 | `Failed` | `Failed` |
 | `Rejected` | `Rejected` |
-| `Cancelling` | `Stopping` |
+| `Running` with a persisted `stop_requested` lifecycle event | `Stopping` |
 | `Cancelled` | `Cancelled` |
-| any status with `deleted_at` set | `Deleted` |
+| `Deleted` or any task with `deleted_at` set | `Deleted` |

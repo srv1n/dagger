@@ -64,7 +64,7 @@ If you implemented `Storage`, update for:
 
 - `TaskSystemBuilder::with_storage_path(...)` still works for standalone task databases.
 - `TaskSystemBuilder::with_sqlite_pool(...)` embeds Dagger into a caller-owned SQLite database.
-- Task Agent storage now initializes and queries the namespaced `dagger_*` schema, and automatically migrates legacy `tasks` / `shared_state` rows into the new tables on first boot.
+- Task Agent storage now initializes and queries the host-canonical `dagger_*` schema used by RZN's embedded migration, and automatically migrates both legacy `tasks` / `shared_state` rows and the earlier divergent embedded `dagger_*` layout into that shape on first boot.
 
 ### Task model changes
 
@@ -82,7 +82,7 @@ The engine also now persists:
 
 - ordered output history
 - lifecycle events
-- stop/cancel state (`Cancelling`, `Cancelled`)
+- stop requests via lifecycle events and durable cancel/delete terminal states
 - soft deletion tombstones
 
 ## Pub/Sub

@@ -260,8 +260,12 @@ async fn run_one(
         Ok(Ok(output)) => {
             // Success
             storage.update_output(id, output).await?;
-            let current_status = storage.get_status(id).await?;
-            let final_status = if current_status == TaskStatus::Cancelling {
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            let final_status = if latest_task.stop_requested_at.is_some() {
                 TaskStatus::Cancelled
             } else {
                 TaskStatus::Completed
@@ -273,13 +277,17 @@ async fn run_one(
         }
         Ok(Err(e)) => {
             // Agent error
-            let current_status = storage.get_status(id).await?;
-            if current_status == TaskStatus::Cancelling {
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            if latest_task.stop_requested_at.is_some() {
                 let mut task = task.clone();
                 task.record_error(&e);
                 storage.put(&task).await?;
                 storage
-                    .update_status(id, TaskStatus::Cancelling, TaskStatus::Cancelled)
+                    .update_status(id, current_status, TaskStatus::Cancelled)
                     .await?;
                 scheduler
                     .on_status_change(id, TaskStatus::Cancelled)
@@ -320,8 +328,12 @@ async fn run_one(
             let mut task = task.clone();
             task.record_error(&e);
             storage.put(&task).await?;
-            let current_status = storage.get_status(id).await?;
-            let final_status = if current_status == TaskStatus::Cancelling {
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            let final_status = if latest_task.stop_requested_at.is_some() {
                 TaskStatus::Cancelled
             } else {
                 TaskStatus::Failed

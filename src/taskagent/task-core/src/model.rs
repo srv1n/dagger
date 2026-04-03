@@ -34,6 +34,7 @@ pub enum TaskStatus {
     Accepted = 8,
     Cancelling = 9,
     Cancelled = 10,
+    Deleted = 11,
 }
 
 impl TaskStatus {
@@ -50,6 +51,7 @@ impl TaskStatus {
             8 => Some(TaskStatus::Accepted),
             9 => Some(TaskStatus::Cancelling),
             10 => Some(TaskStatus::Cancelled),
+            11 => Some(TaskStatus::Deleted),
             _ => None,
         }
     }
@@ -67,6 +69,7 @@ impl TaskStatus {
             TaskStatus::Accepted => "accepted",
             TaskStatus::Cancelling => "cancelling",
             TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Deleted => "deleted",
         }
     }
 
@@ -83,6 +86,7 @@ impl TaskStatus {
             "accepted" => Some(TaskStatus::Accepted),
             "cancelling" => Some(TaskStatus::Cancelling),
             "cancelled" => Some(TaskStatus::Cancelled),
+            "deleted" => Some(TaskStatus::Deleted),
             _ => None,
         }
     }
@@ -311,12 +315,16 @@ impl Task {
     }
 
     pub fn is_deleted(&self) -> bool {
-        self.deleted_at.is_some()
+        self.deleted_at.is_some() || self.status() == TaskStatus::Deleted
     }
 
     pub fn public_status(&self) -> PublicTaskStatus {
-        if self.deleted_at.is_some() {
+        if self.is_deleted() {
             return PublicTaskStatus::Deleted;
+        }
+
+        if self.stop_requested_at.is_some() && self.status() == TaskStatus::Running {
+            return PublicTaskStatus::Stopping;
         }
 
         match self.status() {
@@ -331,6 +339,7 @@ impl Task {
             TaskStatus::Rejected => PublicTaskStatus::Rejected,
             TaskStatus::Cancelling => PublicTaskStatus::Stopping,
             TaskStatus::Cancelled => PublicTaskStatus::Cancelled,
+            TaskStatus::Deleted => PublicTaskStatus::Deleted,
         }
     }
 
