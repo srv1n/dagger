@@ -40,12 +40,20 @@ async fn main() -> Result<(), task_core::TaskError> {
 
     let _task_id = system
         .submit_task(NewTaskSpec {
+            job: None,
             agent: 1,
+            public_id: None,
+            thread_id: Some(Arc::from("thread-1")),
+            subject: Some(Arc::from("echo")),
+            description: Arc::from("echo"),
+            owner: Some(Arc::from("example")),
+            metadata: serde_json::json!({ "surface": "example" }),
+            source: None,
+            acceptance_criteria: None,
             input: Bytes::from("hello"),
             dependencies: Vec::new().into(),
             durability: task_core::Durability::BestEffort,
             task_type: task_core::TaskType::Task,
-            description: Arc::from("echo"),
             timeout: None,
             max_retries: Some(3),
             parent: None,
@@ -61,3 +69,50 @@ async fn main() -> Result<(), task_core::TaskError> {
 - Use `TaskContext` to access dependency outputs and shared state.
 - The scheduler automatically evaluates dependencies and enqueues tasks.
 - Recovery runs at startup to requeue running tasks (BestEffort) or pause them (AtMostOnce).
+
+## Storage Modes
+
+- `with_storage_path(...)` keeps task-core standalone and is the right fit for tests, examples, and isolated tooling.
+- `with_sqlite_pool(...)` embeds task-core into a caller-owned app database and initializes the `dagger_*` tables idempotently.
+
+## Durable Task Surface
+
+Task records now carry both execution data and host-facing metadata:
+
+- Engine/runtime: status, retries, parent id, dependency edges, payload bytes, output summary, error bytes
+- Host/public: `public_id`, `thread_id`, `subject`, `description`, `owner`, metadata JSON, and source metadata
+
+The SQLite storage backend persists:
+
+- `dagger_jobs`
+- `dagger_tasks`
+- `dagger_task_dependencies`
+- `dagger_task_outputs`
+- `dagger_task_events`
+- `dagger_shared_state`
+
+Host code can:
+
+- fetch tasks by `public_id`
+- list tasks by thread
+- list child tasks, dependencies, and dependents
+- append and read ordered output history
+- append and read lifecycle event history
+- request stop/cancel and soft-delete tasks without losing history
+
+## Status Mapping
+
+Public/host status projection is derived from engine state:
+
+| Engine status | Host/public status |
+| --- | --- |
+| `Pending`, `Ready`, `Accepted` | `Queued` |
+| `Blocked` | `Blocked` |
+| `Running` | `Running` |
+| `Paused` | `Paused` |
+| `Completed` | `Succeeded` |
+| `Failed` | `Failed` |
+| `Rejected` | `Rejected` |
+| `Cancelling` | `Stopping` |
+| `Cancelled` | `Cancelled` |
+| any status with `deleted_at` set | `Deleted` |

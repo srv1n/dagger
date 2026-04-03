@@ -260,15 +260,33 @@ async fn run_one(
         Ok(Ok(output)) => {
             // Success
             storage.update_output(id, output).await?;
+            let current_status = storage.get_status(id).await?;
+            let final_status = if current_status == TaskStatus::Cancelling {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Completed
+            };
             storage
-                .update_status(id, TaskStatus::Running, TaskStatus::Completed)
+                .update_status(id, current_status, final_status)
                 .await?;
-            scheduler
-                .on_status_change(id, TaskStatus::Completed)
-                .await?;
+            scheduler.on_status_change(id, final_status).await?;
         }
         Ok(Err(e)) => {
             // Agent error
+            let current_status = storage.get_status(id).await?;
+            if current_status == TaskStatus::Cancelling {
+                let mut task = task.clone();
+                task.record_error(&e);
+                storage.put(&task).await?;
+                storage
+                    .update_status(id, TaskStatus::Cancelling, TaskStatus::Cancelled)
+                    .await?;
+                scheduler
+                    .on_status_change(id, TaskStatus::Cancelled)
+                    .await?;
+                return Ok(());
+            }
+
             let should_retry = e.is_retryable()
                 && task.durability == Durability::BestEffort
                 && task.retry_count.load(std::sync::atomic::Ordering::Relaxed) < task.max_retries;
@@ -280,7 +298,7 @@ async fn run_one(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 storage.put(&task).await?;
                 storage
-                    .update_status(id, TaskStatus::Running, TaskStatus::Pending)
+                    .update_status(id, current_status, TaskStatus::Pending)
                     .await?;
                 if !scheduler.push_ready(id) {
                     warn!(task_id = %id, "Retry enqueue failed (ready queue full)");
@@ -291,7 +309,7 @@ async fn run_one(
                 task.record_error(&e);
                 storage.put(&task).await?;
                 storage
-                    .update_status(id, TaskStatus::Running, TaskStatus::Failed)
+                    .update_status(id, current_status, TaskStatus::Failed)
                     .await?;
                 scheduler.on_status_change(id, TaskStatus::Failed).await?;
             }
@@ -302,10 +320,16 @@ async fn run_one(
             let mut task = task.clone();
             task.record_error(&e);
             storage.put(&task).await?;
+            let current_status = storage.get_status(id).await?;
+            let final_status = if current_status == TaskStatus::Cancelling {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Failed
+            };
             storage
-                .update_status(id, TaskStatus::Running, TaskStatus::Failed)
+                .update_status(id, current_status, final_status)
                 .await?;
-            scheduler.on_status_change(id, TaskStatus::Failed).await?;
+            scheduler.on_status_change(id, final_status).await?;
         }
     }
 
@@ -335,7 +359,19 @@ impl TaskHandle for TaskHandleImpl {
         parent: TaskId,
         mut spec: NewTaskSpec,
     ) -> Result<TaskId, TaskError> {
+        let parent_task = self
+            .storage
+            .get(parent)
+            .await?
+            .ok_or(TaskError::TaskNotFound(parent))?;
         spec.parent = Some(parent);
+        spec.job = Some(parent_task.job);
+        if spec.thread_id.is_none() {
+            spec.thread_id = parent_task.thread_id.clone();
+        }
+        if spec.owner.is_none() {
+            spec.owner = parent_task.owner.clone();
+        }
         self.spawn_task(spec).await
     }
 }

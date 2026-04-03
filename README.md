@@ -84,6 +84,7 @@ async fn handler(msg: Message) -> anyhow::Result<()> {
 
 - **Parallel Execution**: Automatic parallelization of independent nodes
 - **SQLite Persistence**: ACID-compliant storage with compression
+- **Embedded Durable Tasks**: Task Agent storage can share a caller-provided app SQLite pool or run standalone for tests and examples
 - **Send-Compatible**: Works with Tauri and cross-thread async contexts
 - **Retry Logic**: Configurable retry strategies with exponential backoff
 - **Visual Debugging**: Export execution graphs as DOT files
@@ -124,6 +125,43 @@ Sample outputs and notes on nondeterminism: `examples/README.md`.
 - [Task Agent Guide](docs/TASK_AGENT_ARCHITECTURE.md) - Dynamic tasks
 - [Pub/Sub Guide](docs/PUBSUB_ARCHITECTURE.md) - Event-driven agents
 - [Upgrading / Adoption Notes](docs/UPGRADING.md) - Downstream migration checklist
+
+## Embedded Task Storage
+
+Task Agent mode now persists into namespaced `dagger_*` tables:
+
+- `dagger_jobs`
+- `dagger_tasks`
+- `dagger_task_dependencies`
+- `dagger_task_outputs`
+- `dagger_task_events`
+- `dagger_shared_state`
+
+Use path-based storage for standalone tests or demos:
+
+```rust
+let system = dagger::TaskSystemBuilder::new()
+    .with_storage_path("tasks.db")
+    .build(std::sync::Arc::new(dagger::AgentRegistry::new()))
+    .await?;
+```
+
+Use pool-based storage when the host app wants Dagger embedded inside its own SQLite database:
+
+```rust
+let pool = sqlx::SqlitePool::connect("sqlite:app.db").await?;
+let system = dagger::TaskSystemBuilder::new()
+    .with_sqlite_pool(pool)
+    .build(std::sync::Arc::new(dagger::AgentRegistry::new()))
+    .await?;
+```
+
+Task storage now distinguishes engine/runtime fields from host/public fields:
+
+- Engine/runtime: execution status, retries, dependency edges, payload input/output
+- Host/public: `public_id`, `thread_id`, `subject`, `description`, `owner`, metadata JSON, and source metadata
+
+Host integrations can query durable tasks by public id, thread, parent/child hierarchy, and dependency graph, and can list ordered output and lifecycle event history.
 
 ## Recent Changes
 

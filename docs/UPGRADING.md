@@ -50,7 +50,40 @@ This note summarizes the changes you need to make if you are adopting this crate
 
 If you implemented `Storage`, update for:
 - `list_tasks(...)` and `list_tasks_by_job(...)` signatures (now return `Vec<Task>`).
-- Dependency storage uses JSON serialization.
+- new host-facing query methods:
+  - `get_by_public_id(...)`
+  - `list_tasks_by_thread(...)`
+  - `list_child_tasks(...)`
+  - `list_task_dependencies(...)`
+  - `list_task_dependents(...)`
+  - ordered output and lifecycle event APIs
+  - stop and soft-delete APIs
+- dependency storage now lives in the relational `dagger_task_dependencies` table instead of serialized JSON.
+
+### Embedded SQLite support
+
+- `TaskSystemBuilder::with_storage_path(...)` still works for standalone task databases.
+- `TaskSystemBuilder::with_sqlite_pool(...)` embeds Dagger into a caller-owned SQLite database.
+- Task Agent storage now initializes and queries the namespaced `dagger_*` schema, and automatically migrates legacy `tasks` / `shared_state` rows into the new tables on first boot.
+
+### Task model changes
+
+`NewTaskSpec` and `Task` now carry host-facing durable-task metadata:
+
+- `public_id`
+- `thread_id`
+- `subject`
+- `description`
+- `owner`
+- metadata JSON
+- source metadata
+
+The engine also now persists:
+
+- ordered output history
+- lifecycle events
+- stop/cancel state (`Cancelling`, `Cancelled`)
+- soft deletion tombstones
 
 ## Pub/Sub
 

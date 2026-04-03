@@ -44,7 +44,7 @@ impl Scheduler {
 
         // Only process completed or failed tasks
         match new_status {
-            TaskStatus::Completed | TaskStatus::Failed => {
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
                 // Get all tasks that depend on this task
                 if let Some(dependent_tasks) = self.dependency_index.get(&task_id) {
                     let dependents: Vec<TaskId> = dependent_tasks.iter().map(|s| *s).collect();
@@ -373,19 +373,26 @@ mod tests {
 
     fn create_test_task(task_id: TaskId, dependencies: Vec<TaskId>, status: TaskStatus) -> Task {
         let spec = NewTaskSpec {
+            job: Some(1),
             agent: 1,
+            public_id: Some(Arc::from(format!("task-{}", task_id))),
+            thread_id: Some(Arc::from("thread-1")),
+            subject: Some(Arc::from("Test task")),
+            description: Arc::from("Test task"),
+            owner: Some(Arc::from("owner-1")),
+            metadata: serde_json::json!({}),
+            source: None,
+            acceptance_criteria: None,
             input: Bytes::from_static(b"{}"),
             dependencies: dependencies.into(),
             durability: Durability::BestEffort,
             task_type: TaskType::Task,
-            description: Arc::from("Test task"),
             timeout: None,
             max_retries: Some(3),
             parent: None,
         };
 
-        let mut task = Task::from_spec(task_id, spec);
-        task.job = 1;
+        let task = Task::from_spec(task_id, spec);
         task.status.store(status as u8, Ordering::Relaxed);
         task
     }
