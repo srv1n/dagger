@@ -80,7 +80,7 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
-            by_id: vec![None; u16::MAX as usize],
+            by_id: vec![None; usize::from(u16::MAX) + 1],
             by_name: DashMap::new(),
         }
     }
@@ -91,10 +91,18 @@ impl AgentRegistry {
         name: &'static str,
         agent: Arc<dyn Agent>,
     ) -> Result<(), TaskError> {
-        if self.by_id[id as usize].is_some() {
+        let idx = usize::from(id);
+        if self.by_id[idx].is_some() {
             return Err(TaskError::AgentAlreadyRegistered(id));
         }
-        self.by_id[id as usize] = Some(agent);
+        if let Some(existing) = self.by_name.get(name) {
+            return Err(TaskError::Internal(format!(
+                "agent name '{}' is already registered with id {}",
+                name, *existing
+            )));
+        }
+
+        self.by_id[idx] = Some(agent);
         self.by_name.insert(name, id);
         Ok(())
     }
@@ -110,6 +118,12 @@ impl AgentRegistry {
 
     pub fn id_for_name(&self, name: &str) -> Option<AgentId> {
         self.by_name.get(name).map(|id| *id)
+    }
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -260,15 +274,41 @@ async fn run_one(
         Ok(Ok(output)) => {
             // Success
             storage.update_output(id, output).await?;
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            let final_status = if latest_task.stop_requested_at.is_some() {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Completed
+            };
             storage
-                .update_status(id, TaskStatus::Running, TaskStatus::Completed)
+                .update_status(id, current_status, final_status)
                 .await?;
-            scheduler
-                .on_status_change(id, TaskStatus::Completed)
-                .await?;
+            scheduler.on_status_change(id, final_status).await?;
         }
         Ok(Err(e)) => {
             // Agent error
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            if latest_task.stop_requested_at.is_some() {
+                let mut task = task.clone();
+                task.record_error(&e);
+                storage.put(&task).await?;
+                storage
+                    .update_status(id, current_status, TaskStatus::Cancelled)
+                    .await?;
+                scheduler
+                    .on_status_change(id, TaskStatus::Cancelled)
+                    .await?;
+                return Ok(());
+            }
+
             let should_retry = e.is_retryable()
                 && task.durability == Durability::BestEffort
                 && task.retry_count.load(std::sync::atomic::Ordering::Relaxed) < task.max_retries;
@@ -280,7 +320,7 @@ async fn run_one(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 storage.put(&task).await?;
                 storage
-                    .update_status(id, TaskStatus::Running, TaskStatus::Pending)
+                    .update_status(id, current_status, TaskStatus::Pending)
                     .await?;
                 if !scheduler.push_ready(id) {
                     warn!(task_id = %id, "Retry enqueue failed (ready queue full)");
@@ -291,7 +331,7 @@ async fn run_one(
                 task.record_error(&e);
                 storage.put(&task).await?;
                 storage
-                    .update_status(id, TaskStatus::Running, TaskStatus::Failed)
+                    .update_status(id, current_status, TaskStatus::Failed)
                     .await?;
                 scheduler.on_status_change(id, TaskStatus::Failed).await?;
             }
@@ -302,10 +342,20 @@ async fn run_one(
             let mut task = task.clone();
             task.record_error(&e);
             storage.put(&task).await?;
+            let latest_task = storage
+                .get(id)
+                .await?
+                .ok_or_else(|| TaskError::TaskNotFound(id))?;
+            let current_status = latest_task.status();
+            let final_status = if latest_task.stop_requested_at.is_some() {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Failed
+            };
             storage
-                .update_status(id, TaskStatus::Running, TaskStatus::Failed)
+                .update_status(id, current_status, final_status)
                 .await?;
-            scheduler.on_status_change(id, TaskStatus::Failed).await?;
+            scheduler.on_status_change(id, final_status).await?;
         }
     }
 
@@ -335,7 +385,19 @@ impl TaskHandle for TaskHandleImpl {
         parent: TaskId,
         mut spec: NewTaskSpec,
     ) -> Result<TaskId, TaskError> {
+        let parent_task = self
+            .storage
+            .get(parent)
+            .await?
+            .ok_or(TaskError::TaskNotFound(parent))?;
         spec.parent = Some(parent);
+        spec.job = Some(parent_task.job);
+        if spec.thread_id.is_none() {
+            spec.thread_id = parent_task.thread_id.clone();
+        }
+        if spec.owner.is_none() {
+            spec.owner = parent_task.owner.clone();
+        }
         self.spawn_task(spec).await
     }
 }

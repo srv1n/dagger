@@ -69,6 +69,12 @@ impl CompositeHook {
     }
 }
 
+impl Default for CompositeHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl EventHook for CompositeHook {
     async fn handle(&self, ctx: &HookContext, event: &ExecutionEvent) -> Vec<ExecutorCommand> {

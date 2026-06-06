@@ -1,3 +1,5 @@
+#![allow(clippy::module_inception)]
+
 // Core modules
 pub mod dag_flow;
 pub mod dag_flow_parallel;

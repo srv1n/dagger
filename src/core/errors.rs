@@ -372,6 +372,12 @@ impl ErrorContext {
     }
 }
 
+impl Default for ErrorContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Macro for creating errors with context
 #[macro_export]
 macro_rules! dagger_error {

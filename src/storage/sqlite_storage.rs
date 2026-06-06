@@ -201,7 +201,7 @@ impl SqliteStorage {
                     id: row.try_get("id")?,
                     name: row.try_get("name")?,
                     status: FlowRunStatus::from_str(&row.try_get::<String, _>("status")?)
-                        .map_err(|e| StorageError::InvalidStatus(e))?,
+                        .map_err(StorageError::InvalidStatus)?,
                     created_at: DateTime::parse_from_rfc3339(
                         &row.try_get::<String, _>("created_at")?,
                     )?

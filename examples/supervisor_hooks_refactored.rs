@@ -134,6 +134,12 @@ impl HookProcessor {
     }
 }
 
+impl Default for HookProcessor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ============= Example Hooks =============
 
 /// A hook that adds cleanup nodes after certain operations
@@ -364,6 +370,12 @@ impl RefactoredDagExecutor {
             nodes_completed: final_metrics.nodes_completed,
             nodes_failed: final_metrics.nodes_failed,
         })
+    }
+}
+
+impl Default for RefactoredDagExecutor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

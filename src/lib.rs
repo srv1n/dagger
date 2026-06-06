@@ -17,9 +17,11 @@ pub mod storage; // SQLite storage backend
 
 // Core exports
 pub use anyhow;
+pub use async_trait;
 pub use core::errors::{DaggerError, Result};
 pub use core::limits::{ResourceLimits, ResourceTracker};
 pub use dagger_macros::{action, pubsub_agent, task_agent};
+pub use linkme;
 pub use serde_json;
 
 // Re-export task-core for macro expansion convenience
@@ -38,9 +40,10 @@ pub use coord::{Coordinator, ExecutorCommand, NodeAction};
 
 // Task Agent exports
 pub use taskagent::{
-    Agent, AgentError, AgentId, AgentRegistry, Durability, JobId, NewTaskSpec, Task, TaskConfig,
-    TaskConfigBuilder, TaskContext, TaskHandle, TaskId, TaskStatus, TaskSystem, TaskSystemBuilder,
-    TaskType,
+    Agent, AgentError, AgentId, AgentRegistry, Durability, JobId, NewTaskEvent, NewTaskSpec,
+    PublicTaskStatus, Task, TaskConfig, TaskConfigBuilder, TaskContext, TaskEventRecord,
+    TaskHandle, TaskId, TaskOutputRecord, TaskSourceMetadata, TaskStatus, TaskSystem,
+    TaskSystemBuilder, TaskType,
 };
 
 // Pub/Sub exports

@@ -18,7 +18,6 @@ use dagger::{
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tracing_subscriber;
 
 /// Simple action that adds two numbers
 struct AddAction;
@@ -84,62 +83,59 @@ impl EventHook for DynamicGrowthHook {
     async fn handle(&self, ctx: &HookContext, event: &ExecutionEvent) -> Vec<ExecutorCommand> {
         let mut commands = Vec::new();
 
-        match event {
-            ExecutionEvent::NodeCompleted { node, outcome } => {
-                // Check if this was an "add" node
-                if node.node_id.starts_with("add_") {
-                    // Extract the result from the outcome
-                    if let NodeOutcome::Success {
-                        outputs: Some(outputs),
-                    } = outcome
-                    {
-                        if let Some(result) = outputs.get("result").and_then(|v| v.as_f64()) {
+        if let ExecutionEvent::NodeCompleted { node, outcome } = event {
+            // Check if this was an "add" node
+            if node.node_id.starts_with("add_") {
+                // Extract the result from the outcome
+                if let NodeOutcome::Success {
+                    outputs: Some(outputs),
+                } = outcome
+                {
+                    if let Some(result) = outputs.get("result").and_then(|v| v.as_f64()) {
+                        println!(
+                            "Hook: Node {} completed with result {}",
+                            node.node_id, result
+                        );
+
+                        // If result exceeds threshold, add a multiply node
+                        if result > self.threshold {
                             println!(
-                                "Hook: Node {} completed with result {}",
-                                node.node_id, result
+                                "Hook: Result {} exceeds threshold {}, adding multiply node",
+                                result, self.threshold
                             );
 
-                            // If result exceeds threshold, add a multiply node
-                            if result > self.threshold {
-                                println!(
-                                    "Hook: Result {} exceeds threshold {}, adding multiply node",
-                                    result, self.threshold
-                                );
+                            let multiply_node_id = format!("multiply_{}", node.node_id);
 
-                                let multiply_node_id = format!("multiply_{}", node.node_id);
+                            // Store the input value for the multiply node in cache
+                            let _ = insert_value(
+                                &self.cache,
+                                &multiply_node_id,
+                                "value",
+                                json!(result),
+                            );
 
-                                // Store the input value for the multiply node in cache
-                                let _ = insert_value(
-                                    &self.cache,
-                                    &multiply_node_id,
-                                    "value",
-                                    json!(result),
-                                );
+                            // Create a multiply node that depends on the add node
+                            let spec = NodeSpec {
+                                id: Some(multiply_node_id.clone()),
+                                action: "multiply".to_string(),
+                                deps: vec![node.node_id.clone()],
+                                inputs: json!({
+                                    "value": result
+                                }),
+                                timeout: Some(30),
+                                try_count: Some(1),
+                            };
 
-                                // Create a multiply node that depends on the add node
-                                let spec = NodeSpec {
-                                    id: Some(multiply_node_id.clone()),
-                                    action: "multiply".to_string(),
-                                    deps: vec![node.node_id.clone()],
-                                    inputs: json!({
-                                        "value": result
-                                    }),
-                                    timeout: Some(30),
-                                    try_count: Some(1),
-                                };
+                            commands.push(ExecutorCommand::AddNode {
+                                dag_name: ctx.dag_name.clone(),
+                                spec,
+                            });
 
-                                commands.push(ExecutorCommand::AddNode {
-                                    dag_name: ctx.dag_name.clone(),
-                                    spec,
-                                });
-
-                                println!("Hook: Scheduled multiply node: {}", multiply_node_id);
-                            }
+                            println!("Hook: Scheduled multiply node: {}", multiply_node_id);
                         }
                     }
                 }
             }
-            _ => {}
         }
 
         commands

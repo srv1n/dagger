@@ -2,7 +2,8 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{format_ident, quote};
 use syn::{
-    parse::Parser, parse_macro_input, FnArg, ItemFn, Lit, Meta, MetaNameValue, ReturnType, Type,
+    parse::Parser, parse_macro_input, FnArg, GenericArgument, ItemFn, Lit, Meta, MetaNameValue,
+    PathArguments, ReturnType, Type,
 };
 
 use proc_macro_crate::{crate_name, FoundCrate};
@@ -13,7 +14,8 @@ fn dagger_path() -> syn::Path {
             let ident = syn::Ident::new(&name, Span::call_site());
             syn::parse_quote!(::#ident)
         }
-        Ok(FoundCrate::Itself) | Err(_) => syn::parse_quote!(::dagger),
+        Ok(FoundCrate::Itself) => syn::parse_quote!(::dagger),
+        Err(_) => syn::parse_quote!(::dagger),
     }
 }
 
@@ -33,7 +35,7 @@ fn task_core_path() -> syn::Path {
                 let ident = syn::Ident::new(&name, Span::call_site());
                 syn::parse_quote!(::#ident)
             }
-            FoundCrate::Itself => syn::parse_quote!(::task_core),
+            FoundCrate::Itself => syn::parse_quote!(crate),
         }
     } else {
         syn::parse_quote!(::task_core)
@@ -60,9 +62,31 @@ fn return_is_result(ret: &ReturnType) -> bool {
     }
 }
 
-fn return_is_node_output(ret: &ReturnType) -> bool {
+fn result_ok_type(ty: &Type) -> Option<&Type> {
+    let Type::Path(path) = ty else {
+        return None;
+    };
+
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Result" {
+        return None;
+    }
+
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+
+    args.args.iter().find_map(|arg| match arg {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    })
+}
+
+fn return_ok_is_node_output(ret: &ReturnType) -> bool {
     match ret {
-        ReturnType::Type(_, ty) => type_ends_with(ty, "NodeOutput"),
+        ReturnType::Type(_, ty) => result_ok_type(ty)
+            .map(|ok_ty| type_ends_with(ok_ty, "NodeOutput"))
+            .unwrap_or_else(|| type_ends_with(ty, "NodeOutput")),
         _ => false,
     }
 }
@@ -134,8 +158,14 @@ fn to_camel_case(name: &str) -> String {
 ///
 /// # Example
 /// ```rust
+/// use dagger_macros::task_agent;
+/// use task_core::{Task, TaskContext};
+///
 /// #[task_agent(name = "calculator", description = "Performs calculations")]
-/// async fn calculator(task: Task, ctx: std::sync::Arc<TaskContext>) -> Result<serde_json::Value> {
+/// async fn calculator(
+///     _task: Task,
+///     _ctx: std::sync::Arc<TaskContext>,
+/// ) -> anyhow::Result<serde_json::Value> {
 ///     Ok(serde_json::json!({"ok": true}))
 /// }
 /// ```
@@ -195,6 +225,7 @@ pub fn task_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let task_core = task_core_path();
+    let register_name = format_ident!("__{}_AGENT_REG", fn_name.to_string().to_ascii_uppercase());
 
     let output = quote! {
         #input_fn
@@ -208,21 +239,21 @@ pub fn task_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub const DESCRIPTION: &'static str = #description;
         }
 
-        #[async_trait::async_trait]
+        #[#task_core::async_trait::async_trait]
         impl #task_core::Agent for #struct_name {
             async fn execute(
                 &self,
                 task: #task_core::Task,
                 ctx: std::sync::Arc<#task_core::TaskContext>,
-            ) -> Result<#task_core::Bytes, #task_core::AgentError> {
+            ) -> std::result::Result<#task_core::Bytes, #task_core::AgentError> {
                 let result = #call?;
                 let output = #task_core::IntoBytes::into_bytes(result)?;
                 Ok(output)
             }
         }
 
-        #[linkme::distributed_slice(#task_core::AGENTS)]
-        static AGENT_REGISTRATION: fn(&mut #task_core::AgentRegistry) = |registry| {
+        #[#task_core::linkme::distributed_slice(#task_core::AGENTS)]
+        static #register_name: fn(&mut #task_core::AgentRegistry) = |registry| {
             registry
                 .register(
                     #struct_name::AGENT_ID,
@@ -326,7 +357,7 @@ pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
         }),
     };
 
-    let wrap_output = if return_is_node_output(&input_fn.sig.output) {
+    let wrap_output = if return_ok_is_node_output(&input_fn.sig.output) {
         quote!(result)
     } else {
         quote!({
@@ -353,7 +384,7 @@ pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Debug, Clone)]
         #fn_vis struct #struct_name;
 
-        #[async_trait::async_trait]
+        #[#dagger::async_trait::async_trait]
         impl #dagger::coord::action::NodeAction for #struct_name {
             fn name(&self) -> &str {
                 #action_name
@@ -376,7 +407,7 @@ pub fn action(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         }
 
-        #[linkme::distributed_slice(#dagger::coord::registry::ACTION_REGISTRARS)]
+        #[#dagger::linkme::distributed_slice(#dagger::coord::registry::ACTION_REGISTRARS)]
         #fn_vis static #register_name: fn(&#dagger::coord::registry::ActionRegistry) = |registry| {
             registry.register(std::sync::Arc::new(#struct_name));
         };
@@ -488,7 +519,7 @@ pub fn pubsub_agent(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[derive(Debug, Clone)]
         #fn_vis struct #struct_name;
 
-        #[async_trait::async_trait]
+        #[#dagger::async_trait::async_trait]
         impl #dagger::pubsub::PubSubAgent for #struct_name {
             fn name(&self) -> String {
                 #agent_name.to_string()

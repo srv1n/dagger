@@ -247,7 +247,8 @@ impl PubSubExecutor {
     /// Register an agent with the executor
     pub async fn register_agent(&mut self, agent: Arc<dyn PubSubAgent>) -> Result<()> {
         let name = agent.name();
-        let node_id = format!("{}_{}", name, Uuid::new_v4().to_string()[..8].to_string());
+        let uuid = Uuid::new_v4().to_string();
+        let node_id = format!("{}_{}", name, &uuid[..8]);
 
         let metadata = AgentMetadata {
             name: name.clone(),
@@ -447,15 +448,11 @@ impl PubSubExecutor {
                             }
                         }
                     }
-                    _ = async {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                         let stopped_read = stopped.read().await;
                         if *stopped_read {
-                            return;
+                            break;
                         }
-                        // Small delay to prevent busy waiting
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    } => {
-                        break;
                     }
                 }
             }

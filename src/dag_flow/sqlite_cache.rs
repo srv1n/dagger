@@ -6,8 +6,11 @@
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde_json::Value;
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Pool, Sqlite, SqlitePool};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::str::FromStr;
 use tracing::{debug, info};
 
 use super::dag_flow::{Cache, ExecutionTree, SerializableData, SerializableExecutionTree};
@@ -27,7 +30,18 @@ impl SqliteCache {
             database_url.to_string()
         };
 
-        let pool = SqlitePool::connect(&url).await?;
+        // If the cache points at a file on disk, ensure the parent dir exists.
+        // This avoids `SQLITE_CANTOPEN` (code 14) when the app data dir was deleted.
+        if let Some(path) = sqlite_file_path_from_url(&url) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // SQLx's `SqlitePool::connect` does NOT create the file by default.
+        // We want the cache DB to be durable and auto-create on first boot.
+        let opts = SqliteConnectOptions::from_str(&url)?.create_if_missing(true);
+        let pool = SqlitePool::connect_with(opts).await?;
 
         // Initialize database schema
         Self::initialize_schema(&pool).await?;
@@ -270,6 +284,16 @@ impl SqliteCache {
             Some((value_str,)) => {
                 let value: Value = serde_json::from_str(&value_str)
                     .map_err(|e| anyhow!("Failed to deserialize JSON value: {}", e))?;
+
+                // Stored artifacts may use the internal SerializableData wrapper
+                // (`{"value": ...}`). Public JSON reads should return the user value,
+                // not the storage wrapper.
+                if let Some(wrapped) = value.get("value") {
+                    if value.as_object().map(|obj| obj.len() == 1).unwrap_or(false) {
+                        return Ok(Some(wrapped.clone()));
+                    }
+                }
+
                 Ok(Some(value))
             }
             None => Ok(None),
@@ -289,7 +313,7 @@ impl SqliteCache {
         let node_id = parts[1];
         let key = parts[2..].join("/"); // Allow keys with slashes
 
-        let serialized_value = serde_json::to_string(&value)
+        let serialized_value = serde_json::to_string(&SerializableData { value })
             .map_err(|e| anyhow!("Failed to serialize JSON value: {}", e))?;
 
         // Use INSERT OR REPLACE for upsert behavior
@@ -459,6 +483,18 @@ impl SqliteCache {
         }
     }
 
+    /// Delete an execution state row.
+    pub async fn delete_execution_state(&self, dag_id: &str, state_type: &str) -> Result<()> {
+        sqlx::query("DELETE FROM execution_state WHERE dag_id = ? AND state_type = ?")
+            .bind(dag_id)
+            .bind(state_type)
+            .execute(&self.pool)
+            .await?;
+
+        debug!("Deleted {} state for DAG: {}", state_type, dag_id);
+        Ok(())
+    }
+
     /// Debug utility to print database contents
     pub async fn debug_print_db(&self) -> Result<()> {
         info!("=== SQLite DB Contents ===");
@@ -513,4 +549,26 @@ impl SqliteCache {
 
         Ok(())
     }
+}
+
+fn sqlite_file_path_from_url(url: &str) -> Option<PathBuf> {
+    // `sqlite::memory:` is a special case; nothing to create on disk.
+    if url == "sqlite::memory:" || url == ":memory:" {
+        return None;
+    }
+
+    let rest = url.strip_prefix("sqlite:")?;
+    // Strip query parameters, if any.
+    let rest = rest.split('?').next().unwrap_or(rest);
+
+    // SQLx accepts both `sqlite:/abs/path.db` and `sqlite://relative.db`.
+    // For the latter, strip the leading `//` so PathBuf doesn't treat it as a UNC path.
+    let rest = rest.strip_prefix("//").unwrap_or(rest);
+
+    // If this still looks like an in-memory connection string, ignore it.
+    if rest == ":memory:" || rest.is_empty() {
+        return None;
+    }
+
+    Some(PathBuf::from(rest))
 }

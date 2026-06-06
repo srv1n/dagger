@@ -28,12 +28,20 @@ async fn main() -> anyhow::Result<()> {
 
     system
         .submit_task(NewTaskSpec {
+            job: None,
             agent: agent_id,
+            public_id: None,
+            thread_id: Some(Arc::from("demo-thread")),
+            subject: Some(Arc::from("echo")),
+            description: Arc::from("echo"),
+            owner: Some(Arc::from("example")),
+            metadata: serde_json::json!({ "surface": "example" }),
+            source: None,
+            acceptance_criteria: None,
             input: Bytes::from("hello"),
             dependencies: Vec::new().into(),
             durability: Durability::BestEffort,
             task_type: TaskType::Task,
-            description: Arc::from("echo"),
             timeout: None,
             max_retries: Some(3),
             parent: None,

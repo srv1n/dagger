@@ -63,6 +63,10 @@ impl Recovery {
     /// 3. Re-enqueues recoverable tasks to the ready queue if dependencies are met
     pub async fn recover(&self) -> Result<RecoveryStats> {
         info!("Starting task recovery process");
+        if !self.config.auto_recover {
+            info!("Recovery skipped because auto_recover is disabled");
+            return Ok(RecoveryStats::default());
+        }
         let mut stats = RecoveryStats::default();
 
         // Get all running task IDs
@@ -108,6 +112,13 @@ impl Recovery {
             "Recovering task {} with durability mode {:?}",
             task_id, durability
         );
+
+        if task.stop_requested_at.is_some() && task.status() == TaskStatus::Running {
+            self.storage
+                .update_status(task_id, TaskStatus::Running, TaskStatus::Cancelled)
+                .await?;
+            return Ok(RecoveryOutcome::Paused);
+        }
 
         match durability {
             DurabilityMode::BestEffort => self.recover_best_effort(task).await,
@@ -181,9 +192,10 @@ impl Recovery {
     /// Determine the durability mode for a task
     /// In the future, this could read from task metadata or configuration
     fn get_task_durability(&self, _task: &Task) -> DurabilityMode {
-        // For now, use the default durability mode
-        // In the future, this could check task.metadata for a durability field
-        self.config.default_durability
+        match _task.durability {
+            crate::model::Durability::BestEffort => DurabilityMode::BestEffort,
+            crate::model::Durability::AtMostOnce => DurabilityMode::AtMostOnce,
+        }
     }
 
     /// Check if a task should be enqueued based on its dependencies
@@ -262,19 +274,26 @@ mod tests {
 
     fn create_running_task(task_id: TaskId) -> Task {
         let spec = NewTaskSpec {
+            job: Some(1),
             agent: 1,
+            public_id: Some(Arc::from(format!("task-{}", task_id))),
+            thread_id: Some(Arc::from("thread-1")),
+            subject: Some(Arc::from("Test task")),
+            description: Arc::from("Test task"),
+            owner: Some(Arc::from("owner-1")),
+            metadata: serde_json::json!({}),
+            source: None,
+            acceptance_criteria: None,
             input: Bytes::from_static(b"{}"),
             dependencies: vec![].into(),
             durability: Durability::BestEffort,
             task_type: TaskType::Task,
-            description: Arc::from("Test task"),
             timeout: None,
             max_retries: Some(3),
             parent: None,
         };
 
-        let mut task = Task::from_spec(task_id, spec);
-        task.job = 1;
+        let task = Task::from_spec(task_id, spec);
         task.status
             .store(TaskStatus::Running as u8, Ordering::Relaxed);
         task
@@ -311,13 +330,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_recover_with_at_most_once() {
-        let (mut recovery, storage, _temp_dir) = create_test_recovery().await;
-
-        // Change config to AtMostOnce
-        recovery.config.default_durability = DurabilityMode::AtMostOnce;
+        let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create and store a running task
-        let task = create_running_task(1);
+        let mut task = create_running_task(1);
+        task.durability = Durability::AtMostOnce;
         storage.put(&task).await.unwrap();
 
         // Run recovery
@@ -343,7 +360,7 @@ mod tests {
         let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create a completed dependency
-        let mut dep_task = create_running_task(1);
+        let dep_task = create_running_task(1);
         dep_task
             .status
             .store(TaskStatus::Completed as u8, Ordering::Relaxed);
@@ -367,7 +384,7 @@ mod tests {
         let (recovery, storage, _temp_dir) = create_test_recovery().await;
 
         // Create a pending dependency
-        let mut dep_task = create_running_task(1);
+        let dep_task = create_running_task(1);
         dep_task
             .status
             .store(TaskStatus::Pending as u8, Ordering::Relaxed);

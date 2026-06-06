@@ -258,7 +258,7 @@ async fn apply_command(
             // Notify observers about added node
             for observer in &exec.observers {
                 observer
-                    .on_nodes_added(run_id, dag_name, &[id.clone()])
+                    .on_nodes_added(run_id, dag_name, std::slice::from_ref(&id))
                     .await;
             }
         }

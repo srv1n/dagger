@@ -32,6 +32,7 @@ impl FlowRunStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "pending" => Ok(FlowRunStatus::Pending),
@@ -67,6 +68,7 @@ impl NodeRunStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Result<Self, String> {
         match s {
             "pending" => Ok(NodeRunStatus::Pending),

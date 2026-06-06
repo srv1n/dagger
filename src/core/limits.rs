@@ -662,8 +662,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_execution_time_limits() {
-        let mut limits = ResourceLimits::default();
-        limits.max_total_execution_time = Duration::from_millis(100);
+        let limits = ResourceLimits {
+            max_total_execution_time: Duration::from_millis(100),
+            ..Default::default()
+        };
 
         let tracker = ResourceTracker::new(limits.clone()).unwrap();
         tracker.start_execution().await;

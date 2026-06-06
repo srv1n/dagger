@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -31,6 +32,9 @@ pub enum TaskStatus {
     Paused = 6,
     Rejected = 7,
     Accepted = 8,
+    Cancelling = 9,
+    Cancelled = 10,
+    Deleted = 11,
 }
 
 impl TaskStatus {
@@ -45,9 +49,105 @@ impl TaskStatus {
             6 => Some(TaskStatus::Paused),
             7 => Some(TaskStatus::Rejected),
             8 => Some(TaskStatus::Accepted),
+            9 => Some(TaskStatus::Cancelling),
+            10 => Some(TaskStatus::Cancelled),
+            11 => Some(TaskStatus::Deleted),
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskStatus::Pending => "pending",
+            TaskStatus::Blocked => "blocked",
+            TaskStatus::Ready => "ready",
+            TaskStatus::Running => "running",
+            TaskStatus::Completed => "completed",
+            TaskStatus::Failed => "failed",
+            TaskStatus::Paused => "paused",
+            TaskStatus::Rejected => "rejected",
+            TaskStatus::Accepted => "accepted",
+            TaskStatus::Cancelling => "cancelling",
+            TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Deleted => "deleted",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(TaskStatus::Pending),
+            "blocked" => Some(TaskStatus::Blocked),
+            "ready" => Some(TaskStatus::Ready),
+            "running" => Some(TaskStatus::Running),
+            "completed" => Some(TaskStatus::Completed),
+            "failed" => Some(TaskStatus::Failed),
+            "paused" => Some(TaskStatus::Paused),
+            "rejected" => Some(TaskStatus::Rejected),
+            "accepted" => Some(TaskStatus::Accepted),
+            "cancelling" => Some(TaskStatus::Cancelling),
+            "cancelled" => Some(TaskStatus::Cancelled),
+            "deleted" => Some(TaskStatus::Deleted),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        TaskStatus::from_str(value).ok_or(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublicTaskStatus {
+    Queued,
+    Blocked,
+    Running,
+    Paused,
+    Succeeded,
+    Failed,
+    Rejected,
+    Stopping,
+    Cancelled,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSourceMetadata {
+    pub surface: Option<String>,
+    pub tool_name: Option<String>,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub run_id: Option<String>,
+    pub call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutputRecord {
+    pub sequence: u64,
+    pub output: Bytes,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewTaskEvent {
+    pub event_type: String,
+    pub status: Option<TaskStatus>,
+    pub reason: Option<String>,
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEventRecord {
+    pub sequence: u64,
+    pub event_type: String,
+    pub status: Option<TaskStatus>,
+    pub reason: Option<String>,
+    pub payload: Option<Value>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// Task type hierarchy
@@ -64,6 +164,7 @@ pub enum TaskType {
 #[derive(Debug)]
 pub struct Task {
     pub id: TaskId,
+    pub public_id: Arc<str>,
     pub job: JobId,
     pub agent: AgentId,
     pub status: AtomicU8,
@@ -80,10 +181,20 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 
-    // Optional fields from architect's extended design
+    // Host-facing metadata
+    pub thread_id: Option<Arc<str>>,
+    pub subject: Option<Arc<str>>,
+    pub description: Arc<str>,
+    pub owner: Option<Arc<str>>,
+    pub metadata: Value,
+    pub source: Option<TaskSourceMetadata>,
     pub acceptance_criteria: Option<Arc<str>>,
     pub status_reason: Option<Arc<str>>,
     pub summary: Option<Arc<str>>,
+    pub stop_reason: Option<Arc<str>>,
+    pub stop_requested_at: Option<DateTime<Utc>>,
+    pub deleted_at: Option<DateTime<Utc>>,
+    pub deleted_reason: Option<Arc<str>>,
 
     // Error storage
     pub error: Option<Bytes>,
@@ -94,18 +205,25 @@ pub struct Task {
 pub struct TaskPayload {
     pub input: Bytes,
     pub output: tokio::sync::RwLock<Option<Bytes>>,
-    pub description: Arc<str>,
 }
 
 /// Specification for creating new tasks
 #[derive(Debug, Clone)]
 pub struct NewTaskSpec {
+    pub job: Option<JobId>,
     pub agent: AgentId,
+    pub public_id: Option<Arc<str>>,
+    pub thread_id: Option<Arc<str>>,
+    pub subject: Option<Arc<str>>,
+    pub description: Arc<str>,
+    pub owner: Option<Arc<str>>,
+    pub metadata: Value,
+    pub source: Option<TaskSourceMetadata>,
+    pub acceptance_criteria: Option<Arc<str>>,
     pub input: Bytes,
     pub dependencies: SmallVec<[TaskId; 4]>,
     pub durability: Durability,
     pub task_type: TaskType,
-    pub description: Arc<str>,
     pub timeout: Option<Duration>,
     pub max_retries: Option<u8>,
     pub parent: Option<TaskId>,
@@ -115,9 +233,12 @@ pub struct NewTaskSpec {
 #[derive(Debug)]
 pub struct Job {
     pub id: JobId,
+    pub public_id: Arc<str>,
     pub root_task: TaskId,
     pub status: AtomicU8,
     pub summary: tokio::sync::RwLock<Option<String>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Agent error types
@@ -157,9 +278,15 @@ impl Task {
     /// Create task from specification
     pub fn from_spec(id: TaskId, spec: NewTaskSpec) -> Self {
         let now = Utc::now();
+        let description = spec.description;
+        let public_id = spec
+            .public_id
+            .unwrap_or_else(|| Arc::<str>::from(format!("task-{}", id)));
+        let subject = spec.subject.or_else(|| Some(description.clone()));
         Self {
             id,
-            job: 0, // Will be set by job manager
+            public_id,
+            job: spec.job.unwrap_or(id),
             agent: spec.agent,
             status: AtomicU8::new(TaskStatus::Pending as u8),
             durability: spec.durability,
@@ -168,7 +295,6 @@ impl Task {
             payload: Arc::new(TaskPayload {
                 input: spec.input,
                 output: tokio::sync::RwLock::new(None),
-                description: spec.description,
             }),
             parent: spec.parent,
             task_type: spec.task_type,
@@ -176,10 +302,53 @@ impl Task {
             timeout: spec.timeout,
             created_at: now,
             updated_at: now,
-            acceptance_criteria: None,
+            thread_id: spec.thread_id,
+            subject,
+            description,
+            owner: spec.owner,
+            metadata: spec.metadata,
+            source: spec.source,
+            acceptance_criteria: spec.acceptance_criteria,
             status_reason: None,
             summary: None,
+            stop_reason: None,
+            stop_requested_at: None,
+            deleted_at: None,
+            deleted_reason: None,
             error: None,
+        }
+    }
+
+    pub fn status(&self) -> TaskStatus {
+        TaskStatus::from_u8(self.status.load(Ordering::Relaxed)).unwrap_or(TaskStatus::Pending)
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some() || self.status() == TaskStatus::Deleted
+    }
+
+    pub fn public_status(&self) -> PublicTaskStatus {
+        if self.is_deleted() {
+            return PublicTaskStatus::Deleted;
+        }
+
+        if self.stop_requested_at.is_some() && self.status() == TaskStatus::Running {
+            return PublicTaskStatus::Stopping;
+        }
+
+        match self.status() {
+            TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Accepted => {
+                PublicTaskStatus::Queued
+            }
+            TaskStatus::Blocked => PublicTaskStatus::Blocked,
+            TaskStatus::Running => PublicTaskStatus::Running,
+            TaskStatus::Paused => PublicTaskStatus::Paused,
+            TaskStatus::Completed => PublicTaskStatus::Succeeded,
+            TaskStatus::Failed => PublicTaskStatus::Failed,
+            TaskStatus::Rejected => PublicTaskStatus::Rejected,
+            TaskStatus::Cancelling => PublicTaskStatus::Stopping,
+            TaskStatus::Cancelled => PublicTaskStatus::Cancelled,
+            TaskStatus::Deleted => PublicTaskStatus::Deleted,
         }
     }
 
@@ -191,6 +360,7 @@ impl Task {
             AgentError::Timeout(d) => Bytes::from(format!("Timeout: {:?}", d)),
         };
         self.error = Some(error_bytes);
+        self.status_reason = Some(Arc::from(err.to_string()));
     }
 }
 
@@ -198,6 +368,7 @@ impl Clone for Task {
     fn clone(&self) -> Self {
         Self {
             id: self.id,
+            public_id: self.public_id.clone(),
             job: self.job,
             agent: self.agent,
             status: AtomicU8::new(self.status.load(Ordering::Relaxed)),
@@ -211,9 +382,19 @@ impl Clone for Task {
             timeout: self.timeout,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            thread_id: self.thread_id.clone(),
+            subject: self.subject.clone(),
+            description: self.description.clone(),
+            owner: self.owner.clone(),
+            metadata: self.metadata.clone(),
+            source: self.source.clone(),
             acceptance_criteria: self.acceptance_criteria.clone(),
             status_reason: self.status_reason.clone(),
             summary: self.summary.clone(),
+            stop_reason: self.stop_reason.clone(),
+            stop_requested_at: self.stop_requested_at,
+            deleted_at: self.deleted_at,
+            deleted_reason: self.deleted_reason.clone(),
             error: self.error.clone(),
         }
     }

@@ -59,6 +59,12 @@ impl BranchState {
     }
 }
 
+impl Default for BranchState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Branch registry for managing branch states
 #[derive(Clone)]
 pub struct BranchRegistry {

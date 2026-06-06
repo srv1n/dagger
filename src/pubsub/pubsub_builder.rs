@@ -11,6 +11,12 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+pub type PubSubBuildOutput = (
+    PubSubConfig,
+    HashMap<String, ChannelConfig>,
+    HashMap<String, SubscriptionConfig>,
+);
+
 /// PubSub system configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PubSubConfig {
@@ -151,7 +157,7 @@ impl Default for PubSubPerformanceConfig {
 }
 
 /// PubSub security configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PubSubSecurityConfig {
     /// Enable authentication for publishers
     pub enable_publisher_auth: bool,
@@ -165,19 +171,6 @@ pub struct PubSubSecurityConfig {
     pub message_validation: Option<String>,
     /// Rate limiting settings
     pub rate_limiting: Option<RateLimitConfig>,
-}
-
-impl Default for PubSubSecurityConfig {
-    fn default() -> Self {
-        Self {
-            enable_publisher_auth: false,
-            enable_subscriber_auth: false,
-            enable_encryption: false,
-            enable_acl: false,
-            message_validation: None,
-            rate_limiting: None,
-        }
-    }
 }
 
 /// Rate limiting configuration
@@ -496,13 +489,7 @@ impl PubSubBuilder {
     }
 
     /// Build the configuration
-    pub fn build(
-        self,
-    ) -> Result<(
-        PubSubConfig,
-        HashMap<String, ChannelConfig>,
-        HashMap<String, SubscriptionConfig>,
-    )> {
+    pub fn build(self) -> Result<PubSubBuildOutput> {
         self.validate()?;
         Ok((self.config, self.channels, self.subscriptions))
     }

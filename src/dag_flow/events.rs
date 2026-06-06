@@ -93,6 +93,12 @@ impl BufferingEventSink {
     }
 }
 
+impl Default for BufferingEventSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventSink for BufferingEventSink {
     fn emit(&self, envelope: &RuntimeEventEnvelope) {
         self.events.write().push(envelope.clone());
