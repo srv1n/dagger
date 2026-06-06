@@ -17,9 +17,11 @@ pub mod storage; // SQLite storage backend
 
 // Core exports
 pub use anyhow;
+pub use async_trait;
 pub use core::errors::{DaggerError, Result};
 pub use core::limits::{ResourceLimits, ResourceTracker};
 pub use dagger_macros::{action, pubsub_agent, task_agent};
+pub use linkme;
 pub use serde_json;
 
 // Re-export task-core for macro expansion convenience

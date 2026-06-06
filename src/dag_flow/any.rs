@@ -135,7 +135,7 @@ impl Eq for TypeInfo {}
 
 impl PartialOrd for TypeInfo {
     fn partial_cmp(&self, other: &TypeInfo) -> Option<std::cmp::Ordering> {
-        self.id.partial_cmp(&other.id)
+        Some(self.cmp(other))
     }
 }
 
@@ -146,7 +146,6 @@ impl Ord for TypeInfo {
 }
 
 /// A [`Box`]ed [`IntoAny`].
-
 pub type DynAny = Box<dyn IntoAny + Send + Sync>;
 
 // impl std::fmt::Debug for DynAny {

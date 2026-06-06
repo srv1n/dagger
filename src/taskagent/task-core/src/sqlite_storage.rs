@@ -342,7 +342,7 @@ impl SqliteStorage {
             let source = row
                 .source_metadata_json
                 .as_deref()
-                .map(|json| serde_json::from_str::<TaskSourceMetadata>(json))
+                .map(serde_json::from_str::<TaskSourceMetadata>)
                 .transpose()
                 .map_err(|e| {
                     TaskError::Serialization(format!(
@@ -365,6 +365,11 @@ impl SqliteStorage {
                 .transpose()?
                 .map(|ts| ts.timestamp_millis());
             let status = normalize_status_for_host(&row.status);
+            let stop_reason = row.stop_reason.clone();
+            let status_reason = row
+                .status_reason
+                .or_else(|| stop_reason.clone())
+                .or(row.deleted_reason);
 
             sqlx::query(
                 r#"
@@ -405,7 +410,7 @@ impl SqliteStorage {
             .bind(row.payload_input)
             .bind(row.payload_output)
             .bind(row.summary)
-            .bind(row.status_reason.or(row.stop_reason).or(row.deleted_reason))
+            .bind(status_reason)
             .bind(row.error_data)
             .bind(created_at_ms)
             .bind(updated_at_ms)
@@ -415,6 +420,44 @@ impl SqliteStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| TaskError::Storage(format!("Failed to migrate embedded task {}: {}", row.id, e)))?;
+
+            if let Some(stop_requested_ms) = stop_requested_ms {
+                let payload_json = merge_event_payload(
+                    Some(
+                        serde_json::json!({
+                            "next_status": status,
+                        })
+                        .to_string(),
+                    ),
+                    stop_reason,
+                )?;
+                sqlx::query(
+                    r#"
+                    INSERT INTO dagger_task_events (
+                        id, task_id, event_type, from_status, to_status, actor_type, actor_id,
+                        origin_thread_id, origin_turn_id, origin_run_id, payload_json, created_at_ms
+                    ) VALUES (?, ?, 'stop_requested', ?, ?, 'agent', ?, ?, ?, ?, ?, ?)
+                    "#,
+                )
+                .bind(format!("migrated-stop-request-{}", row.id))
+                .bind(row.id)
+                .bind(Option::<String>::None)
+                .bind(status)
+                .bind(Option::<String>::None)
+                .bind(Option::<String>::None)
+                .bind(Option::<String>::None)
+                .bind(Option::<String>::None)
+                .bind(payload_json)
+                .bind(stop_requested_ms)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    TaskError::Storage(format!(
+                        "Failed to migrate embedded stop request for task {}: {}",
+                        row.id, e
+                    ))
+                })?;
+            }
         }
 
         for dep in old_deps {
@@ -1220,7 +1263,7 @@ impl Storage for SqliteStorage {
             task.parent.is_none().then_some(task.id),
             task.status(),
             now_ms,
-            task.thread_id.as_deref().map(|v| v.as_ref()),
+            task.thread_id.as_deref(),
             output_summary,
         )
         .await?;
@@ -2324,10 +2367,7 @@ mod tests {
         let retrieved = storage.get(task_id).await?.expect("task stored");
         assert_eq!(retrieved.id, task_id);
         assert_eq!(retrieved.public_id.as_ref(), "task-public-1");
-        assert_eq!(
-            retrieved.thread_id.as_deref().map(|s| s.as_ref()),
-            Some("thread-a")
-        );
+        assert_eq!(retrieved.thread_id.as_deref(), Some("thread-a"));
         assert_eq!(retrieved.metadata["surface"], "test");
         assert_eq!(
             retrieved.source.as_ref().and_then(|s| s.call_id.as_deref()),
@@ -2799,10 +2839,7 @@ mod tests {
         let storage = SqliteStorage::open_with_pool(pool.clone()).await?;
         let migrated = storage.get(1).await?.expect("migrated embedded task");
         assert_eq!(migrated.public_id.as_ref(), "task-old-1");
-        assert_eq!(
-            migrated.thread_id.as_deref().map(|value| value.as_ref()),
-            Some("thread-old")
-        );
+        assert_eq!(migrated.thread_id.as_deref(), Some("thread-old"));
         assert_eq!(
             migrated
                 .source
@@ -2824,7 +2861,11 @@ mod tests {
             Some(Bytes::from_static(b"out"))
         );
         assert_eq!(storage.list_outputs(1).await?.len(), 1);
-        assert_eq!(storage.list_events(1).await?.len(), 1);
+        let events = storage.list_events(1).await?;
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "stop_requested"));
         assert_eq!(
             storage.get_shared_state("scope/key").await?,
             Some(Bytes::from_static(b"val"))

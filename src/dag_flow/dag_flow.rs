@@ -124,6 +124,26 @@ fn default_cache_snapshot_interval() -> u64 {
     300 // 5 minutes
 }
 
+fn default_node_timeout() -> u64 {
+    300
+}
+
+fn default_node_try_count() -> u8 {
+    3
+}
+
+fn default_node_onfailure() -> bool {
+    true
+}
+
+fn default_graph_author() -> String {
+    "unknown".to_string()
+}
+
+fn default_graph_version() -> String {
+    "1.0".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OnFailure {
     Continue,
@@ -246,17 +266,25 @@ pub struct DagMetadata {
 }
 
 /// Represents a graph of nodes.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Graph {
     /// The nodes in the graph.
+    #[serde(default)]
     pub nodes: Vec<Node>,
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub instructions: Option<Vec<String>>,
+    #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default = "default_graph_author")]
     pub author: String,
+    #[serde(default = "default_graph_version")]
     pub version: String,
+    #[serde(default)]
     pub signature: String,
+    #[serde(default)]
     pub config: Option<DagConfig>,
 }
 
@@ -302,23 +330,32 @@ pub struct Node {
     ///
     pub id: String,
     /// The dependencies of the node (other nodes that must be executed before this node).
+    #[serde(default)]
     pub dependencies: Vec<String>,
     /// The inputs of the node.
+    #[serde(default)]
     pub inputs: Vec<IField>,
     /// The outputs of the node.
+    #[serde(default)]
     pub outputs: Vec<OField>,
     /// The action to be executed by the node.
     pub action: String,
     /// The failure action to be executed if the node's action fails.
+    #[serde(default)]
     pub failure: String,
-    /// The on-failure behavior (continue or terminate).
+    /// Whether node-level retry/failure behavior is enabled.
+    #[serde(default = "default_node_onfailure")]
     pub onfailure: bool,
     /// The description of the node.
+    #[serde(default)]
     pub description: String,
     /// The timeout for the node's action in seconds.
+    #[serde(default = "default_node_timeout")]
     pub timeout: u64,
     /// The number of times to retry the node's action if it fails.
+    #[serde(default = "default_node_try_count")]
     pub try_count: u8,
+    #[serde(default)]
     pub instructions: Option<Vec<String>>,
 }
 
@@ -482,7 +519,7 @@ impl Cache {
         let map = self
             .data
             .entry(node_id.to_string())
-            .or_insert_with(|| DashMap::new());
+            .or_insert_with(DashMap::new);
         map.insert(key.to_string(), SerializableData { value });
         self.mark_dirty(node_id, key);
         Ok(())
@@ -530,10 +567,8 @@ pub fn load_cache_from_json(json_data: &str) -> Result<Cache> {
     let cache: HashMap<String, DashMap<String, SerializableData>> = deserialized_cache
         .into_iter()
         .map(|(node_id, category_map)| {
-            let converted_category: DashMap<String, SerializableData> = category_map
-                .into_iter()
-                .map(|(output_name, value)| (output_name, value))
-                .collect();
+            let converted_category: DashMap<String, SerializableData> =
+                category_map.into_iter().collect();
             (node_id, converted_category)
         })
         .collect(); // This collect needs the type hint
@@ -561,6 +596,54 @@ pub fn generate_node_id(action_name: &str) -> String {
     format!("{}_{}", action_name, timestamp)
 }
 
+fn json_inputs_to_ifields(node_id: &str, inputs: &Value) -> Result<Vec<IField>, DagError> {
+    if inputs.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let obj = inputs.as_object().ok_or_else(|| {
+        DagError::ValidationError("node inputs must be a JSON object".to_string())
+    })?;
+
+    Ok(obj
+        .keys()
+        .map(|key| IField {
+            name: key.clone(),
+            description: None,
+            reference: format!("{}.{}", node_id, key),
+        })
+        .collect())
+}
+
+fn store_node_inputs(cache: &Cache, node_id: &str, inputs: &Value) -> Result<(), DagError> {
+    if inputs.is_null() {
+        return Ok(());
+    }
+
+    let obj = inputs.as_object().ok_or_else(|| {
+        DagError::ValidationError("node inputs must be a JSON object".to_string())
+    })?;
+
+    for (key, value) in obj {
+        crate::insert_value(cache, node_id, key, value.clone())
+            .map_err(|e| DagError::ExecutionError(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn upsert_input_ref(inputs: &mut Vec<IField>, input_name: &str, reference: String) {
+    if let Some(existing) = inputs.iter_mut().find(|field| field.name == input_name) {
+        existing.reference = reference;
+    } else {
+        inputs.push(IField {
+            name: input_name.to_string(),
+            description: None,
+            reference,
+        });
+    }
+}
+
 pub fn get_input<T: for<'de> Deserialize<'de>>(
     cache: &Cache,
     node_id: &str,
@@ -573,10 +656,10 @@ pub fn get_input<T: for<'de> Deserialize<'de>>(
             let value: T = serde_json::from_value(serializable_data.value.clone())?; // Deserialize from Value
             Ok(value)
         } else {
-            Err(anyhow!("Key '{}' not found in node '{}'", key, node_id).into())
+            Err(anyhow!("Key '{}' not found in node '{}'", key, node_id))
         }
     } else {
-        Err(anyhow!("Node '{}' not found in cache", node_id).into())
+        Err(anyhow!("Node '{}' not found in cache", node_id))
     }
 }
 
@@ -597,7 +680,7 @@ pub fn parse_input_from_name<T: for<'de> Deserialize<'de>>(
     // Split the reference into node ID and output name
     let parts: Vec<&str> = reference.split('.').collect();
     if parts.len() != 2 {
-        return Err(anyhow!("Invalid reference format: '{}'", reference).into());
+        return Err(anyhow!("Invalid reference format: '{}'", reference));
     }
     let node_id = parts[0];
     let output_name = parts[1];
@@ -745,6 +828,12 @@ impl AppState {
     }
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Application data injected into NodeCtx for DAG actions
 #[derive(Clone)]
 pub struct DagNodeContextData {
@@ -827,6 +916,9 @@ pub trait ExecutionObserver: Send + Sync {
     async fn on_nodes_added(&self, run_id: &str, dag_name: &str, node_ids: &[String]);
 }
 
+pub type PrebuiltDag = (DiGraph<Node, ()>, HashMap<String, NodeIndex>);
+pub type PrebuiltDags = Arc<RwLock<HashMap<String, PrebuiltDag>>>;
+
 /// The main executor for DAGs.
 pub struct DagExecutor {
     /// A registry of custom actions.
@@ -834,8 +926,7 @@ pub struct DagExecutor {
     /// The graphs to be executed.
     pub graphs: Arc<RwLock<HashMap<String, Graph>>>,
     /// The prebuilt DAGs.
-    pub prebuilt_dags:
-        Arc<RwLock<HashMap<String, (DiGraph<Node, ()>, HashMap<String, NodeIndex>)>>>,
+    pub prebuilt_dags: PrebuiltDags,
     pub config: DagConfig,
     pub sqlite_cache: Arc<SqliteCache>,
     pub stopped: Arc<RwLock<bool>>,
@@ -1228,14 +1319,23 @@ impl DagExecutor {
         let mut node_indices = HashMap::new();
 
         for node in &graph.nodes {
+            if node.id.trim().is_empty() {
+                return Err(anyhow!("node id must not be empty"));
+            }
+            if node_indices.contains_key(&node.id) {
+                return Err(anyhow!(
+                    "duplicate node id '{}' in DAG '{}'",
+                    node.id,
+                    graph.name
+                ));
+            }
+
             let node_index = dag.add_node(node.clone());
             node_indices.insert(node.id.clone(), node_index);
         }
 
-        validate_dag_structure(&dag)?;
         validate_node_dependencies(&graph.nodes, &node_indices)?;
         validate_node_actions(self, &graph.nodes).await?;
-        // validate_io_data_types(&graph.nodes)?;
 
         for node in &graph.nodes {
             let dependent_node_index = node_indices[&node.id];
@@ -1244,6 +1344,8 @@ impl DagExecutor {
                 dag.add_edge(dependency_node_index, dependent_node_index, ());
             }
         }
+
+        validate_dag_structure(&dag)?;
 
         Ok((dag, node_indices))
     }
@@ -1302,9 +1404,7 @@ impl DagExecutor {
             .save_cache(dag_id, cache)
             .await
             .map_err(|e| {
-                DagError::DatabaseError(sqlx::Error::Protocol(
-                    format!("Cache save error: {}", e).into(),
-                ))
+                DagError::DatabaseError(sqlx::Error::Protocol(format!("Cache save error: {}", e)))
             })
     }
 
@@ -1318,9 +1418,10 @@ impl DagExecutor {
             .save_cache_delta(dag_id, delta)
             .await
             .map_err(|e| {
-                DagError::DatabaseError(sqlx::Error::Protocol(
-                    format!("Cache delta save error: {}", e).into(),
-                ))
+                DagError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Cache delta save error: {}",
+                    e
+                )))
             })
     }
 
@@ -1503,10 +1604,10 @@ impl DagExecutor {
         {
             warn!("Failed to update DAG state to active: {}", e);
         }
-        // Remove pending state by saving empty data
+        // Remove pending state after promoting the DAG to active.
         if let Err(e) = self
             .sqlite_cache
-            .save_execution_state(dag_id, "pending", &[])
+            .delete_execution_state(dag_id, "pending")
             .await
         {
             warn!("Failed to remove pending DAG state: {}", e);
@@ -1794,9 +1895,10 @@ impl DagExecutor {
                 .save_execution_tree(&normalized_id, tree)
                 .await
                 .map_err(|e| {
-                    DagError::DatabaseError(sqlx::Error::Protocol(
-                        format!("Execution tree save error: {}", e).into(),
-                    ))
+                    DagError::DatabaseError(sqlx::Error::Protocol(format!(
+                        "Execution tree save error: {}",
+                        e
+                    )))
                 })?;
         } else {
             warn!("No execution tree found to save for '{}'", dag_id);
@@ -1822,9 +1924,7 @@ impl DagExecutor {
     /// Debug utility to print SQLite DB contents
     pub async fn debug_print_db(&self) -> Result<(), DagError> {
         self.sqlite_cache.debug_print_db().await.map_err(|e| {
-            DagError::DatabaseError(sqlx::Error::Protocol(
-                format!("Debug print error: {}", e).into(),
-            ))
+            DagError::DatabaseError(sqlx::Error::Protocol(format!("Debug print error: {}", e)))
         })
     }
 
@@ -1850,9 +1950,10 @@ impl DagExecutor {
             .get_json(&normalized_dag, &path)
             .await
             .map_err(|e| {
-                DagError::DatabaseError(sqlx::Error::Protocol(
-                    format!("Failed to get node output: {}", e).into(),
-                ))
+                DagError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Failed to get node output: {}",
+                    e
+                )))
             })
     }
 
@@ -1877,9 +1978,10 @@ impl DagExecutor {
             .set_json(&normalized_dag, &path, value.clone())
             .await
             .map_err(|e| {
-                DagError::DatabaseError(sqlx::Error::Protocol(
-                    format!("Failed to set node output: {}", e).into(),
-                ))
+                DagError::DatabaseError(sqlx::Error::Protocol(format!(
+                    "Failed to set node output: {}",
+                    e
+                )))
             })
     }
 
@@ -1928,53 +2030,120 @@ impl DagExecutor {
         format!("{}_{}", prefix, counter)
     }
 
-    /// Atomic node addition with specs
+    /// Atomic node addition with specs.
+    ///
+    /// The graph is staged and validated before it is committed. If any spec is
+    /// invalid, the existing DAG is left unchanged.
     pub async fn add_nodes_atomic(
         &mut self,
         dag_name: &str,
         specs: Vec<super::planning::NodeSpec>,
         cache: &Cache,
     ) -> Result<Vec<String>, DagError> {
-        let mut node_ids = Vec::new();
+        let mut staged_graph = {
+            let graphs = self.graphs.read().await;
+            graphs
+                .get(dag_name)
+                .cloned()
+                .ok_or_else(|| DagError::DagNotFound(dag_name.to_string()))?
+        };
 
-        // First validate all specs
-        for spec in &specs {
-            let action_name = &spec.action;
-            if !self.function_registry.contains(action_name) {
-                return Err(DagError::ActionNotRegistered(action_name.clone()));
+        let mut all_ids: HashSet<String> =
+            staged_graph.nodes.iter().map(|n| n.id.clone()).collect();
+        let mut planned_specs = Vec::with_capacity(specs.len());
+        let mut node_ids = Vec::with_capacity(specs.len());
+
+        for spec in specs {
+            let node_id = spec
+                .id
+                .clone()
+                .unwrap_or_else(|| self.gen_node_id(&spec.action));
+            if node_id.trim().is_empty() {
+                return Err(DagError::InvalidGraph(
+                    "node id must not be empty".to_string(),
+                ));
+            }
+            if !all_ids.insert(node_id.clone()) {
+                return Err(DagError::NodeAlreadyExists(node_id));
+            }
+            planned_specs.push((node_id.clone(), spec));
+            node_ids.push(node_id);
+        }
+
+        for (node_id, spec) in &planned_specs {
+            if !self.function_registry.contains(&spec.action) {
+                return Err(DagError::ActionNotRegistered(spec.action.clone()));
+            }
+            for dep in &spec.deps {
+                if !all_ids.contains(dep) {
+                    return Err(DagError::DependencyNotFound(dep.clone()));
+                }
+                if dep == node_id {
+                    return Err(DagError::InvalidGraph(format!(
+                        "node '{}' cannot depend on itself",
+                        node_id
+                    )));
+                }
             }
         }
 
-        // Then add all nodes atomically
-        for spec in specs {
-            let node_id = spec.id.unwrap_or_else(|| self.gen_node_id(&spec.action));
+        let mut staged_inputs: Vec<(String, serde_json::Value)> = Vec::new();
+        for (node_id, spec) in planned_specs {
+            let try_count = match spec.try_count {
+                Some(count) => u8::try_from(count).map_err(|_| {
+                    DagError::ValidationError(format!(
+                        "try_count for node '{}' exceeds u8::MAX",
+                        node_id
+                    ))
+                })?,
+                None => self.config.max_attempts.unwrap_or(3),
+            };
 
-            // Add the node with timeout from spec
-            self.add_node_with_timeout(
-                dag_name,
-                node_id.clone(),
-                spec.action,
-                spec.deps,
-                spec.timeout,
-            )
-            .await?;
-
-            // Set inputs if provided
+            let inputs = json_inputs_to_ifields(&node_id, &spec.inputs)?;
             if !spec.inputs.is_null() {
-                self.set_node_inputs_json(dag_name, &node_id, spec.inputs, cache)
-                    .await?;
+                staged_inputs.push((node_id.clone(), spec.inputs.clone()));
             }
 
-            node_ids.push(node_id);
+            staged_graph.nodes.push(Node {
+                id: node_id.clone(),
+                dependencies: spec.deps,
+                inputs,
+                outputs: Vec::new(),
+                action: spec.action,
+                failure: String::new(),
+                onfailure: true,
+                description: format!("Dynamically added node: {}", node_id),
+                timeout: spec
+                    .timeout
+                    .unwrap_or_else(|| self.config.timeout_seconds.unwrap_or(300)),
+                try_count,
+                instructions: None,
+            });
+        }
+
+        let (staged_dag, staged_indices) = self
+            .build_dag_internal(&staged_graph)
+            .await
+            .map_err(|e| DagError::InvalidGraph(e.to_string()))?;
+
+        {
+            let mut graphs = self.graphs.write().await;
+            let mut dags = self.prebuilt_dags.write().await;
+            graphs.insert(dag_name.to_string(), staged_graph);
+            dags.insert(dag_name.to_string(), (staged_dag, staged_indices));
+        }
+
+        for (node_id, inputs) in staged_inputs {
+            store_node_inputs(cache, &node_id, &inputs)?;
         }
 
         Ok(node_ids)
     }
 
-    /// Set node inputs from JSON
+    /// Set node inputs from JSON.
     ///
-    /// This function converts JSON inputs to IField format and stores the values in cache.
-    /// The cache parameter is required because DagExecutor doesn't maintain a cache reference.
+    /// This function converts JSON object keys to `IField` references and stores
+    /// the corresponding literal values in the cache under the node namespace.
     pub async fn set_node_inputs_json(
         &mut self,
         dag_name: &str,
@@ -1982,44 +2151,33 @@ impl DagExecutor {
         inputs: serde_json::Value,
         cache: &Cache,
     ) -> Result<(), DagError> {
-        // Convert JSON inputs to IField format so they can be resolved by the coordinator
-        let mut ifields = Vec::new();
+        let ifields = json_inputs_to_ifields(node_id, &inputs)?;
+        let mut found = false;
 
-        if let Some(obj) = inputs.as_object() {
-            for (key, value) in obj {
-                // Create an IField that references the node's namespace in cache
-                let ifield = IField {
-                    name: key.clone(),
-                    description: None,
-                    reference: format!("{}.{}", node_id, key), // Reference pattern: node_id.field_name
-                };
-                ifields.push(ifield);
+        {
+            let mut graphs = self.graphs.write().await;
+            let mut dags = self.prebuilt_dags.write().await;
 
-                // CRITICAL: Store the actual value in the cache so it can be resolved later!
-                if let Err(e) = crate::insert_value(cache, node_id, key, value.clone()) {
-                    tracing::warn!(
-                        "Failed to store input value in cache for {}.{}: {}",
-                        node_id,
-                        key,
-                        e
-                    );
+            if let Some((dag, node_map)) = dags.get_mut(dag_name) {
+                if let Some(&node_idx) = node_map.get(node_id) {
+                    dag[node_idx].inputs = ifields.clone();
+                    found = true;
+                }
+            }
+
+            if let Some(graph) = graphs.get_mut(dag_name) {
+                if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == node_id) {
+                    node.inputs = ifields;
+                    found = true;
                 }
             }
         }
 
-        // Update the node's inputs in the prebuilt DAG
-        // Use async write since we're in an async context
-        let mut dags = self.prebuilt_dags.write().await;
-
-        if let Some((graph, node_map)) = dags.get_mut(dag_name) {
-            if let Some(&node_idx) = node_map.get(node_id) {
-                // Update the node's inputs with the IFields
-                graph[node_idx].inputs = ifields;
-                return Ok(());
-            }
+        if !found {
+            return Err(DagError::NodeNotFound(node_id.to_string()));
         }
 
-        Err(DagError::NodeNotFound(node_id.to_string()))
+        store_node_inputs(cache, node_id, &inputs)
     }
 
     /// Set (or add) a single node input reference.
@@ -2034,38 +2192,60 @@ impl DagExecutor {
         reference: impl Into<String>,
     ) -> Result<(), DagError> {
         let reference = reference.into();
+        let mut found = false;
 
+        let mut graphs = self.graphs.write().await;
         let mut dags = self.prebuilt_dags.write().await;
-        if let Some((graph, node_map)) = dags.get_mut(dag_name) {
+
+        if let Some((dag, node_map)) = dags.get_mut(dag_name) {
             if let Some(&node_idx) = node_map.get(node_id) {
-                let inputs = &mut graph[node_idx].inputs;
-                if let Some(existing) = inputs.iter_mut().find(|f| f.name == input_name) {
-                    existing.reference = reference;
-                } else {
-                    inputs.push(IField {
-                        name: input_name.to_string(),
-                        description: None,
-                        reference,
-                    });
-                }
-                return Ok(());
+                upsert_input_ref(&mut dag[node_idx].inputs, input_name, reference.clone());
+                found = true;
             }
         }
 
-        Err(DagError::NodeNotFound(node_id.to_string()))
+        if let Some(graph) = graphs.get_mut(dag_name) {
+            if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == node_id) {
+                upsert_input_ref(&mut node.inputs, input_name, reference);
+                found = true;
+            }
+        }
+
+        if found {
+            Ok(())
+        } else {
+            Err(DagError::NodeNotFound(node_id.to_string()))
+        }
     }
 
-    /// Get node inputs as JSON
-    pub fn get_node_inputs_json(
+    /// Get node input references as JSON.
+    pub async fn get_node_inputs_json(
         &self,
         dag_name: &str,
         node_id: &str,
     ) -> Result<serde_json::Value, DagError> {
-        // Retrieve inputs from cache
-        let _cache_key = format!("node_inputs.{}.{}", dag_name, node_id);
+        let graphs = self.graphs.read().await;
+        let graph = graphs
+            .get(dag_name)
+            .ok_or_else(|| DagError::DagNotFound(dag_name.to_string()))?;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| DagError::NodeNotFound(node_id.to_string()))?;
 
-        // For now, return empty object as placeholder
-        Ok(serde_json::json!({}))
+        let mut inputs = serde_json::Map::new();
+        for field in &node.inputs {
+            inputs.insert(
+                field.name.clone(),
+                serde_json::json!({
+                    "reference": field.reference,
+                    "description": field.description,
+                }),
+            );
+        }
+
+        Ok(serde_json::Value::Object(inputs))
     }
 
     /// Check if a node exists in a DAG
@@ -2322,27 +2502,17 @@ async fn record_execution_snapshot(
                     dag_name,
                     serialized.len()
                 );
-                match zstd::encode_all(&*serialized, 3) {
-                    Ok(compressed) => {
-                        info!(
-                            "Compressed cache for '{}': {} bytes",
-                            dag_name,
-                            compressed.len()
-                        );
-                        match executor
-                            .sqlite_cache
-                            .save_snapshot(dag_name, &compressed)
-                            .await
-                        {
-                            Ok(_) => {
-                                info!("Successfully saved full snapshot for '{}'", dag_name)
-                            }
-                            Err(e) => {
-                                error!("Failed to save snapshot for '{}': {}", dag_name, e)
-                            }
-                        }
+                match executor
+                    .sqlite_cache
+                    .save_snapshot(dag_name, &serialized)
+                    .await
+                {
+                    Ok(_) => {
+                        info!("Successfully saved full snapshot for '{}'", dag_name)
                     }
-                    Err(e) => error!("Failed to compress cache for '{}': {}", dag_name, e),
+                    Err(e) => {
+                        error!("Failed to save snapshot for '{}': {}", dag_name, e)
+                    }
                 }
             }
             Err(e) => error!("Failed to serialize cache for '{}': {}", dag_name, e),
@@ -2392,6 +2562,7 @@ fn store_node_outputs(cache: &Cache, node_id: &str, outputs: &Value) -> Result<(
 }
 
 /// Execute node with context for parallel execution
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_node_with_context(
     node: &Node,
     cache: &Cache,
@@ -3058,6 +3229,8 @@ pub async fn execute_dag_async(
     let mut node_outcomes = Vec::new();
     let mut overall_success = true;
     let mut executed_nodes = std::collections::HashSet::new();
+    let mut failed_nodes = std::collections::HashSet::new();
+    let mut skipped_nodes = std::collections::HashSet::new();
 
     // Main execution loop
     while !*executor.stopped.read().await {
@@ -3120,19 +3293,33 @@ pub async fn execute_dag_async(
                 continue;
             }
 
+            if node
+                .dependencies
+                .iter()
+                .any(|dep| failed_nodes.contains(dep) || skipped_nodes.contains(dep))
+            {
+                has_new_nodes = true;
+                overall_success = false;
+                executed_nodes.insert(node.id.clone());
+                skipped_nodes.insert(node.id.clone());
+                node_outcomes.push(skipped_due_to_failed_dependency(&node.id));
+                continue;
+            }
+
             has_new_nodes = true;
             let outcome = execute_node_async(executor, node, cache).await;
             executed_nodes.insert(node.id.clone());
 
             if !outcome.success {
+                failed_nodes.insert(node.id.clone());
                 match executor.config.on_failure {
                     OnFailure::Stop => {
                         node_outcomes.push(outcome);
                         return (create_execution_report(node_outcomes, false, None), false);
                     }
                     OnFailure::Pause => {
-                        // Save state before pausing
-                        if let Err(e) = executor.save_cache(&node.id, cache).await {
+                        // Save state before pausing. The cache belongs to the DAG, not the failed node.
+                        if let Err(e) = executor.save_cache(dag_name, cache).await {
                             error!("Failed to save cache before pause: {}", e);
                         }
                         node_outcomes.push(outcome);
@@ -3450,6 +3637,15 @@ async fn handle_failure(
     }
 }
 
+pub(super) fn skipped_due_to_failed_dependency(node_id: &str) -> NodeExecutionOutcome {
+    NodeExecutionOutcome {
+        node_id: node_id.to_string(),
+        success: false,
+        retry_messages: Vec::new(),
+        final_error: Some("Skipped because one or more dependencies failed".to_string()),
+    }
+}
+
 /// Helper function to create execution reports
 pub(super) fn create_execution_report(
     node_outcomes: Vec<NodeExecutionOutcome>,
@@ -3603,16 +3799,11 @@ impl SerializableExecutionTree {
 }
 
 /// Execution mode for workflows
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum ExecutionMode {
     /// Execute a static, pre-loaded DAG
+    #[default]
     Static,
     /// Start an agent-driven flow
     Agent,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        ExecutionMode::Static
-    }
 }

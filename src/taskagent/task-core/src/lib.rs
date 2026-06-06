@@ -60,10 +60,12 @@ pub mod storage;
 pub mod util;
 
 // Re-exports for convenience
+pub use async_trait;
 pub use bytes::Bytes;
 pub use config::{TaskConfig, TaskConfigBuilder};
 pub use error::{Result, TaskError};
 pub use executor::{Agent, AgentRegistry, SharedState, TaskContext, TaskHandle};
+pub use linkme;
 pub use model::{
     AgentError, AgentId, Durability, JobId, NewTaskEvent, NewTaskSpec, PublicTaskStatus, Task,
     TaskEventRecord, TaskId, TaskOutputRecord, TaskSourceMetadata, TaskStatus, TaskType,
@@ -98,6 +100,7 @@ pub struct TaskSystem {
     pub(crate) config: Arc<TaskConfig>,
     recovery_stats: Arc<RwLock<recovery::RecoveryStats>>,
     shutdown_flag: Arc<AtomicBool>,
+    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
     executor_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -171,6 +174,8 @@ impl TaskSystem {
 
         info!("Recovery complete: {:?}", recovery_stats);
 
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
         // Create system
         let system = Arc::new(Self {
             storage: storage_dyn,
@@ -181,12 +186,12 @@ impl TaskSystem {
             config: Arc::new(config),
             recovery_stats: Arc::new(RwLock::new(recovery_stats)),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
             executor_handle: Mutex::new(None),
         });
 
         // Start executor
         let executor_clone = system.executor.clone();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = executor_clone.run(shutdown_rx).await {
@@ -195,9 +200,6 @@ impl TaskSystem {
         });
 
         *system.executor_handle.lock().await = Some(handle);
-
-        // Note: shutdown_tx will be handled differently in the new architecture
-        let _ = shutdown_tx;
 
         Ok(system)
     }
@@ -238,7 +240,9 @@ impl TaskSystem {
         info!("Initiating shutdown");
         self.shutdown_flag.store(true, Ordering::Relaxed);
 
-        // Note: shutdown signaling will be handled differently with the new architecture
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
 
         // Wait for executor to finish
         if let Some(handle) = self.executor_handle.lock().await.take() {
@@ -396,5 +400,11 @@ impl TaskSystemBuilder {
     pub async fn build_with_registry(self) -> Result<Arc<TaskSystem>> {
         let registry = AgentRegistry::new();
         self.build(Arc::new(registry)).await
+    }
+}
+
+impl Default for TaskSystemBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }

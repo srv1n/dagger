@@ -336,6 +336,12 @@ impl TaskConfigBuilder {
     }
 }
 
+impl Default for TaskConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,10 +369,11 @@ mod tests {
 
     #[test]
     fn test_validation_errors() {
-        let mut config = TaskConfig::default();
-
         // Test max_workers validation
-        config.max_workers = 0;
+        let mut config = TaskConfig {
+            max_workers: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         config.max_workers = 10;
 

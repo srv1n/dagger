@@ -190,19 +190,13 @@ impl Scheduler {
 
         // Add task dependencies to the task_dependencies index
         if !task.dependencies.is_empty() {
-            let deps = self
-                .task_dependencies
-                .entry(task.id)
-                .or_insert_with(DashSet::new);
+            let deps = self.task_dependencies.entry(task.id).or_default();
 
             for dep_id in &task.dependencies {
                 deps.insert(*dep_id);
 
                 // Add to dependency index (reverse mapping)
-                let dependents = self
-                    .dependency_index
-                    .entry(*dep_id)
-                    .or_insert_with(DashSet::new);
+                let dependents = self.dependency_index.entry(*dep_id).or_default();
                 dependents.insert(task.id);
             }
         }

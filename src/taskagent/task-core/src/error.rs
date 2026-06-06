@@ -227,12 +227,10 @@ impl TaskError {
 
     /// Check if this error indicates a transient condition
     pub fn is_transient(&self) -> bool {
-        match self {
-            Self::QueueFull { .. }
-            | Self::WorkerPoolExhausted { .. }
-            | Self::TaskNotReady { .. } => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            Self::QueueFull { .. } | Self::WorkerPoolExhausted { .. } | Self::TaskNotReady { .. }
+        )
     }
 
     /// Get suggested retry delay for this error

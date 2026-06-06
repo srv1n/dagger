@@ -1,3 +1,5 @@
+#![allow(clippy::module_inception)]
+
 pub mod pubsub;
 // pub mod enhanced_pubsub;
 pub mod pubsub_builder;

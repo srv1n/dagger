@@ -80,7 +80,7 @@ pub struct AgentRegistry {
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
-            by_id: vec![None; u16::MAX as usize],
+            by_id: vec![None; usize::from(u16::MAX) + 1],
             by_name: DashMap::new(),
         }
     }
@@ -91,10 +91,18 @@ impl AgentRegistry {
         name: &'static str,
         agent: Arc<dyn Agent>,
     ) -> Result<(), TaskError> {
-        if self.by_id[id as usize].is_some() {
+        let idx = usize::from(id);
+        if self.by_id[idx].is_some() {
             return Err(TaskError::AgentAlreadyRegistered(id));
         }
-        self.by_id[id as usize] = Some(agent);
+        if let Some(existing) = self.by_name.get(name) {
+            return Err(TaskError::Internal(format!(
+                "agent name '{}' is already registered with id {}",
+                name, *existing
+            )));
+        }
+
+        self.by_id[idx] = Some(agent);
         self.by_name.insert(name, id);
         Ok(())
     }
@@ -110,6 +118,12 @@ impl AgentRegistry {
 
     pub fn id_for_name(&self, name: &str) -> Option<AgentId> {
         self.by_name.get(name).map(|id| *id)
+    }
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

@@ -73,6 +73,7 @@ impl TaskStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "pending" => Some(TaskStatus::Pending),
@@ -89,6 +90,14 @@ impl TaskStatus {
             "deleted" => Some(TaskStatus::Deleted),
             _ => None,
         }
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        TaskStatus::from_str(value).ok_or(())
     }
 }
 

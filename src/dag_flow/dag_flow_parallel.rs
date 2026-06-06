@@ -1,6 +1,6 @@
 use super::dag_flow::{
-    create_execution_report, execute_node_with_context, parse_input_from_name, Cache,
-    DagExecutionReport, DagExecutor, Node, OnFailure,
+    create_execution_report, execute_node_with_context, parse_input_from_name,
+    skipped_due_to_failed_dependency, Cache, DagExecutionReport, DagExecutor, Node, OnFailure,
 };
 use petgraph::graph::DiGraph;
 use std::collections::HashSet;
@@ -19,6 +19,9 @@ pub async fn execute_dag_parallel(
     let mut node_outcomes = Vec::new();
     let mut overall_success = true;
     let mut executed_nodes = HashSet::new();
+    let mut in_flight_nodes = HashSet::new();
+    let mut failed_nodes = HashSet::new();
+    let mut skipped_nodes = HashSet::new();
 
     let context = executor.execution_context.as_ref().unwrap();
     let semaphore = Arc::new(Semaphore::new(context.max_parallel_nodes));
@@ -28,6 +31,7 @@ pub async fn execute_dag_parallel(
 
     // Track active tasks
     let mut active_tasks = 0;
+    let mut task_handles = Vec::new();
 
     loop {
         // Check for completion conditions
@@ -63,6 +67,7 @@ pub async fn execute_dag_parallel(
 
         if let Some(max_iter) = executor.config.max_iterations {
             if supervisor_iteration >= max_iter as usize {
+                abort_unfinished_tasks(&task_handles);
                 return (
                     create_execution_report(
                         node_outcomes,
@@ -76,6 +81,7 @@ pub async fn execute_dag_parallel(
 
         let elapsed = chrono::Local::now().naive_local() - executor.start_time;
         if elapsed.num_seconds() > executor.config.timeout_seconds.unwrap_or(3600) as i64 {
+            abort_unfinished_tasks(&task_handles);
             return (
                 create_execution_report(
                     node_outcomes,
@@ -86,16 +92,40 @@ pub async fn execute_dag_parallel(
             );
         }
 
-        // Find all nodes ready for execution
+        // Mark nodes whose dependencies have failed as skipped. Otherwise they stay
+        // permanently unexecuted and make the report look cleaner than reality.
+        for idx in current_dag.node_indices() {
+            let node = &current_dag[idx];
+            if !executed_nodes.contains(&node.id)
+                && !in_flight_nodes.contains(&node.id)
+                && node
+                    .dependencies
+                    .iter()
+                    .any(|dep| failed_nodes.contains(dep) || skipped_nodes.contains(dep))
+            {
+                overall_success = false;
+                executed_nodes.insert(node.id.clone());
+                skipped_nodes.insert(node.id.clone());
+                node_outcomes.push(skipped_due_to_failed_dependency(&node.id));
+            }
+        }
+
+        // Find all nodes ready for execution. `in_flight_nodes` is required so a
+        // long-running node is not spawned again after a sibling completes.
         let ready_nodes: Vec<Node> = current_dag
             .node_indices()
             .filter_map(|idx| {
                 let node = &current_dag[idx];
                 if !executed_nodes.contains(&node.id)
+                    && !in_flight_nodes.contains(&node.id)
                     && node
                         .dependencies
                         .iter()
                         .all(|dep| executed_nodes.contains(dep))
+                    && !node
+                        .dependencies
+                        .iter()
+                        .any(|dep| failed_nodes.contains(dep) || skipped_nodes.contains(dep))
                 {
                     Some(node.clone())
                 } else {
@@ -107,6 +137,7 @@ pub async fn execute_dag_parallel(
         // Launch new tasks for ready nodes
         let ready_count = ready_nodes.len();
         for node in ready_nodes {
+            in_flight_nodes.insert(node.id.clone());
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let tx_clone = tx.clone();
             let node_clone = node.clone();
@@ -130,7 +161,7 @@ pub async fn execute_dag_parallel(
                 node.id, active_tasks
             );
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let outcome = execute_node_with_context(
                     &node_clone,
                     &cache_clone,
@@ -148,6 +179,7 @@ pub async fn execute_dag_parallel(
                 drop(permit); // Release semaphore
                 let _ = tx_clone.send(outcome);
             });
+            task_handles.push(handle);
         }
 
         // If no active tasks and no more nodes, we're done
@@ -166,25 +198,29 @@ pub async fn execute_dag_parallel(
                         outcome.node_id, active_tasks
                     );
 
+                    in_flight_nodes.remove(&outcome.node_id);
                     executed_nodes.insert(outcome.node_id.clone());
 
                     // Note: Supervisor hooks cannot be called here due to borrow checker constraints
                     // This would require a redesign of the execution flow to properly support hooks
 
                     if !outcome.success {
+                        failed_nodes.insert(outcome.node_id.clone());
                         match executor.config.on_failure {
                             OnFailure::Stop => {
                                 node_outcomes.push(outcome);
+                                abort_unfinished_tasks(&task_handles);
                                 return (
                                     create_execution_report(node_outcomes, false, None),
                                     false,
                                 );
                             }
                             OnFailure::Pause => {
-                                if let Err(e) = executor.save_cache(&outcome.node_id, cache).await {
+                                if let Err(e) = executor.save_cache(dag_name, cache).await {
                                     error!("Failed to save cache before pause: {}", e);
                                 }
                                 node_outcomes.push(outcome);
+                                abort_unfinished_tasks(&task_handles);
                                 return (
                                     create_execution_report(node_outcomes, false, None),
                                     false,
@@ -229,6 +265,7 @@ pub async fn execute_dag_parallel(
         }
 
         if *executor.paused.read().await {
+            abort_unfinished_tasks(&task_handles);
             return (
                 create_execution_report(node_outcomes, overall_success, None),
                 false,
@@ -255,4 +292,10 @@ pub async fn execute_dag_parallel(
         create_execution_report(node_outcomes, overall_success, None),
         false,
     )
+}
+
+fn abort_unfinished_tasks(handles: &[tokio::task::JoinHandle<()>]) {
+    for handle in handles {
+        handle.abort();
+    }
 }

@@ -95,6 +95,12 @@ impl CompositeSupervisor {
     }
 }
 
+impl Default for CompositeSupervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl SupervisorHook for CompositeSupervisor {
     async fn on_node_complete(

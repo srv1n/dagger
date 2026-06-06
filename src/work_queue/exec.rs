@@ -328,11 +328,13 @@ async fn run_exec(host: &dyn ExecHost, spec: &ExecSpec, ctx: &NodeCtx) -> ExecRe
         }
     }
 
-    let stdout_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> = child
+    type StreamReadTask = Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>>;
+
+    let stdout_task: StreamReadTask = child
         .stdout
         .take()
         .map(|stdout| tokio::spawn(read_stream_limited(stdout, max_stdout_bytes)));
-    let stderr_task: Option<JoinHandle<Result<(Vec<u8>, bool), std::io::Error>>> = child
+    let stderr_task: StreamReadTask = child
         .stderr
         .take()
         .map(|stderr| tokio::spawn(read_stream_limited(stderr, max_stderr_bytes)));

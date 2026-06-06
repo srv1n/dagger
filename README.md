@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let (_tx, rx) = tokio::sync::oneshot::channel();
     let report = executor.execute_static_dag("pipeline", &cache, rx).await?;
     
-    println!("Completed: {}", report.success);
+    println!("Completed: {}", report.overall_success);
     Ok(())
 }
 

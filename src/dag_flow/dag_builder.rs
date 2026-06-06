@@ -412,10 +412,10 @@ impl DagFlowBuilder {
         let mut rec_stack = HashSet::new();
 
         for node_id in self.nodes.keys() {
-            if !visited.contains(node_id) {
-                if self.has_cycle_util(node_id, &mut visited, &mut rec_stack)? {
-                    return Ok(true);
-                }
+            if !visited.contains(node_id)
+                && self.has_cycle_util(node_id, &mut visited, &mut rec_stack)?
+            {
+                return Ok(true);
             }
         }
 

@@ -16,10 +16,8 @@ use std::sync::Arc;
 async fn test_dag_executor_creation() {
     let registry = ActionRegistry::new();
 
-    let _executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
-
-    // Test passed if we get here without panicking
-    assert!(true);
+    let executor = DagExecutor::new(None, registry, ":memory:").await.unwrap();
+    assert!(!*executor.stopped.read().await);
 }
 
 /// Test that cache operations work
@@ -47,38 +45,39 @@ async fn test_yaml_loading() {
 
     // Try to load YAML from examples
     let yaml_path = "examples/fixtures/pipeline.yaml";
-    if std::path::Path::new(yaml_path).exists() {
+    let loaded = if std::path::Path::new(yaml_path).exists() {
         let result = executor.load_yaml_file(yaml_path).await;
         // Should not panic, whether it succeeds or fails
         match result {
-            Ok(_) => println!("YAML loaded successfully"),
-            Err(e) => println!("YAML loading failed (expected): {}", e),
+            Ok(_) => true,
+            Err(e) => {
+                println!("YAML loading failed (expected): {}", e);
+                false
+            }
         }
-    }
+    } else {
+        false
+    };
 
-    assert!(true);
+    assert_eq!(!executor.graphs.read().await.is_empty(), loaded);
 }
 
 /// Test configuration
 #[tokio::test]
 async fn test_dag_config() {
-    let mut config = dagger::DagConfig::default();
-    config.enable_parallel_execution = true;
-    config.max_parallel_nodes = 5;
+    let config = dagger::DagConfig {
+        enable_parallel_execution: true,
+        max_parallel_nodes: 5,
+        ..Default::default()
+    };
 
     let registry = ActionRegistry::new();
 
-    let _executor = DagExecutor::new(Some(config), registry, ":memory:")
+    let executor = DagExecutor::new(Some(config), registry, ":memory:")
         .await
         .unwrap();
-
-    assert!(true);
-}
-
-/// Cleanup function
-#[tokio::test]
-async fn test_cleanup() {
-    assert!(true);
+    assert!(executor.config.enable_parallel_execution);
+    assert_eq!(executor.config.max_parallel_nodes, 5);
 }
 
 /// Test that services are accessible in nodes

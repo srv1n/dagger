@@ -101,7 +101,8 @@ impl<T> ReadyQueue<T> {
     }
 }
 
-// Implement Send and Sync for ReadyQueue
+// SAFETY: ReadyQueue only exposes thread-safe operations through SegQueue and AtomicUsize.
+// T: Send is required because queued values may move across threads.
 unsafe impl<T: Send> Send for ReadyQueue<T> {}
 unsafe impl<T: Send> Sync for ReadyQueue<T> {}
 
