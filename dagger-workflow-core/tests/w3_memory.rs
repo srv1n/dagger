@@ -165,6 +165,13 @@ fn reusable_conformance_suite_runs_against_memory_adapter() {
             self.clock.advance_ms(milliseconds).unwrap();
         }
 
+        fn object_records(
+            &self,
+            scope: &ExecutionScope,
+        ) -> Vec<dagger_workflow_core::artifact::ObjectRecord> {
+            self.store.object_records(scope)
+        }
+
         fn fresh(&self) -> Self {
             let clock = Arc::new(TestClock::new(Timestamp(0)));
             Self {

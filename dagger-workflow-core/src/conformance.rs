@@ -5,7 +5,7 @@ use crate::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
     AuthenticatedPrincipal, DecisionAuthorizationPolicy,
 };
-use crate::artifact::{ObjectStore, ObjectStoreError, VerifiedObjectRef};
+use crate::artifact::{ObjectRecord, ObjectStore, ObjectStoreError, VerifiedObjectRef};
 use crate::definition::{
     ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
     PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
@@ -86,6 +86,8 @@ pub trait ConformanceAdapter {
     fn objects(&self) -> &Self::Objects;
     /// Advances the adapter's database-equivalent clock.
     fn advance_clock_ms(&self, milliseconds: i64);
+    /// Returns exact workflow-store object metadata for no-write assertions.
+    fn object_records(&self, scope: &ExecutionScope) -> Vec<ObjectRecord>;
     /// Constructs a completely fresh store/object-store pair.
     fn fresh(&self) -> Self
     where
@@ -1358,121 +1360,239 @@ async fn expand_map_recomputes_identity<A: ConformanceAdapter>(
         },
     )
     .await?;
-    if !matches!(
-        adapter
-            .store()
-            .expand_map(
-                scope,
-                ExpandMap {
-                    permit: fixture.permit,
-                    run_id: id("map-run-38"),
-                    map_node_id: id("map"),
-                    expected_node_version: Version(1),
-                    input: fixture.input,
-                    ordered_items: Vec::new(),
-                    expansion_digest: map_expansion_digest(&[]),
-                },
-            )
-            .await,
-        Err(StoreError::IdempotencyConflict)
-    ) {
-        return Err(failure(38, "forged empty Map expansion was accepted"));
+    let mut wrong_order = fixture.ordered_items.clone();
+    wrong_order.swap(0, 1);
+    let mut dropped = fixture.ordered_items.clone();
+    dropped.pop();
+    let variants = [
+        (
+            fixture.ordered_items.clone(),
+            Digest::new(format!("sha256:{}", "00".repeat(32)))
+                .map_err(|_| failure(38, "forged digest construction failed"))?,
+            "forged Map expansion digest was accepted",
+        ),
+        (
+            wrong_order,
+            fixture.expansion_digest.clone(),
+            "forged Map item order was accepted",
+        ),
+        (
+            dropped,
+            fixture.expansion_digest.clone(),
+            "forged dropped Map item was accepted",
+        ),
+    ];
+    for (ordered_items, expansion_digest, detail) in variants {
+        if !matches!(
+            adapter
+                .store()
+                .expand_map(
+                    scope,
+                    ExpandMap {
+                        permit: fixture.permit.clone(),
+                        run_id: id("map-run-38"),
+                        map_node_id: id("map"),
+                        expected_node_version: Version(1),
+                        input: fixture.input.clone(),
+                        ordered_items,
+                        expansion_digest,
+                    },
+                )
+                .await,
+            Err(StoreError::IdempotencyConflict)
+        ) {
+            return Err(failure(38, detail));
+        }
     }
     Ok(())
 }
 
 async fn map_concurrency_admission<A: ConformanceAdapter>(
-    adapter: &A,
+    adapter_factory: &A,
     scope: &ExecutionScope,
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
-    let fixture = prepare_map_conformance(
-        adapter,
-        scope,
-        39,
-        2,
-        1,
-        RetryPolicy {
-            max_attempts: 1,
-            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
-        },
-    )
-    .await?;
-    adapter
-        .store()
-        .expand_map(
+    for max_concurrency in [1, 2] {
+        let adapter = adapter_factory.fresh();
+        let fixture = prepare_map_conformance(
+            &adapter,
             scope,
-            ExpandMap {
-                permit: fixture.permit.clone(),
-                run_id: id("map-run-39"),
-                map_node_id: id("map"),
-                expected_node_version: Version(1),
-                input: fixture.input.clone(),
-                ordered_items: fixture.ordered_items,
-                expansion_digest: fixture.expansion_digest,
+            39,
+            3,
+            max_concurrency,
+            RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffPolicy::Fixed { delay_ms: 0 },
             },
         )
-        .await
-        .map_err(|_| failure(39, "valid Map expansion failed"))?;
-    let children = adapter
-        .store()
-        .list_nodes(
-            scope,
-            &id("map-run-39"),
-            PageRequest {
-                cursor: None,
-                page_size: 100,
-            },
-        )
-        .await
-        .map_err(|_| failure(39, "Map children read failed"))?
-        .items
-        .into_iter()
-        .filter(|node| node.parent_map_instance_id.is_some())
-        .collect::<Vec<_>>();
-    let first = &children[0];
-    let second = &children[1];
-    if !matches!(
+        .await?;
         adapter
             .store()
-            .claim_node_attempt(
+            .expand_map(
                 scope,
-                ClaimNodeAttempt {
+                ExpandMap {
                     permit: fixture.permit.clone(),
                     run_id: id("map-run-39"),
-                    node_id: first.node_instance_id.clone(),
-                    expected_node_version: first.version,
-                    attempt_id: id("map-attempt-first"),
-                    worker_id: id("worker"),
-                    bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.input.digest().clone(),
+                    map_node_id: id("map"),
+                    expected_node_version: Version(1),
+                    input: fixture.input.clone(),
+                    ordered_items: fixture.ordered_items,
+                    expansion_digest: fixture.expansion_digest,
                 },
             )
-            .await,
-        Ok(ClaimNodeAttemptResult::Claimed { .. })
-    ) {
-        return Err(failure(39, "first Map child was not admitted"));
-    }
-    if !matches!(
-        adapter
+            .await
+            .map_err(|_| failure(39, "valid Map expansion failed"))?;
+        let children = adapter
             .store()
-            .claim_node_attempt(
+            .list_nodes(
                 scope,
-                ClaimNodeAttempt {
-                    permit: fixture.permit,
-                    run_id: id("map-run-39"),
-                    node_id: second.node_instance_id.clone(),
-                    expected_node_version: second.version,
-                    attempt_id: id("map-attempt-second"),
-                    worker_id: id("worker"),
-                    bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.input.digest().clone(),
+                &id("map-run-39"),
+                PageRequest {
+                    cursor: None,
+                    page_size: 100,
                 },
             )
-            .await,
-        Ok(ClaimNodeAttemptResult::MapConcurrencyLimited)
-    ) {
-        return Err(failure(39, "Map concurrency cap admitted a sibling"));
+            .await
+            .map_err(|_| failure(39, "Map children read failed"))?
+            .items
+            .into_iter()
+            .filter(|node| node.parent_map_instance_id.is_some())
+            .collect::<Vec<_>>();
+        for (index, child) in children.iter().take(max_concurrency as usize).enumerate() {
+            if !matches!(
+                adapter
+                    .store()
+                    .claim_node_attempt(
+                        scope,
+                        ClaimNodeAttempt {
+                            permit: fixture.permit.clone(),
+                            run_id: id("map-run-39"),
+                            node_id: child.node_instance_id.clone(),
+                            expected_node_version: child.version,
+                            attempt_id: id(&format!("map-attempt-admitted-{index}")),
+                            worker_id: id("worker"),
+                            bound_input: fixture.input.clone(),
+                            binding_derivation_digest: fixture.input.digest().clone(),
+                        },
+                    )
+                    .await,
+                Ok(ClaimNodeAttemptResult::Claimed { .. })
+            ) {
+                return Err(failure(39, "Map child below concurrency cap was refused"));
+            }
+        }
+        let refused_input = adapter
+            .objects()
+            .put(
+                scope,
+                &serde_jcs::to_vec(&json!({"refused_at_cap": max_concurrency}))
+                    .map_err(|_| failure(39, "refused input encoding failed"))?,
+                "application/json",
+            )
+            .await
+            .map_err(|_| failure(39, "refused input publication failed"))?;
+        let events_before = adapter
+            .store()
+            .list_events_after(
+                scope,
+                &id("map-run-39"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1_000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .map_err(|_| failure(39, "pre-refusal events read failed"))?;
+        let run_version_before = adapter
+            .store()
+            .get_run(scope, &id("map-run-39"))
+            .await
+            .map_err(|_| failure(39, "pre-refusal run read failed"))?
+            .run
+            .version;
+        let node_versions_before = adapter
+            .store()
+            .list_nodes(
+                scope,
+                &id("map-run-39"),
+                PageRequest {
+                    cursor: None,
+                    page_size: 100,
+                },
+            )
+            .await
+            .map_err(|_| failure(39, "pre-refusal nodes read failed"))?
+            .items
+            .into_iter()
+            .map(|node| (node.node_instance_id, node.version))
+            .collect::<Vec<_>>();
+        let records_before = adapter.object_records(scope);
+        let refused = &children[max_concurrency as usize];
+        if !matches!(
+            adapter
+                .store()
+                .claim_node_attempt(
+                    scope,
+                    ClaimNodeAttempt {
+                        permit: fixture.permit,
+                        run_id: id("map-run-39"),
+                        node_id: refused.node_instance_id.clone(),
+                        expected_node_version: refused.version,
+                        attempt_id: id("map-attempt-refused"),
+                        worker_id: id("worker"),
+                        binding_derivation_digest: refused_input.digest().clone(),
+                        bound_input: refused_input,
+                    },
+                )
+                .await,
+            Ok(ClaimNodeAttemptResult::MapConcurrencyLimited)
+        ) {
+            return Err(failure(39, "Map concurrency boundary was not enforced"));
+        }
+        let events_after = adapter
+            .store()
+            .list_events_after(
+                scope,
+                &id("map-run-39"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1_000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .map_err(|_| failure(39, "post-refusal events read failed"))?;
+        let run_version_after = adapter
+            .store()
+            .get_run(scope, &id("map-run-39"))
+            .await
+            .map_err(|_| failure(39, "post-refusal run read failed"))?
+            .run
+            .version;
+        let node_versions_after = adapter
+            .store()
+            .list_nodes(
+                scope,
+                &id("map-run-39"),
+                PageRequest {
+                    cursor: None,
+                    page_size: 100,
+                },
+            )
+            .await
+            .map_err(|_| failure(39, "post-refusal nodes read failed"))?
+            .items
+            .into_iter()
+            .map(|node| (node.node_instance_id, node.version))
+            .collect::<Vec<_>>();
+        if events_after != events_before
+            || run_version_after != run_version_before
+            || node_versions_after != node_versions_before
+            || adapter.object_records(scope) != records_before
+        {
+            return Err(failure(39, "Map concurrency refusal mutated store state"));
+        }
     }
     Ok(())
 }
@@ -1482,7 +1602,8 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
     scope: &ExecutionScope,
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
-    let delay = 86_400_000_i64;
+    let initial_delay = 1_000_i64;
+    let max_delay = 5_000_i64;
     let fixture = prepare_map_conformance(
         adapter,
         scope,
@@ -1490,11 +1611,11 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
         1,
         1,
         RetryPolicy {
-            max_attempts: 100,
+            max_attempts: 5,
             backoff: BackoffPolicy::Exponential {
-                initial_delay_ms: delay as u64,
-                multiplier: 16,
-                max_delay_ms: delay as u64,
+                initial_delay_ms: initial_delay as u64,
+                multiplier: 2,
+                max_delay_ms: max_delay as u64,
             },
         },
     )
@@ -1532,8 +1653,8 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
         .find(|node| node.parent_map_instance_id.is_some())
         .ok_or_else(|| failure(40, "backoff child missing"))?
         .node_instance_id;
-    let mut permit = fixture.permit;
-    for attempt_number in 1..100 {
+    let permit = fixture.permit;
+    for attempt_number in 1..5 {
         let node = adapter
             .store()
             .get_node(scope, &id("map-run-40"), &child_id)
@@ -1603,21 +1724,19 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
             )
             .await
             .map_err(|_| failure(40, "backoff attempt read failed"))?;
+        let expected_delay = [initial_delay, 2_000, 4_000, max_delay][attempt_number as usize - 1];
         if waiting.next_eligible_at
-            != attempt
-                .finished_at
-                .and_then(|finished| finished.0.checked_add(delay).map(crate::ids::Timestamp))
+            != attempt.finished_at.and_then(|finished| {
+                finished
+                    .0
+                    .checked_add(expected_delay)
+                    .map(crate::ids::Timestamp)
+            })
         {
-            return Err(failure(40, "exponential backoff did not cap"));
+            return Err(failure(40, "exponential backoff progression was incorrect"));
         }
-        if attempt_number < 99 {
-            adapter.advance_clock_ms(delay);
-            permit = adapter
-                .store()
-                .acquire_engine_claim(scope, id("map-engine-40"))
-                .await
-                .map_err(|_| failure(40, "backoff engine takeover failed"))?
-                .permit;
+        if attempt_number < 4 {
+            adapter.advance_clock_ms(expected_delay);
             adapter
                 .store()
                 .release_retry(

@@ -292,6 +292,18 @@ impl<C: Clock> InMemoryStore<C> {
             .unwrap_or_default()
     }
 
+    /// Returns exact registered object metadata for conformance diagnostics.
+    pub fn object_records(&self, scope: &ExecutionScope) -> Vec<crate::artifact::ObjectRecord> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .object_records
+            .iter()
+            .filter(|((record_scope, _), _)| record_scope == scope)
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+
     /// Returns one immutable invocation.
     pub fn get_invocation(
         &self,
@@ -3183,7 +3195,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
     ) -> Result<ClaimNodeAttemptResult, StoreError> {
         self.transaction(|mut state, now| {
             running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-            verified(&mut state, scope, &command.bound_input, now)?;
             if command.bound_input.media_type() != "application/json" {
                 return Err(StoreError::InvalidField);
             }
@@ -3289,6 +3300,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     return Ok(ClaimNodeAttemptResult::MapConcurrencyLimited);
                 }
             }
+            verified(&mut state, scope, &command.bound_input, now)?;
             if state.attempts.contains_key(&(
                 scope.clone(),
                 command.run_id.clone(),
@@ -6420,6 +6432,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         })
                         .is_some_and(|producer| {
                             producer.parent_map_instance_id.as_ref() == Some(owner_node_id)
+                                && producer
+                                    .result_ref
+                                    .as_ref()
+                                    .is_some_and(|result| result.0 == command.bad_ref)
                         });
                 if !directly_owned && !child_output_owned_by_map {
                     return Err(StoreError::InvalidFailedReadProof);

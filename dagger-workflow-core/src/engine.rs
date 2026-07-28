@@ -1069,19 +1069,31 @@ where
                     .put(scope, &bytes, "application/json")
                     .await
                     .map_err(|_| EngineError::ObjectWrite)?;
-                self.store
+                let current_parent = self
+                    .store
+                    .get_node(scope, &run.run_id, &parent.node_instance_id)
+                    .await?;
+                if current_parent.status != crate::run::NodeState::WaitingChildren {
+                    continue;
+                }
+                match self
+                    .store
                     .complete_map(
                         scope,
                         CompleteMap {
                             permit: permit.clone(),
                             run_id: run.run_id.clone(),
                             map_node_id: parent.node_instance_id.clone(),
-                            expected_node_version: parent.version,
+                            expected_node_version: current_parent.version,
                             aggregate,
                         },
                     )
-                    .await?;
-                changed += 1;
+                    .await
+                {
+                    Ok(_) => changed += 1,
+                    Err(StoreError::CasConflict | StoreError::ChildrenIncomplete) => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
         }
         Ok(changed)
