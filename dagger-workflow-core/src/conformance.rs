@@ -1,25 +1,29 @@
 //! Adapter-neutral black-box checks shared by volatile and durable stores.
 
 use crate::action::{ActionOutcome, CompatibilityReport};
-use crate::approval::AuthenticatedPrincipal;
+use crate::approval::{
+    canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
+    AuthenticatedPrincipal, DecisionAuthorizationPolicy,
+};
 use crate::artifact::{ObjectStore, ObjectStoreError};
 use crate::definition::{
-    ActionReference, BackoffPolicy, Binding, BindingSource, NodeDefinition, PublishableDefinition,
-    RetryPolicy, TimeoutPolicy, WorkflowDefinition,
+    ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
+    PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
 };
 use crate::ids::{CostUnits, Digest, Id, TopologicalRank, Version};
 use crate::run::{AttemptState, NodeState, RunLimits, RunState};
 use crate::scope::ExecutionScope;
 use crate::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
-    CompletionObjects, CreateDefinition, CreateRun, EventPageRequest, PublishRevision,
-    ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, WorkflowStore,
+    CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EventPageRequest,
+    PublishRevision, RequestApproval, ResolveTerminalNode, ResolvedActionSchemas, StartRun,
+    StoreError, SuspendIncompatible, WorkflowStore,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 36;
+pub const CASE_COUNT: usize = 40;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -59,6 +63,10 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "terminal_resolution",
     "due_completion_times_out",
     "timeout_observation_order",
+    "blocked_run_host_command_fence",
+    "corruption_transition_by_source_state",
+    "multi_attempt_recovery_sorter",
+    "exponential_backoff_cap",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -74,6 +82,10 @@ pub trait ConformanceAdapter {
     fn objects(&self) -> &Self::Objects;
     /// Advances the adapter's database-equivalent clock.
     fn advance_clock_ms(&self, milliseconds: i64);
+    /// Constructs a completely fresh store/object-store pair.
+    fn fresh(&self) -> Self
+    where
+        Self: Sized;
 }
 
 /// A conformance-suite failure naming the first violated case.
@@ -91,90 +103,139 @@ pub struct ConformanceFailure {
 /// Runtime command cases are intentionally exercised by adapter-specific
 /// fixtures built through the same public `WorkflowStore` trait; this entry
 /// point covers the prerequisites that require no published workflow fixture.
-pub async fn run_conformance<A: ConformanceAdapter>(
+async fn run_original_case<A: ConformanceAdapter>(
     adapter: &A,
     scope_a: &ExecutionScope,
     scope_b: &ExecutionScope,
-) -> Result<usize, ConformanceFailure> {
+    case: usize,
+) -> Result<(), ConformanceFailure> {
     let bytes = br#"{"same":true}"#;
     let a = adapter
         .objects()
         .put(scope_a, bytes, "application/json")
         .await
         .map_err(|_| failure(1, "object publication failed"))?;
+    if case == 1 {
+        return Ok(());
+    }
     let b = adapter
         .objects()
         .put(scope_b, bytes, "application/json")
         .await
         .map_err(|_| failure(2, "second-scope publication failed"))?;
-    if a.digest() != b.digest() {
-        return Err(failure(3, "equal bytes did not share a digest"));
+    if case == 2 {
+        return Ok(());
     }
-    if a.scope() == b.scope() {
-        return Err(failure(4, "verified refs were not scope-bound"));
+    if case == 3 {
+        if a.digest() != b.digest() {
+            return Err(failure(3, "equal bytes did not share a digest"));
+        }
+        return Ok(());
+    }
+    if case == 4 {
+        if a.scope() == b.scope() {
+            return Err(failure(4, "verified refs were not scope-bound"));
+        }
+        return Ok(());
     }
     let replay = adapter
         .objects()
         .publish_if_absent(scope_a, bytes, "application/json")
         .await
         .map_err(|_| failure(5, "same-scope replay failed"))?;
-    if replay != a {
-        return Err(failure(5, "same-scope replay changed the capability"));
+    if case == 5 {
+        if replay != a {
+            return Err(failure(5, "same-scope replay changed the capability"));
+        }
+        return Ok(());
     }
     let read_a = adapter
         .objects()
         .get(scope_a, a.digest())
         .await
         .map_err(|_| failure(6, "verified read failed"))?;
-    if read_a.bytes != bytes {
-        return Err(failure(7, "verified read changed bytes"));
+    if case == 6 {
+        return Ok(());
     }
-    if adapter.objects().get(scope_b, b.digest()).await.is_err() {
-        return Err(failure(8, "scope-b verified read failed"));
+    if case == 7 {
+        if read_a.bytes != bytes {
+            return Err(failure(7, "verified read changed bytes"));
+        }
+        return Ok(());
+    }
+    if case == 8 {
+        if adapter.objects().get(scope_b, b.digest()).await.is_err() {
+            return Err(failure(8, "scope-b verified read failed"));
+        }
+        return Ok(());
     }
     let missing = Digest::new(format!("sha256:{}", "0".repeat(64))).expect("fixture digest");
-    if adapter.objects().get(scope_a, &missing).await.is_ok() {
-        return Err(failure(9, "missing read did not mint a failure"));
+    if case == 9 {
+        if adapter.objects().get(scope_a, &missing).await.is_ok() {
+            return Err(failure(9, "missing read did not mint a failure"));
+        }
+        return Ok(());
     }
     let first = adapter
         .store()
         .acquire_engine_claim(scope_a, id("engine-a"))
         .await
         .map_err(|_| failure(10, "first engine claim failed"))?;
-    if first.claim.control_plane_id != "scheduler" {
-        return Err(failure(11, "control-plane ID was not frozen scheduler"));
+    if case == 10 {
+        return Ok(());
     }
-    if !matches!(
-        adapter
-            .store()
-            .acquire_engine_claim(scope_a, id("engine-b"))
-            .await,
-        Err(StoreError::EngineAlreadyLive { .. })
-    ) {
-        return Err(failure(12, "second live engine was accepted"));
+    if case == 11 {
+        if first.claim.control_plane_id != "scheduler" {
+            return Err(failure(11, "control-plane ID was not frozen scheduler"));
+        }
+        return Ok(());
+    }
+    if case == 12 {
+        if !matches!(
+            adapter
+                .store()
+                .acquire_engine_claim(scope_a, id("engine-b"))
+                .await,
+            Err(StoreError::EngineAlreadyLive { .. })
+        ) {
+            return Err(failure(12, "second live engine was accepted"));
+        }
+        return Ok(());
     }
     adapter
         .store()
         .acquire_engine_claim(scope_b, id("engine-b"))
         .await
         .map_err(|_| failure(13, "claim leaked across scopes"))?;
+    if case == 13 {
+        return Ok(());
+    }
     adapter.advance_clock_ms(20_000);
     let takeover = adapter
         .store()
         .acquire_engine_claim(scope_a, id("engine-c"))
         .await
         .map_err(|_| failure(14, "expired takeover failed"))?;
-    if takeover.claim.generation != first.claim.generation + 1 {
-        return Err(failure(15, "takeover generation did not increment"));
+    if case == 14 {
+        return Ok(());
     }
-    if !matches!(
-        adapter
-            .store()
-            .heartbeat_engine_claim(scope_a, &first.permit)
-            .await,
-        Err(StoreError::EngineClaimLost)
-    ) {
-        return Err(failure(16, "stale permit survived takeover"));
+    if case == 15 {
+        if takeover.claim.generation != first.claim.generation + 1 {
+            return Err(failure(15, "takeover generation did not increment"));
+        }
+        return Ok(());
+    }
+    if case == 16 {
+        if !matches!(
+            adapter
+                .store()
+                .heartbeat_engine_claim(scope_a, &first.permit)
+                .await,
+            Err(StoreError::EngineClaimLost)
+        ) {
+            return Err(failure(16, "stale permit survived takeover"));
+        }
+        return Ok(());
     }
 
     let schema = adapter
@@ -202,6 +263,9 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(17, "definition creation failed"))?;
+    if case == 17 {
+        return Ok(());
+    }
     let definition = WorkflowDefinition {
         definition_format_version: "0.1".to_owned(),
         definition_id: id("conformance-definition"),
@@ -284,6 +348,9 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(18, "revision publication failed"))?;
+    if case == 18 {
+        return Ok(());
+    }
     let input = adapter
         .objects()
         .put(scope_a, br#"{"value":1}"#, "application/json")
@@ -313,31 +380,43 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         .create_run(scope_a, create(CostUnits(10)))
         .await
         .map_err(|_| failure(19, "run creation failed"))?;
+    if case == 19 {
+        return Ok(());
+    }
     let replay_receipt = adapter
         .store()
         .create_run(scope_a, create(CostUnits(10)))
         .await
         .map_err(|_| failure(20, "create replay failed"))?;
-    if replay_receipt != receipt {
-        return Err(failure(20, "create replay changed its receipt"));
+    if case == 20 {
+        if replay_receipt != receipt {
+            return Err(failure(20, "create replay changed its receipt"));
+        }
+        return Ok(());
     }
-    if !matches!(
-        adapter
-            .store()
-            .create_run(scope_a, create(CostUnits(11)))
-            .await,
-        Err(StoreError::IdempotencyConflict)
-    ) {
-        return Err(failure(21, "conflicting create replay was accepted"));
+    if case == 21 {
+        if !matches!(
+            adapter
+                .store()
+                .create_run(scope_a, create(CostUnits(11)))
+                .await,
+            Err(StoreError::IdempotencyConflict)
+        ) {
+            return Err(failure(21, "conflicting create replay was accepted"));
+        }
+        return Ok(());
     }
-    if !matches!(
-        adapter
-            .store()
-            .get_run(scope_b, &id("conformance-run"))
-            .await,
-        Err(StoreError::NotFound)
-    ) {
-        return Err(failure(22, "run point read crossed scope"));
+    if case == 22 {
+        if !matches!(
+            adapter
+                .store()
+                .get_run(scope_b, &id("conformance-run"))
+                .await,
+            Err(StoreError::NotFound)
+        ) {
+            return Err(failure(22, "run point read crossed scope"));
+        }
+        return Ok(());
     }
     adapter
         .store()
@@ -355,31 +434,37 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(23, "run start failed"))?;
+    if case == 23 {
+        return Ok(());
+    }
     let node = adapter
         .store()
         .get_node(scope_a, &id("conformance-run"), &id("action"))
         .await
         .map_err(|_| failure(23, "entry node read failed"))?;
-    if !matches!(
-        adapter
-            .store()
-            .claim_node_attempt(
-                scope_a,
-                ClaimNodeAttempt {
-                    permit: takeover.permit.clone(),
-                    run_id: id("conformance-run"),
-                    node_id: id("action"),
-                    expected_node_version: Version(u64::MAX),
-                    attempt_id: id("cas-rejected"),
-                    worker_id: id("worker"),
-                    bound_input: input.clone(),
-                    binding_derivation_digest: schema.digest().clone(),
-                },
-            )
-            .await,
-        Err(StoreError::CasConflict)
-    ) {
-        return Err(failure(24, "stale node version was accepted"));
+    if case == 24 {
+        if !matches!(
+            adapter
+                .store()
+                .claim_node_attempt(
+                    scope_a,
+                    ClaimNodeAttempt {
+                        permit: takeover.permit.clone(),
+                        run_id: id("conformance-run"),
+                        node_id: id("action"),
+                        expected_node_version: Version(u64::MAX),
+                        attempt_id: id("cas-rejected"),
+                        worker_id: id("worker"),
+                        bound_input: input.clone(),
+                        binding_derivation_digest: schema.digest().clone(),
+                    },
+                )
+                .await,
+            Err(StoreError::CasConflict)
+        ) {
+            return Err(failure(24, "stale node version was accepted"));
+        }
+        return Ok(());
     }
     let claimed = adapter
         .store()
@@ -410,29 +495,35 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         .get_node(scope_a, &id("conformance-run"), &id("action"))
         .await
         .map_err(|_| failure(25, "claimed node read failed"))?;
-    if running_node.status != NodeState::Running {
-        return Err(failure(25, "claimed node was not Running"));
+    if case == 25 {
+        if running_node.status != NodeState::Running {
+            return Err(failure(25, "claimed node was not Running"));
+        }
+        return Ok(());
     }
-    if !matches!(
-        adapter
-            .store()
-            .claim_node_attempt(
-                scope_a,
-                ClaimNodeAttempt {
-                    permit: takeover.permit.clone(),
-                    run_id: id("conformance-run"),
-                    node_id: id("action"),
-                    expected_node_version: running_node.version,
-                    attempt_id: id("active-fenced"),
-                    worker_id: id("worker"),
-                    bound_input: input.clone(),
-                    binding_derivation_digest: schema.digest().clone(),
-                },
-            )
-            .await,
-        Err(StoreError::CasConflict)
-    ) {
-        return Err(failure(26, "active attempt fence was bypassed"));
+    if case == 26 {
+        if !matches!(
+            adapter
+                .store()
+                .claim_node_attempt(
+                    scope_a,
+                    ClaimNodeAttempt {
+                        permit: takeover.permit.clone(),
+                        run_id: id("conformance-run"),
+                        node_id: id("action"),
+                        expected_node_version: running_node.version,
+                        attempt_id: id("active-fenced"),
+                        worker_id: id("worker"),
+                        bound_input: input.clone(),
+                        binding_derivation_digest: schema.digest().clone(),
+                    },
+                )
+                .await,
+            Err(StoreError::CasConflict)
+        ) {
+            return Err(failure(26, "active attempt fence was bypassed"));
+        }
+        return Ok(());
     }
     let reserved = adapter
         .store()
@@ -440,8 +531,11 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         .await
         .map_err(|_| failure(27, "reserved run read failed"))?
         .run;
-    if reserved.budget_reserved != CostUnits(2) || reserved.budget_consumed != CostUnits(0) {
-        return Err(failure(27, "reservation totals were wrong"));
+    if case == 27 {
+        if reserved.budget_reserved != CostUnits(2) || reserved.budget_consumed != CostUnits(0) {
+            return Err(failure(27, "reservation totals were wrong"));
+        }
+        return Ok(());
     }
     let output = adapter
         .objects()
@@ -473,13 +567,19 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(28, "attempt completion failed"))?;
+    if case == 28 {
+        return Ok(());
+    }
     let attempt = adapter
         .store()
         .get_attempt(scope_a, &id("conformance-run"), &id("attempt"))
         .await
         .map_err(|_| failure(29, "terminal attempt read failed"))?;
-    if attempt.status != AttemptState::Succeeded {
-        return Err(failure(29, "attempt was not terminal Succeeded"));
+    if case == 29 {
+        if attempt.status != AttemptState::Succeeded {
+            return Err(failure(29, "attempt was not terminal Succeeded"));
+        }
+        return Ok(());
     }
     let settled = adapter
         .store()
@@ -487,8 +587,11 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         .await
         .map_err(|_| failure(30, "settled run read failed"))?
         .run;
-    if settled.budget_reserved != CostUnits(0) || settled.budget_consumed != CostUnits(1) {
-        return Err(failure(30, "settlement totals were wrong"));
+    if case == 30 {
+        if settled.budget_reserved != CostUnits(0) || settled.budget_consumed != CostUnits(1) {
+            return Err(failure(30, "settlement totals were wrong"));
+        }
+        return Ok(());
     }
     let events = adapter
         .store()
@@ -503,28 +606,37 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(31, "event read failed"))?;
-    if !events
-        .iter()
-        .enumerate()
-        .all(|(index, event)| event.event_seq == index as u64 + 1)
-    {
-        return Err(failure(31, "event sequence was not contiguous"));
+    if case == 31 {
+        if !events
+            .iter()
+            .enumerate()
+            .all(|(index, event)| event.event_seq == index as u64 + 1)
+        {
+            return Err(failure(31, "event sequence was not contiguous"));
+        }
+        return Ok(());
     }
-    if events.iter().any(|event| {
-        event.batch_index >= event.batch_count
-            || events
-                .iter()
-                .filter(|candidate| candidate.batch_id == event.batch_id)
-                .count()
-                != event.batch_count as usize
-    }) {
-        return Err(failure(32, "batch metadata was not contiguous"));
+    if case == 32 {
+        if events.iter().any(|event| {
+            event.batch_index >= event.batch_count
+                || events
+                    .iter()
+                    .filter(|candidate| candidate.batch_id == event.batch_id)
+                    .count()
+                    != event.batch_count as usize
+        }) {
+            return Err(failure(32, "batch metadata was not contiguous"));
+        }
+        return Ok(());
     }
-    if events.iter().any(|event| {
-        event.event_type == crate::event::EventType::EdgeSatisfied
-            && event.payload.get("cause").is_some()
-    }) {
-        return Err(failure(33, "EdgeSatisfied carried a forbidden cause"));
+    if case == 33 {
+        if events.iter().any(|event| {
+            event.event_type == crate::event::EventType::EdgeSatisfied
+                && event.payload.get("cause").is_some()
+        }) {
+            return Err(failure(33, "EdgeSatisfied carried a forbidden cause"));
+        }
+        return Ok(());
     }
     let terminal = adapter
         .store()
@@ -545,16 +657,19 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(34, "terminal resolution failed"))?;
-    if adapter
-        .store()
-        .get_run(scope_a, &id("conformance-run"))
-        .await
-        .map_err(|_| failure(34, "terminal run read failed"))?
-        .run
-        .status
-        != RunState::Succeeded
-    {
-        return Err(failure(34, "run did not become Succeeded"));
+    if case == 34 {
+        if adapter
+            .store()
+            .get_run(scope_a, &id("conformance-run"))
+            .await
+            .map_err(|_| failure(34, "terminal run read failed"))?
+            .run
+            .status
+            != RunState::Succeeded
+        {
+            return Err(failure(34, "run did not become Succeeded"));
+        }
+        return Ok(());
     }
     adapter
         .store()
@@ -649,11 +764,14 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         )
         .await
         .map_err(|_| failure(35, "due completion failed"))?;
-    if !matches!(
-        due_result,
-        CompleteAttemptResult::TimedOutAndStaleRecorded(_)
-    ) {
-        return Err(failure(35, "due completion did not time out"));
+    if case == 35 {
+        if !matches!(
+            due_result,
+            CompleteAttemptResult::TimedOutAndStaleRecorded(_)
+        ) {
+            return Err(failure(35, "due completion did not time out"));
+        }
+        return Ok(());
     }
     let due_events = adapter
         .store()
@@ -672,13 +790,465 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         .iter()
         .position(|event| event.event_type == crate::event::EventType::AttemptTimedOut)
         .ok_or_else(|| failure(36, "A06 event missing"))?;
-    if due_events
-        .get(timeout_index + 1)
-        .is_none_or(|event| event.event_type != crate::event::EventType::StaleCompletionObserved)
-    {
-        return Err(failure(36, "A06 and A14 were not adjacent and ordered"));
+    if case == 36 {
+        if due_events.get(timeout_index + 1).is_none_or(|event| {
+            event.event_type != crate::event::EventType::StaleCompletionObserved
+        }) {
+            return Err(failure(36, "A06 and A14 were not adjacent and ordered"));
+        }
+        return Ok(());
     }
-    Ok(CASE_COUNT)
+    Ok(())
+}
+
+macro_rules! original_fixtures {
+    ($( $function:ident => $case:literal ),+ $(,)?) => {
+        $(
+            async fn $function<A: ConformanceAdapter>(
+                adapter: &A,
+                scope_a: &ExecutionScope,
+                scope_b: &ExecutionScope,
+            ) -> Result<(), ConformanceFailure> {
+                run_original_case(adapter, scope_a, scope_b, $case).await
+            }
+        )+
+    };
+}
+
+original_fixtures! {
+    publish_scope_a => 1,
+    publish_scope_b => 2,
+    equal_bytes_equal_digest => 3,
+    verified_ref_scope_binding => 4,
+    same_scope_publish_replay => 5,
+    verified_read_scope_a => 6,
+    verified_read_exact_bytes => 7,
+    verified_read_scope_b => 8,
+    missing_read_proof => 9,
+    first_engine_claim => 10,
+    frozen_control_plane_id => 11,
+    live_peer_rejected => 12,
+    claim_scope_locality => 13,
+    expired_takeover => 14,
+    takeover_generation_checked_increment => 15,
+    stale_permit_rejected => 16,
+    create_definition => 17,
+    publish_revision => 18,
+    create_run_receipt => 19,
+    create_receipt_replay => 20,
+    create_receipt_conflict => 21,
+    point_read_scope_isolation => 22,
+    start_run => 23,
+    node_version_cas_rejection => 24,
+    claim_attempt => 25,
+    active_attempt_fence => 26,
+    budget_reservation => 27,
+    complete_attempt => 28,
+    attempt_terminal_state => 29,
+    budget_settlement => 30,
+    event_sequence_contiguity => 31,
+    batch_metadata_contiguity => 32,
+    closed_edge_payload => 33,
+    terminal_resolution => 34,
+    due_completion_times_out => 35,
+    timeout_observation_order => 36,
+}
+
+async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let schema = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(37, "schema publication failed"))?;
+    let creator = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "creator".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(37, "creator capability failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("approval-definition"),
+                display_name: "approval".to_owned(),
+                description: String::new(),
+                principal: creator.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "definition creation failed"))?;
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: id("approval-definition"),
+        name: "approval".to_owned(),
+        description: String::new(),
+        run_input_schema_digest: schema.digest().clone(),
+        run_output_schema_digest: schema.digest().clone(),
+        entry_node_id: id("approval"),
+        nodes: vec![
+            NodeDefinition::Approval {
+                id: id("approval"),
+                request: BindingSource::RunInput {
+                    pointer: String::new(),
+                },
+                gate: ApprovalGateConfig {
+                    expires_after_ms: 10_000,
+                    on_expiry: ApprovalExpiryPolicy::Reject,
+                    authorization: DecisionAuthorizationPolicy {
+                        allowed_principal_ids: vec!["approver".to_owned()],
+                        allowed_role_ids: Vec::new(),
+                    },
+                },
+                next: vec![id("succeed")],
+            },
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::Constant {
+                    value: serde_json::Value::Null,
+                },
+            },
+        ],
+    };
+    let canonical = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&definition)
+                .map_err(|_| failure(37, "definition encoding failed"))?,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(37, "definition publication failed"))?;
+    adapter
+        .store()
+        .publish_revision(
+            scope,
+            PublishRevision {
+                definition_id: id("approval-definition"),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical.clone(),
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::new(),
+                parsed_revision: PublishableDefinition {
+                    definition,
+                    topological_ranks: BTreeMap::from([
+                        (id("approval"), TopologicalRank(0)),
+                        (id("succeed"), TopologicalRank(1)),
+                    ]),
+                },
+                principal: creator.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "revision publication failed"))?;
+    let input = adapter
+        .objects()
+        .put(scope, br#"{"request":true}"#, "application/json")
+        .await
+        .map_err(|_| failure(37, "input publication failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: id("approval-run"),
+                definition_id: id("approval-definition"),
+                revision_hash: canonical.digest().clone(),
+                input,
+                budget_limit: CostUnits(1),
+                limits: RunLimits {
+                    max_dynamic_node_instances: 1,
+                    max_total_attempts: 1,
+                    max_total_events: 100,
+                    max_inline_json_bytes_per_value: 10_000,
+                    max_artifacts_per_attempt: 1,
+                    max_aggregate_object_bytes_per_run: 100_000,
+                    max_run_lifetime_ms: 100_000,
+                },
+                principal: creator,
+                idempotency_token: "approval-create-token".to_owned(),
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "run creation failed"))?;
+    let claim = adapter
+        .store()
+        .acquire_engine_claim(scope, id("approval-engine"))
+        .await
+        .map_err(|_| failure(37, "engine claim failed"))?;
+    adapter
+        .store()
+        .start_run(
+            scope,
+            StartRun {
+                permit: claim.permit.clone(),
+                run_id: id("approval-run"),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "run start failed"))?;
+    let node = adapter
+        .store()
+        .get_node(scope, &id("approval-run"), &id("approval"))
+        .await
+        .map_err(|_| failure(37, "approval node read failed"))?;
+    let request = adapter
+        .objects()
+        .put(scope, br#"{"request":true}"#, "application/json")
+        .await
+        .map_err(|_| failure(37, "approval request publication failed"))?;
+    let gate = adapter
+        .store()
+        .request_approval(
+            scope,
+            RequestApproval {
+                permit: claim.permit.clone(),
+                run_id: id("approval-run"),
+                node_id: id("approval"),
+                expected_node_version: node.version,
+                gate_id: id("approval-gate"),
+                request,
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "approval request failed"))?;
+    let approver = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "approver".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(37, "approver capability failed"))?;
+    let output = adapter
+        .objects()
+        .put(
+            scope,
+            &canonical_human_approval_result(None, &approver),
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(37, "approval output publication failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, &id("approval-run"))
+        .await
+        .map_err(|_| failure(37, "run read failed"))?
+        .run;
+    let decide = |output, approver| DecideApproval {
+        run_id: id("approval-run"),
+        gate_id: gate.gate_id.clone(),
+        expected_run_version: run.version,
+        expected_gate_version: gate.version,
+        decision: ApprovalDecision::Approve,
+        decision_payload: None,
+        approval_output: Some(output),
+        principal: approver,
+    };
+    adapter
+        .store()
+        .decide_approval(scope, decide(output.clone(), approver.clone()))
+        .await
+        .map_err(|_| failure(37, "initial approval failed"))?;
+    let incompatibilities = adapter
+        .objects()
+        .put(scope, br#"{"missing":["synthetic"]}"#, "application/json")
+        .await
+        .map_err(|_| failure(37, "incompatibility publication failed"))?;
+    adapter
+        .store()
+        .suspend_incompatible(
+            scope,
+            SuspendIncompatible {
+                permit: claim.permit,
+                run_id: id("approval-run"),
+                incompatibilities,
+                evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: vec!["synthetic".to_owned()],
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(37, "run suspension failed"))?;
+    if !matches!(
+        adapter
+            .store()
+            .decide_approval(scope, decide(output, approver))
+            .await,
+        Err(StoreError::RunBlockedIncompatible)
+    ) {
+        return Err(failure(37, "blocked approval replay bypassed the fence"));
+    }
+    Ok(())
+}
+
+async fn corruption_transition_by_source_state<A: ConformanceAdapter>(
+    _adapter: &A,
+    _scope_a: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let cases = [
+        (RunState::Pending, "R14"),
+        (RunState::Running, "R15"),
+        (RunState::BlockedIncompatible, "R16"),
+        (RunState::Succeeded, "R17"),
+        (RunState::Failed, "R18"),
+        (RunState::ContractFailed, "R19"),
+        (RunState::RetriesExhausted, "R20"),
+        (RunState::BudgetExhausted, "R21"),
+        (RunState::Cancelled, "R22"),
+    ];
+    if cases.into_iter().any(|(status, expected)| {
+        crate::memory::corruption_run_transition(status) != Some(expected)
+    }) {
+        return Err(failure(
+            38,
+            "corruption transition did not match source state",
+        ));
+    }
+    Ok(())
+}
+
+async fn multi_attempt_recovery_sorter<A: ConformanceAdapter>(
+    _adapter: &A,
+    _scope_a: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let node = id("node");
+    let earlier_attempt = id("attempt-z");
+    let later_attempt = id("attempt-a");
+    let earlier = crate::memory::recovery_subject_order_key(3, 4, &node, 1, &earlier_attempt);
+    let later = crate::memory::recovery_subject_order_key(3, 4, &node, 2, &later_attempt);
+    let earlier_rank = crate::memory::recovery_subject_order_key(2, 99, &node, 99, &later_attempt);
+    if !(earlier < later && earlier_rank < earlier) {
+        return Err(failure(
+            39,
+            "recovery sorter ignored rank or attempt number",
+        ));
+    }
+    Ok(())
+}
+
+async fn exponential_backoff_cap<A: ConformanceAdapter>(
+    _adapter: &A,
+    _scope_a: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let policy = RetryPolicy {
+        max_attempts: 100,
+        backoff: BackoffPolicy::Exponential {
+            initial_delay_ms: 86_400_000,
+            multiplier: 16,
+            max_delay_ms: 86_400_000,
+        },
+    };
+    if crate::memory::retry_at(crate::ids::Timestamp(10), &policy, 100)
+        != Ok(crate::ids::Timestamp(86_400_010))
+    {
+        return Err(failure(40, "overflowing exponential backoff did not cap"));
+    }
+    Ok(())
+}
+
+/// One independently executed conformance result.
+#[derive(Debug)]
+pub struct ConformanceCaseResult {
+    /// Stable fixture name.
+    pub name: &'static str,
+    /// Per-case failure, or none when the case passed.
+    pub failure: Option<ConformanceFailure>,
+}
+
+impl ConformanceCaseResult {
+    /// Whether this independently isolated fixture passed.
+    pub fn passed(&self) -> bool {
+        self.failure.is_none()
+    }
+}
+
+/// Runs every fixture against a newly constructed adapter pair.
+pub async fn run_conformance<A: ConformanceAdapter>(
+    adapter_factory: &A,
+    scope_a: &ExecutionScope,
+    scope_b: &ExecutionScope,
+) -> Vec<ConformanceCaseResult> {
+    let mut results = Vec::with_capacity(CASE_COUNT);
+    macro_rules! run_fixture {
+        ($name:literal, $fixture:ident) => {{
+            let adapter = adapter_factory.fresh();
+            results.push(ConformanceCaseResult {
+                name: $name,
+                failure: $fixture(&adapter, scope_a, scope_b).await.err(),
+            });
+        }};
+    }
+    run_fixture!("publish_scope_a", publish_scope_a);
+    run_fixture!("publish_scope_b", publish_scope_b);
+    run_fixture!("equal_bytes_equal_digest", equal_bytes_equal_digest);
+    run_fixture!("verified_ref_scope_binding", verified_ref_scope_binding);
+    run_fixture!("same_scope_publish_replay", same_scope_publish_replay);
+    run_fixture!("verified_read_scope_a", verified_read_scope_a);
+    run_fixture!("verified_read_exact_bytes", verified_read_exact_bytes);
+    run_fixture!("verified_read_scope_b", verified_read_scope_b);
+    run_fixture!("missing_read_proof", missing_read_proof);
+    run_fixture!("first_engine_claim", first_engine_claim);
+    run_fixture!("frozen_control_plane_id", frozen_control_plane_id);
+    run_fixture!("live_peer_rejected", live_peer_rejected);
+    run_fixture!("claim_scope_locality", claim_scope_locality);
+    run_fixture!("expired_takeover", expired_takeover);
+    run_fixture!(
+        "takeover_generation_checked_increment",
+        takeover_generation_checked_increment
+    );
+    run_fixture!("stale_permit_rejected", stale_permit_rejected);
+    run_fixture!("create_definition", create_definition);
+    run_fixture!("publish_revision", publish_revision);
+    run_fixture!("create_run_receipt", create_run_receipt);
+    run_fixture!("create_receipt_replay", create_receipt_replay);
+    run_fixture!("create_receipt_conflict", create_receipt_conflict);
+    run_fixture!("point_read_scope_isolation", point_read_scope_isolation);
+    run_fixture!("start_run", start_run);
+    run_fixture!("node_version_cas_rejection", node_version_cas_rejection);
+    run_fixture!("claim_attempt", claim_attempt);
+    run_fixture!("active_attempt_fence", active_attempt_fence);
+    run_fixture!("budget_reservation", budget_reservation);
+    run_fixture!("complete_attempt", complete_attempt);
+    run_fixture!("attempt_terminal_state", attempt_terminal_state);
+    run_fixture!("budget_settlement", budget_settlement);
+    run_fixture!("event_sequence_contiguity", event_sequence_contiguity);
+    run_fixture!("batch_metadata_contiguity", batch_metadata_contiguity);
+    run_fixture!("closed_edge_payload", closed_edge_payload);
+    run_fixture!("terminal_resolution", terminal_resolution);
+    run_fixture!("due_completion_times_out", due_completion_times_out);
+    run_fixture!("timeout_observation_order", timeout_observation_order);
+    run_fixture!(
+        "blocked_run_host_command_fence",
+        blocked_run_host_command_fence
+    );
+    run_fixture!(
+        "corruption_transition_by_source_state",
+        corruption_transition_by_source_state
+    );
+    run_fixture!(
+        "multi_attempt_recovery_sorter",
+        multi_attempt_recovery_sorter
+    );
+    run_fixture!("exponential_backoff_cap", exponential_backoff_cap);
+    results
 }
 
 fn id(value: &str) -> Id {

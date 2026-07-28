@@ -4,15 +4,19 @@ use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
 };
 use crate::artifact::ObjectStore;
-use crate::definition::{Binding, BindingSource, ChoiceCase, NodeDefinition, WorkflowDefinition};
-use crate::ids::{edge_id, Digest, Id};
+use crate::definition::{
+    Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource, NodeDefinition,
+    WorkflowDefinition,
+};
+use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChildIdentity};
 use crate::run::{NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompletionObjects, ExpireApproval, ExpireRunLifetime, PageRequest, RecordChoice,
-    RecoverAbandonedAttemptsForRun, ReleaseRetry, ResolveTerminalNode, ResumeCompatible, StartRun,
-    StoreError, SuspendIncompatible, TimeoutAttempt, WorkflowStore,
+    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime, OrderedMapItem,
+    PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun, ReleaseRetry, RequestApproval,
+    ResolveTerminalNode, ResumeCompatible, StartRun, StoreError, SuspendIncompatible,
+    TimeoutAttempt, WorkflowStore,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -266,6 +270,14 @@ where
                     self.execute_choice(scope, &permit, node).await?;
                     changed += 1;
                 }
+                NodeKind::Map => {
+                    self.execute_map(scope, &permit, node).await?;
+                    changed += 1;
+                }
+                NodeKind::Approval => {
+                    self.execute_approval(scope, &permit, node).await?;
+                    changed += 1;
+                }
                 NodeKind::Succeed | NodeKind::Fail => {
                     self.execute_terminal(scope, &permit, node).await?;
                     changed += 1;
@@ -327,6 +339,7 @@ where
                 changed += 1;
             }
         }
+        changed += self.complete_waiting_maps(scope, &permit).await?;
         Ok(changed)
     }
 
@@ -541,13 +554,20 @@ where
     ) -> Result<Option<ClaimedAction>, EngineError> {
         let (run, definition) = self.definition_for(scope, &node.run_id).await?;
         let definition_node = find_node(&definition, &node.definition_node_id)?;
-        let (action_ref, bindings) = match definition_node {
-            NodeDefinition::Action {
-                action, bindings, ..
-            } => (action, bindings),
+        let action_ref = match definition_node {
+            NodeDefinition::Action { action, .. } => action,
+            NodeDefinition::Map { action, .. } if node.parent_map_instance_id.is_some() => action,
             _ => return Err(EngineError::DefinitionDecode),
         };
-        let bound = self.bind_object(scope, &run, &definition, bindings).await?;
+        let bound = match definition_node {
+            NodeDefinition::Action { bindings, .. } => {
+                self.bind_object(scope, &run, bindings).await?
+            }
+            NodeDefinition::Map { bindings, .. } => {
+                self.bind_map_object(scope, &run, &node, bindings).await?
+            }
+            _ => return Err(EngineError::DefinitionDecode),
+        };
         let bound_object = self
             .object_store
             .put(scope, &bound, "application/json")
@@ -619,12 +639,77 @@ where
         &self,
         scope: &ExecutionScope,
         run: &crate::run::WorkflowRun,
-        _definition: &WorkflowDefinition,
         bindings: &[Binding],
     ) -> Result<Vec<u8>, EngineError> {
         let mut target = Value::Object(Map::new());
         for binding in bindings {
             let value = self.resolve_source(scope, run, &binding.source).await?;
+            set_pointer(&mut target, &binding.target, value)?;
+        }
+        serde_jcs::to_vec(&target).map_err(|_| EngineError::Binding)
+    }
+
+    async fn bind_map_object(
+        &self,
+        scope: &ExecutionScope,
+        run: &crate::run::WorkflowRun,
+        child: &NodeRun,
+        bindings: &[MapBinding],
+    ) -> Result<Vec<u8>, EngineError> {
+        let parent_id = child
+            .parent_map_instance_id
+            .as_ref()
+            .ok_or(EngineError::Binding)?;
+        let parent = self.store.get_node(scope, &run.run_id, parent_id).await?;
+        let map_input = parent.map_input_ref.ok_or(EngineError::Binding)?;
+        let input = self
+            .object_store
+            .get(scope, &map_input.0.digest)
+            .await
+            .map_err(|_| EngineError::ObjectRead)?;
+        let items: Value =
+            serde_json::from_slice(&input.bytes).map_err(|_| EngineError::Binding)?;
+        let index = child.map_item_index.ok_or(EngineError::Binding)?;
+        let item = items
+            .as_array()
+            .and_then(|values| values.get(index as usize))
+            .cloned()
+            .ok_or(EngineError::Binding)?;
+        let mut target = Value::Object(Map::new());
+        for binding in bindings {
+            let value = match &binding.source {
+                MapBindingSource::Constant { value } => value.clone(),
+                MapBindingSource::RunInput { pointer } => {
+                    self.resolve_source(
+                        scope,
+                        run,
+                        &BindingSource::RunInput {
+                            pointer: pointer.clone(),
+                        },
+                    )
+                    .await?
+                }
+                MapBindingSource::NodeOutput { node_id, pointer } => {
+                    self.resolve_source(
+                        scope,
+                        run,
+                        &BindingSource::NodeOutput {
+                            node_id: node_id.clone(),
+                            pointer: pointer.clone(),
+                        },
+                    )
+                    .await?
+                }
+                MapBindingSource::MapItem { pointer } => {
+                    if pointer.is_empty() {
+                        item.clone()
+                    } else {
+                        item.pointer(pointer).cloned().ok_or(EngineError::Binding)?
+                    }
+                }
+                MapBindingSource::MapIndex => Value::from(index),
+                MapBindingSource::ArtifactRef { .. } => return Err(EngineError::Binding),
+            };
             set_pointer(&mut target, &binding.target, value)?;
         }
         serde_jcs::to_vec(&target).map_err(|_| EngineError::Binding)
@@ -731,6 +816,183 @@ where
             )
             .await?;
         Ok(())
+    }
+
+    async fn execute_map(
+        &self,
+        scope: &ExecutionScope,
+        permit: &crate::store::EnginePermit,
+        node: NodeRun,
+    ) -> Result<(), EngineError> {
+        let (run, definition) = self.definition_for(scope, &node.run_id).await?;
+        let NodeDefinition::Map { items, .. } = find_node(&definition, &node.definition_node_id)?
+        else {
+            return Err(EngineError::DefinitionDecode);
+        };
+        let value = self.resolve_source(scope, &run, items).await?;
+        let values = value.as_array().ok_or(EngineError::Binding)?;
+        let bytes = serde_jcs::to_vec(&value).map_err(|_| EngineError::Binding)?;
+        let input = self
+            .object_store
+            .put(scope, &bytes, "application/json")
+            .await
+            .map_err(|_| EngineError::ObjectWrite)?;
+        let mut identities = Vec::with_capacity(values.len());
+        let mut ordered_items = Vec::with_capacity(values.len());
+        for (index, item) in values.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| EngineError::Binding)?;
+            let item_digest = sha(&serde_jcs::to_vec(item).map_err(|_| EngineError::Binding)?);
+            let child_id = map_child_id(&node.run_id, &node.node_instance_id, index, &item_digest);
+            identities.push(MapChildIdentity {
+                item_index: index,
+                item_digest: item_digest.clone(),
+                child_id: child_id.clone(),
+            });
+            ordered_items.push(OrderedMapItem {
+                index,
+                item_digest,
+                child_id,
+            });
+        }
+        self.store
+            .expand_map(
+                scope,
+                ExpandMap {
+                    permit: permit.clone(),
+                    run_id: node.run_id,
+                    map_node_id: node.node_instance_id,
+                    expected_node_version: node.version,
+                    input,
+                    ordered_items,
+                    expansion_digest: map_expansion_digest(&identities),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn execute_approval(
+        &self,
+        scope: &ExecutionScope,
+        permit: &crate::store::EnginePermit,
+        node: NodeRun,
+    ) -> Result<(), EngineError> {
+        let (run, definition) = self.definition_for(scope, &node.run_id).await?;
+        let NodeDefinition::Approval { request, .. } =
+            find_node(&definition, &node.definition_node_id)?
+        else {
+            return Err(EngineError::DefinitionDecode);
+        };
+        let request = self.resolve_source(scope, &run, request).await?;
+        let bytes = serde_jcs::to_vec(&request).map_err(|_| EngineError::Binding)?;
+        let request = self
+            .object_store
+            .put(scope, &bytes, "application/json")
+            .await
+            .map_err(|_| EngineError::ObjectWrite)?;
+        self.store
+            .request_approval(
+                scope,
+                RequestApproval {
+                    permit: permit.clone(),
+                    run_id: node.run_id.clone(),
+                    node_id: node.node_instance_id.clone(),
+                    expected_node_version: node.version,
+                    gate_id: approval_gate_id(&node.run_id, &node.node_instance_id),
+                    request,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn complete_waiting_maps(
+        &self,
+        scope: &ExecutionScope,
+        permit: &crate::store::EnginePermit,
+    ) -> Result<usize, EngineError> {
+        let mut changed = 0;
+        let runs = self
+            .store
+            .scan_compatibility_rechecks(scope, first_page())
+            .await?
+            .items;
+        for run in runs
+            .into_iter()
+            .filter(|run| run.status == crate::run::RunState::Running)
+        {
+            let mut cursor = None;
+            let mut nodes = Vec::new();
+            loop {
+                let page = self
+                    .store
+                    .list_nodes(
+                        scope,
+                        &run.run_id,
+                        PageRequest {
+                            cursor: cursor.clone(),
+                            page_size: 1000,
+                        },
+                    )
+                    .await?;
+                nodes.extend(page.items);
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            for parent in nodes.iter().filter(|node| {
+                node.kind == NodeKind::Map && node.status == crate::run::NodeState::WaitingChildren
+            }) {
+                let mut children = nodes
+                    .iter()
+                    .filter(|node| {
+                        node.parent_map_instance_id.as_ref() == Some(&parent.node_instance_id)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if children.len() != parent.map_child_count.unwrap_or(0) as usize
+                    || children
+                        .iter()
+                        .any(|child| child.status != crate::run::NodeState::Succeeded)
+                {
+                    continue;
+                }
+                children.sort_by_key(|child| child.map_item_index);
+                let mut values: Vec<Value> = Vec::with_capacity(children.len());
+                for child in children {
+                    let output = child.result_ref.ok_or(EngineError::Binding)?;
+                    let object = self
+                        .object_store
+                        .get(scope, &output.0.digest)
+                        .await
+                        .map_err(|_| EngineError::ObjectRead)?;
+                    values.push(
+                        serde_json::from_slice(&object.bytes).map_err(|_| EngineError::Binding)?,
+                    );
+                }
+                let bytes = serde_jcs::to_vec(&values).map_err(|_| EngineError::Binding)?;
+                let aggregate = self
+                    .object_store
+                    .put(scope, &bytes, "application/json")
+                    .await
+                    .map_err(|_| EngineError::ObjectWrite)?;
+                self.store
+                    .complete_map(
+                        scope,
+                        CompleteMap {
+                            permit: permit.clone(),
+                            run_id: run.run_id.clone(),
+                            map_node_id: parent.node_instance_id.clone(),
+                            expected_node_version: parent.version,
+                            aggregate,
+                        },
+                    )
+                    .await?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     async fn execute_terminal(
@@ -915,6 +1177,23 @@ fn sha(bytes: &[u8]) -> Digest {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Digest::new(format!("sha256:{hex}")).expect("SHA-256 output is valid")
+}
+
+fn approval_gate_id(run_id: &Id, node_id: &Id) -> Id {
+    fn length_prefixed(value: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(8 + value.len());
+        encoded.extend((value.len() as u64).to_be_bytes());
+        encoded.extend(value);
+        encoded
+    }
+    let mut bytes = length_prefixed(b"dagger-approval-v1");
+    bytes.extend(length_prefixed(run_id.as_str().as_bytes()));
+    bytes.extend(length_prefixed(node_id.as_str().as_bytes()));
+    let hex = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Id::new(format!("approval_{hex}")).expect("SHA-256 gate ID is valid")
 }
 
 struct ThreadWake(thread::Thread);
