@@ -164,6 +164,15 @@ fn reusable_conformance_suite_runs_against_memory_adapter() {
         fn advance_clock_ms(&self, milliseconds: i64) {
             self.clock.advance_ms(milliseconds).unwrap();
         }
+
+        fn fresh(&self) -> Self {
+            let clock = Arc::new(TestClock::new(Timestamp(0)));
+            Self {
+                store: InMemoryStore::new(clock.clone()),
+                objects: InMemoryObjectStore::new(clock.clone()),
+                clock,
+            }
+        }
     }
 
     block_on(async {
@@ -173,15 +182,20 @@ fn reusable_conformance_suite_runs_against_memory_adapter() {
             objects: InMemoryObjectStore::new(clock.clone()),
             clock,
         };
-        assert_eq!(
-            dagger_workflow_core::conformance::run_conformance(
-                &adapter,
-                &scope("tenant-a"),
-                &scope("tenant-b"),
-            )
-            .await
-            .unwrap(),
-            dagger_workflow_core::conformance::CASE_COUNT
+        let results = dagger_workflow_core::conformance::run_conformance(
+            &adapter,
+            &scope("tenant-a"),
+            &scope("tenant-b"),
+        )
+        .await;
+        assert_eq!(results.len(), dagger_workflow_core::conformance::CASE_COUNT);
+        assert!(
+            results.iter().all(|result| result.passed()),
+            "{:?}",
+            results
+                .iter()
+                .filter(|result| !result.passed())
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             dagger_workflow_core::conformance::CASE_NAMES

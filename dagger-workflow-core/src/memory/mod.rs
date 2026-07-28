@@ -1,6 +1,9 @@
 //! Deterministic in-memory implementations of the frozen store boundaries.
 
-use crate::action::{ActionInvocation, ActionOutcome, CompletionCredential};
+use crate::action::{
+    ActionInvocation, ActionOutcome, CompletionCredential, DiagnosticsEnvelope,
+    DiagnosticsValidationError,
+};
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalResolutionSource};
 use crate::artifact::{
     ArtifactKind, ArtifactMetadataConflict, ArtifactRef, FailedReadClass, FailedReadProof, JsonRef,
@@ -11,8 +14,8 @@ use crate::definition::{ActionPin, BackoffPolicy, NodeDefinition, PublishableDef
 use crate::engine::Clock;
 use crate::event::{EventActorKind, EventType, WorkflowEvent};
 use crate::ids::{
-    artifact_ref_id, edge_id, idempotency_key, ArtifactRefIdentity, CostUnits, Digest, Id,
-    NodeInstanceId, Timestamp, Version,
+    artifact_ref_id, edge_id, idempotency_key, map_child_id, ArtifactRefIdentity, CostUnits,
+    Digest, Id, NodeInstanceId, Timestamp, Version,
 };
 use crate::revision::WorkflowRevision;
 use crate::run::{
@@ -24,7 +27,7 @@ use crate::scope::ExecutionScope;
 use crate::store::*;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -162,6 +165,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                 object.media_type,
                 object.object_key,
                 self.nonce.clone(),
+                object.bytes.clone(),
             ),
             bytes: object.bytes,
         })
@@ -195,6 +199,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                 media_type.to_owned(),
                 existing.object_key.clone(),
                 self.nonce.clone(),
+                bytes.to_vec(),
             ));
         }
         let object_key = format!(
@@ -218,6 +223,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
             media_type.to_owned(),
             object_key,
             self.nonce.clone(),
+            bytes.to_vec(),
         ))
     }
 }
@@ -226,6 +232,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
 struct MemoryState {
     object_store_nonce: Option<Vec<u8>>,
     object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
+    verified_object_bytes: BTreeMap<(ExecutionScope, Digest), Vec<u8>>,
     artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,
     definitions: BTreeMap<(ExecutionScope, Id), DefinitionRecord>,
     revisions: BTreeMap<(ExecutionScope, Id, Digest), WorkflowRevision>,
@@ -357,12 +364,15 @@ impl<C: Clock> InMemoryStore<C> {
                             _ => "R13",
                         };
                         specs.push(event_spec(
-                            EventType::RunCancelled,
                             transition,
                             None,
                             None,
                             None,
-                            json!({"reason_code": "RunEventLimitExceeded", "prior_status": prior.status}),
+                            event_payload::run_cancelled(
+                                &(Option::<()>::None),
+                                &("RunEventLimitExceeded"),
+                                &(prior.status),
+                            ),
                         ));
                         append_batch(
                             &mut capacity_state,
@@ -413,6 +423,10 @@ fn verified(
     } else {
         state.object_records.insert(key, record);
     }
+    state
+        .verified_object_bytes
+        .entry((scope.clone(), object.digest().clone()))
+        .or_insert_with(|| object.verified_bytes().to_vec());
     Ok(())
 }
 
@@ -649,7 +663,7 @@ fn action_config<'a>(
         })
 }
 
-fn retry_at(
+pub(crate) fn retry_at(
     now: Timestamp,
     policy: &crate::definition::RetryPolicy,
     attempt_number: u32,
@@ -664,16 +678,169 @@ fn retry_at(
             let exponent = attempt_number
                 .checked_sub(1)
                 .ok_or(StoreError::ArithmeticOverflow)?;
-            let factor = u64::from(multiplier)
-                .checked_pow(exponent)
-                .ok_or(StoreError::ArithmeticOverflow)?;
-            initial_delay_ms
-                .checked_mul(factor)
-                .ok_or(StoreError::ArithmeticOverflow)?
-                .min(max_delay_ms)
+            let factor = u64::from(multiplier).saturating_pow(exponent);
+            initial_delay_ms.saturating_mul(factor).min(max_delay_ms)
         }
     };
     checked_add_time(now, delay)
+}
+
+fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
+    if schema.as_object().is_some_and(serde_json::Map::is_empty) {
+        return true;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let Some(pointer) = reference.strip_prefix('#') else {
+            return false;
+        };
+        return root
+            .pointer(pointer)
+            .is_some_and(|resolved| schema_accepts(root, resolved, value));
+    }
+    if schema
+        .get("const")
+        .is_some_and(|constant| constant != value)
+        || schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .is_some_and(|values| !values.contains(value))
+    {
+        return false;
+    }
+    let type_matches = |name: &str| match name {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => false,
+    };
+    let matches_type = match schema.get("type") {
+        Some(Value::String(name)) => type_matches(name),
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).any(type_matches),
+        None => true,
+        _ => false,
+    };
+    if !matches_type {
+        return false;
+    }
+    if let Some(text) = value.as_str() {
+        let length = text.chars().count() as u64;
+        if schema
+            .get("minLength")
+            .and_then(Value::as_u64)
+            .is_some_and(|minimum| length < minimum)
+            || schema
+                .get("maxLength")
+                .and_then(Value::as_u64)
+                .is_some_and(|maximum| length > maximum)
+            || schema
+                .get("pattern")
+                .and_then(Value::as_str)
+                .is_some_and(|pattern| !supported_pattern_matches(pattern, text))
+        {
+            return false;
+        }
+    }
+    if let Some(number) = value.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|minimum| number < minimum)
+            || schema
+                .get("maximum")
+                .and_then(Value::as_f64)
+                .is_some_and(|maximum| number > maximum)
+        {
+            return false;
+        }
+    }
+    if let Some(values) = value.as_array() {
+        if schema
+            .get("minItems")
+            .and_then(Value::as_u64)
+            .is_some_and(|minimum| (values.len() as u64) < minimum)
+            || schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .is_some_and(|maximum| values.len() as u64 > maximum)
+        {
+            return false;
+        }
+        let Some(items) = schema.get("items") else {
+            return false;
+        };
+        if !values.iter().all(|item| schema_accepts(root, items, item)) {
+            return false;
+        }
+        if schema
+            .get("uniqueItems")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let mut unique = BTreeSet::new();
+            if !values.iter().all(|item| {
+                serde_jcs::to_vec(item)
+                    .ok()
+                    .is_some_and(|bytes| unique.insert(bytes))
+            }) {
+                return false;
+            }
+        }
+    }
+    if let Some(object) = value.as_object() {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        if schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| {
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|name| !object.contains_key(name))
+            })
+            || object.iter().any(|(name, field)| {
+                properties.get(name).map_or(true, |field_schema| {
+                    !schema_accepts(root, field_schema, field)
+                })
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn supported_pattern_matches(pattern: &str, value: &str) -> bool {
+    let anchored_start = pattern.starts_with('^');
+    let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
+    let body = pattern
+        .strip_prefix('^')
+        .unwrap_or(pattern)
+        .strip_suffix('$')
+        .unwrap_or_else(|| pattern.strip_prefix('^').unwrap_or(pattern));
+    if body.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'[' | b'(' | b'{' | b'*' | b'+' | b'?' | b'|' | b'\\' | b'.'
+        )
+    }) {
+        // Publication already validated the Rust-regex syntax. The volatile
+        // adapter fails closed for patterns outside its literal fast path.
+        return false;
+    }
+    match (anchored_start, anchored_end) {
+        (true, true) => value == body,
+        (true, false) => value.starts_with(body),
+        (false, true) => value.ends_with(body),
+        (false, false) => value.contains(body),
+    }
 }
 
 fn validate_limits(limits: &crate::run::RunLimits) -> bool {
@@ -691,24 +858,159 @@ fn validate_limits(limits: &crate::run::RunLimits) -> bool {
         && limits.max_run_lifetime_ms <= 31_536_000_000
 }
 
-fn event_spec(
+pub(crate) fn corruption_run_transition(status: RunState) -> Option<&'static str> {
+    match status {
+        RunState::Pending => Some("R14"),
+        RunState::Running => Some("R15"),
+        RunState::BlockedIncompatible => Some("R16"),
+        RunState::Succeeded => Some("R17"),
+        RunState::Failed => Some("R18"),
+        RunState::ContractFailed => Some("R19"),
+        RunState::RetriesExhausted => Some("R20"),
+        RunState::BudgetExhausted => Some("R21"),
+        RunState::Cancelled => Some("R22"),
+        RunState::CorruptStorage => None,
+    }
+}
+
+struct TypedEventPayload {
     event_type: EventType,
+    value: Value,
+}
+
+fn payload_value(value: impl Serialize) -> Value {
+    serde_json::to_value(value).expect("closed event payload field serializes")
+}
+
+fn value_object(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    )
+}
+
+fn typed_event_payload(
+    event_type: EventType,
+    fields: impl IntoIterator<Item = (&'static str, Value)>,
+) -> TypedEventPayload {
+    let value = Value::Object(
+        fields
+            .into_iter()
+            .filter(|(_, value)| !value.is_null())
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    );
+    assert!(
+        event_payload_is_closed(event_type, &value),
+        "internal event payload does not match the frozen catalogue"
+    );
+    TypedEventPayload { event_type, value }
+}
+
+macro_rules! payload_constructors {
+    ($( $function:ident => $variant:ident ( $( $field:ident ),+ ) );+ $(;)?) => {
+        mod event_payload {
+            use super::*;
+            $(
+                #[allow(dead_code)]
+                pub(super) fn $function($( $field: impl Serialize ),+) -> TypedEventPayload {
+                    typed_event_payload(
+                        EventType::$variant,
+                        [$( (stringify!($field), payload_value($field)) ),+],
+                    )
+                }
+            )+
+        }
+    };
+}
+
+payload_constructors! {
+    run_created => RunCreated(definition_id, revision_hash, input_digest, budget_limit, limits, create_request_fingerprint);
+    node_created_pending => NodeCreatedPending(definition_node_id, kind, incoming_total, topological_rank);
+    node_created_ready => NodeCreatedReady(definition_node_id, kind, topological_rank);
+    run_started => RunStarted(revision_hash, compatibility_evidence_digest);
+    run_blocked_incompatible => RunBlockedIncompatible(incompatibilities_digest, incompatible_reference_locations, suspension_fingerprint);
+    node_blocked_incompatible => NodeBlockedIncompatible(blocked_from_status, action_reference_location, required_semantic_digest);
+    run_resumed_compatible => RunResumedCompatible(compatibility_evidence_digest);
+    node_resumed_compatible => NodeResumedCompatible(restored_status, available_semantic_digest);
+    run_succeeded => RunSucceeded(output_digest, consumed_cost_units);
+    run_failed => RunFailed(failure_kind, diagnostics_digest);
+    run_contract_failed => RunContractFailed(failure_kind, diagnostics_digest);
+    run_retries_exhausted => RunRetriesExhausted(node_instance_id, attempt_id, max_attempts);
+    run_budget_exhausted => RunBudgetExhausted(node_instance_id, requested, available, limit_minus_consumed, permanently_infeasible);
+    run_cancelled => RunCancelled(principal, reason_code, prior_status);
+    run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id, bad_digest, error_class, corrupt_proof_fingerprint, store_instance_nonce_digest, prior_status, owner_node_id);
+    node_became_ready => NodeBecameReady(incoming_satisfied, incoming_skipped, incoming_total);
+    node_retry_eligible => NodeRetryEligible(next_eligible_at, database_now);
+    node_attempt_claimed => NodeAttemptClaimed(attempt_id, invocation_id, attempt_number, worker_id);
+    attempt_started => AttemptStarted(attempt_number, worker_id, engine_generation, deadline_at, declared_max_cost_units, idempotency_key_digest, bound_input_digest, completion_credential_digest);
+    budget_reserved => BudgetReserved(ledger_seq, amount, available_after);
+    map_child_created => MapChildCreated(parent_map_instance_id, item_index, item_digest, topological_rank);
+    map_expanded => MapExpanded(map_input_digest, expansion_digest, child_count, max_concurrency);
+    map_zero_items_succeeded => MapZeroItemsSucceeded(map_input_digest, expansion_digest, aggregate_digest);
+    map_succeeded => MapSucceeded(child_count, aggregate_digest);
+    choice_selected => ChoiceSelected(choice_input_digest, selector_value_digest, selection_kind, case_index, edge_id);
+    approval_requested => ApprovalRequested(gate_id, request_digest, expires_at, on_expiry, authorization_policy_digest);
+    approval_approved => ApprovalApproved(gate_id, decision_payload_digest, approval_output_digest, resolution_source);
+    approval_rejected => ApprovalRejected(gate_id, decision_payload_digest, resolution_source);
+    approval_expired_approved => ApprovalExpiredApproved(gate_id, expires_at, approval_output_digest);
+    approval_expired_rejected => ApprovalExpiredRejected(gate_id, expires_at);
+    succeed_node_reached => SucceedNodeReached(output_digest);
+    fail_node_reached => FailNodeReached(code, message_digest);
+    node_succeeded => NodeSucceeded(attempt_id, output_digest, artifact_digests);
+    node_retry_scheduled => NodeRetryScheduled(attempt_id, attempt_number, next_eligible_at, cause);
+    node_failed => NodeFailed(attempt_id, failure_kind, error_code, diagnostics_digest);
+    node_contract_failed => NodeContractFailed(attempt_id, failure_kind, diagnostics_digest);
+    node_retries_exhausted => NodeRetriesExhausted(attempt_id, attempt_number, max_attempts, cause);
+    node_budget_waiting => NodeBudgetWaiting(requested, available, consumed, reserved, limit);
+    node_budget_exhausted => NodeBudgetExhausted(requested, available, limit_minus_consumed);
+    node_skipped => NodeSkipped(incoming_skipped, incoming_total);
+    node_cancelled => NodeCancelled(prior_status, terminal_run_status, reason_code);
+    map_failed_fast => MapFailedFast(failed_child_id, child_failure_kind);
+    map_contract_failed => MapContractFailed(failure_kind, failed_child_id);
+    map_retries_exhausted => MapRetriesExhausted(failed_child_id, attempt_id, max_attempts);
+    map_budget_exhausted => MapBudgetExhausted(failed_child_id, requested, available);
+    node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id, bad_digest, error_class, corrupt_proof_fingerprint, prior_status);
+    attempt_succeeded => AttemptSucceeded(actual_cost_units, output_digest, artifact_digests);
+    attempt_retryable_failed => AttemptRetryableFailed(actual_cost_units, error_code, diagnostics_digest);
+    attempt_permanent_failed => AttemptPermanentFailed(actual_cost_units, error_code, diagnostics_digest);
+    attempt_contract_failed => AttemptContractFailed(charged_cost_units, failure_kind, diagnostics_digest);
+    attempt_timed_out => AttemptTimedOut(deadline_at, database_now, charged_cost_units);
+    attempt_outcome_unknown => AttemptOutcomeUnknown(dead_engine_generation, recovery_generation, charged_cost_units);
+    attempt_cancelled => AttemptCancelled(reason_code, charged_cost_units);
+    attempt_marked_stale => AttemptMarkedStale(active_attempt_id, submitted_outcome_category, submitted_payload_digest, charged_cost_units);
+    stale_completion_observed => StaleCompletionObserved(immutable_terminal_state, submitted_outcome_category, submitted_payload_digest, database_arrival_at);
+    budget_settled => BudgetSettled(ledger_seq, reservation_amount, consumed_amount, released_amount, reason, available_after);
+    budget_reservation_refused => BudgetReservationRefused(requested, consumed, reserved, limit, available, permanently_infeasible);
+    approval_gate_created => ApprovalGateCreated(request_digest, expires_at, on_expiry, authorization_policy_digest);
+    approval_gate_approved => ApprovalGateApproved(principal, decision_payload_digest, approval_output_digest, decision_fingerprint);
+    approval_gate_rejected => ApprovalGateRejected(principal, decision_payload_digest, decision_fingerprint);
+    approval_gate_expired_approved => ApprovalGateExpiredApproved(expires_at, database_now, approval_output_digest);
+    approval_gate_expired_rejected => ApprovalGateExpiredRejected(expires_at, database_now);
+    approval_gate_cancelled => ApprovalGateCancelled(terminal_run_status, reason_code);
+    edge_satisfied => EdgeSatisfied(edge_id, from_node_id, to_node_id);
+    edge_skipped => EdgeSkipped(edge_id, from_node_id, to_node_id, cause);
+}
+
+fn event_spec(
     transition: &str,
     node: Option<&NodeInstanceId>,
     attempt: Option<&Id>,
     gate: Option<&Id>,
-    mut payload: Value,
+    payload: TypedEventPayload,
 ) -> EventSpec {
-    if let Value::Object(fields) = &mut payload {
-        fields.retain(|_, value| !value.is_null());
-    }
     EventSpec {
-        event_type,
+        event_type: payload.event_type,
         transition: transition.to_owned(),
         node: node.cloned(),
         attempt: attempt.cloned(),
         gate: gate.cloned(),
-        payload,
+        payload: payload.value,
+        topological_rank: 0,
+        map_item_index: -1,
+        attempt_number: 0,
     }
 }
 
@@ -719,9 +1021,301 @@ struct EventSpec {
     attempt: Option<Id>,
     gate: Option<Id>,
     payload: Value,
+    topological_rank: u32,
+    map_item_index: i64,
+    attempt_number: u32,
 }
 
-fn event_order(spec: &EventSpec) -> (u8, String, String, u8, String) {
+fn event_payload_fields(
+    event_type: EventType,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    use EventType::*;
+    match event_type {
+        RunCreated => (
+            &[
+                "definition_id",
+                "revision_hash",
+                "input_digest",
+                "budget_limit",
+                "limits",
+                "create_request_fingerprint",
+            ],
+            &[],
+        ),
+        NodeCreatedPending => (
+            &[
+                "definition_node_id",
+                "kind",
+                "incoming_total",
+                "topological_rank",
+            ],
+            &[],
+        ),
+        NodeCreatedReady => (&["definition_node_id", "kind", "topological_rank"], &[]),
+        RunStarted => (&["revision_hash", "compatibility_evidence_digest"], &[]),
+        RunBlockedIncompatible => (
+            &[
+                "incompatibilities_digest",
+                "incompatible_reference_locations",
+                "suspension_fingerprint",
+            ],
+            &[],
+        ),
+        NodeBlockedIncompatible => (
+            &[
+                "blocked_from_status",
+                "action_reference_location",
+                "required_semantic_digest",
+            ],
+            &[],
+        ),
+        RunResumedCompatible => (&["compatibility_evidence_digest"], &[]),
+        NodeResumedCompatible => (&["restored_status", "available_semantic_digest"], &[]),
+        RunSucceeded => (&["output_digest", "consumed_cost_units"], &[]),
+        RunFailed | RunContractFailed => (&["failure_kind"], &["diagnostics_digest"]),
+        RunRetriesExhausted => (&["node_instance_id", "attempt_id", "max_attempts"], &[]),
+        RunBudgetExhausted => (
+            &[
+                "node_instance_id",
+                "requested",
+                "available",
+                "limit_minus_consumed",
+                "permanently_infeasible",
+            ],
+            &[],
+        ),
+        RunCancelled => (&["reason_code", "prior_status"], &["principal"]),
+        RunCorruptStorage => (
+            &[
+                "bad_artifact_ref_id",
+                "bad_digest",
+                "error_class",
+                "corrupt_proof_fingerprint",
+                "store_instance_nonce_digest",
+                "prior_status",
+            ],
+            &["owner_node_id"],
+        ),
+        NodeBecameReady => (
+            &["incoming_satisfied", "incoming_skipped", "incoming_total"],
+            &[],
+        ),
+        NodeRetryEligible => (&["next_eligible_at", "database_now"], &[]),
+        NodeAttemptClaimed => (
+            &["attempt_id", "invocation_id", "attempt_number", "worker_id"],
+            &[],
+        ),
+        AttemptStarted => (
+            &[
+                "attempt_number",
+                "worker_id",
+                "engine_generation",
+                "deadline_at",
+                "declared_max_cost_units",
+                "idempotency_key_digest",
+                "bound_input_digest",
+                "completion_credential_digest",
+            ],
+            &[],
+        ),
+        BudgetReserved => (&["ledger_seq", "amount", "available_after"], &[]),
+        MapChildCreated => (
+            &[
+                "parent_map_instance_id",
+                "item_index",
+                "item_digest",
+                "topological_rank",
+            ],
+            &[],
+        ),
+        MapExpanded => (
+            &[
+                "map_input_digest",
+                "expansion_digest",
+                "child_count",
+                "max_concurrency",
+            ],
+            &[],
+        ),
+        MapZeroItemsSucceeded => (
+            &["map_input_digest", "expansion_digest", "aggregate_digest"],
+            &[],
+        ),
+        MapSucceeded => (&["child_count", "aggregate_digest"], &[]),
+        ChoiceSelected => (
+            &[
+                "choice_input_digest",
+                "selector_value_digest",
+                "selection_kind",
+                "edge_id",
+            ],
+            &["case_index"],
+        ),
+        ApprovalRequested => (
+            &[
+                "gate_id",
+                "request_digest",
+                "expires_at",
+                "on_expiry",
+                "authorization_policy_digest",
+            ],
+            &[],
+        ),
+        ApprovalApproved => (
+            &["gate_id", "approval_output_digest", "resolution_source"],
+            &["decision_payload_digest"],
+        ),
+        ApprovalRejected => (
+            &["gate_id", "resolution_source"],
+            &["decision_payload_digest"],
+        ),
+        ApprovalExpiredApproved => (&["gate_id", "expires_at", "approval_output_digest"], &[]),
+        ApprovalExpiredRejected => (&["gate_id", "expires_at"], &[]),
+        SucceedNodeReached => (&["output_digest"], &[]),
+        FailNodeReached => (&["code", "message_digest"], &[]),
+        NodeSucceeded => (&["attempt_id", "output_digest", "artifact_digests"], &[]),
+        NodeRetryScheduled => (
+            &["attempt_id", "attempt_number", "next_eligible_at", "cause"],
+            &[],
+        ),
+        NodeFailed => (
+            &["attempt_id", "failure_kind", "error_code"],
+            &["diagnostics_digest"],
+        ),
+        NodeContractFailed => (&["failure_kind"], &["attempt_id", "diagnostics_digest"]),
+        NodeRetriesExhausted => (
+            &["attempt_id", "attempt_number", "max_attempts", "cause"],
+            &[],
+        ),
+        NodeBudgetWaiting => (
+            &["requested", "available", "consumed", "reserved", "limit"],
+            &[],
+        ),
+        NodeBudgetExhausted => (&["requested", "available", "limit_minus_consumed"], &[]),
+        NodeSkipped => (&["incoming_skipped", "incoming_total"], &[]),
+        NodeCancelled => (&["prior_status", "terminal_run_status", "reason_code"], &[]),
+        MapFailedFast => (&["failed_child_id", "child_failure_kind"], &[]),
+        MapContractFailed => (&["failure_kind"], &["failed_child_id"]),
+        MapRetriesExhausted => (&["failed_child_id", "attempt_id", "max_attempts"], &[]),
+        MapBudgetExhausted => (&["failed_child_id", "requested", "available"], &[]),
+        NodeCorruptStorage => (
+            &[
+                "bad_artifact_ref_id",
+                "bad_digest",
+                "error_class",
+                "corrupt_proof_fingerprint",
+                "prior_status",
+            ],
+            &[],
+        ),
+        AttemptSucceeded => (
+            &["actual_cost_units", "output_digest", "artifact_digests"],
+            &[],
+        ),
+        AttemptRetryableFailed | AttemptPermanentFailed => (
+            &["actual_cost_units", "error_code"],
+            &["diagnostics_digest"],
+        ),
+        AttemptContractFailed => (
+            &["charged_cost_units", "failure_kind"],
+            &["diagnostics_digest"],
+        ),
+        AttemptTimedOut => (&["deadline_at", "database_now", "charged_cost_units"], &[]),
+        AttemptOutcomeUnknown => (
+            &[
+                "dead_engine_generation",
+                "recovery_generation",
+                "charged_cost_units",
+            ],
+            &[],
+        ),
+        AttemptCancelled => (&["reason_code", "charged_cost_units"], &[]),
+        AttemptMarkedStale => (
+            &[
+                "submitted_outcome_category",
+                "submitted_payload_digest",
+                "charged_cost_units",
+            ],
+            &["active_attempt_id"],
+        ),
+        StaleCompletionObserved => (
+            &[
+                "immutable_terminal_state",
+                "submitted_outcome_category",
+                "submitted_payload_digest",
+                "database_arrival_at",
+            ],
+            &[],
+        ),
+        BudgetSettled => (
+            &[
+                "ledger_seq",
+                "reservation_amount",
+                "consumed_amount",
+                "released_amount",
+                "reason",
+                "available_after",
+            ],
+            &[],
+        ),
+        BudgetReservationRefused => (
+            &[
+                "requested",
+                "consumed",
+                "reserved",
+                "limit",
+                "available",
+                "permanently_infeasible",
+            ],
+            &[],
+        ),
+        ApprovalGateCreated => (
+            &[
+                "request_digest",
+                "expires_at",
+                "on_expiry",
+                "authorization_policy_digest",
+            ],
+            &[],
+        ),
+        ApprovalGateApproved => (
+            &[
+                "principal",
+                "approval_output_digest",
+                "decision_fingerprint",
+            ],
+            &["decision_payload_digest"],
+        ),
+        ApprovalGateRejected => (
+            &["principal", "decision_fingerprint"],
+            &["decision_payload_digest"],
+        ),
+        ApprovalGateExpiredApproved => (
+            &["expires_at", "database_now", "approval_output_digest"],
+            &[],
+        ),
+        ApprovalGateExpiredRejected => (&["expires_at", "database_now"], &[]),
+        ApprovalGateCancelled => (&["terminal_run_status", "reason_code"], &[]),
+        EdgeSatisfied => (&["edge_id", "from_node_id", "to_node_id"], &[]),
+        EdgeSkipped => (&["edge_id", "from_node_id", "to_node_id", "cause"], &[]),
+    }
+}
+
+fn event_payload_is_closed(event_type: EventType, payload: &Value) -> bool {
+    let Some(fields) = payload.as_object() else {
+        return false;
+    };
+    let (required, optional) = event_payload_fields(event_type);
+    required.iter().all(|field| fields.contains_key(*field))
+        && fields
+            .keys()
+            .all(|field| required.contains(&field.as_str()) || optional.contains(&field.as_str()))
+}
+
+fn event_order(
+    recovery_batch: bool,
+    spec: &EventSpec,
+) -> (u8, u32, i64, String, u32, String, u8, String) {
     let run_event = spec.node.is_none() && spec.attempt.is_none() && spec.gate.is_none();
     let category = if run_event {
         5
@@ -766,17 +1360,71 @@ fn event_order(spec: &EventSpec) -> (u8, String, String, u8, String) {
         | EventType::BudgetReservationRefused => 3,
         _ => 0,
     };
-    (
-        category,
-        spec.node
-            .as_ref()
-            .map_or_else(String::new, |id| id.as_str().to_owned()),
+    let subject_id = if matches!(
+        spec.event_type,
+        EventType::EdgeSatisfied | EventType::EdgeSkipped
+    ) {
+        spec.payload
+            .get("edge_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    } else {
         spec.attempt
             .as_ref()
             .or(spec.gate.as_ref())
-            .map_or_else(String::new, |id| id.as_str().to_owned()),
+            .map_or_else(String::new, |id| id.as_str().to_owned())
+    };
+    let node_id = spec
+        .node
+        .as_ref()
+        .map_or_else(String::new, |id| id.as_str().to_owned());
+    let (rank, map_index, ordered_node_id, attempt_number, ordered_subject_id) = if recovery_batch {
+        if let (Some(node), Some(attempt)) = (&spec.node, &spec.attempt) {
+            recovery_subject_order_key(
+                spec.topological_rank,
+                spec.map_item_index,
+                node,
+                spec.attempt_number,
+                attempt,
+            )
+        } else {
+            (
+                spec.topological_rank,
+                spec.map_item_index,
+                node_id,
+                spec.attempt_number,
+                subject_id,
+            )
+        }
+    } else {
+        (0, -1, node_id, spec.attempt_number, subject_id)
+    };
+    (
+        category,
+        rank,
+        map_index,
+        ordered_node_id,
+        attempt_number,
+        ordered_subject_id,
         within_subject,
         spec.transition.clone(),
+    )
+}
+
+pub(crate) fn recovery_subject_order_key(
+    topological_rank: u32,
+    map_item_index: i64,
+    node_id: &Id,
+    attempt_number: u32,
+    attempt_id: &Id,
+) -> (u32, i64, String, u32, String) {
+    (
+        topological_rank,
+        map_item_index,
+        node_id.as_str().to_owned(),
+        attempt_number,
+        attempt_id.as_str().to_owned(),
     )
 }
 
@@ -854,7 +1502,7 @@ fn append_batch(
     mut specs: Vec<EventSpec>,
 ) -> Result<(Id, u64, u64), StoreError> {
     for spec in &specs {
-        if !spec.payload.is_object()
+        if !event_payload_is_closed(spec.event_type, &spec.payload)
             || serde_jcs::to_vec(&spec.payload)
                 .map_err(|_| StoreError::InvalidField)?
                 .len()
@@ -863,11 +1511,32 @@ fn append_batch(
             return Err(StoreError::InvalidField);
         }
     }
+    for spec in &mut specs {
+        if let Some(node_id) = &spec.node {
+            if let Some(node) = state
+                .nodes
+                .get(&(scope.clone(), run_id.clone(), node_id.clone()))
+            {
+                spec.topological_rank = node.topological_rank.0;
+                spec.map_item_index = node.map_item_index.map_or(-1, i64::from);
+            }
+        }
+        if let Some(attempt_id) = &spec.attempt {
+            if let Some(attempt) =
+                state
+                    .attempts
+                    .get(&(scope.clone(), run_id.clone(), attempt_id.clone()))
+            {
+                spec.attempt_number = attempt.attempt_number;
+            }
+        }
+    }
     if !specs
         .iter()
         .any(|spec| spec.event_type == EventType::RunCreated)
     {
-        specs.sort_by_key(event_order);
+        let recovery_batch = actor_kind == EventActorKind::Recovery;
+        specs.sort_by_key(|spec| event_order(recovery_batch, spec));
     }
     let run_key = (scope.clone(), run_id.clone());
     let run = state.runs.get(&run_key).ok_or(StoreError::NotFound)?;
@@ -1062,25 +1731,20 @@ fn frontier_reduce(
                 .checked_add(1)
                 .ok_or(StoreError::ArithmeticOverflow)?;
             let payload = if selected {
-                json!({
-                    "edge_id": edge.edge_id,
-                    "from_node_id": edge.from_node_id,
-                    "to_node_id": edge.to_node_id
-                })
+                event_payload::edge_satisfied(
+                    &(&edge.edge_id),
+                    &(&edge.from_node_id),
+                    &(&edge.to_node_id),
+                )
             } else {
-                json!({
-                    "edge_id": edge.edge_id,
-                    "from_node_id": edge.from_node_id,
-                    "to_node_id": edge.to_node_id,
-                    "cause": "choice_unselected"
-                })
+                event_payload::edge_skipped(
+                    &(&edge.edge_id),
+                    &(&edge.from_node_id),
+                    &(&edge.to_node_id),
+                    &("choice_unselected"),
+                )
             };
             specs.push(event_spec(
-                if selected {
-                    EventType::EdgeSatisfied
-                } else {
-                    EventType::EdgeSkipped
-                },
                 if selected { "E01" } else { "E02" },
                 Some(source_node),
                 None,
@@ -1132,27 +1796,25 @@ fn frontier_reduce(
                 node.status = NodeState::Ready;
                 set_node_mutated(node, now)?;
                 specs.push(event_spec(
-                    EventType::NodeBecameReady,
                     "N03",
                     Some(&pending_id),
                     None,
                     None,
-                    json!({
-                        "incoming_satisfied": satisfied,
-                        "incoming_skipped": skipped,
-                        "incoming_total": node.incoming_total
-                    }),
+                    event_payload::node_became_ready(
+                        &(satisfied),
+                        &(skipped),
+                        &(node.incoming_total),
+                    ),
                 ));
             } else {
                 node.status = NodeState::Skipped;
                 set_node_mutated(node, now)?;
                 specs.push(event_spec(
-                    EventType::NodeSkipped,
                     "N28",
                     Some(&pending_id),
                     None,
                     None,
-                    json!({"incoming_skipped": skipped, "incoming_total": node.incoming_total}),
+                    event_payload::node_skipped(&(skipped), &(node.incoming_total)),
                 ));
                 for edge_key in &edge_keys {
                     let edge = state.edges.get_mut(edge_key).expect("edge exists");
@@ -1165,17 +1827,16 @@ fn frontier_reduce(
                             .checked_add(1)
                             .ok_or(StoreError::ArithmeticOverflow)?;
                         specs.push(event_spec(
-                            EventType::EdgeSkipped,
                             "E02",
                             Some(&pending_id),
                             None,
                             None,
-                            json!({
-                                "edge_id": edge.edge_id,
-                                "from_node_id": edge.from_node_id,
-                                "to_node_id": edge.to_node_id,
-                                "cause": "source_skipped"
-                            }),
+                            event_payload::edge_skipped(
+                                &(edge.edge_id),
+                                &(edge.from_node_id),
+                                &(edge.to_node_id),
+                                &("source_skipped"),
+                            ),
                         ));
                     }
                 }
@@ -1293,12 +1954,11 @@ fn cancellation_cascade(
                     attempt.status = AttemptState::Cancelled;
                     attempt.finished_at = Some(now);
                     specs.push(event_spec(
-                        EventType::AttemptCancelled,
                         "A08",
                         Some(&snapshot.node_instance_id),
                         Some(&attempt_id),
                         None,
-                        json!({"reason_code": reason, "charged_cost_units": attempt.reserved_cost}),
+                        event_payload::attempt_cancelled(&(reason), &(attempt.reserved_cost)),
                     ));
                     specs.push(budget_settled_spec(state, scope, run_id, &attempt)?);
                 }
@@ -1314,7 +1974,6 @@ fn cancellation_cascade(
         node.blocked_from_status = None;
         set_node_mutated(node, now)?;
         specs.push(event_spec(
-            EventType::NodeCancelled,
             match prior {
                 NodeState::Pending => "N35",
                 NodeState::Ready => "N36",
@@ -1329,7 +1988,7 @@ fn cancellation_cascade(
             Some(&node.node_instance_id),
             None,
             None,
-            json!({"prior_status": prior, "terminal_run_status": terminal, "reason_code": reason}),
+            event_payload::node_cancelled(&(prior), &(terminal), &(reason)),
         ));
     }
     for gate in state.gates.values_mut().filter(|gate| {
@@ -1346,12 +2005,11 @@ fn cancellation_cascade(
             .checked_add(1)
             .ok_or(StoreError::ArithmeticOverflow)?;
         specs.push(event_spec(
-            EventType::ApprovalGateCancelled,
             "G06",
             Some(&gate.node_instance_id),
             None,
             Some(&gate.gate_id),
-            json!({"terminal_run_status": terminal, "reason_code": reason}),
+            event_payload::approval_gate_cancelled(&(terminal), &(reason)),
         ));
     }
     if frontier_changed {
@@ -1380,6 +2038,58 @@ fn terminalize_run(
     run.finished_at = Some(now);
     set_run_mutated(run, now)?;
     Ok(run.clone())
+}
+
+fn apply_map_contract_failure(
+    state: &mut MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    map_node_id: &Id,
+    failure_kind: NodeFailureKind,
+    now: Timestamp,
+    actor_id: String,
+) -> Result<NodeRun, StoreError> {
+    let key = (scope.clone(), run_id.clone(), map_node_id.clone());
+    let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+    node.status = NodeState::ContractFailed;
+    node.failure_kind = Some(failure_kind);
+    set_node_mutated(&mut node, now)?;
+    state.nodes.insert(key, node.clone());
+    let mut specs = vec![event_spec(
+        "N65",
+        Some(map_node_id),
+        None,
+        None,
+        event_payload::map_contract_failed(&(failure_kind), &(Option::<()>::None)),
+    )];
+    let run_kind = run_failure(failure_kind);
+    terminalize_run(
+        state,
+        scope,
+        run_id,
+        RunState::ContractFailed,
+        Some(run_kind),
+        "ContractFailed",
+        now,
+        &mut specs,
+    )?;
+    specs.push(event_spec(
+        "R08",
+        None,
+        None,
+        None,
+        event_payload::run_contract_failed(&(run_kind), &(Option::<()>::None)),
+    ));
+    append_batch(
+        state,
+        scope,
+        run_id,
+        now,
+        EventActorKind::Engine,
+        actor_id,
+        specs,
+    )?;
+    Ok(node)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1790,281 +2500,278 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: CreateRun,
     ) -> Result<CommandReceipt, StoreError> {
         self.transaction(|mut state, now| {
-        if command.principal.scope() != scope || command.idempotency_token.len() < 16 {
-            return Err(StoreError::InvalidField);
-        }
-        verified(&mut state, scope, &command.input, now)?;
-        if command.input.media_type() != "application/json" || !validate_limits(&command.limits) {
-            return Err(StoreError::RunLimitsInvalid);
-        }
-        if command.input.size_bytes() > command.limits.max_inline_json_bytes_per_value
-            || command.input.size_bytes() > command.limits.max_aggregate_object_bytes_per_run
-        {
-            return Err(StoreError::ContractValidation {
-                kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
-                path: "/input".to_owned(),
-                message: "run input exceeds configured limits".to_owned(),
-                valid_alternatives: Vec::new(),
-            });
-        }
-        let request_fingerprint = fingerprint(
-            "create-run-v1",
-            scope,
-            &CreateFingerprint {
-                run_id: &command.run_id,
-                definition_id: &command.definition_id,
-                revision_hash: &command.revision_hash,
-                input_digest: command.input.digest(),
-                budget_limit: command.budget_limit,
-                limits: &command.limits,
-                principal: command.principal.principal_id(),
-            },
-        );
-        let receipt_key = (
-            scope.clone(),
-            CommandKindKey::Create,
-            command.idempotency_token.clone(),
-        );
-        if let Some(receipt) = state.receipts.get(&receipt_key) {
-            return if receipt.request_fingerprint == request_fingerprint {
-                Ok(receipt.clone())
-            } else {
-                Err(StoreError::IdempotencyConflict)
-            };
-        }
-        let revision_key = (
-            scope.clone(),
-            command.definition_id.clone(),
-            command.revision_hash.clone(),
-        );
-        let revision = state
-            .revisions
-            .get(&revision_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let parsed = state
-            .parsed_revisions
-            .get(&revision_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let static_node_count = u64::try_from(parsed.definition.nodes.len())
-            .map_err(|_| StoreError::ArithmeticOverflow)?;
-        let creation_event_count = 1_u64
-            .checked_add(static_node_count)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        let creation_reserve = 1_u64
-            .checked_add(
-                u64::try_from(parsed.definition.nodes.len())
-                    .map_err(|_| StoreError::ArithmeticOverflow)?,
-            )
-            .and_then(|value| value.checked_add(2))
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        if command.limits.max_total_events
-            < creation_event_count
-                .checked_add(creation_reserve)
-                .ok_or(StoreError::ArithmeticOverflow)?
-        {
-            return Err(StoreError::RunLimitsInvalid);
-        }
-        let run_key = (scope.clone(), command.run_id.clone());
-        if state.runs.contains_key(&run_key) {
-            return Err(StoreError::AlreadyExists);
-        }
-        let lifetime_deadline_at = checked_add_time(now, command.limits.max_run_lifetime_ms)?;
-        let input_ref = json_ref(
-                &mut state,
-            scope,
-            &command.input,
-            ArtifactKind::RunInput,
-            Some(&command.run_id),
-            None,
-            None,
-            0,
-            now,
-        )?;
-        let run = WorkflowRun {
-            scope: scope.clone(),
-            run_id: command.run_id.clone(),
-            definition_id: command.definition_id.clone(),
-            revision_hash: command.revision_hash.clone(),
-            input_ref,
-            create_request_fingerprint: request_fingerprint.clone(),
-            status: RunState::Pending,
-            failure_kind: None,
-            failure_diagnostics_ref: None,
-            output_ref: None,
-            budget_limit: command.budget_limit,
-            budget_consumed: CostUnits(0),
-            budget_reserved: CostUnits(0),
-            dynamic_node_count: 0,
-            total_attempt_count: 0,
-            aggregate_object_bytes: command.input.size_bytes(),
-            limits: command.limits,
-            lifetime_deadline_at,
-            frontier_epoch: 1,
-            last_event_seq: 0,
-            created_at: now,
-            updated_at: now,
-            started_at: None,
-            finished_at: None,
-            blocked_incompatibilities_ref: None,
-            blocked_incompatibility_fingerprint: None,
-            corrupt_bad_artifact_ref_id: None,
-            corrupt_owner_node_id: None,
-            corrupt_error_class: None,
-            corrupt_proof_fingerprint: None,
-            version: Version(1),
-        };
-        state.runs.insert(run_key.clone(), run);
-        state.run_definitions.insert(run_key, parsed.clone());
-        let mut incoming = BTreeMap::<Id, u32>::new();
-        let mut specs = vec![event_spec(
-            EventType::RunCreated,
-            "R01",
-            None,
-            None,
-            None,
-            json!({
-                "definition_id": command.definition_id,
-                "revision_hash": command.revision_hash,
-                "input_digest": command.input.digest(),
-                "budget_limit": command.budget_limit,
-                "limits": state.runs.get(&(scope.clone(), command.run_id.clone())).expect("run inserted").limits,
-                "create_request_fingerprint": request_fingerprint
-            }),
-        )];
-        for node in &parsed.definition.nodes {
-            for (label, target, case_index) in outgoing(node) {
-                let count = incoming.entry(target.clone()).or_default();
-                *count = count
-                    .checked_add(1)
-                    .ok_or(StoreError::ArithmeticOverflow)?;
-                let source = node_id(node);
-                let id = edge_id(&revision.revision_hash, source, &label, &target);
-                state.edges.insert(
-                    (scope.clone(), command.run_id.clone(), id.clone()),
-                    EdgeFact {
-                        scope: scope.clone(),
-                        run_id: command.run_id.clone(),
-                        edge_id: id,
-                        from_node_id: source.clone(),
-                        to_node_id: target,
-                        choice_case_index: case_index,
-                        state: EdgeState::Dormant,
-                        resolved_at: None,
-                        version: Version(1),
-                    },
-                );
+            if command.principal.scope() != scope || command.idempotency_token.len() < 16 {
+                return Err(StoreError::InvalidField);
             }
-        }
-        let mut ordered_nodes = parsed.definition.nodes.iter().collect::<Vec<_>>();
-        ordered_nodes.sort_by_key(|node| node_id(node));
-        for definition_node in ordered_nodes {
-            let id = node_id(definition_node).clone();
-            let ready = id == parsed.definition.entry_node_id;
-            let count = incoming.get(&id).copied().unwrap_or_default();
-            let node = NodeRun {
+            verified(&mut state, scope, &command.input, now)?;
+            if command.input.media_type() != "application/json" || !validate_limits(&command.limits)
+            {
+                return Err(StoreError::RunLimitsInvalid);
+            }
+            if command.input.size_bytes() > command.limits.max_inline_json_bytes_per_value
+                || command.input.size_bytes() > command.limits.max_aggregate_object_bytes_per_run
+            {
+                return Err(StoreError::ContractValidation {
+                    kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
+                    path: "/input".to_owned(),
+                    message: "run input exceeds configured limits".to_owned(),
+                    valid_alternatives: Vec::new(),
+                });
+            }
+            let request_fingerprint = fingerprint(
+                "create-run-v1",
+                scope,
+                &CreateFingerprint {
+                    run_id: &command.run_id,
+                    definition_id: &command.definition_id,
+                    revision_hash: &command.revision_hash,
+                    input_digest: command.input.digest(),
+                    budget_limit: command.budget_limit,
+                    limits: &command.limits,
+                    principal: command.principal.principal_id(),
+                },
+            );
+            let receipt_key = (
+                scope.clone(),
+                CommandKindKey::Create,
+                command.idempotency_token.clone(),
+            );
+            if let Some(receipt) = state.receipts.get(&receipt_key) {
+                return if receipt.request_fingerprint == request_fingerprint {
+                    Ok(receipt.clone())
+                } else {
+                    Err(StoreError::IdempotencyConflict)
+                };
+            }
+            let revision_key = (
+                scope.clone(),
+                command.definition_id.clone(),
+                command.revision_hash.clone(),
+            );
+            let revision = state
+                .revisions
+                .get(&revision_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let parsed = state
+                .parsed_revisions
+                .get(&revision_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let static_node_count = u64::try_from(parsed.definition.nodes.len())
+                .map_err(|_| StoreError::ArithmeticOverflow)?;
+            let creation_event_count = 1_u64
+                .checked_add(static_node_count)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            let creation_reserve = 1_u64
+                .checked_add(
+                    u64::try_from(parsed.definition.nodes.len())
+                        .map_err(|_| StoreError::ArithmeticOverflow)?,
+                )
+                .and_then(|value| value.checked_add(2))
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if command.limits.max_total_events
+                < creation_event_count
+                    .checked_add(creation_reserve)
+                    .ok_or(StoreError::ArithmeticOverflow)?
+            {
+                return Err(StoreError::RunLimitsInvalid);
+            }
+            let run_key = (scope.clone(), command.run_id.clone());
+            if state.runs.contains_key(&run_key) {
+                return Err(StoreError::AlreadyExists);
+            }
+            let lifetime_deadline_at = checked_add_time(now, command.limits.max_run_lifetime_ms)?;
+            let input_ref = json_ref(
+                &mut state,
+                scope,
+                &command.input,
+                ArtifactKind::RunInput,
+                Some(&command.run_id),
+                None,
+                None,
+                0,
+                now,
+            )?;
+            let run = WorkflowRun {
                 scope: scope.clone(),
                 run_id: command.run_id.clone(),
-                node_instance_id: id.clone(),
-                definition_node_id: id.clone(),
-                kind: node_kind(definition_node),
-                parent_map_instance_id: None,
-                map_item_index: None,
-                map_item_digest: None,
-                topological_rank: *parsed
-                    .topological_ranks
-                    .get(&id)
-                    .expect("published node has rank"),
-                status: if ready {
-                    NodeState::Ready
-                } else {
-                    NodeState::Pending
-                },
-                blocked_from_status: None,
-                active_attempt_id: None,
-                attempt_count: 0,
-                next_eligible_at: None,
-                budget_wait_amount: None,
-                result_ref: None,
+                definition_id: command.definition_id.clone(),
+                revision_hash: command.revision_hash.clone(),
+                input_ref,
+                create_request_fingerprint: request_fingerprint.clone(),
+                status: RunState::Pending,
                 failure_kind: None,
                 failure_diagnostics_ref: None,
-                incoming_total: count,
-                incoming_satisfied: 0,
-                incoming_skipped: 0,
-                choice_input_ref: None,
-                choice_selected_case: None,
-                map_input_ref: None,
-                map_expansion_digest: None,
-                map_child_count: None,
-                approval_gate_id: None,
+                output_ref: None,
+                budget_limit: command.budget_limit,
+                budget_consumed: CostUnits(0),
+                budget_reserved: CostUnits(0),
+                dynamic_node_count: 0,
+                total_attempt_count: 0,
+                aggregate_object_bytes: command.input.size_bytes(),
+                limits: command.limits,
+                lifetime_deadline_at,
+                frontier_epoch: 1,
+                last_event_seq: 0,
                 created_at: now,
                 updated_at: now,
+                started_at: None,
+                finished_at: None,
+                blocked_incompatibilities_ref: None,
+                blocked_incompatibility_fingerprint: None,
+                corrupt_bad_artifact_ref_id: None,
+                corrupt_owner_node_id: None,
+                corrupt_error_class: None,
+                corrupt_proof_fingerprint: None,
                 version: Version(1),
             };
-            let payload = if ready {
-                json!({
-                    "definition_node_id": id,
-                    "kind": node.kind,
-                    "topological_rank": node.topological_rank
-                })
-            } else {
-                json!({
-                    "definition_node_id": id,
-                    "kind": node.kind,
-                    "incoming_total": count,
-                    "topological_rank": node.topological_rank
-                })
-            };
-            specs.push(event_spec(
-                if ready {
-                    EventType::NodeCreatedReady
+            state.runs.insert(run_key.clone(), run);
+            state.run_definitions.insert(run_key, parsed.clone());
+            let mut incoming = BTreeMap::<Id, u32>::new();
+            let mut specs = vec![event_spec(
+                "R01",
+                None,
+                None,
+                None,
+                event_payload::run_created(
+                    &(command.definition_id),
+                    &(command.revision_hash),
+                    &(command.input.digest()),
+                    &(command.budget_limit),
+                    &(state
+                        .runs
+                        .get(&(scope.clone(), command.run_id.clone()))
+                        .expect("run inserted")
+                        .limits),
+                    &(request_fingerprint),
+                ),
+            )];
+            for node in &parsed.definition.nodes {
+                for (label, target, case_index) in outgoing(node) {
+                    let count = incoming.entry(target.clone()).or_default();
+                    *count = count.checked_add(1).ok_or(StoreError::ArithmeticOverflow)?;
+                    let source = node_id(node);
+                    let id = edge_id(&revision.revision_hash, source, &label, &target);
+                    state.edges.insert(
+                        (scope.clone(), command.run_id.clone(), id.clone()),
+                        EdgeFact {
+                            scope: scope.clone(),
+                            run_id: command.run_id.clone(),
+                            edge_id: id,
+                            from_node_id: source.clone(),
+                            to_node_id: target,
+                            choice_case_index: case_index,
+                            state: EdgeState::Dormant,
+                            resolved_at: None,
+                            version: Version(1),
+                        },
+                    );
+                }
+            }
+            let mut ordered_nodes = parsed.definition.nodes.iter().collect::<Vec<_>>();
+            ordered_nodes.sort_by_key(|node| node_id(node));
+            for definition_node in ordered_nodes {
+                let id = node_id(definition_node).clone();
+                let ready = id == parsed.definition.entry_node_id;
+                let count = incoming.get(&id).copied().unwrap_or_default();
+                let node = NodeRun {
+                    scope: scope.clone(),
+                    run_id: command.run_id.clone(),
+                    node_instance_id: id.clone(),
+                    definition_node_id: id.clone(),
+                    kind: node_kind(definition_node),
+                    parent_map_instance_id: None,
+                    map_item_index: None,
+                    map_item_digest: None,
+                    topological_rank: *parsed
+                        .topological_ranks
+                        .get(&id)
+                        .expect("published node has rank"),
+                    status: if ready {
+                        NodeState::Ready
+                    } else {
+                        NodeState::Pending
+                    },
+                    blocked_from_status: None,
+                    active_attempt_id: None,
+                    attempt_count: 0,
+                    next_eligible_at: None,
+                    budget_wait_amount: None,
+                    result_ref: None,
+                    failure_kind: None,
+                    failure_diagnostics_ref: None,
+                    incoming_total: count,
+                    incoming_satisfied: 0,
+                    incoming_skipped: 0,
+                    choice_input_ref: None,
+                    choice_selected_case: None,
+                    map_input_ref: None,
+                    map_expansion_digest: None,
+                    map_child_count: None,
+                    approval_gate_id: None,
+                    created_at: now,
+                    updated_at: now,
+                    version: Version(1),
+                };
+                let payload = if ready {
+                    event_payload::node_created_ready(
+                        &(&id),
+                        &(node.kind),
+                        &(node.topological_rank),
+                    )
                 } else {
-                    EventType::NodeCreatedPending
-                },
-                if ready { "N02" } else { "N01" },
-                Some(&id),
-                None,
-                None,
-                payload,
-            ));
-            state
-                .nodes
-                .insert((scope.clone(), command.run_id.clone(), id), node);
-        }
-        let (batch_id, first, last) = append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Host,
-            command.principal.principal_id().to_owned(),
-            specs,
-        )?;
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        set_run_mutated(run, now)?;
-        let receipt = CommandReceipt {
-            scope: scope.clone(),
-            command_kind: CommandKind::CreateRun,
-            idempotency_token: command.idempotency_token,
-            request_fingerprint,
-            run_id: command.run_id.clone(),
-            outcome: CommandReceiptOutcome::CreateRunCommitted {
+                    event_payload::node_created_pending(
+                        &(&id),
+                        &(node.kind),
+                        &(count),
+                        &(node.topological_rank),
+                    )
+                };
+                specs.push(event_spec(
+                    if ready { "N02" } else { "N01" },
+                    Some(&id),
+                    None,
+                    None,
+                    payload,
+                ));
+                state
+                    .nodes
+                    .insert((scope.clone(), command.run_id.clone(), id), node);
+            }
+            let (batch_id, first, last) = append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Host,
+                command.principal.principal_id().to_owned(),
+                specs,
+            )?;
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            set_run_mutated(run, now)?;
+            let receipt = CommandReceipt {
+                scope: scope.clone(),
+                command_kind: CommandKind::CreateRun,
+                idempotency_token: command.idempotency_token,
+                request_fingerprint,
                 run_id: command.run_id.clone(),
-                status: RunState::Pending,
-                run_version: run.version,
-                batch_id: batch_id.clone(),
-                first_event_seq: first,
-                last_event_seq: last,
-            },
-            batch_id,
-            committed_at: now,
-        };
-        state.receipts.insert(receipt_key, receipt.clone());
-        Ok(receipt)
+                outcome: CommandReceiptOutcome::CreateRunCommitted {
+                    run_id: command.run_id.clone(),
+                    status: RunState::Pending,
+                    run_version: run.version,
+                    batch_id: batch_id.clone(),
+                    first_event_seq: first,
+                    last_event_seq: last,
+                },
+                batch_id,
+                committed_at: now,
+            };
+            state.receipts.insert(receipt_key, receipt.clone());
+            Ok(receipt)
         })
     }
     async fn start_run(
@@ -2073,43 +2780,49 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: StartRun,
     ) -> Result<WorkflowRun, StoreError> {
         self.transaction(|mut state, now| {
-        command_fence(&state, scope, &command.run_id, Some(&command.permit), now, false)?;
-        if !command
-            .compatibility_evidence
-            .incompatible_reference_locations
-            .is_empty()
-        {
-            return Err(StoreError::IncompatiblePins);
-        }
-        let key = (scope.clone(), command.run_id.clone());
-        let run = state.runs.get_mut(&key).ok_or(StoreError::NotFound)?;
-        if run.status != RunState::Pending {
-            return Err(StoreError::IllegalTransition);
-        }
-        run.status = RunState::Running;
-        run.started_at = Some(now);
-        set_run_mutated(run, now)?;
-        let revision_hash = run.revision_hash.clone();
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            vec![event_spec(
-                EventType::RunStarted,
-                "R02",
-                None,
-                None,
-                None,
-                json!({
-                    "revision_hash": revision_hash,
-                    "compatibility_evidence_digest": command.compatibility_evidence.evidence_digest
-                }),
-            )],
-        )?;
-        Ok(state.runs.get(&key).expect("run").clone())
+            command_fence(
+                &state,
+                scope,
+                &command.run_id,
+                Some(&command.permit),
+                now,
+                false,
+            )?;
+            if !command
+                .compatibility_evidence
+                .incompatible_reference_locations
+                .is_empty()
+            {
+                return Err(StoreError::IncompatiblePins);
+            }
+            let key = (scope.clone(), command.run_id.clone());
+            let run = state.runs.get_mut(&key).ok_or(StoreError::NotFound)?;
+            if run.status != RunState::Pending {
+                return Err(StoreError::IllegalTransition);
+            }
+            run.status = RunState::Running;
+            run.started_at = Some(now);
+            set_run_mutated(run, now)?;
+            let revision_hash = run.revision_hash.clone();
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                vec![event_spec(
+                    "R02",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_started(
+                        &(revision_hash),
+                        &(command.compatibility_evidence.evidence_digest),
+                    ),
+                )],
+            )?;
+            Ok(state.runs.get(&key).expect("run").clone())
         })
     }
     async fn suspend_incompatible(
@@ -2118,141 +2831,140 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: SuspendIncompatible,
     ) -> Result<WorkflowRun, StoreError> {
         self.transaction(|mut state, now| {
-        permit_check(&state, scope, &command.permit, now)?;
-        verified(&mut state, scope, &command.incompatibilities, now)?;
-        if command.incompatibilities.size_bytes() > 65_536 {
-            return Err(StoreError::EvidenceInvalid);
-        }
-        let key = (scope.clone(), command.run_id.clone());
-        let suspension_fingerprint = suspension_fingerprint(
-            scope,
-            &command.run_id,
-            &command.incompatibilities,
-            &command.evidence.evidence_digest,
-        );
-        let current = state.runs.get(&key).cloned().ok_or(StoreError::NotFound)?;
-        if current.status == RunState::BlockedIncompatible
-            && current.blocked_incompatibility_fingerprint.as_ref() == Some(&suspension_fingerprint)
-        {
-            return Ok(current);
-        }
-        if current.status == RunState::BlockedIncompatible {
-            return Err(StoreError::RunBlockedIncompatible);
-        }
-        if !matches!(current.status, RunState::Pending | RunState::Running)
-            || command.evidence.incompatible_reference_locations.is_empty()
-        {
-            return Err(StoreError::IllegalTransition);
-        }
-        if state.attempts.values().any(|attempt| {
-            attempt.scope == *scope
-                && attempt.run_id == command.run_id
-                && attempt.status == AttemptState::Started
-        }) {
-            return Err(StoreError::CurrentGenerationAttemptPresent);
-        }
-        let incompatibilities_ref = json_ref(
+            permit_check(&state, scope, &command.permit, now)?;
+            verified(&mut state, scope, &command.incompatibilities, now)?;
+            if command.incompatibilities.size_bytes() > 65_536 {
+                return Err(StoreError::EvidenceInvalid);
+            }
+            let key = (scope.clone(), command.run_id.clone());
+            let suspension_fingerprint = suspension_fingerprint(
+                scope,
+                &command.run_id,
+                &command.incompatibilities,
+                &command.evidence.evidence_digest,
+            );
+            let current = state.runs.get(&key).cloned().ok_or(StoreError::NotFound)?;
+            if current.status == RunState::BlockedIncompatible
+                && current.blocked_incompatibility_fingerprint.as_ref()
+                    == Some(&suspension_fingerprint)
+            {
+                return Ok(current);
+            }
+            if current.status == RunState::BlockedIncompatible {
+                return Err(StoreError::RunBlockedIncompatible);
+            }
+            if !matches!(current.status, RunState::Pending | RunState::Running)
+                || command.evidence.incompatible_reference_locations.is_empty()
+            {
+                return Err(StoreError::IllegalTransition);
+            }
+            if state.attempts.values().any(|attempt| {
+                attempt.scope == *scope
+                    && attempt.run_id == command.run_id
+                    && attempt.status == AttemptState::Started
+            }) {
+                return Err(StoreError::CurrentGenerationAttemptPresent);
+            }
+            let incompatibilities_ref = json_ref(
                 &mut state,
-            scope,
-            &command.incompatibilities,
-            ArtifactKind::CompatibilityEvidence,
-            Some(&command.run_id),
-            None,
-            None,
-            0,
-            now,
-        )?;
-        let incompatible = command
-            .evidence
-            .incompatible_reference_locations
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut specs = Vec::new();
-        let mut frontier_changed = false;
-        for node in state.nodes.values_mut().filter(|node| {
-            node.scope == *scope
-                && node.run_id == command.run_id
-                && matches!(
-                    node.status,
-                    NodeState::Pending
-                        | NodeState::Ready
-                        | NodeState::RetryWaiting
-                        | NodeState::BudgetWaiting
-                )
-                && {
-                    let location = if node.parent_map_instance_id.is_some() {
-                        format!("{}/map_action", node.definition_node_id.as_str())
-                    } else {
-                        node.definition_node_id.as_str().to_owned()
-                    };
-                    incompatible.contains(&location)
-                }
-        }) {
-            frontier_changed = true;
-            let prior = node.status;
-            node.blocked_from_status = Some(match prior {
-                NodeState::Pending => BlockedFromState::Pending,
-                NodeState::Ready => BlockedFromState::Ready,
-                NodeState::RetryWaiting => BlockedFromState::RetryWaiting,
-                NodeState::BudgetWaiting => BlockedFromState::BudgetWaiting,
-                _ => unreachable!(),
-            });
-            node.status = NodeState::BlockedIncompatible;
-            set_node_mutated(node, now)?;
-            specs.push(event_spec(
-                EventType::NodeBlockedIncompatible,
-                match prior {
-                    NodeState::Pending => "N29",
-                    NodeState::Ready => "N30",
-                    NodeState::RetryWaiting => "N31",
-                    NodeState::BudgetWaiting => "N61",
+                scope,
+                &command.incompatibilities,
+                ArtifactKind::CompatibilityEvidence,
+                Some(&command.run_id),
+                None,
+                None,
+                0,
+                now,
+            )?;
+            let incompatible = command
+                .evidence
+                .incompatible_reference_locations
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let mut specs = Vec::new();
+            let mut frontier_changed = false;
+            for node in state.nodes.values_mut().filter(|node| {
+                node.scope == *scope
+                    && node.run_id == command.run_id
+                    && matches!(
+                        node.status,
+                        NodeState::Pending
+                            | NodeState::Ready
+                            | NodeState::RetryWaiting
+                            | NodeState::BudgetWaiting
+                    )
+                    && {
+                        let location = if node.parent_map_instance_id.is_some() {
+                            format!("{}/map_action", node.definition_node_id.as_str())
+                        } else {
+                            node.definition_node_id.as_str().to_owned()
+                        };
+                        incompatible.contains(&location)
+                    }
+            }) {
+                frontier_changed = true;
+                let prior = node.status;
+                node.blocked_from_status = Some(match prior {
+                    NodeState::Pending => BlockedFromState::Pending,
+                    NodeState::Ready => BlockedFromState::Ready,
+                    NodeState::RetryWaiting => BlockedFromState::RetryWaiting,
+                    NodeState::BudgetWaiting => BlockedFromState::BudgetWaiting,
                     _ => unreachable!(),
+                });
+                node.status = NodeState::BlockedIncompatible;
+                set_node_mutated(node, now)?;
+                specs.push(event_spec(
+                    match prior {
+                        NodeState::Pending => "N29",
+                        NodeState::Ready => "N30",
+                        NodeState::RetryWaiting => "N31",
+                        NodeState::BudgetWaiting => "N61",
+                        _ => unreachable!(),
+                    },
+                    Some(&node.node_instance_id),
+                    None,
+                    None,
+                    event_payload::node_blocked_incompatible(
+                        &(prior),
+                        &(node.definition_node_id),
+                        &(command.evidence.evidence_digest),
+                    ),
+                ));
+            }
+            if frontier_changed {
+                bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            }
+            let run = state.runs.get_mut(&key).expect("run exists");
+            run.status = RunState::BlockedIncompatible;
+            run.blocked_incompatibilities_ref = Some(incompatibilities_ref);
+            run.blocked_incompatibility_fingerprint = Some(suspension_fingerprint.clone());
+            set_run_mutated(run, now)?;
+            specs.push(event_spec(
+                if current.status == RunState::Pending {
+                    "R03"
+                } else {
+                    "R04"
                 },
-                Some(&node.node_instance_id),
                 None,
                 None,
-                json!({
-                    "blocked_from_status": prior,
-                    "action_reference_location": node.definition_node_id,
-                    "required_semantic_digest": command.evidence.evidence_digest
-                }),
+                None,
+                event_payload::run_blocked_incompatible(
+                    &(command.incompatibilities.digest()),
+                    &(command.evidence.incompatible_reference_locations),
+                    &(suspension_fingerprint),
+                ),
             ));
-        }
-        if frontier_changed {
-            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-        }
-        let run = state.runs.get_mut(&key).expect("run exists");
-        run.status = RunState::BlockedIncompatible;
-        run.blocked_incompatibilities_ref = Some(incompatibilities_ref);
-        run.blocked_incompatibility_fingerprint = Some(suspension_fingerprint.clone());
-        set_run_mutated(run, now)?;
-        specs.push(event_spec(
-            EventType::RunBlockedIncompatible,
-            if current.status == RunState::Pending {
-                "R03"
-            } else {
-                "R04"
-            },
-            None,
-            None,
-            None,
-            json!({
-                "incompatibilities_digest": command.incompatibilities.digest(),
-                "incompatible_reference_locations": command.evidence.incompatible_reference_locations,
-                "suspension_fingerprint": suspension_fingerprint
-            }),
-        ));
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(state.runs.get(&key).expect("run").clone())
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(state.runs.get(&key).expect("run").clone())
         })
     }
     async fn resume_compatible(
@@ -2261,81 +2973,92 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: ResumeCompatible,
     ) -> Result<WorkflowRun, StoreError> {
         self.transaction(|mut state, now| {
-        command_fence(&state, scope, &command.run_id, Some(&command.permit), now, true)?;
-        if !command
-            .availability_evidence
-            .incompatible_reference_locations
-            .is_empty()
-        {
-            return Err(StoreError::StillIncompatible {
-                pins: command
-                    .availability_evidence
-                    .incompatible_reference_locations,
-            });
-        }
-        let key = (scope.clone(), command.run_id.clone());
-        if state.runs.get(&key).ok_or(StoreError::NotFound)?.status != RunState::BlockedIncompatible
-        {
-            return Err(StoreError::IllegalTransition);
-        }
-        let mut specs = Vec::new();
-        let mut frontier_changed = false;
-        for node in state.nodes.values_mut().filter(|node| {
-            node.scope == *scope
-                && node.run_id == command.run_id
-                && node.status == NodeState::BlockedIncompatible
-        }) {
-            frontier_changed = true;
-            let restored = match node.blocked_from_status.take() {
-                Some(BlockedFromState::Pending) => NodeState::Pending,
-                Some(BlockedFromState::Ready) => NodeState::Ready,
-                Some(BlockedFromState::RetryWaiting) => NodeState::RetryWaiting,
-                Some(BlockedFromState::BudgetWaiting) => NodeState::BudgetWaiting,
-                None => return Err(StoreError::CorruptControlPlane),
-            };
-            node.status = restored;
-            set_node_mutated(node, now)?;
+            command_fence(
+                &state,
+                scope,
+                &command.run_id,
+                Some(&command.permit),
+                now,
+                true,
+            )?;
+            if !command
+                .availability_evidence
+                .incompatible_reference_locations
+                .is_empty()
+            {
+                return Err(StoreError::StillIncompatible {
+                    pins: command
+                        .availability_evidence
+                        .incompatible_reference_locations,
+                });
+            }
+            let key = (scope.clone(), command.run_id.clone());
+            if state.runs.get(&key).ok_or(StoreError::NotFound)?.status
+                != RunState::BlockedIncompatible
+            {
+                return Err(StoreError::IllegalTransition);
+            }
+            let mut specs = Vec::new();
+            let mut frontier_changed = false;
+            for node in state.nodes.values_mut().filter(|node| {
+                node.scope == *scope
+                    && node.run_id == command.run_id
+                    && node.status == NodeState::BlockedIncompatible
+            }) {
+                frontier_changed = true;
+                let restored = match node.blocked_from_status.take() {
+                    Some(BlockedFromState::Pending) => NodeState::Pending,
+                    Some(BlockedFromState::Ready) => NodeState::Ready,
+                    Some(BlockedFromState::RetryWaiting) => NodeState::RetryWaiting,
+                    Some(BlockedFromState::BudgetWaiting) => NodeState::BudgetWaiting,
+                    None => return Err(StoreError::CorruptControlPlane),
+                };
+                node.status = restored;
+                set_node_mutated(node, now)?;
+                specs.push(event_spec(
+                    match restored {
+                        NodeState::Pending => "N32",
+                        NodeState::Ready => "N33",
+                        NodeState::RetryWaiting => "N34",
+                        NodeState::BudgetWaiting => "N62",
+                        _ => unreachable!(),
+                    },
+                    Some(&node.node_instance_id),
+                    None,
+                    None,
+                    event_payload::node_resumed_compatible(
+                        &(restored),
+                        &(command.availability_evidence.evidence_digest),
+                    ),
+                ));
+            }
+            if frontier_changed {
+                bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            }
+            let run = state.runs.get_mut(&key).expect("run");
+            run.status = RunState::Running;
+            run.blocked_incompatibilities_ref = None;
+            run.blocked_incompatibility_fingerprint = None;
+            set_run_mutated(run, now)?;
             specs.push(event_spec(
-                EventType::NodeResumedCompatible,
-                match restored {
-                    NodeState::Pending => "N32",
-                    NodeState::Ready => "N33",
-                    NodeState::RetryWaiting => "N34",
-                    NodeState::BudgetWaiting => "N62",
-                    _ => unreachable!(),
-                },
-                Some(&node.node_instance_id),
+                "R05",
                 None,
                 None,
-                json!({"restored_status": restored, "available_semantic_digest": command.availability_evidence.evidence_digest}),
+                None,
+                event_payload::run_resumed_compatible(
+                    &(command.availability_evidence.evidence_digest),
+                ),
             ));
-        }
-        if frontier_changed {
-            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-        }
-        let run = state.runs.get_mut(&key).expect("run");
-        run.status = RunState::Running;
-        run.blocked_incompatibilities_ref = None;
-        run.blocked_incompatibility_fingerprint = None;
-        set_run_mutated(run, now)?;
-        specs.push(event_spec(
-            EventType::RunResumedCompatible,
-            "R05",
-            None,
-            None,
-            None,
-            json!({"compatibility_evidence_digest": command.availability_evidence.evidence_digest}),
-        ));
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(state.runs.get(&key).expect("run").clone())
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(state.runs.get(&key).expect("run").clone())
         })
     }
     async fn claim_node_attempt(
@@ -2344,146 +3067,117 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: ClaimNodeAttempt,
     ) -> Result<ClaimNodeAttemptResult, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        verified(&mut state, scope, &command.bound_input, now)?;
-        if command.bound_input.media_type() != "application/json" {
-            return Err(StoreError::InvalidField);
-        }
-        let run_key = (scope.clone(), command.run_id.clone());
-        let run_snapshot = state
-            .runs
-            .get(&run_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if run_snapshot.status == RunState::BlockedIncompatible {
-            return Err(StoreError::RunBlockedIncompatible);
-        }
-        if run_snapshot.status != RunState::Running {
-            return Err(StoreError::IllegalTransition);
-        }
-        if command.bound_input.size_bytes() > run_snapshot.limits.max_inline_json_bytes_per_value {
-            return Err(StoreError::RunLimitApplied {
-                code: "InlineJsonLimitExceeded".to_owned(),
-            });
-        }
-        let aggregate_after_input = run_snapshot
-            .aggregate_object_bytes
-            .checked_add(command.bound_input.size_bytes())
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        if aggregate_after_input > run_snapshot.limits.max_aggregate_object_bytes_per_run {
-            return Err(StoreError::RunLimitApplied {
-                code: "AggregateObjectLimitExceeded".to_owned(),
-            });
-        }
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let source_status = node.status;
-        if node.version != command.expected_node_version
-            || !matches!(node.status, NodeState::Ready | NodeState::BudgetWaiting)
-            || node.active_attempt_id.is_some()
-        {
-            return Err(StoreError::CasConflict);
-        }
-        if node.kind != NodeKind::Action {
-            return Err(StoreError::IllegalTransition);
-        }
-        let definition = state
-            .run_definitions
-            .get(&run_key)
-            .cloned()
-            .ok_or(StoreError::CorruptControlPlane)?;
-        let (action, retry, timeout_ms, declared_max) =
-            action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
-        if node.attempt_count >= retry.max_attempts {
-            return Err(StoreError::IllegalTransition);
-        }
-        if state.attempts.contains_key(&(
-            scope.clone(),
-            command.run_id.clone(),
-            command.attempt_id.clone(),
-        )) {
-            return Err(StoreError::AttemptIdConflict);
-        }
-        if run_snapshot.total_attempt_count >= run_snapshot.limits.max_total_attempts {
-            let mut specs = vec![event_spec(
-                EventType::NodeContractFailed,
-                if node.status == NodeState::BudgetWaiting {
-                    "N64"
-                } else {
-                    "N46"
-                },
-                Some(&node.node_instance_id),
-                None,
-                None,
-                json!({"failure_kind": "RunAttemptLimitExceeded"}),
-            )];
-            node.status = NodeState::ContractFailed;
-            node.failure_kind = Some(NodeFailureKind::RunAttemptLimitExceeded);
-            node.budget_wait_amount = None;
-            set_node_mutated(&mut node, now)?;
-            state.nodes.insert(node_key, node);
-            let run = terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::ContractFailed,
-                Some(RunFailureKind::RunAttemptLimitExceeded),
-                "RunAttemptLimitExceeded",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(
-                EventType::RunContractFailed,
-                "R08",
-                None,
-                None,
-                None,
-                json!({"failure_kind": "RunAttemptLimitExceeded"}),
-            ));
-            append_batch(
-                &mut state,
-                scope,
-                &command.run_id,
-                now,
-                EventActorKind::Engine,
-                command.permit.instance_id().as_str().to_owned(),
-                specs,
-            )?;
-            return Ok(ClaimNodeAttemptResult::RunLimitApplied(run));
-        }
-        let available = run_snapshot
-            .budget_limit
-            .0
-            .checked_sub(run_snapshot.budget_consumed.0)
-            .and_then(|value| value.checked_sub(run_snapshot.budget_reserved.0))
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        let limit_minus_consumed = run_snapshot
-            .budget_limit
-            .0
-            .checked_sub(run_snapshot.budget_consumed.0)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        if available < declared_max.0 {
-            if declared_max.0 <= limit_minus_consumed {
-                if source_status == NodeState::BudgetWaiting
-                    && node.budget_wait_amount == Some(declared_max)
-                {
-                    return Ok(ClaimNodeAttemptResult::BudgetWaitingApplied(node));
-                }
-                node.status = NodeState::BudgetWaiting;
-                node.budget_wait_amount = Some(declared_max);
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            verified(&mut state, scope, &command.bound_input, now)?;
+            if command.bound_input.media_type() != "application/json" {
+                return Err(StoreError::InvalidField);
+            }
+            let run_key = (scope.clone(), command.run_id.clone());
+            let run_snapshot = state
+                .runs
+                .get(&run_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if run_snapshot.status == RunState::BlockedIncompatible {
+                return Err(StoreError::RunBlockedIncompatible);
+            }
+            if run_snapshot.status != RunState::Running {
+                return Err(StoreError::IllegalTransition);
+            }
+            if command.bound_input.size_bytes()
+                > run_snapshot.limits.max_inline_json_bytes_per_value
+            {
+                return Err(StoreError::RunLimitApplied {
+                    code: "InlineJsonLimitExceeded".to_owned(),
+                });
+            }
+            let aggregate_after_input = run_snapshot
+                .aggregate_object_bytes
+                .checked_add(command.bound_input.size_bytes())
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if aggregate_after_input > run_snapshot.limits.max_aggregate_object_bytes_per_run {
+                return Err(StoreError::RunLimitApplied {
+                    code: "AggregateObjectLimitExceeded".to_owned(),
+                });
+            }
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let source_status = node.status;
+            if node.version != command.expected_node_version
+                || !matches!(node.status, NodeState::Ready | NodeState::BudgetWaiting)
+                || node.active_attempt_id.is_some()
+            {
+                return Err(StoreError::CasConflict);
+            }
+            if node.kind != NodeKind::Action {
+                return Err(StoreError::IllegalTransition);
+            }
+            let definition = state
+                .run_definitions
+                .get(&run_key)
+                .cloned()
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let (action, retry, timeout_ms, declared_max) =
+                action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
+            if node.attempt_count >= retry.max_attempts {
+                return Err(StoreError::IllegalTransition);
+            }
+            if state.attempts.contains_key(&(
+                scope.clone(),
+                command.run_id.clone(),
+                command.attempt_id.clone(),
+            )) {
+                return Err(StoreError::AttemptIdConflict);
+            }
+            if run_snapshot.total_attempt_count >= run_snapshot.limits.max_total_attempts {
+                let mut specs = vec![event_spec(
+                    if node.status == NodeState::BudgetWaiting {
+                        "N64"
+                    } else {
+                        "N46"
+                    },
+                    Some(&node.node_instance_id),
+                    None,
+                    None,
+                    event_payload::node_contract_failed(
+                        &(Option::<()>::None),
+                        &("RunAttemptLimitExceeded"),
+                        &(Option::<()>::None),
+                    ),
+                )];
+                node.status = NodeState::ContractFailed;
+                node.failure_kind = Some(NodeFailureKind::RunAttemptLimitExceeded);
+                node.budget_wait_amount = None;
                 set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node.clone());
-                bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-                let run = state.runs.get_mut(&run_key).expect("run");
-                set_run_mutated(run, now)?;
+                state.nodes.insert(node_key, node);
+                let run = terminalize_run(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    RunState::ContractFailed,
+                    Some(RunFailureKind::RunAttemptLimitExceeded),
+                    "RunAttemptLimitExceeded",
+                    now,
+                    &mut specs,
+                )?;
+                specs.push(event_spec(
+                    "R08",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_contract_failed(
+                        &("RunAttemptLimitExceeded"),
+                        &(Option::<()>::None),
+                    ),
+                ));
                 append_batch(
                     &mut state,
                     scope,
@@ -2491,58 +3185,268 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     now,
                     EventActorKind::Engine,
                     command.permit.instance_id().as_str().to_owned(),
-                    vec![event_spec(
-                        EventType::NodeBudgetWaiting,
-                        "N59",
+                    specs,
+                )?;
+                return Ok(ClaimNodeAttemptResult::RunLimitApplied(run));
+            }
+            let available = run_snapshot
+                .budget_limit
+                .0
+                .checked_sub(run_snapshot.budget_consumed.0)
+                .and_then(|value| value.checked_sub(run_snapshot.budget_reserved.0))
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            let limit_minus_consumed = run_snapshot
+                .budget_limit
+                .0
+                .checked_sub(run_snapshot.budget_consumed.0)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if available < declared_max.0 {
+                if declared_max.0 <= limit_minus_consumed {
+                    if source_status == NodeState::BudgetWaiting
+                        && node.budget_wait_amount == Some(declared_max)
+                    {
+                        return Ok(ClaimNodeAttemptResult::BudgetWaitingApplied(node));
+                    }
+                    node.status = NodeState::BudgetWaiting;
+                    node.budget_wait_amount = Some(declared_max);
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node.clone());
+                    bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+                    let run = state.runs.get_mut(&run_key).expect("run");
+                    set_run_mutated(run, now)?;
+                    append_batch(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        now,
+                        EventActorKind::Engine,
+                        command.permit.instance_id().as_str().to_owned(),
+                        vec![event_spec(
+                            "N59",
+                            Some(&command.node_id),
+                            None,
+                            None,
+                            event_payload::node_budget_waiting(
+                                &(declared_max),
+                                &(available.to_string()),
+                                &(run_snapshot.budget_consumed),
+                                &(run_snapshot.budget_reserved),
+                                &(run_snapshot.budget_limit),
+                            ),
+                        )],
+                    )?;
+                    return Ok(ClaimNodeAttemptResult::BudgetWaitingApplied(node));
+                }
+                node.status = NodeState::BudgetExhausted;
+                node.failure_kind = None;
+                node.budget_wait_amount = None;
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(node_key, node);
+                let mut specs = vec![
+                    event_spec(
+                        if source_status == NodeState::BudgetWaiting {
+                            "N60"
+                        } else {
+                            "N27"
+                        },
                         Some(&command.node_id),
                         None,
                         None,
-                        json!({"requested": declared_max, "available": available.to_string(), "consumed": run_snapshot.budget_consumed, "reserved": run_snapshot.budget_reserved, "limit": run_snapshot.budget_limit}),
-                    )],
+                        event_payload::node_budget_exhausted(
+                            &(declared_max),
+                            &(available.to_string()),
+                            &(limit_minus_consumed.to_string()),
+                        ),
+                    ),
+                    event_spec(
+                        if source_status == NodeState::BudgetWaiting {
+                            "N60"
+                        } else {
+                            "N27"
+                        },
+                        Some(&command.node_id),
+                        None,
+                        None,
+                        event_payload::budget_reservation_refused(
+                            &(declared_max),
+                            &(run_snapshot.budget_consumed),
+                            &(run_snapshot.budget_reserved),
+                            &(run_snapshot.budget_limit),
+                            &(available.to_string()),
+                            &(true),
+                        ),
+                    ),
+                ];
+                let run = terminalize_run(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    RunState::BudgetExhausted,
+                    None,
+                    "BudgetExhausted",
+                    now,
+                    &mut specs,
                 )?;
-                return Ok(ClaimNodeAttemptResult::BudgetWaitingApplied(node));
+                specs.push(event_spec(
+                    "R10",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_budget_exhausted(
+                        &(command.node_id),
+                        &(declared_max),
+                        &(available.to_string()),
+                        &(limit_minus_consumed.to_string()),
+                        &(true),
+                    ),
+                ));
+                append_batch(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    now,
+                    EventActorKind::Engine,
+                    command.permit.instance_id().as_str().to_owned(),
+                    specs,
+                )?;
+                return Ok(ClaimNodeAttemptResult::BudgetExhaustedApplied(run));
             }
-            node.status = NodeState::BudgetExhausted;
-            node.failure_kind = None;
+            let credential = CompletionCredential::from_minted_bytes(entropy()?);
+            let deadline_at = checked_add_time(now, timeout_ms)?;
+            let bound_input_ref = json_ref(
+                &mut state,
+                scope,
+                &command.bound_input,
+                ArtifactKind::ActionInvocationInput,
+                Some(&command.run_id),
+                Some(&command.node_id),
+                Some(&command.attempt_id),
+                0,
+                now,
+            )?;
+            let reference_location = if node.parent_map_instance_id.is_some() {
+                format!("{}/map_action", node.definition_node_id.as_str())
+            } else {
+                node.definition_node_id.as_str().to_owned()
+            };
+            let invocation = ActionInvocation {
+                scope: scope.clone(),
+                run_id: command.run_id.clone(),
+                invocation_id: command.attempt_id.clone(),
+                node_instance_id: command.node_id.clone(),
+                attempt_id: command.attempt_id.clone(),
+                action_reference_location: reference_location,
+                action_name: action.name.clone(),
+                contract_version: action.contract_version.clone(),
+                revision_hash: run_snapshot.revision_hash.clone(),
+                input_schema_digest: action.input_schema_digest.clone(),
+                output_schema_digest: action.output_schema_digest.clone(),
+                compatible_implementation_requirement: action
+                    .compatible_implementation_requirement
+                    .clone(),
+                bound_input_ref,
+                bound_input_digest: command.bound_input.digest().clone(),
+                bound_input_size_bytes: command.bound_input.size_bytes(),
+                binding_derivation_digest: command.binding_derivation_digest,
+                created_at: now,
+            };
+            let attempt_number = node
+                .attempt_count
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            let attempt = NodeAttempt {
+                scope: scope.clone(),
+                run_id: command.run_id.clone(),
+                attempt_id: command.attempt_id.clone(),
+                node_instance_id: command.node_id.clone(),
+                attempt_number,
+                worker_id: command.worker_id.clone(),
+                engine_instance_id: command.permit.instance_id().clone(),
+                engine_generation: command.permit.generation(),
+                completion_credential_digest: credential.digest(),
+                invocation_id: invocation.invocation_id.clone(),
+                idempotency_key: idempotency_key(scope, &command.run_id, &command.node_id),
+                status: AttemptState::Started,
+                declared_max_cost: declared_max,
+                reserved_cost: declared_max,
+                settled_cost: None,
+                deadline_at,
+                started_at: now,
+                finished_at: None,
+                output_ref: None,
+                artifact_refs: Vec::new(),
+                error_class: None,
+                error_code: None,
+                diagnostics_ref: None,
+            };
+            node.status = NodeState::Running;
+            node.active_attempt_id = Some(command.attempt_id.clone());
+            node.attempt_count = attempt_number;
             node.budget_wait_amount = None;
             set_node_mutated(&mut node, now)?;
             state.nodes.insert(node_key, node);
-            let mut specs = vec![
-                event_spec(
-                    EventType::NodeBudgetExhausted,
-                    if source_status == NodeState::BudgetWaiting { "N60" } else { "N27" },
-                    Some(&command.node_id),
-                    None,
-                    None,
-                    json!({"requested": declared_max, "available": available.to_string(), "limit_minus_consumed": limit_minus_consumed.to_string()}),
+            state.attempts.insert(
+                (
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.attempt_id.clone(),
                 ),
-                event_spec(
-                    EventType::BudgetReservationRefused,
-                    if source_status == NodeState::BudgetWaiting { "N60" } else { "N27" },
-                    Some(&command.node_id),
-                    None,
-                    None,
-                    json!({"requested": declared_max, "consumed": run_snapshot.budget_consumed, "reserved": run_snapshot.budget_reserved, "limit": run_snapshot.budget_limit, "available": available.to_string(), "permanently_infeasible": true}),
+                attempt.clone(),
+            );
+            state.invocations.insert(
+                (
+                    scope.clone(),
+                    command.run_id.clone(),
+                    invocation.invocation_id.clone(),
                 ),
-            ];
-            let run = terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::BudgetExhausted,
-                None,
-                "BudgetExhausted",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(
-                EventType::RunBudgetExhausted,
-                "R10",
-                None,
-                None,
-                None,
-                json!({"node_instance_id": command.node_id, "requested": declared_max, "available": available.to_string(), "limit_minus_consumed": limit_minus_consumed.to_string(), "permanently_infeasible": true}),
-            ));
+                invocation.clone(),
+            );
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            let run = state.runs.get_mut(&run_key).expect("run");
+            run.total_attempt_count = run
+                .total_attempt_count
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            run.budget_reserved.0 = run
+                .budget_reserved
+                .0
+                .checked_add(declared_max.0)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            run.aggregate_object_bytes = run
+                .aggregate_object_bytes
+                .checked_add(command.bound_input.size_bytes())
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
+                return Err(StoreError::RunLimitApplied {
+                    code: "AggregateObjectLimitExceeded".to_owned(),
+                });
+            }
+            set_run_mutated(run, now)?;
+            let ledger_key = (scope.clone(), command.run_id.clone());
+            let ledger_seq = u64::try_from(state.ledger.get(&ledger_key).map_or(0, Vec::len))
+                .map_err(|_| StoreError::ArithmeticOverflow)?
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            state
+                .ledger
+                .entry(ledger_key.clone())
+                .or_default()
+                .push(BudgetLedgerEntry {
+                    scope: scope.clone(),
+                    run_id: command.run_id.clone(),
+                    ledger_seq,
+                    attempt_id: command.attempt_id.clone(),
+                    node_instance_id: command.node_id.clone(),
+                    kind: BudgetLedgerKind::Reserve,
+                    reserved_delta: i128::from(declared_max.0),
+                    consumed_delta: CostUnits(0),
+                    reservation_amount: declared_max,
+                    reason: BudgetLedgerReason::Started,
+                    created_at: now,
+                });
+            let available_after = available
+                .checked_sub(declared_max.0)
+                .ok_or(StoreError::ArithmeticOverflow)?;
             append_batch(
                 &mut state,
                 scope,
@@ -2550,184 +3454,52 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 now,
                 EventActorKind::Engine,
                 command.permit.instance_id().as_str().to_owned(),
-                specs,
+                vec![
+                    event_spec(
+                        "A01",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::attempt_started(
+                            &(attempt_number),
+                            &(command.worker_id),
+                            &(command.permit.generation()),
+                            &(deadline_at),
+                            &(declared_max),
+                            &(digest(attempt.idempotency_key.as_bytes())),
+                            &(invocation.bound_input_digest),
+                            &(credential.digest()),
+                        ),
+                    ),
+                    event_spec(
+                        "N05",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::node_attempt_claimed(
+                            &(command.attempt_id),
+                            &(invocation.invocation_id),
+                            &(attempt_number),
+                            &(attempt.worker_id),
+                        ),
+                    ),
+                    event_spec(
+                        "A01",
+                        Some(&command.node_id),
+                        Some(&attempt.attempt_id),
+                        None,
+                        event_payload::budget_reserved(
+                            &(ledger_seq),
+                            &(declared_max),
+                            &(available_after.to_string()),
+                        ),
+                    ),
+                ],
             )?;
-            return Ok(ClaimNodeAttemptResult::BudgetExhaustedApplied(run));
-        }
-        let credential = CompletionCredential::from_minted_bytes(entropy()?);
-        let deadline_at = checked_add_time(now, timeout_ms)?;
-        let bound_input_ref = json_ref(
-                &mut state,
-            scope,
-            &command.bound_input,
-            ArtifactKind::ActionInvocationInput,
-            Some(&command.run_id),
-            Some(&command.node_id),
-            Some(&command.attempt_id),
-            0,
-            now,
-        )?;
-        let reference_location = if node.parent_map_instance_id.is_some() {
-            format!("{}/map_action", node.definition_node_id.as_str())
-        } else {
-            node.definition_node_id.as_str().to_owned()
-        };
-        let invocation = ActionInvocation {
-            scope: scope.clone(),
-            run_id: command.run_id.clone(),
-            invocation_id: command.attempt_id.clone(),
-            node_instance_id: command.node_id.clone(),
-            attempt_id: command.attempt_id.clone(),
-            action_reference_location: reference_location,
-            action_name: action.name.clone(),
-            contract_version: action.contract_version.clone(),
-            revision_hash: run_snapshot.revision_hash.clone(),
-            input_schema_digest: action.input_schema_digest.clone(),
-            output_schema_digest: action.output_schema_digest.clone(),
-            compatible_implementation_requirement: action
-                .compatible_implementation_requirement
-                .clone(),
-            bound_input_ref,
-            bound_input_digest: command.bound_input.digest().clone(),
-            bound_input_size_bytes: command.bound_input.size_bytes(),
-            binding_derivation_digest: command.binding_derivation_digest,
-            created_at: now,
-        };
-        let attempt_number = node
-            .attempt_count
-            .checked_add(1)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        let attempt = NodeAttempt {
-            scope: scope.clone(),
-            run_id: command.run_id.clone(),
-            attempt_id: command.attempt_id.clone(),
-            node_instance_id: command.node_id.clone(),
-            attempt_number,
-            worker_id: command.worker_id.clone(),
-            engine_instance_id: command.permit.instance_id().clone(),
-            engine_generation: command.permit.generation(),
-            completion_credential_digest: credential.digest(),
-            invocation_id: invocation.invocation_id.clone(),
-            idempotency_key: idempotency_key(scope, &command.run_id, &command.node_id),
-            status: AttemptState::Started,
-            declared_max_cost: declared_max,
-            reserved_cost: declared_max,
-            settled_cost: None,
-            deadline_at,
-            started_at: now,
-            finished_at: None,
-            output_ref: None,
-            artifact_refs: Vec::new(),
-            error_class: None,
-            error_code: None,
-            diagnostics_ref: None,
-        };
-        node.status = NodeState::Running;
-        node.active_attempt_id = Some(command.attempt_id.clone());
-        node.attempt_count = attempt_number;
-        node.budget_wait_amount = None;
-        set_node_mutated(&mut node, now)?;
-        state.nodes.insert(node_key, node);
-        state.attempts.insert(
-            (
-                scope.clone(),
-                command.run_id.clone(),
-                command.attempt_id.clone(),
-            ),
-            attempt.clone(),
-        );
-        state.invocations.insert(
-            (
-                scope.clone(),
-                command.run_id.clone(),
-                invocation.invocation_id.clone(),
-            ),
-            invocation.clone(),
-        );
-        bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-        let run = state.runs.get_mut(&run_key).expect("run");
-        run.total_attempt_count = run
-            .total_attempt_count
-            .checked_add(1)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        run.budget_reserved.0 = run
-            .budget_reserved
-            .0
-            .checked_add(declared_max.0)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        run.aggregate_object_bytes = run
-            .aggregate_object_bytes
-            .checked_add(command.bound_input.size_bytes())
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
-            return Err(StoreError::RunLimitApplied {
-                code: "AggregateObjectLimitExceeded".to_owned(),
-            });
-        }
-        set_run_mutated(run, now)?;
-        let ledger_key = (scope.clone(), command.run_id.clone());
-        let ledger_seq = u64::try_from(state.ledger.get(&ledger_key).map_or(0, Vec::len))
-            .map_err(|_| StoreError::ArithmeticOverflow)?
-            .checked_add(1)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        state
-            .ledger
-            .entry(ledger_key.clone())
-            .or_default()
-            .push(BudgetLedgerEntry {
-                scope: scope.clone(),
-                run_id: command.run_id.clone(),
-                ledger_seq,
-                attempt_id: command.attempt_id.clone(),
-                node_instance_id: command.node_id.clone(),
-                kind: BudgetLedgerKind::Reserve,
-                reserved_delta: i128::from(declared_max.0),
-                consumed_delta: CostUnits(0),
-                reservation_amount: declared_max,
-                reason: BudgetLedgerReason::Started,
-                created_at: now,
-            });
-        let available_after = available
-            .checked_sub(declared_max.0)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            vec![
-                event_spec(
-                    EventType::AttemptStarted,
-                    "A01",
-                    Some(&command.node_id),
-                    Some(&command.attempt_id),
-                    None,
-                    json!({"attempt_number": attempt_number, "worker_id": command.worker_id, "engine_generation": command.permit.generation(), "deadline_at": deadline_at, "declared_max_cost_units": declared_max, "idempotency_key_digest": digest(attempt.idempotency_key.as_bytes()), "bound_input_digest": invocation.bound_input_digest, "completion_credential_digest": credential.digest()}),
-                ),
-                event_spec(
-                    EventType::NodeAttemptClaimed,
-                    "N05",
-                    Some(&command.node_id),
-                    Some(&command.attempt_id),
-                    None,
-                    json!({"attempt_id": command.attempt_id, "invocation_id": invocation.invocation_id, "attempt_number": attempt_number, "worker_id": attempt.worker_id}),
-                ),
-                event_spec(
-                    EventType::BudgetReserved,
-                    "A01",
-                    Some(&command.node_id),
-                    Some(&attempt.attempt_id),
-                    None,
-                    json!({"ledger_seq": ledger_seq, "amount": declared_max, "available_after": available_after.to_string()}),
-                ),
-            ],
-        )?;
-        Ok(ClaimNodeAttemptResult::Claimed {
-            invocation,
-            completion_credential: credential,
-        })
+            Ok(ClaimNodeAttemptResult::Claimed {
+                invocation,
+                completion_credential: credential,
+            })
         })
     }
     async fn complete_attempt(
@@ -2736,34 +3508,96 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: CompleteAttempt,
     ) -> Result<CompleteAttemptResult, StoreError> {
         self.transaction(|mut state, now| {
-        command
-            .submitted_outcome
-            .validate()
-            .map_err(|_| StoreError::InvalidField)?;
-        let attempt_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.attempt_id.clone(),
-        );
-        let mut attempt = state
-            .attempts
-            .get(&attempt_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if attempt.node_instance_id != command.node_id
-            || attempt.completion_credential_digest != command.completion_credential.digest()
-        {
-            state.attempts.insert(attempt_key, attempt);
-            return Err(StoreError::InvalidCompletionCredential);
-        }
-        if attempt.status != AttemptState::Started {
-            if state.stale_observed.insert((
+            command
+                .submitted_outcome
+                .validate()
+                .map_err(|_| StoreError::InvalidField)?;
+            let attempt_key = (
                 scope.clone(),
                 command.run_id.clone(),
                 command.attempt_id.clone(),
-            )) {
-                let immutable = attempt.status;
+            );
+            let mut attempt = state
+                .attempts
+                .get(&attempt_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if attempt.node_instance_id != command.node_id
+                || attempt.completion_credential_digest != command.completion_credential.digest()
+            {
+                state.attempts.insert(attempt_key, attempt);
+                return Err(StoreError::InvalidCompletionCredential);
+            }
+            if attempt.status != AttemptState::Started {
+                if state.stale_observed.insert((
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.attempt_id.clone(),
+                )) {
+                    let immutable = attempt.status;
+                    state.attempts.insert(attempt_key, attempt.clone());
+                    append_batch(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        now,
+                        EventActorKind::ActionCompletion,
+                        "completion".to_owned(),
+                        vec![event_spec(
+                            match immutable {
+                                AttemptState::Succeeded => "A10",
+                                AttemptState::RetryableFailed => "A11",
+                                AttemptState::PermanentFailed => "A12",
+                                AttemptState::ContractFailed => "A13",
+                                AttemptState::TimedOut => "A14",
+                                AttemptState::UnknownOutcome => "A15",
+                                AttemptState::Cancelled => "A16",
+                                AttemptState::Stale => "A17",
+                                AttemptState::Started => unreachable!(),
+                            },
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            None,
+                            event_payload::stale_completion_observed(
+                                &(immutable),
+                                &(outcome_category(&command.submitted_outcome)),
+                                &(outcome_digest(&command.submitted_outcome)),
+                                &(now),
+                            ),
+                        )],
+                    )?;
+                    return Ok(CompleteAttemptResult::StaleRecorded(attempt));
+                }
                 state.attempts.insert(attempt_key, attempt.clone());
+                return Ok(CompleteAttemptResult::AlreadyObserved(attempt));
+            }
+            running_fence(&state, scope, &command.run_id, None, now)?;
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let active = node.active_attempt_id.as_ref() == Some(&command.attempt_id);
+            if !active {
+                let reservation = attempt.reserved_cost;
+                settle(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &mut attempt,
+                    reservation,
+                    BudgetLedgerReason::Stale,
+                    now,
+                )?;
+                attempt.status = AttemptState::Stale;
+                attempt.finished_at = Some(now);
+                state.attempts.insert(attempt_key, attempt.clone());
+                let settled = budget_settled_spec(&state, scope, &command.run_id, &attempt)?;
                 append_batch(
                     &mut state,
                     scope,
@@ -2771,166 +3605,647 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     now,
                     EventActorKind::ActionCompletion,
                     "completion".to_owned(),
-                    vec![event_spec(
-                        EventType::StaleCompletionObserved,
-                        match immutable {
-                            AttemptState::Succeeded => "A10",
-                            AttemptState::RetryableFailed => "A11",
-                            AttemptState::PermanentFailed => "A12",
-                            AttemptState::ContractFailed => "A13",
-                            AttemptState::TimedOut => "A14",
-                            AttemptState::UnknownOutcome => "A15",
-                            AttemptState::Cancelled => "A16",
-                            AttemptState::Stale => "A17",
-                            AttemptState::Started => unreachable!(),
-                        },
-                        Some(&command.node_id),
-                        Some(&command.attempt_id),
-                        None,
-                        json!({"immutable_terminal_state": immutable, "submitted_outcome_category": outcome_category(&command.submitted_outcome), "submitted_payload_digest": outcome_digest(&command.submitted_outcome), "database_arrival_at": now}),
-                    )],
+                    vec![
+                        event_spec(
+                            "A09",
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            None,
+                            event_payload::attempt_marked_stale(
+                                &(node.active_attempt_id),
+                                &(outcome_category(&command.submitted_outcome)),
+                                &(outcome_digest(&command.submitted_outcome)),
+                                &(reservation),
+                            ),
+                        ),
+                        settled,
+                    ],
                 )?;
                 return Ok(CompleteAttemptResult::StaleRecorded(attempt));
             }
-            state.attempts.insert(attempt_key, attempt.clone());
-            return Ok(CompleteAttemptResult::AlreadyObserved(attempt));
-        }
-        running_fence(&state, scope, &command.run_id, None, now)?;
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let active = node.active_attempt_id.as_ref() == Some(&command.attempt_id);
-        if !active {
-            let reservation = attempt.reserved_cost;
+            if state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
+                .ok_or(StoreError::NotFound)?
+                .status
+                != RunState::Running
+            {
+                state.attempts.insert(attempt_key, attempt);
+                return Err(StoreError::AttemptFenced);
+            }
+            if let Some(diagnostics) = &command.objects.diagnostics {
+                verified(&mut state, scope, diagnostics, now)?;
+                if diagnostics.media_type() != "application/json" {
+                    state.attempts.insert(attempt_key, attempt);
+                    return Err(StoreError::DiagnosticsInvalid {
+                        path: "/".to_owned(),
+                        code: "media_type".to_owned(),
+                    });
+                }
+                if diagnostics.size_bytes() > 65_536 {
+                    state.attempts.insert(attempt_key, attempt);
+                    return Err(StoreError::DiagnosticsTooLarge {
+                        limit_bytes: 65_536,
+                        observed_bytes: diagnostics.size_bytes(),
+                    });
+                }
+            }
+            if let ActionOutcome::Success { artifacts, .. } = &command.submitted_outcome {
+                let output = command
+                    .objects
+                    .output
+                    .as_ref()
+                    .ok_or(StoreError::ObjectNotVerified)?;
+                verified(&mut state, scope, output, now)?;
+                if output.media_type() != "application/json"
+                    || artifacts.len() != command.objects.artifacts.len()
+                {
+                    state.attempts.insert(attempt_key, attempt);
+                    return Err(StoreError::ObjectNotVerified);
+                }
+                for object in &command.objects.artifacts {
+                    verified(&mut state, scope, object, now)?;
+                }
+                let run = state
+                    .runs
+                    .get(&(scope.clone(), command.run_id.clone()))
+                    .expect("run");
+                if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
+                    > run.limits.max_artifacts_per_attempt
+                {
+                    state.attempts.insert(attempt_key, attempt);
+                    return Err(StoreError::RunLimitApplied {
+                        code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
+                    });
+                }
+                let artifact_bytes =
+                    command
+                        .objects
+                        .artifacts
+                        .iter()
+                        .try_fold(0_u64, |total, object| {
+                            total
+                                .checked_add(object.size_bytes())
+                                .ok_or(StoreError::ArithmeticOverflow)
+                        })?;
+                let charged_bytes = output
+                    .size_bytes()
+                    .checked_add(artifact_bytes)
+                    .ok_or(StoreError::ArithmeticOverflow)?;
+                if run
+                    .aggregate_object_bytes
+                    .checked_add(charged_bytes)
+                    .ok_or(StoreError::ArithmeticOverflow)?
+                    > run.limits.max_aggregate_object_bytes_per_run
+                {
+                    state.attempts.insert(attempt_key, attempt);
+                    return Err(StoreError::RunLimitApplied {
+                        code: "AggregateObjectLimitExceeded".to_owned(),
+                    });
+                }
+            }
+            if now >= attempt.deadline_at {
+                let reservation = attempt.reserved_cost;
+                let (attempt, exhausted) =
+                    timeout_active(&mut state, scope, &command.run_id, &mut node, attempt, now)?;
+                state.attempts.insert(attempt_key.clone(), attempt.clone());
+                state.nodes.insert(node_key.clone(), node.clone());
+                let mut specs = timeout_specs(
+                    &state,
+                    scope,
+                    &command.run_id,
+                    &attempt,
+                    reservation,
+                    now,
+                    exhausted,
+                    node.next_eligible_at,
+                )?;
+                if exhausted {
+                    terminalize_run(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        RunState::RetriesExhausted,
+                        None,
+                        "RetriesExhausted",
+                        now,
+                        &mut specs,
+                    )?;
+                    specs.push(event_spec(
+                        "R09",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_retries_exhausted(
+                            &(command.node_id),
+                            &(command.attempt_id),
+                            &(attempt.attempt_number),
+                        ),
+                    ));
+                }
+                specs.push(event_spec(
+                    "A14",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::stale_completion_observed(
+                        &(AttemptState::TimedOut),
+                        &(outcome_category(&command.submitted_outcome)),
+                        &(outcome_digest(&command.submitted_outcome)),
+                        &(now),
+                    ),
+                ));
+                state.stale_observed.insert((
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.attempt_id.clone(),
+                ));
+                state.attempts.insert(attempt_key, attempt.clone());
+                state.nodes.insert(node_key, node);
+                append_batch(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    now,
+                    EventActorKind::ActionCompletion,
+                    "completion".to_owned(),
+                    specs,
+                )?;
+                return if exhausted {
+                    Ok(CompleteAttemptResult::TimedOutAndStaleRecorded(attempt))
+                } else {
+                    Ok(CompleteAttemptResult::TimedOutAndStaleRecorded(attempt))
+                };
+            }
+            let (actual, reason) = outcome_cost_reason(&command.submitted_outcome);
+            let contract_cost_failure = actual.0 > attempt.reserved_cost.0;
+            let charged = if contract_cost_failure {
+                attempt.reserved_cost
+            } else {
+                actual
+            };
             settle(
                 &mut state,
                 scope,
                 &command.run_id,
                 &mut attempt,
-                reservation,
-                BudgetLedgerReason::Stale,
+                charged,
+                reason,
                 now,
             )?;
-            attempt.status = AttemptState::Stale;
-            attempt.finished_at = Some(now);
-            state.attempts.insert(attempt_key, attempt.clone());
-            let settled = budget_settled_spec(&state, scope, &command.run_id, &attempt)?;
-            append_batch(
-                &mut state,
-                scope,
-                &command.run_id,
-                now,
-                EventActorKind::ActionCompletion,
-                "completion".to_owned(),
-                vec![
-                    event_spec(
-                        EventType::AttemptMarkedStale,
-                        "A09",
+            let mut specs = Vec::new();
+            if contract_cost_failure {
+                attempt.status = AttemptState::ContractFailed;
+                attempt.error_class = Some(AttemptErrorClass::Contract);
+                attempt.finished_at = Some(now);
+                node.status = NodeState::ContractFailed;
+                node.active_attempt_id = None;
+                node.failure_kind = Some(NodeFailureKind::ActionCostProtocolViolation);
+                set_node_mutated(&mut node, now)?;
+                specs.push(event_spec(
+                    "A05",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::attempt_contract_failed(
+                        &(charged),
+                        &("ActionCostProtocolViolation"),
+                        &(Option::<()>::None),
+                    ),
+                ));
+                specs.push(event_spec(
+                    "N21",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::node_contract_failed(
+                        &(command.attempt_id),
+                        &("ActionCostProtocolViolation"),
+                        &(Option::<()>::None),
+                    ),
+                ));
+                specs.push(budget_settled_spec(
+                    &state,
+                    scope,
+                    &command.run_id,
+                    &attempt,
+                )?);
+                state.nodes.insert(node_key, node);
+                state.attempts.insert(attempt_key, attempt);
+                let run = terminalize_run(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    RunState::ContractFailed,
+                    Some(RunFailureKind::ActionCostProtocolViolation),
+                    "ActionCostProtocolViolation",
+                    now,
+                    &mut specs,
+                )?;
+                specs.push(event_spec(
+                    "R08",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_contract_failed(
+                        &("ActionCostProtocolViolation"),
+                        &(Option::<()>::None),
+                    ),
+                ));
+                append_batch(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    now,
+                    EventActorKind::ActionCompletion,
+                    "completion".to_owned(),
+                    specs,
+                )?;
+                return Ok(CompleteAttemptResult::TerminalRun(run));
+            }
+            match &command.submitted_outcome {
+                ActionOutcome::Success { artifacts, .. } => {
+                    let output = command
+                        .objects
+                        .output
+                        .as_ref()
+                        .ok_or(StoreError::ObjectNotVerified)?;
+                    if artifacts.len() != command.objects.artifacts.len() {
+                        return Err(StoreError::ObjectNotVerified);
+                    }
+                    let run_snapshot = state
+                        .runs
+                        .get(&(scope.clone(), command.run_id.clone()))
+                        .expect("run")
+                        .clone();
+                    if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
+                        > run_snapshot.limits.max_artifacts_per_attempt
+                    {
+                        return Err(StoreError::RunLimitApplied {
+                            code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
+                        });
+                    }
+                    let output_ref = json_ref(
+                        &mut state,
+                        scope,
+                        output,
+                        ArtifactKind::NodeOutput,
+                        Some(&command.run_id),
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        0,
+                        now,
+                    )?;
+                    let mut refs = Vec::new();
+                    for (index, object) in command.objects.artifacts.iter().enumerate() {
+                        verified(&mut state, scope, object, now)?;
+                        refs.push(artifact(
+                            &mut state,
+                            scope,
+                            object,
+                            ArtifactKind::ActionArtifact,
+                            Some(&command.run_id),
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?,
+                            now,
+                        )?);
+                    }
+                    let bytes = command.objects.artifacts.iter().try_fold(
+                        output.size_bytes(),
+                        |total, object| {
+                            total
+                                .checked_add(object.size_bytes())
+                                .ok_or(StoreError::ArithmeticOverflow)
+                        },
+                    )?;
+                    let run = state
+                        .runs
+                        .get_mut(&(scope.clone(), command.run_id.clone()))
+                        .expect("run");
+                    run.aggregate_object_bytes = run
+                        .aggregate_object_bytes
+                        .checked_add(bytes)
+                        .ok_or(StoreError::ArithmeticOverflow)?;
+                    if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
+                        return Err(StoreError::RunLimitApplied {
+                            code: "AggregateObjectLimitExceeded".to_owned(),
+                        });
+                    }
+                    set_run_mutated(run, now)?;
+                    attempt.status = AttemptState::Succeeded;
+                    attempt.output_ref = Some(output_ref.clone());
+                    attempt.artifact_refs = refs.clone();
+                    attempt.finished_at = Some(now);
+                    node.status = NodeState::Succeeded;
+                    node.active_attempt_id = None;
+                    node.result_ref = Some(output_ref);
+                    set_node_mutated(&mut node, now)?;
+                    specs.push(event_spec(
+                        "A02",
                         Some(&command.node_id),
                         Some(&command.attempt_id),
                         None,
-                        json!({"active_attempt_id": node.active_attempt_id, "submitted_outcome_category": outcome_category(&command.submitted_outcome), "submitted_payload_digest": outcome_digest(&command.submitted_outcome), "charged_cost_units": reservation}),
-                    ),
-                    settled,
-                ],
-            )?;
-            return Ok(CompleteAttemptResult::StaleRecorded(attempt));
-        }
-        if state
-            .runs
-            .get(&(scope.clone(), command.run_id.clone()))
-            .ok_or(StoreError::NotFound)?
-            .status
-            != RunState::Running
-        {
-            state.attempts.insert(attempt_key, attempt);
-            return Err(StoreError::AttemptFenced);
-        }
-        if let Some(diagnostics) = &command.objects.diagnostics {
-            verified(&mut state, scope, diagnostics, now)?;
-            if diagnostics.media_type() != "application/json" {
-                state.attempts.insert(attempt_key, attempt);
-                return Err(StoreError::DiagnosticsInvalid {
-                    path: "/".to_owned(),
-                    code: "media_type".to_owned(),
-                });
+                        event_payload::attempt_succeeded(
+                            &(actual),
+                            &(output.digest()),
+                            &(refs
+                                .iter()
+                                .map(|reference| reference.digest.clone())
+                                .collect::<Vec<_>>()),
+                        ),
+                    ));
+                    specs.push(event_spec(
+                        "N18",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::node_succeeded(
+                            &(command.attempt_id),
+                            &(output.digest()),
+                            &(refs
+                                .iter()
+                                .map(|reference| reference.digest.clone())
+                                .collect::<Vec<_>>()),
+                        ),
+                    ));
+                    specs.push(budget_settled_spec(
+                        &state,
+                        scope,
+                        &command.run_id,
+                        &attempt,
+                    )?);
+                    state.nodes.insert(node_key, node);
+                    state.attempts.insert(attempt_key, attempt.clone());
+                    frontier_reduce(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        &command.node_id,
+                        None,
+                        now,
+                        &mut specs,
+                    )?;
+                    append_batch(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        now,
+                        EventActorKind::ActionCompletion,
+                        "completion".to_owned(),
+                        specs,
+                    )?;
+                    Ok(CompleteAttemptResult::Applied(attempt))
+                }
+                ActionOutcome::Retryable { code, .. } => {
+                    attempt.status = AttemptState::RetryableFailed;
+                    attempt.error_class = Some(AttemptErrorClass::Retryable);
+                    attempt.error_code = Some(code.clone());
+                    attempt.finished_at = Some(now);
+                    let definition = state
+                        .run_definitions
+                        .get(&(scope.clone(), command.run_id.clone()))
+                        .expect("definition")
+                        .clone();
+                    let (_, retry, _, _) =
+                        action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
+                    specs.push(event_spec(
+                        "A03",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::attempt_retryable_failed(
+                            &(actual),
+                            &(code),
+                            &(Option::<()>::None),
+                        ),
+                    ));
+                    if attempt.attempt_number >= retry.max_attempts {
+                        node.status = NodeState::RetriesExhausted;
+                        node.active_attempt_id = None;
+                        set_node_mutated(&mut node, now)?;
+                        specs.push(event_spec(
+                            "N24",
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            None,
+                            event_payload::node_retries_exhausted(
+                                &(command.attempt_id),
+                                &(attempt.attempt_number),
+                                &(retry.max_attempts),
+                                &("retryable"),
+                            ),
+                        ));
+                        specs.push(budget_settled_spec(
+                            &state,
+                            scope,
+                            &command.run_id,
+                            &attempt,
+                        )?);
+                        state.nodes.insert(node_key, node);
+                        state.attempts.insert(attempt_key, attempt.clone());
+                        let run = terminalize_run(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            RunState::RetriesExhausted,
+                            None,
+                            "RetriesExhausted",
+                            now,
+                            &mut specs,
+                        )?;
+                        specs.push(event_spec(
+                            "R09",
+                            None,
+                            None,
+                            None,
+                            event_payload::run_retries_exhausted(
+                                &(command.node_id),
+                                &(command.attempt_id),
+                                &(retry.max_attempts),
+                            ),
+                        ));
+                        append_batch(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            now,
+                            EventActorKind::ActionCompletion,
+                            "completion".to_owned(),
+                            specs,
+                        )?;
+                        Ok(CompleteAttemptResult::TerminalRun(run))
+                    } else {
+                        node.status = NodeState::RetryWaiting;
+                        node.active_attempt_id = None;
+                        node.next_eligible_at = Some(retry_at(now, retry, attempt.attempt_number)?);
+                        set_node_mutated(&mut node, now)?;
+                        specs.push(event_spec(
+                            "N19",
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            None,
+                            event_payload::node_retry_scheduled(
+                                &(command.attempt_id),
+                                &(attempt.attempt_number),
+                                &(node.next_eligible_at),
+                                &("retryable"),
+                            ),
+                        ));
+                        let returned = node.clone();
+                        state.nodes.insert(node_key, node);
+                        state.attempts.insert(attempt_key, attempt.clone());
+                        specs.push(budget_settled_spec(
+                            &state,
+                            scope,
+                            &command.run_id,
+                            &attempt,
+                        )?);
+                        append_batch(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            now,
+                            EventActorKind::ActionCompletion,
+                            "completion".to_owned(),
+                            specs,
+                        )?;
+                        Ok(CompleteAttemptResult::RetryScheduled(returned))
+                    }
+                }
+                ActionOutcome::Permanent { code, .. } => {
+                    attempt.status = AttemptState::PermanentFailed;
+                    attempt.error_class = Some(AttemptErrorClass::Permanent);
+                    attempt.error_code = Some(code.clone());
+                    attempt.finished_at = Some(now);
+                    node.status = NodeState::Failed;
+                    node.active_attempt_id = None;
+                    node.failure_kind = Some(NodeFailureKind::ActionPermanent);
+                    set_node_mutated(&mut node, now)?;
+                    specs.push(event_spec(
+                        "A04",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::attempt_permanent_failed(
+                            &(actual),
+                            &(code),
+                            &(Option::<()>::None),
+                        ),
+                    ));
+                    specs.push(event_spec(
+                        "N20",
+                        Some(&command.node_id),
+                        Some(&command.attempt_id),
+                        None,
+                        event_payload::node_failed(
+                            &(command.attempt_id),
+                            &("ActionPermanent"),
+                            &(code),
+                            &(Option::<()>::None),
+                        ),
+                    ));
+                    specs.push(budget_settled_spec(
+                        &state,
+                        scope,
+                        &command.run_id,
+                        &attempt,
+                    )?);
+                    state.nodes.insert(node_key, node);
+                    state.attempts.insert(attempt_key, attempt.clone());
+                    let run = terminalize_run(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        RunState::Failed,
+                        Some(RunFailureKind::ActionPermanent),
+                        "ActionPermanent",
+                        now,
+                        &mut specs,
+                    )?;
+                    specs.push(event_spec(
+                        "R07",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_failed(&("ActionPermanent"), &(Option::<()>::None)),
+                    ));
+                    append_batch(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        now,
+                        EventActorKind::ActionCompletion,
+                        "completion".to_owned(),
+                        specs,
+                    )?;
+                    Ok(CompleteAttemptResult::TerminalRun(run))
+                }
             }
-            if diagnostics.size_bytes() > 65_536 {
-                state.attempts.insert(attempt_key, attempt);
-                return Err(StoreError::DiagnosticsTooLarge {
-                    limit_bytes: 65_536,
-                    observed_bytes: diagnostics.size_bytes(),
-                });
+        })
+    }
+    async fn timeout_attempt(
+        &self,
+        scope: &ExecutionScope,
+        command: TimeoutAttempt,
+    ) -> Result<NodeAttempt, StoreError> {
+        self.transaction(|mut state, now| {
+            let fenced_run =
+                running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            if fenced_run.status != RunState::Running {
+                return Err(StoreError::IllegalTransition);
             }
-        }
-        if let ActionOutcome::Success { artifacts, .. } = &command.submitted_outcome {
-            let output = command
-                .objects
-                .output
-                .as_ref()
-                .ok_or(StoreError::ObjectNotVerified)?;
-            verified(&mut state, scope, output, now)?;
-            if output.media_type() != "application/json"
-                || artifacts.len() != command.objects.artifacts.len()
+            let attempt_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.attempt_id.clone(),
+            );
+            let attempt = state
+                .attempts
+                .remove(&attempt_key)
+                .ok_or(StoreError::NotFound)?;
+            if attempt.status != AttemptState::Started
+                || attempt.node_instance_id != command.node_id
             {
-                state.attempts.insert(attempt_key, attempt);
-                return Err(StoreError::ObjectNotVerified);
+                return Err(StoreError::AttemptFenced);
             }
-            for object in &command.objects.artifacts {
-                verified(&mut state, scope, object, now)?;
-            }
-            let run = state
-                .runs
-                .get(&(scope.clone(), command.run_id.clone()))
-                .expect("run");
-            if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
-                > run.limits.max_artifacts_per_attempt
-            {
+            if attempt.deadline_at > now {
+                let deadline = attempt.deadline_at;
                 state.attempts.insert(attempt_key, attempt);
-                return Err(StoreError::RunLimitApplied {
-                    code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
+                return Err(StoreError::DeadlineNotDue {
+                    database_now: now,
+                    deadline,
                 });
             }
-            let artifact_bytes =
-                command
-                    .objects
-                    .artifacts
-                    .iter()
-                    .try_fold(0_u64, |total, object| {
-                        total
-                            .checked_add(object.size_bytes())
-                            .ok_or(StoreError::ArithmeticOverflow)
-                    })?;
-            let charged_bytes = output
-                .size_bytes()
-                .checked_add(artifact_bytes)
-                .ok_or(StoreError::ArithmeticOverflow)?;
-            if run
-                .aggregate_object_bytes
-                .checked_add(charged_bytes)
-                .ok_or(StoreError::ArithmeticOverflow)?
-                > run.limits.max_aggregate_object_bytes_per_run
-            {
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if node.active_attempt_id.as_ref() != Some(&command.attempt_id) {
                 state.attempts.insert(attempt_key, attempt);
-                return Err(StoreError::RunLimitApplied {
-                    code: "AggregateObjectLimitExceeded".to_owned(),
-                });
+                return Err(StoreError::AttemptFenced);
             }
-        }
-        if now >= attempt.deadline_at {
             let reservation = attempt.reserved_cost;
             let (attempt, exhausted) =
                 timeout_active(&mut state, scope, &command.run_id, &mut node, attempt, now)?;
-            state.attempts.insert(attempt_key.clone(), attempt.clone());
-            state.nodes.insert(node_key.clone(), node.clone());
-            let mut specs = timeout_specs(&state, scope, &command.run_id, &attempt, reservation, now, exhausted, node.next_eligible_at)?;
+            let mut specs = timeout_specs(
+                &state,
+                scope,
+                &command.run_id,
+                &attempt,
+                reservation,
+                now,
+                exhausted,
+                node.next_eligible_at,
+            )?;
+            state.attempts.insert(attempt_key, attempt.clone());
+            state.nodes.insert(node_key, node);
             if exhausted {
                 terminalize_run(
                     &mut state,
@@ -2943,405 +4258,27 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     &mut specs,
                 )?;
                 specs.push(event_spec(
-                    EventType::RunRetriesExhausted,
                     "R09",
                     None,
                     None,
                     None,
-                    json!({"node_instance_id": command.node_id, "attempt_id": command.attempt_id, "max_attempts": attempt.attempt_number}),
+                    event_payload::run_retries_exhausted(
+                        &(command.node_id),
+                        &(command.attempt_id),
+                        &(attempt.attempt_number),
+                    ),
                 ));
             }
-            specs.push(event_spec(
-                EventType::StaleCompletionObserved,
-                "A14",
-                Some(&command.node_id),
-                Some(&command.attempt_id),
-                None,
-                json!({"immutable_terminal_state": AttemptState::TimedOut, "submitted_outcome_category": outcome_category(&command.submitted_outcome), "submitted_payload_digest": outcome_digest(&command.submitted_outcome), "database_arrival_at": now}),
-            ));
-            state.stale_observed.insert((
-                scope.clone(),
-                command.run_id.clone(),
-                command.attempt_id.clone(),
-            ));
-            state.attempts.insert(attempt_key, attempt.clone());
-            state.nodes.insert(node_key, node);
             append_batch(
                 &mut state,
                 scope,
                 &command.run_id,
                 now,
-                EventActorKind::ActionCompletion,
-                "completion".to_owned(),
+                EventActorKind::Clock,
+                command.permit.instance_id().as_str().to_owned(),
                 specs,
             )?;
-            return if exhausted {
-                Ok(CompleteAttemptResult::TimedOutAndStaleRecorded(attempt))
-            } else {
-                Ok(CompleteAttemptResult::TimedOutAndStaleRecorded(attempt))
-            };
-        }
-        let (actual, reason) = outcome_cost_reason(&command.submitted_outcome);
-        let contract_cost_failure = actual.0 > attempt.reserved_cost.0;
-        let charged = if contract_cost_failure {
-            attempt.reserved_cost
-        } else {
-            actual
-        };
-        settle(
-            &mut state,
-            scope,
-            &command.run_id,
-            &mut attempt,
-            charged,
-            reason,
-            now,
-        )?;
-        let mut specs = Vec::new();
-        if contract_cost_failure {
-            attempt.status = AttemptState::ContractFailed;
-            attempt.error_class = Some(AttemptErrorClass::Contract);
-            attempt.finished_at = Some(now);
-            node.status = NodeState::ContractFailed;
-            node.active_attempt_id = None;
-            node.failure_kind = Some(NodeFailureKind::ActionCostProtocolViolation);
-            set_node_mutated(&mut node, now)?;
-            specs.push(event_spec(EventType::AttemptContractFailed, "A05", Some(&command.node_id), Some(&command.attempt_id), None, json!({"charged_cost_units": charged, "failure_kind": "ActionCostProtocolViolation"})));
-            specs.push(event_spec(EventType::NodeContractFailed, "N21", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "failure_kind": "ActionCostProtocolViolation"})));
-            specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-            state.nodes.insert(node_key, node);
-            state.attempts.insert(attempt_key, attempt);
-            let run = terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::ContractFailed,
-                Some(RunFailureKind::ActionCostProtocolViolation),
-                "ActionCostProtocolViolation",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(
-                EventType::RunContractFailed,
-                "R08",
-                None,
-                None,
-                None,
-                json!({"failure_kind": "ActionCostProtocolViolation"}),
-            ));
-            append_batch(
-                &mut state,
-                scope,
-                &command.run_id,
-                now,
-                EventActorKind::ActionCompletion,
-                "completion".to_owned(),
-                specs,
-            )?;
-            return Ok(CompleteAttemptResult::TerminalRun(run));
-        }
-        match &command.submitted_outcome {
-            ActionOutcome::Success { artifacts, .. } => {
-                let output = command
-                    .objects
-                    .output
-                    .as_ref()
-                    .ok_or(StoreError::ObjectNotVerified)?;
-                if artifacts.len() != command.objects.artifacts.len() {
-                    return Err(StoreError::ObjectNotVerified);
-                }
-                let run_snapshot = state
-                    .runs
-                    .get(&(scope.clone(), command.run_id.clone()))
-                    .expect("run")
-                    .clone();
-                if u64::try_from(artifacts.len())
-                    .map_err(|_| StoreError::ArithmeticOverflow)?
-                    > run_snapshot.limits.max_artifacts_per_attempt
-                {
-                    return Err(StoreError::RunLimitApplied {
-                        code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
-                    });
-                }
-                let output_ref = json_ref(
-                &mut state,
-                    scope,
-                    output,
-                    ArtifactKind::NodeOutput,
-                    Some(&command.run_id),
-                    Some(&command.node_id),
-                    Some(&command.attempt_id),
-                    0,
-                    now,
-                )?;
-                let mut refs = Vec::new();
-                for (index, object) in command.objects.artifacts.iter().enumerate() {
-                    verified(&mut state, scope, object, now)?;
-                    refs.push(artifact(
-                        &mut state,
-                        scope,
-                        object,
-                        ArtifactKind::ActionArtifact,
-                        Some(&command.run_id),
-                        Some(&command.node_id),
-                        Some(&command.attempt_id),
-                        u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?,
-                        now,
-                    )?);
-                }
-                let bytes = command.objects.artifacts.iter().try_fold(
-                    output.size_bytes(),
-                    |total, object| {
-                        total
-                            .checked_add(object.size_bytes())
-                            .ok_or(StoreError::ArithmeticOverflow)
-                    },
-                )?;
-                let run = state
-                    .runs
-                    .get_mut(&(scope.clone(), command.run_id.clone()))
-                    .expect("run");
-                run.aggregate_object_bytes = run
-                    .aggregate_object_bytes
-                    .checked_add(bytes)
-                    .ok_or(StoreError::ArithmeticOverflow)?;
-                if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
-                    return Err(StoreError::RunLimitApplied {
-                        code: "AggregateObjectLimitExceeded".to_owned(),
-                    });
-                }
-                set_run_mutated(run, now)?;
-                attempt.status = AttemptState::Succeeded;
-                attempt.output_ref = Some(output_ref.clone());
-                attempt.artifact_refs = refs.clone();
-                attempt.finished_at = Some(now);
-                node.status = NodeState::Succeeded;
-                node.active_attempt_id = None;
-                node.result_ref = Some(output_ref);
-                set_node_mutated(&mut node, now)?;
-                specs.push(event_spec(EventType::AttemptSucceeded, "A02", Some(&command.node_id), Some(&command.attempt_id), None, json!({"actual_cost_units": actual, "output_digest": output.digest(), "artifact_digests": refs.iter().map(|reference| reference.digest.clone()).collect::<Vec<_>>()})));
-                specs.push(event_spec(EventType::NodeSucceeded, "N18", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "output_digest": output.digest(), "artifact_digests": refs.iter().map(|reference| reference.digest.clone()).collect::<Vec<_>>()})));
-                specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-                state.nodes.insert(node_key, node);
-                state.attempts.insert(attempt_key, attempt.clone());
-                frontier_reduce(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    &command.node_id,
-                    None,
-                    now,
-                    &mut specs,
-                )?;
-                append_batch(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    now,
-                    EventActorKind::ActionCompletion,
-                    "completion".to_owned(),
-                    specs,
-                )?;
-                Ok(CompleteAttemptResult::Applied(attempt))
-            }
-            ActionOutcome::Retryable { code, .. } => {
-                attempt.status = AttemptState::RetryableFailed;
-                attempt.error_class = Some(AttemptErrorClass::Retryable);
-                attempt.error_code = Some(code.clone());
-                attempt.finished_at = Some(now);
-                let definition = state
-                    .run_definitions
-                    .get(&(scope.clone(), command.run_id.clone()))
-                    .expect("definition")
-                    .clone();
-                let (_, retry, _, _) =
-                    action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
-                specs.push(event_spec(
-                    EventType::AttemptRetryableFailed,
-                    "A03",
-                    Some(&command.node_id),
-                    Some(&command.attempt_id),
-                    None,
-                    json!({"actual_cost_units": actual, "error_code": code}),
-                ));
-                if attempt.attempt_number >= retry.max_attempts {
-                    node.status = NodeState::RetriesExhausted;
-                    node.active_attempt_id = None;
-                    set_node_mutated(&mut node, now)?;
-                    specs.push(event_spec(EventType::NodeRetriesExhausted, "N24", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": retry.max_attempts, "cause": "retryable"})));
-                    specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-                    state.nodes.insert(node_key, node);
-                    state.attempts.insert(attempt_key, attempt.clone());
-                    let run = terminalize_run(
-                        &mut state,
-                        scope,
-                        &command.run_id,
-                        RunState::RetriesExhausted,
-                        None,
-                        "RetriesExhausted",
-                        now,
-                        &mut specs,
-                    )?;
-                    specs.push(event_spec(EventType::RunRetriesExhausted, "R09", None, None, None, json!({"node_instance_id": command.node_id, "attempt_id": command.attempt_id, "max_attempts": retry.max_attempts})));
-                    append_batch(
-                        &mut state,
-                        scope,
-                        &command.run_id,
-                        now,
-                        EventActorKind::ActionCompletion,
-                        "completion".to_owned(),
-                        specs,
-                    )?;
-                    Ok(CompleteAttemptResult::TerminalRun(run))
-                } else {
-                    node.status = NodeState::RetryWaiting;
-                    node.active_attempt_id = None;
-                    node.next_eligible_at = Some(retry_at(now, retry, attempt.attempt_number)?);
-                    set_node_mutated(&mut node, now)?;
-                    specs.push(event_spec(EventType::NodeRetryScheduled, "N19", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": node.next_eligible_at, "cause": "retryable"})));
-                    let returned = node.clone();
-                    state.nodes.insert(node_key, node);
-                    state.attempts.insert(attempt_key, attempt.clone());
-                    specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-                    append_batch(
-                        &mut state,
-                        scope,
-                        &command.run_id,
-                        now,
-                        EventActorKind::ActionCompletion,
-                        "completion".to_owned(),
-                        specs,
-                    )?;
-                    Ok(CompleteAttemptResult::RetryScheduled(returned))
-                }
-            }
-            ActionOutcome::Permanent { code, .. } => {
-                attempt.status = AttemptState::PermanentFailed;
-                attempt.error_class = Some(AttemptErrorClass::Permanent);
-                attempt.error_code = Some(code.clone());
-                attempt.finished_at = Some(now);
-                node.status = NodeState::Failed;
-                node.active_attempt_id = None;
-                node.failure_kind = Some(NodeFailureKind::ActionPermanent);
-                set_node_mutated(&mut node, now)?;
-                specs.push(event_spec(
-                    EventType::AttemptPermanentFailed,
-                    "A04",
-                    Some(&command.node_id),
-                    Some(&command.attempt_id),
-                    None,
-                    json!({"actual_cost_units": actual, "error_code": code}),
-                ));
-                specs.push(event_spec(EventType::NodeFailed, "N20", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "failure_kind": "ActionPermanent", "error_code": code})));
-                specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-                state.nodes.insert(node_key, node);
-                state.attempts.insert(attempt_key, attempt.clone());
-                let run = terminalize_run(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    RunState::Failed,
-                    Some(RunFailureKind::ActionPermanent),
-                    "ActionPermanent",
-                    now,
-                    &mut specs,
-                )?;
-                specs.push(event_spec(
-                    EventType::RunFailed,
-                    "R07",
-                    None,
-                    None,
-                    None,
-                    json!({"failure_kind": "ActionPermanent"}),
-                ));
-                append_batch(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    now,
-                    EventActorKind::ActionCompletion,
-                    "completion".to_owned(),
-                    specs,
-                )?;
-                Ok(CompleteAttemptResult::TerminalRun(run))
-            }
-        }
-        })
-    }
-    async fn timeout_attempt(
-        &self,
-        scope: &ExecutionScope,
-        command: TimeoutAttempt,
-    ) -> Result<NodeAttempt, StoreError> {
-        self.transaction(|mut state, now| {
-        let fenced_run =
-            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        if fenced_run.status != RunState::Running {
-            return Err(StoreError::IllegalTransition);
-        }
-        let attempt_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.attempt_id.clone(),
-        );
-        let attempt = state
-            .attempts
-            .remove(&attempt_key)
-            .ok_or(StoreError::NotFound)?;
-        if attempt.status != AttemptState::Started || attempt.node_instance_id != command.node_id {
-            return Err(StoreError::AttemptFenced);
-        }
-        if attempt.deadline_at > now {
-            let deadline = attempt.deadline_at;
-            state.attempts.insert(attempt_key, attempt);
-            return Err(StoreError::DeadlineNotDue {
-                database_now: now,
-                deadline,
-            });
-        }
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if node.active_attempt_id.as_ref() != Some(&command.attempt_id) {
-            state.attempts.insert(attempt_key, attempt);
-            return Err(StoreError::AttemptFenced);
-        }
-        let reservation = attempt.reserved_cost;
-        let (attempt, exhausted) =
-            timeout_active(&mut state, scope, &command.run_id, &mut node, attempt, now)?;
-        let mut specs = timeout_specs(&state, scope, &command.run_id, &attempt, reservation, now, exhausted, node.next_eligible_at)?;
-        state.attempts.insert(attempt_key, attempt.clone());
-        state.nodes.insert(node_key, node);
-        if exhausted {
-            terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::RetriesExhausted,
-                None,
-                "RetriesExhausted",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(EventType::RunRetriesExhausted, "R09", None, None, None, json!({"node_instance_id": command.node_id, "attempt_id": command.attempt_id, "max_attempts": attempt.attempt_number})));
-        }
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Clock,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(attempt)
+            Ok(attempt)
         })
     }
     async fn recover_abandoned_attempts_for_run(
@@ -3350,171 +4287,217 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: RecoverAbandonedAttemptsForRun,
     ) -> Result<Vec<NodeAttempt>, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        let mut keys = state
-            .attempts
-            .iter()
-            .filter(|((attempt_scope, attempt_run, _), attempt)| {
-                attempt_scope == scope
-                    && attempt_run == &command.run_id
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            let frontier_epoch_before = state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
+                .ok_or(StoreError::NotFound)?
+                .frontier_epoch;
+            let mut keys = state
+                .attempts
+                .iter()
+                .filter(|((attempt_scope, attempt_run, _), attempt)| {
+                    attempt_scope == scope
+                        && attempt_run == &command.run_id
+                        && attempt.status == AttemptState::Started
+                        && attempt.engine_generation < command.permit.generation()
+                })
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            keys.sort_by_key(|key| {
+                let attempt = state.attempts.get(key).expect("attempt");
+                let node = state
+                    .nodes
+                    .get(&(
+                        scope.clone(),
+                        command.run_id.clone(),
+                        attempt.node_instance_id.clone(),
+                    ))
+                    .expect("node");
+                (
+                    node.topological_rank,
+                    node.map_item_index,
+                    node.node_instance_id.clone(),
+                    attempt.attempt_number,
+                    attempt.attempt_id.clone(),
+                )
+            });
+            if state.attempts.values().any(|attempt| {
+                attempt.scope == *scope
+                    && attempt.run_id == command.run_id
                     && attempt.status == AttemptState::Started
-                    && attempt.engine_generation < command.permit.generation()
-            })
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        keys.sort_by_key(|key| {
-            let attempt = state.attempts.get(key).expect("attempt");
-            let node = state
-                .nodes
-                .get(&(
+                    && attempt.engine_generation == command.permit.generation()
+            }) {
+                return Err(StoreError::CurrentGenerationAttemptPresent);
+            }
+            let definition = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .cloned()
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let mut recovered = Vec::new();
+            let mut rows = Vec::new();
+            let mut specs = Vec::new();
+            for key in keys {
+                let mut attempt = state
+                    .attempts
+                    .remove(&key)
+                    .expect("frozen key remains present");
+                let reservation = attempt.reserved_cost;
+                settle(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &mut attempt,
+                    reservation,
+                    BudgetLedgerReason::UnknownOutcome,
+                    now,
+                )?;
+                attempt.status = AttemptState::UnknownOutcome;
+                attempt.finished_at = Some(now);
+                let node_key = (
                     scope.clone(),
                     command.run_id.clone(),
                     attempt.node_instance_id.clone(),
-                ))
-                .expect("node");
-            (
-                node.topological_rank,
-                node.map_item_index,
-                node.node_instance_id.clone(),
-                attempt.attempt_number,
-                attempt.attempt_id.clone(),
-            )
-        });
-        if state.attempts.values().any(|attempt| {
-            attempt.scope == *scope
-                && attempt.run_id == command.run_id
-                && attempt.status == AttemptState::Started
-                && attempt.engine_generation == command.permit.generation()
-        }) {
-            return Err(StoreError::CurrentGenerationAttemptPresent);
-        }
-        let definition = state
-            .run_definitions
-            .get(&(scope.clone(), command.run_id.clone()))
-            .cloned()
-            .ok_or(StoreError::CorruptControlPlane)?;
-        let mut recovered = Vec::new();
-        let mut rows = Vec::new();
-        let mut specs = Vec::new();
-        for key in keys {
-            let mut attempt = state.attempts.remove(&key).expect("frozen key remains present");
-            let reservation = attempt.reserved_cost;
-            settle(
-                &mut state,
-                scope,
-                &command.run_id,
-                &mut attempt,
-                reservation,
-                BudgetLedgerReason::UnknownOutcome,
-                now,
-            )?;
-            attempt.status = AttemptState::UnknownOutcome;
-            attempt.finished_at = Some(now);
-            let node_key = (
-                scope.clone(),
-                command.run_id.clone(),
-                attempt.node_instance_id.clone(),
-            );
-            let node = state
-                .nodes
-                .get(&node_key)
-                .cloned()
-                .ok_or(StoreError::NotFound)?;
-            if node.active_attempt_id.as_ref() != Some(&attempt.attempt_id) {
-                return Err(StoreError::AttemptFenced);
+                );
+                let node = state
+                    .nodes
+                    .get(&node_key)
+                    .cloned()
+                    .ok_or(StoreError::NotFound)?;
+                if node.active_attempt_id.as_ref() != Some(&attempt.attempt_id) {
+                    return Err(StoreError::AttemptFenced);
+                }
+                let (_, retry, _, _) =
+                    action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
+                let exhausted = attempt.attempt_number >= retry.max_attempts;
+                specs.push(event_spec(
+                    "A07",
+                    Some(&attempt.node_instance_id),
+                    Some(&attempt.attempt_id),
+                    None,
+                    event_payload::attempt_outcome_unknown(
+                        &(attempt.engine_generation),
+                        &(command.permit.generation()),
+                        &(reservation),
+                    ),
+                ));
+                specs.push(budget_settled_spec(
+                    &state,
+                    scope,
+                    &command.run_id,
+                    &attempt,
+                )?);
+                state.attempts.insert(key.clone(), attempt.clone());
+                recovered.push(attempt.clone());
+                rows.push((key, node_key, attempt, node, exhausted, retry.clone()));
             }
-            let (_, retry, _, _) =
-                action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
-            let exhausted = attempt.attempt_number >= retry.max_attempts;
-            specs.push(event_spec(EventType::AttemptOutcomeUnknown, "A07", Some(&attempt.node_instance_id), Some(&attempt.attempt_id), None, json!({"dead_engine_generation": attempt.engine_generation, "recovery_generation": command.permit.generation(), "charged_cost_units": reservation})));
-            specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
-            state.attempts.insert(key.clone(), attempt.clone());
-            recovered.push(attempt.clone());
-            rows.push((key, node_key, attempt, node, exhausted, retry.clone()));
-        }
-        let exhausted_primary = rows.iter().position(|row| row.4);
-        if let Some(primary_index) = exhausted_primary {
-            let primary = rows[primary_index].2.clone();
-            let primary_max_attempts = rows[primary_index].5.max_attempts;
-            for (index, (_, node_key, attempt, mut node, _, retry)) in
-                rows.into_iter().enumerate()
-            {
-                node.active_attempt_id = None;
-                node.next_eligible_at = None;
-                node.budget_wait_amount = None;
-                if index == primary_index {
-                    node.status = NodeState::RetriesExhausted;
+            let exhausted_primary = rows.iter().position(|row| row.4);
+            if let Some(primary_index) = exhausted_primary {
+                let primary = rows[primary_index].2.clone();
+                let primary_max_attempts = rows[primary_index].5.max_attempts;
+                for (index, (_, node_key, attempt, mut node, _, retry)) in
+                    rows.into_iter().enumerate()
+                {
+                    node.active_attempt_id = None;
+                    node.next_eligible_at = None;
+                    node.budget_wait_amount = None;
+                    if index == primary_index {
+                        node.status = NodeState::RetriesExhausted;
+                        specs.push(event_spec(
+                            "N26",
+                            Some(&node.node_instance_id),
+                            Some(&attempt.attempt_id),
+                            None,
+                            event_payload::node_retries_exhausted(
+                                &(attempt.attempt_id),
+                                &(attempt.attempt_number),
+                                &(retry.max_attempts),
+                                &("unknown"),
+                            ),
+                        ));
+                    } else {
+                        let prior = node.status;
+                        node.status = NodeState::Cancelled;
+                        specs.push(event_spec(
+                            "N66",
+                            Some(&node.node_instance_id),
+                            None,
+                            None,
+                            event_payload::node_cancelled(
+                                &(prior),
+                                &(RunState::RetriesExhausted),
+                                &("RetriesExhausted"),
+                            ),
+                        ));
+                    }
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node);
+                }
+                terminalize_run(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    RunState::RetriesExhausted,
+                    None,
+                    "RetriesExhausted",
+                    now,
+                    &mut specs,
+                )?;
+                specs.push(event_spec(
+                    "R09",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_retries_exhausted(
+                        &(primary.node_instance_id),
+                        &(primary.attempt_id),
+                        &(primary_max_attempts),
+                    ),
+                ));
+            } else {
+                for (_, node_key, attempt, mut node, _, retry) in rows {
+                    let next_eligible_at = retry_at(now, &retry, attempt.attempt_number)?;
+                    node.status = NodeState::RetryWaiting;
+                    node.active_attempt_id = None;
+                    node.next_eligible_at = Some(next_eligible_at);
+                    set_node_mutated(&mut node, now)?;
                     specs.push(event_spec(
-                        EventType::NodeRetriesExhausted,
-                        "N26",
+                        "N23",
                         Some(&node.node_instance_id),
                         Some(&attempt.attempt_id),
                         None,
-                        json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": retry.max_attempts, "cause": "unknown"}),
+                        event_payload::node_retry_scheduled(
+                            &(attempt.attempt_id),
+                            &(attempt.attempt_number),
+                            &(next_eligible_at),
+                            &("unknown"),
+                        ),
                     ));
-                } else {
-                    let prior = node.status;
-                    node.status = NodeState::Cancelled;
-                    specs.push(event_spec(
-                        EventType::NodeCancelled,
-                        "N66",
-                        Some(&node.node_instance_id),
-                        None,
-                        None,
-                        json!({"prior_status": prior, "terminal_run_status": RunState::RetriesExhausted, "reason_code": "RetriesExhausted"}),
-                    ));
+                    state.nodes.insert(node_key, node);
                 }
-                set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node);
             }
-            terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::RetriesExhausted,
-                None,
-                "RetriesExhausted",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(
-                EventType::RunRetriesExhausted,
-                "R09",
-                None,
-                None,
-                None,
-                json!({"node_instance_id": primary.node_instance_id, "attempt_id": primary.attempt_id, "max_attempts": primary_max_attempts}),
-            ));
-        } else {
-            for (_, node_key, attempt, mut node, _, retry) in rows {
-                let next_eligible_at = retry_at(now, &retry, attempt.attempt_number)?;
-                node.status = NodeState::RetryWaiting;
-                node.active_attempt_id = None;
-                node.next_eligible_at = Some(next_eligible_at);
-                set_node_mutated(&mut node, now)?;
-                specs.push(event_spec(
-                    EventType::NodeRetryScheduled,
-                    "N23",
-                    Some(&node.node_instance_id),
-                    Some(&attempt.attempt_id),
-                    None,
-                    json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": next_eligible_at, "cause": "unknown"}),
-                ));
-                state.nodes.insert(node_key, node);
+            if !specs.is_empty() {
+                if state
+                    .runs
+                    .get(&(scope.clone(), command.run_id.clone()))
+                    .ok_or(StoreError::NotFound)?
+                    .frontier_epoch
+                    == frontier_epoch_before
+                {
+                    bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+                }
+                append_batch(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    now,
+                    EventActorKind::Recovery,
+                    command.permit.instance_id().as_str().to_owned(),
+                    specs,
+                )?;
             }
-        }
-        if !specs.is_empty() {
-            append_batch(
-                &mut state,
-                scope,
-                &command.run_id,
-                now,
-                EventActorKind::Recovery,
-                command.permit.instance_id().as_str().to_owned(),
-                specs,
-            )?;
-        }
-        Ok(recovered)
+            Ok(recovered)
         })
     }
     async fn release_retry(
@@ -3562,12 +4545,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 EventActorKind::Clock,
                 command.permit.instance_id().as_str().to_owned(),
                 vec![event_spec(
-                    EventType::NodeRetryEligible,
                     "N04",
                     Some(&command.node_id),
                     None,
                     None,
-                    json!({"next_eligible_at": eligible, "database_now": now}),
+                    event_payload::node_retry_eligible(&(eligible), &(now)),
                 )],
             )?;
             Ok(returned)
@@ -3579,163 +4561,170 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: RecordChoice,
     ) -> Result<NodeRun, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        verified(&mut state, scope, &command.input, now)?;
-        let key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
-        if let (Some(existing_input), Some(existing_selection)) =
-            (&node.choice_input_ref, &node.choice_selected_case)
-        {
-            return if existing_input.0.digest == *command.input.digest()
-                && existing_selection == &command.selection
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            verified(&mut state, scope, &command.input, now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+            if let (Some(existing_input), Some(existing_selection)) =
+                (&node.choice_input_ref, &node.choice_selected_case)
             {
-                Ok(node)
-            } else {
-                Err(StoreError::IdempotencyConflict)
-            };
-        }
-        if node.version != command.expected_node_version
-            || node.status != NodeState::Ready
-            || node.kind != NodeKind::Choice
-        {
-            return Err(StoreError::CasConflict);
-        }
-        let definition = state
-            .run_definitions
-            .get(&(scope.clone(), command.run_id.clone()))
-            .ok_or(StoreError::CorruptControlPlane)?;
-        let (cases, default) = definition
-            .definition
-            .nodes
-            .iter()
-            .find_map(|candidate| match candidate {
-                NodeDefinition::Choice {
-                    id, cases, default, ..
-                } if id == &node.definition_node_id => Some((cases, default)),
-                _ => None,
-            })
-            .ok_or(StoreError::CorruptControlPlane)?;
-        let mut expected = None;
-        for (index, case) in cases.iter().enumerate() {
-            let (values, target) = match case {
-                crate::definition::ChoiceCase::Equals { equals, next } => {
-                    (std::slice::from_ref(equals), next)
+                return if existing_input.0.digest == *command.input.digest()
+                    && existing_selection == &command.selection
+                {
+                    Ok(node)
+                } else {
+                    Err(StoreError::IdempotencyConflict)
+                };
+            }
+            if node.version != command.expected_node_version
+                || node.status != NodeState::Ready
+                || node.kind != NodeKind::Choice
+            {
+                return Err(StoreError::CasConflict);
+            }
+            let definition = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let (cases, default) = definition
+                .definition
+                .nodes
+                .iter()
+                .find_map(|candidate| match candidate {
+                    NodeDefinition::Choice {
+                        id, cases, default, ..
+                    } if id == &node.definition_node_id => Some((cases, default)),
+                    _ => None,
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let mut expected = None;
+            for (index, case) in cases.iter().enumerate() {
+                let (values, target) = match case {
+                    crate::definition::ChoiceCase::Equals { equals, next } => {
+                        (std::slice::from_ref(equals), next)
+                    }
+                    crate::definition::ChoiceCase::In { r#in, next } => (r#in.as_slice(), next),
+                };
+                if values.iter().any(|value| {
+                    serde_jcs::to_vec(value)
+                        .map(|bytes| digest(&bytes) == command.evaluated_selector_digest)
+                        .unwrap_or(false)
+                }) {
+                    expected = Some(ChoiceSelection::Case {
+                        case_index: index as u32,
+                        edge_id: edge_id(
+                            &state
+                                .runs
+                                .get(&(scope.clone(), command.run_id.clone()))
+                                .expect("run")
+                                .revision_hash,
+                            &node.definition_node_id,
+                            &format!("case/{index}"),
+                            target,
+                        ),
+                    });
+                    break;
                 }
-                crate::definition::ChoiceCase::In { r#in, next } => (r#in.as_slice(), next),
+            }
+            let expected = expected.unwrap_or_else(|| ChoiceSelection::Default {
+                edge_id: edge_id(
+                    &state
+                        .runs
+                        .get(&(scope.clone(), command.run_id.clone()))
+                        .expect("run")
+                        .revision_hash,
+                    &node.definition_node_id,
+                    "default",
+                    default,
+                ),
+            });
+            if command.selection != expected {
+                return Err(StoreError::InvalidField);
+            }
+            let selected = match &command.selection {
+                ChoiceSelection::Case { edge_id, .. } | ChoiceSelection::Default { edge_id } => {
+                    edge_id.clone()
+                }
             };
-            if values.iter().any(|value| {
-                serde_jcs::to_vec(value)
-                    .map(|bytes| digest(&bytes) == command.evaluated_selector_digest)
-                    .unwrap_or(false)
-            }) {
-                expected = Some(ChoiceSelection::Case {
-                    case_index: index as u32,
-                    edge_id: edge_id(
-                        &state
-                            .runs
-                            .get(&(scope.clone(), command.run_id.clone()))
-                            .expect("run")
-                            .revision_hash,
-                        &node.definition_node_id,
-                        &format!("case/{index}"),
-                        target,
-                    ),
-                });
-                break;
+            let outgoing_ids = state
+                .edges
+                .values()
+                .filter(|edge| {
+                    edge.scope == *scope
+                        && edge.run_id == command.run_id
+                        && edge.from_node_id == command.node_id
+                })
+                .map(|edge| edge.edge_id.clone())
+                .collect::<BTreeSet<_>>();
+            if !outgoing_ids.contains(&selected) {
+                return Err(StoreError::InvalidField);
             }
-        }
-        let expected = expected.unwrap_or_else(|| ChoiceSelection::Default {
-            edge_id: edge_id(
-                &state
-                    .runs
-                    .get(&(scope.clone(), command.run_id.clone()))
-                    .expect("run")
-                    .revision_hash,
-                &node.definition_node_id,
-                "default",
-                default,
-            ),
-        });
-        if command.selection != expected {
-            return Err(StoreError::InvalidField);
-        }
-        let selected = match &command.selection {
-            ChoiceSelection::Case { edge_id, .. } | ChoiceSelection::Default { edge_id } => {
-                edge_id.clone()
-            }
-        };
-        let outgoing_ids = state
-            .edges
-            .values()
-            .filter(|edge| {
-                edge.scope == *scope
-                    && edge.run_id == command.run_id
-                    && edge.from_node_id == command.node_id
-            })
-            .map(|edge| edge.edge_id.clone())
-            .collect::<BTreeSet<_>>();
-        if !outgoing_ids.contains(&selected) {
-            return Err(StoreError::InvalidField);
-        }
-        node.status = NodeState::Succeeded;
-        node.choice_input_ref = Some(json_ref(
+            node.status = NodeState::Succeeded;
+            node.choice_input_ref = Some(json_ref(
                 &mut state,
-            scope,
-            &command.input,
-            ArtifactKind::ChoiceInput,
-            Some(&command.run_id),
-            Some(&command.node_id),
-            None,
-            0,
-            now,
-        )?);
-        node.choice_selected_case = Some(command.selection.clone());
-        set_node_mutated(&mut node, now)?;
-        state.nodes.insert(key, node.clone());
-        let choice_payload = match &command.selection {
-            ChoiceSelection::Case { case_index, .. } => {
-                json!({"choice_input_digest": command.input.digest(), "selector_value_digest": command.evaluated_selector_digest, "selection_kind": "case", "case_index": case_index, "edge_id": selected})
-            }
-            ChoiceSelection::Default { .. } => {
-                json!({"choice_input_digest": command.input.digest(), "selector_value_digest": command.evaluated_selector_digest, "selection_kind": "default", "edge_id": selected})
-            }
-        };
-        let mut specs = vec![event_spec(
-            EventType::ChoiceSelected,
-            "N09",
-            Some(&command.node_id),
-            None,
-            None,
-            choice_payload,
-        )];
-        frontier_reduce(
-            &mut state,
-            scope,
-            &command.run_id,
-            &command.node_id,
-            Some(&selected),
-            now,
-            &mut specs,
-        )?;
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(node)
+                scope,
+                &command.input,
+                ArtifactKind::ChoiceInput,
+                Some(&command.run_id),
+                Some(&command.node_id),
+                None,
+                0,
+                now,
+            )?);
+            node.choice_selected_case = Some(command.selection.clone());
+            set_node_mutated(&mut node, now)?;
+            state.nodes.insert(key, node.clone());
+            let choice_payload = match &command.selection {
+                ChoiceSelection::Case { case_index, .. } => event_payload::choice_selected(
+                    &(command.input.digest()),
+                    &(&command.evaluated_selector_digest),
+                    &("case"),
+                    &(case_index),
+                    &(&selected),
+                ),
+                ChoiceSelection::Default { .. } => event_payload::choice_selected(
+                    &(command.input.digest()),
+                    &(&command.evaluated_selector_digest),
+                    &("default"),
+                    &(Option::<()>::None),
+                    &(&selected),
+                ),
+            };
+            let mut specs = vec![event_spec(
+                "N09",
+                Some(&command.node_id),
+                None,
+                None,
+                choice_payload,
+            )];
+            frontier_reduce(
+                &mut state,
+                scope,
+                &command.run_id,
+                &command.node_id,
+                Some(&selected),
+                now,
+                &mut specs,
+            )?;
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            set_run_mutated(run, now)?;
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(node)
         })
     }
     async fn expand_map(
@@ -3744,86 +4733,403 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: ExpandMap,
     ) -> Result<NodeRun, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        verified(&mut state, scope, &command.input, now)?;
-        let key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.map_node_id.clone(),
-        );
-        let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
-        if let Some(existing) = &node.map_expansion_digest {
-            return if existing == &command.expansion_digest {
-                Ok(node)
-            } else {
-                Err(StoreError::IdempotencyConflict)
-            };
-        }
-        if node.version != command.expected_node_version
-            || node.status != NodeState::Ready
-            || node.kind != NodeKind::Map
-        {
-            return Err(StoreError::CasConflict);
-        }
-        let run_key = (scope.clone(), command.run_id.clone());
-        let mut run = state
-            .runs
-            .get(&run_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let added_nodes = u64::try_from(command.ordered_items.len())
-            .map_err(|_| StoreError::ArithmeticOverflow)?;
-        let dynamic_after = run
-            .dynamic_node_count
-            .checked_add(added_nodes)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        if dynamic_after > run.limits.max_dynamic_node_instances {
-            return Err(StoreError::RunLimitApplied {
-                code: "RunDynamicNodeLimitExceeded".to_owned(),
-            });
-        }
-        let definition = state.run_definitions.get(&run_key).expect("definition");
-        let (max_items, max_concurrency) = definition
-            .definition
-            .nodes
-            .iter()
-            .find_map(|candidate| match candidate {
-                NodeDefinition::Map {
-                    id,
-                    max_items,
-                    max_concurrency,
-                    ..
-                } if id == &node.definition_node_id => Some((*max_items, *max_concurrency)),
-                _ => None,
-            })
-            .ok_or(StoreError::CorruptControlPlane)?;
-        if command.ordered_items.len() > max_items as usize {
-            return Err(StoreError::ContractValidationApplied {
-                code: "MapBoundExceeded".to_owned(),
-            });
-        }
-        node.map_input_ref = Some(json_ref(
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            verified(&mut state, scope, &command.input, now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.map_node_id.clone(),
+            );
+            let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+            if let Some(existing) = &node.map_expansion_digest {
+                return if existing == &command.expansion_digest {
+                    Ok(node)
+                } else {
+                    Err(StoreError::IdempotencyConflict)
+                };
+            }
+            if node.version != command.expected_node_version
+                || node.status != NodeState::Ready
+                || node.kind != NodeKind::Map
+            {
+                return Err(StoreError::CasConflict);
+            }
+            let run_key = (scope.clone(), command.run_id.clone());
+            let mut run = state
+                .runs
+                .get(&run_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let added_nodes = u64::try_from(command.ordered_items.len())
+                .map_err(|_| StoreError::ArithmeticOverflow)?;
+            let dynamic_after = run
+                .dynamic_node_count
+                .checked_add(added_nodes)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if dynamic_after > run.limits.max_dynamic_node_instances {
+                return Err(StoreError::RunLimitApplied {
+                    code: "RunDynamicNodeLimitExceeded".to_owned(),
+                });
+            }
+            let definition = state.run_definitions.get(&run_key).expect("definition");
+            let (max_items, max_concurrency) = definition
+                .definition
+                .nodes
+                .iter()
+                .find_map(|candidate| match candidate {
+                    NodeDefinition::Map {
+                        id,
+                        max_items,
+                        max_concurrency,
+                        ..
+                    } if id == &node.definition_node_id => Some((*max_items, *max_concurrency)),
+                    _ => None,
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
+            if command.ordered_items.len() > max_items as usize {
+                return Err(StoreError::ContractValidationApplied {
+                    code: "MapBoundExceeded".to_owned(),
+                });
+            }
+            node.map_input_ref = Some(json_ref(
                 &mut state,
-            scope,
-            &command.input,
-            ArtifactKind::MapInput,
-            Some(&command.run_id),
-            Some(&command.map_node_id),
-            None,
-            0,
-            now,
-        )?);
-        node.map_expansion_digest = Some(command.expansion_digest.clone());
-        node.map_child_count = Some(
-            u32::try_from(command.ordered_items.len())
-                .map_err(|_| StoreError::ArithmeticOverflow)?,
-        );
-        let mut specs = Vec::new();
-        if command.ordered_items.is_empty() {
+                scope,
+                &command.input,
+                ArtifactKind::MapInput,
+                Some(&command.run_id),
+                Some(&command.map_node_id),
+                None,
+                0,
+                now,
+            )?);
+            node.map_expansion_digest = Some(command.expansion_digest.clone());
+            node.map_child_count = Some(
+                u32::try_from(command.ordered_items.len())
+                    .map_err(|_| StoreError::ArithmeticOverflow)?,
+            );
+            let mut specs = Vec::new();
+            let zero_aggregate_bytes = if command.ordered_items.is_empty() {
+                command.input.size_bytes()
+            } else {
+                0
+            };
+            if command.ordered_items.is_empty() {
+                node.status = NodeState::Succeeded;
+                node.result_ref = Some(json_ref(
+                    &mut state,
+                    scope,
+                    &command.input,
+                    ArtifactKind::MapAggregate,
+                    Some(&command.run_id),
+                    Some(&command.map_node_id),
+                    None,
+                    0,
+                    now,
+                )?);
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(key, node.clone());
+                specs.push(event_spec(
+                    "N07",
+                    Some(&command.map_node_id),
+                    None,
+                    None,
+                    event_payload::map_zero_items_succeeded(
+                        &(command.input.digest()),
+                        &(command.expansion_digest),
+                        &(command.input.digest()),
+                    ),
+                ));
+                frontier_reduce(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    None,
+                    now,
+                    &mut specs,
+                )?;
+            } else {
+                node.status = NodeState::WaitingChildren;
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(key, node.clone());
+                for item in command.ordered_items {
+                    let child_key = (scope.clone(), command.run_id.clone(), item.child_id.clone());
+                    if state.nodes.contains_key(&child_key) {
+                        return Err(StoreError::IdempotencyConflict);
+                    }
+                    let child = NodeRun {
+                        scope: scope.clone(),
+                        run_id: command.run_id.clone(),
+                        node_instance_id: item.child_id.clone(),
+                        definition_node_id: node.definition_node_id.clone(),
+                        kind: NodeKind::Action,
+                        parent_map_instance_id: Some(command.map_node_id.clone()),
+                        map_item_index: Some(item.index),
+                        map_item_digest: Some(item.item_digest.clone()),
+                        topological_rank: node.topological_rank,
+                        status: NodeState::Ready,
+                        blocked_from_status: None,
+                        active_attempt_id: None,
+                        attempt_count: 0,
+                        next_eligible_at: None,
+                        budget_wait_amount: None,
+                        result_ref: None,
+                        failure_kind: None,
+                        failure_diagnostics_ref: None,
+                        incoming_total: 0,
+                        incoming_satisfied: 0,
+                        incoming_skipped: 0,
+                        choice_input_ref: None,
+                        choice_selected_case: None,
+                        map_input_ref: None,
+                        map_expansion_digest: None,
+                        map_child_count: None,
+                        approval_gate_id: None,
+                        created_at: now,
+                        updated_at: now,
+                        version: Version(1),
+                    };
+                    specs.push(event_spec(
+                        "N02M",
+                        Some(&item.child_id),
+                        None,
+                        None,
+                        event_payload::map_child_created(
+                            &(command.map_node_id),
+                            &(item.index),
+                            &(item.item_digest),
+                            &(child.topological_rank),
+                        ),
+                    ));
+                    state.nodes.insert(child_key, child);
+                }
+                specs.push(event_spec(
+                    "N06",
+                    Some(&command.map_node_id),
+                    None,
+                    None,
+                    event_payload::map_expanded(
+                        &(command.input.digest()),
+                        &(command.expansion_digest),
+                        &(node.map_child_count),
+                        &(max_concurrency),
+                    ),
+                ));
+                bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            }
+            run.dynamic_node_count = dynamic_after;
+            run.aggregate_object_bytes = run
+                .aggregate_object_bytes
+                .checked_add(command.input.size_bytes())
+                .and_then(|bytes| bytes.checked_add(zero_aggregate_bytes))
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
+                return Err(StoreError::RunLimitApplied {
+                    code: "AggregateObjectLimitExceeded".to_owned(),
+                });
+            }
+            set_run_mutated(&mut run, now)?;
+            state.runs.insert(run_key, run);
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(node)
+        })
+    }
+    async fn complete_map(
+        &self,
+        scope: &ExecutionScope,
+        command: CompleteMap,
+    ) -> Result<NodeRun, StoreError> {
+        self.transaction(|mut state, now| {
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            verified(&mut state, scope, &command.aggregate, now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.map_node_id.clone(),
+            );
+            let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+            if node.status == NodeState::Succeeded {
+                return node
+                    .result_ref
+                    .as_ref()
+                    .is_some_and(|reference| reference.0.digest == *command.aggregate.digest())
+                    .then_some(node)
+                    .ok_or(StoreError::AggregateMismatch);
+            }
+            if node.version != command.expected_node_version
+                || node.status != NodeState::WaitingChildren
+            {
+                return Err(StoreError::CasConflict);
+            }
+            let mut children = state
+                .nodes
+                .values()
+                .filter(|child| {
+                    child.scope == *scope
+                        && child.run_id == command.run_id
+                        && child.parent_map_instance_id.as_ref() == Some(&command.map_node_id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if children
+                .iter()
+                .any(|child| child.status != NodeState::Succeeded)
+            {
+                return Err(StoreError::ChildrenIncomplete);
+            }
+            let expected_count = node
+                .map_child_count
+                .ok_or(StoreError::CorruptControlPlane)? as usize;
+            if children.len() != expected_count {
+                return Err(StoreError::AggregateMismatch);
+            }
+            children.sort_by_key(|child| child.map_item_index);
+            if children.iter().enumerate().any(|(index, child)| {
+                child.map_item_index != u32::try_from(index).ok()
+                    || child
+                        .map_item_digest
+                        .as_ref()
+                        .zip(child.map_item_index)
+                        .is_none_or(|(item_digest, item_index)| {
+                            map_child_id(
+                                &command.run_id,
+                                &command.map_node_id,
+                                item_index,
+                                item_digest,
+                            ) != child.node_instance_id
+                        })
+            }) {
+                return Err(StoreError::AggregateMismatch);
+            }
+            let aggregate_bytes = command.aggregate.verified_bytes();
+            let aggregate_value: Value = serde_json::from_slice(aggregate_bytes)
+                .map_err(|_| StoreError::AggregateMismatch)?;
+            if command.aggregate.media_type() != "application/json"
+                || serde_jcs::to_vec(&aggregate_value).map_err(|_| StoreError::AggregateMismatch)?
+                    != aggregate_bytes
+            {
+                return Err(StoreError::AggregateMismatch);
+            }
+            let aggregate_values = aggregate_value
+                .as_array()
+                .filter(|values| values.len() == expected_count)
+                .ok_or(StoreError::AggregateMismatch)?;
+            if aggregate_values
+                .iter()
+                .zip(&children)
+                .any(|(value, child)| {
+                    child.result_ref.as_ref().is_none_or(|result| {
+                        serde_jcs::to_vec(value)
+                            .map(|bytes| digest(&bytes) != result.0.digest)
+                            .unwrap_or(true)
+                    })
+                })
+            {
+                return Err(StoreError::AggregateMismatch);
+            }
+            let run_key = (scope.clone(), command.run_id.clone());
+            let run_snapshot = state
+                .runs
+                .get(&run_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let actor_id = command.permit.instance_id().as_str().to_owned();
+            if command.aggregate.size_bytes() > run_snapshot.limits.max_inline_json_bytes_per_value
+            {
+                return apply_map_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    NodeFailureKind::InlineJsonLimitExceeded,
+                    now,
+                    actor_id,
+                );
+            }
+            let aggregate_after = run_snapshot
+                .aggregate_object_bytes
+                .checked_add(command.aggregate.size_bytes())
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if aggregate_after > run_snapshot.limits.max_aggregate_object_bytes_per_run {
+                return apply_map_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    NodeFailureKind::AggregateObjectLimitExceeded,
+                    now,
+                    actor_id,
+                );
+            }
+            let revision = state
+                .revisions
+                .get(&(
+                    scope.clone(),
+                    run_snapshot.definition_id.clone(),
+                    run_snapshot.revision_hash.clone(),
+                ))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let reference_location = format!("{}/map_action", node.definition_node_id.as_str());
+            let schema_digest = &revision
+                .action_pins
+                .iter()
+                .find(|pin| pin.reference_location == reference_location)
+                .ok_or(StoreError::CorruptControlPlane)?
+                .output_schema_ref
+                .0
+                .digest;
+            let schema_bytes = state
+                .verified_object_bytes
+                .get(&(scope.clone(), schema_digest.clone()))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let schema: Value = serde_json::from_slice(schema_bytes)
+                .map_err(|_| StoreError::CorruptControlPlane)?;
+            if aggregate_values
+                .iter()
+                .any(|value| !schema_accepts(&schema, &schema, value))
+            {
+                return apply_map_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    NodeFailureKind::ActionOutputSchemaMismatch,
+                    now,
+                    actor_id,
+                );
+            }
             node.status = NodeState::Succeeded;
+            node.result_ref = Some(json_ref(
+                &mut state,
+                scope,
+                &command.aggregate,
+                ArtifactKind::MapAggregate,
+                Some(&command.run_id),
+                Some(&command.map_node_id),
+                None,
+                0,
+                now,
+            )?);
             set_node_mutated(&mut node, now)?;
             state.nodes.insert(key, node.clone());
-            specs.push(event_spec(EventType::MapZeroItemsSucceeded, "N07", Some(&command.map_node_id), None, None, json!({"map_input_digest": command.input.digest(), "expansion_digest": command.expansion_digest, "aggregate_digest": command.input.digest()})));
+            let mut specs = vec![event_spec(
+                "N08",
+                Some(&command.map_node_id),
+                None,
+                None,
+                event_payload::map_succeeded(
+                    &(node.map_child_count),
+                    &(command.aggregate.digest()),
+                ),
+            )];
             frontier_reduce(
                 &mut state,
                 scope,
@@ -3833,157 +5139,19 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 now,
                 &mut specs,
             )?;
-        } else {
-            node.status = NodeState::WaitingChildren;
-            set_node_mutated(&mut node, now)?;
-            state.nodes.insert(key, node.clone());
-            for item in command.ordered_items {
-                let child_key = (scope.clone(), command.run_id.clone(), item.child_id.clone());
-                if state.nodes.contains_key(&child_key) {
-                    return Err(StoreError::IdempotencyConflict);
-                }
-                let child = NodeRun {
-                    scope: scope.clone(),
-                    run_id: command.run_id.clone(),
-                    node_instance_id: item.child_id.clone(),
-                    definition_node_id: node.definition_node_id.clone(),
-                    kind: NodeKind::Action,
-                    parent_map_instance_id: Some(command.map_node_id.clone()),
-                    map_item_index: Some(item.index),
-                    map_item_digest: Some(item.item_digest.clone()),
-                    topological_rank: node.topological_rank,
-                    status: NodeState::Ready,
-                    blocked_from_status: None,
-                    active_attempt_id: None,
-                    attempt_count: 0,
-                    next_eligible_at: None,
-                    budget_wait_amount: None,
-                    result_ref: None,
-                    failure_kind: None,
-                    failure_diagnostics_ref: None,
-                    incoming_total: 0,
-                    incoming_satisfied: 0,
-                    incoming_skipped: 0,
-                    choice_input_ref: None,
-                    choice_selected_case: None,
-                    map_input_ref: None,
-                    map_expansion_digest: None,
-                    map_child_count: None,
-                    approval_gate_id: None,
-                    created_at: now,
-                    updated_at: now,
-                    version: Version(1),
-                };
-                specs.push(event_spec(EventType::MapChildCreated, "N02M", Some(&item.child_id), None, None, json!({"parent_map_instance_id": command.map_node_id, "item_index": item.index, "item_digest": item.item_digest, "topological_rank": child.topological_rank})));
-                state.nodes.insert(child_key, child);
-            }
-            specs.push(event_spec(EventType::MapExpanded, "N06", Some(&command.map_node_id), None, None, json!({"map_input_digest": command.input.digest(), "expansion_digest": command.expansion_digest, "child_count": node.map_child_count, "max_concurrency": max_concurrency})));
-            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-        }
-        run.dynamic_node_count = dynamic_after;
-        run.aggregate_object_bytes = run
-            .aggregate_object_bytes
-            .checked_add(command.input.size_bytes())
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        set_run_mutated(&mut run, now)?;
-        state.runs.insert(run_key, run);
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(node)
-        })
-    }
-    async fn complete_map(
-        &self,
-        scope: &ExecutionScope,
-        command: CompleteMap,
-    ) -> Result<NodeRun, StoreError> {
-        self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        verified(&mut state, scope, &command.aggregate, now)?;
-        let key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.map_node_id.clone(),
-        );
-        let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
-        if node.status == NodeState::Succeeded {
-            return node
-                .result_ref
-                .as_ref()
-                .is_some_and(|reference| reference.0.digest == *command.aggregate.digest())
-                .then_some(node)
-                .ok_or(StoreError::AggregateMismatch);
-        }
-        if node.version != command.expected_node_version
-            || node.status != NodeState::WaitingChildren
-        {
-            return Err(StoreError::CasConflict);
-        }
-        if state.nodes.values().any(|child| {
-            child.scope == *scope
-                && child.run_id == command.run_id
-                && child.parent_map_instance_id.as_ref() == Some(&command.map_node_id)
-                && child.status != NodeState::Succeeded
-        }) {
-            return Err(StoreError::ChildrenIncomplete);
-        }
-        node.status = NodeState::Succeeded;
-        node.result_ref = Some(json_ref(
+            let run = state.runs.get_mut(&run_key).expect("run");
+            run.aggregate_object_bytes = aggregate_after;
+            set_run_mutated(run, now)?;
+            append_batch(
                 &mut state,
-            scope,
-            &command.aggregate,
-            ArtifactKind::MapAggregate,
-            Some(&command.run_id),
-            Some(&command.map_node_id),
-            None,
-            0,
-            now,
-        )?);
-        set_node_mutated(&mut node, now)?;
-        state.nodes.insert(key, node.clone());
-        let mut specs = vec![event_spec(
-            EventType::MapSucceeded,
-            "N08",
-            Some(&command.map_node_id),
-            None,
-            None,
-            json!({"child_count": node.map_child_count, "aggregate_digest": command.aggregate.digest()}),
-        )];
-        frontier_reduce(
-            &mut state,
-            scope,
-            &command.run_id,
-            &command.map_node_id,
-            None,
-            now,
-            &mut specs,
-        )?;
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        run.aggregate_object_bytes = run
-            .aggregate_object_bytes
-            .checked_add(command.aggregate.size_bytes())
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(node)
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(node)
         })
     }
     async fn request_approval(
@@ -3992,116 +5160,125 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: RequestApproval,
     ) -> Result<ApprovalGate, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        verified(&mut state, scope, &command.request, now)?;
-        let gate_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.gate_id.clone(),
-        );
-        if let Some(gate) = state.gates.get(&gate_key) {
-            return Ok(gate.clone());
-        }
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if node.version != command.expected_node_version
-            || node.status != NodeState::Ready
-            || node.kind != NodeKind::Approval
-        {
-            return Err(StoreError::CasConflict);
-        }
-        let definition = state
-            .run_definitions
-            .get(&(scope.clone(), command.run_id.clone()))
-            .expect("definition");
-        let gate_config = definition
-            .definition
-            .nodes
-            .iter()
-            .find_map(|candidate| match candidate {
-                NodeDefinition::Approval { id, gate, .. } if id == &node.definition_node_id => {
-                    Some(gate.clone())
-                }
-                _ => None,
-            })
-            .ok_or(StoreError::CorruptControlPlane)?;
-        let gate = ApprovalGate {
-            scope: scope.clone(),
-            run_id: command.run_id.clone(),
-            gate_id: command.gate_id.clone(),
-            node_instance_id: command.node_id.clone(),
-            request_ref: json_ref(
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            verified(&mut state, scope, &command.request, now)?;
+            let gate_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.gate_id.clone(),
+            );
+            if let Some(gate) = state.gates.get(&gate_key) {
+                return Ok(gate.clone());
+            }
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if node.version != command.expected_node_version
+                || node.status != NodeState::Ready
+                || node.kind != NodeKind::Approval
+            {
+                return Err(StoreError::CasConflict);
+            }
+            let definition = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .expect("definition");
+            let gate_config = definition
+                .definition
+                .nodes
+                .iter()
+                .find_map(|candidate| match candidate {
+                    NodeDefinition::Approval { id, gate, .. } if id == &node.definition_node_id => {
+                        Some(gate.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let gate = ApprovalGate {
+                scope: scope.clone(),
+                run_id: command.run_id.clone(),
+                gate_id: command.gate_id.clone(),
+                node_instance_id: command.node_id.clone(),
+                request_ref: json_ref(
+                    &mut state,
+                    scope,
+                    &command.request,
+                    ArtifactKind::ApprovalRequest,
+                    Some(&command.run_id),
+                    Some(&command.node_id),
+                    None,
+                    0,
+                    now,
+                )?,
+                status: crate::run::GateState::Pending,
+                expires_at: checked_add_time(now, gate_config.expires_after_ms)?,
+                on_expiry: gate_config.on_expiry,
+                authorization_policy: gate_config.authorization,
+                decision_payload_ref: None,
+                deciding_principal: None,
+                resolution_source: None,
+                decided_at: None,
+                decision_fingerprint: None,
+                version: Version(1),
+            };
+            node.status = NodeState::WaitingApproval;
+            node.approval_gate_id = Some(command.gate_id.clone());
+            set_node_mutated(&mut node, now)?;
+            state.nodes.insert(node_key, node);
+            state.gates.insert(gate_key, gate.clone());
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            let authorization_policy_digest = digest(
+                &serde_jcs::to_vec(&gate.authorization_policy)
+                    .map_err(|_| StoreError::TransactionFailed)?,
+            );
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            set_run_mutated(run, now)?;
+            append_batch(
                 &mut state,
                 scope,
-                &command.request,
-                ArtifactKind::ApprovalRequest,
-                Some(&command.run_id),
-                Some(&command.node_id),
-                None,
-                0,
+                &command.run_id,
                 now,
-            )?,
-            status: crate::run::GateState::Pending,
-            expires_at: checked_add_time(now, gate_config.expires_after_ms)?,
-            on_expiry: gate_config.on_expiry,
-            authorization_policy: gate_config.authorization,
-            decision_payload_ref: None,
-            deciding_principal: None,
-            resolution_source: None,
-            decided_at: None,
-            decision_fingerprint: None,
-            version: Version(1),
-        };
-        node.status = NodeState::WaitingApproval;
-        node.approval_gate_id = Some(command.gate_id.clone());
-        set_node_mutated(&mut node, now)?;
-        state.nodes.insert(node_key, node);
-        state.gates.insert(gate_key, gate.clone());
-        bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-        let authorization_policy_digest = digest(
-            &serde_jcs::to_vec(&gate.authorization_policy)
-                .map_err(|_| StoreError::TransactionFailed)?,
-        );
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            vec![
-                event_spec(
-                    EventType::ApprovalRequested,
-                    "N11",
-                    Some(&command.node_id),
-                    None,
-                    Some(&command.gate_id),
-                    json!({"gate_id": command.gate_id, "request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": authorization_policy_digest}),
-                ),
-                event_spec(
-                    EventType::ApprovalGateCreated,
-                    "G01",
-                    Some(&command.node_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": authorization_policy_digest}),
-                ),
-            ],
-        )?;
-        Ok(gate)
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                vec![
+                    event_spec(
+                        "N11",
+                        Some(&command.node_id),
+                        None,
+                        Some(&command.gate_id),
+                        event_payload::approval_requested(
+                            &(command.gate_id),
+                            &(command.request.digest()),
+                            &(gate.expires_at),
+                            &(gate.on_expiry),
+                            &(authorization_policy_digest),
+                        ),
+                    ),
+                    event_spec(
+                        "G01",
+                        Some(&command.node_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_gate_created(
+                            &(command.request.digest()),
+                            &(gate.expires_at),
+                            &(gate.on_expiry),
+                            &(authorization_policy_digest),
+                        ),
+                    ),
+                ],
+            )?;
+            Ok(gate)
         })
     }
     async fn decide_approval(
@@ -4110,210 +5287,257 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: DecideApproval,
     ) -> Result<ApprovalGate, StoreError> {
         self.transaction(|mut state, now| {
-        if command.principal.scope() != scope {
-            return Err(StoreError::ApprovalUnauthorized);
-        }
-        let gate_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.gate_id.clone(),
-        );
-        let mut gate = state
-            .gates
-            .get(&gate_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let authorized = gate
-            .authorization_policy
-            .allowed_principal_ids
-            .iter()
-            .any(|id| id == command.principal.principal_id())
-            || command
-                .principal
-                .role_ids()
+            if command.principal.scope() != scope {
+                return Err(StoreError::ApprovalUnauthorized);
+            }
+            let gate_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.gate_id.clone(),
+            );
+            let mut gate = state
+                .gates
+                .get(&gate_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let authorized = gate
+                .authorization_policy
+                .allowed_principal_ids
                 .iter()
-                .any(|role| gate.authorization_policy.allowed_role_ids.contains(role));
-        if !authorized {
-            return Err(StoreError::ApprovalUnauthorized);
-        }
-        if let Some(payload) = &command.decision_payload {
-            verified(&mut state, scope, payload, now)?;
-            if payload.media_type() != "application/json" {
-                return Err(StoreError::ObjectNotVerified);
+                .any(|id| id == command.principal.principal_id())
+                || command
+                    .principal
+                    .role_ids()
+                    .iter()
+                    .any(|role| gate.authorization_policy.allowed_role_ids.contains(role));
+            if !authorized {
+                return Err(StoreError::ApprovalUnauthorized);
             }
-        }
-        if let Some(output) = &command.approval_output {
-            verified(&mut state, scope, output, now)?;
-        }
-        if command.decision == ApprovalDecision::Reject && command.approval_output.is_some() {
-            return Err(StoreError::InvalidField);
-        }
-        let decision_fingerprint = approval_decision_fingerprint(
-            scope,
-            &command.run_id,
-            &command.gate_id,
-            command.decision,
-            command.decision_payload.as_ref(),
-            command.approval_output.as_ref(),
-            &command.principal,
-        );
-        if gate.status != crate::run::GateState::Pending {
-            return if gate.decision_fingerprint.as_ref() == Some(&decision_fingerprint) {
-                Ok(gate)
-            } else {
-                Err(StoreError::ApprovalAlreadyResolved)
-            };
-        }
-        running_fence(&state, scope, &command.run_id, None, now)?;
-        if gate.version != command.expected_gate_version
-            || state
-                .runs
-                .get(&(scope.clone(), command.run_id.clone()))
-                .expect("run")
-                .version
-                != command.expected_run_version
-        {
-            return Err(StoreError::ApprovalRaceLost);
-        }
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            gate.node_instance_id.clone(),
-        );
-        let mut node = state.nodes.get(&node_key).cloned().expect("gate node");
-        let mut specs = Vec::new();
-        let payload_reference = command
-            .decision_payload
-            .as_ref()
-            .map(|payload| {
-                artifact(
-                    &mut state,
-                    scope,
-                    payload,
-                    ArtifactKind::ApprovalDecisionPayload,
-                    Some(&command.run_id),
-                    Some(&node.node_instance_id),
-                    None,
-                    0,
-                    now,
-                )
-            })
-            .transpose()?;
-        let payload_value = payload_reference
-            .as_ref()
-            .map(|reference| crate::artifact::ArtifactRefValue {
-                artifact_ref_id: reference.artifact_ref_id.clone(),
-                digest: reference.digest.clone(),
-                size_bytes: reference.size_bytes.to_string(),
-                media_type: reference.media_type.clone(),
-            });
-        match command.decision {
-            ApprovalDecision::Approve => {
-                let output = command
-                    .approval_output
-                    .as_ref()
-                    .ok_or(StoreError::ObjectNotVerified)?;
-                let expected = crate::approval::canonical_human_approval_result(
-                    payload_value,
-                    &command.principal,
-                );
-                if output.media_type() != "application/json"
-                    || output.digest() != &digest(&expected)
-                    || output.size_bytes() != expected.len() as u64
-                {
-                    return Err(StoreError::ContractValidationApplied {
-                        code: "ApprovalPayloadInvalid".to_owned(),
-                    });
+            running_fence(&state, scope, &command.run_id, None, now)?;
+            if let Some(payload) = &command.decision_payload {
+                verified(&mut state, scope, payload, now)?;
+                if payload.media_type() != "application/json" {
+                    return Err(StoreError::ObjectNotVerified);
                 }
-                gate.status = crate::run::GateState::Approved;
-                node.status = NodeState::Succeeded;
-                node.result_ref = Some(json_ref(
+            }
+            if let Some(output) = &command.approval_output {
+                verified(&mut state, scope, output, now)?;
+            }
+            if command.decision == ApprovalDecision::Reject && command.approval_output.is_some() {
+                return Err(StoreError::InvalidField);
+            }
+            let decision_fingerprint = approval_decision_fingerprint(
+                scope,
+                &command.run_id,
+                &command.gate_id,
+                command.decision,
+                command.decision_payload.as_ref(),
+                command.approval_output.as_ref(),
+                &command.principal,
+            );
+            if gate.status != crate::run::GateState::Pending {
+                return if gate.decision_fingerprint.as_ref() == Some(&decision_fingerprint) {
+                    Ok(gate)
+                } else {
+                    Err(StoreError::ApprovalAlreadyResolved)
+                };
+            }
+            if gate.version != command.expected_gate_version
+                || state
+                    .runs
+                    .get(&(scope.clone(), command.run_id.clone()))
+                    .expect("run")
+                    .version
+                    != command.expected_run_version
+            {
+                return Err(StoreError::ApprovalRaceLost);
+            }
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                gate.node_instance_id.clone(),
+            );
+            let mut node = state.nodes.get(&node_key).cloned().expect("gate node");
+            let mut specs = Vec::new();
+            let payload_reference = command
+                .decision_payload
+                .as_ref()
+                .map(|payload| {
+                    artifact(
+                        &mut state,
+                        scope,
+                        payload,
+                        ArtifactKind::ApprovalDecisionPayload,
+                        Some(&command.run_id),
+                        Some(&node.node_instance_id),
+                        None,
+                        0,
+                        now,
+                    )
+                })
+                .transpose()?;
+            let payload_value =
+                payload_reference
+                    .as_ref()
+                    .map(|reference| crate::artifact::ArtifactRefValue {
+                        artifact_ref_id: reference.artifact_ref_id.clone(),
+                        digest: reference.digest.clone(),
+                        size_bytes: reference.size_bytes.to_string(),
+                        media_type: reference.media_type.clone(),
+                    });
+            match command.decision {
+                ApprovalDecision::Approve => {
+                    let output = command
+                        .approval_output
+                        .as_ref()
+                        .ok_or(StoreError::ObjectNotVerified)?;
+                    let expected = crate::approval::canonical_human_approval_result(
+                        payload_value,
+                        &command.principal,
+                    );
+                    if output.media_type() != "application/json"
+                        || output.digest() != &digest(&expected)
+                        || output.size_bytes() != expected.len() as u64
+                    {
+                        return Err(StoreError::ContractValidationApplied {
+                            code: "ApprovalPayloadInvalid".to_owned(),
+                        });
+                    }
+                    gate.status = crate::run::GateState::Approved;
+                    node.status = NodeState::Succeeded;
+                    node.result_ref = Some(json_ref(
+                        &mut state,
+                        scope,
+                        output,
+                        ArtifactKind::NodeOutput,
+                        Some(&command.run_id),
+                        Some(&node.node_instance_id),
+                        None,
+                        0,
+                        now,
+                    )?);
+                    specs.push(event_spec(
+                        "G02",
+                        Some(&node.node_instance_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_gate_approved(
+                            &(command.principal.principal_id()),
+                            &(command
+                                .decision_payload
+                                .as_ref()
+                                .map(VerifiedObjectRef::digest)),
+                            &(output.digest()),
+                            &(decision_fingerprint),
+                        ),
+                    ));
+                    specs.push(event_spec(
+                        "N12",
+                        Some(&node.node_instance_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_approved(
+                            &(gate.gate_id),
+                            &(command
+                                .decision_payload
+                                .as_ref()
+                                .map(VerifiedObjectRef::digest)),
+                            &(output.digest()),
+                            &("human"),
+                        ),
+                    ));
+                    let node_id = node.node_instance_id.clone();
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node);
+                    frontier_reduce(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        &node_id,
+                        None,
+                        now,
+                        &mut specs,
+                    )?;
+                }
+                ApprovalDecision::Reject => {
+                    gate.status = crate::run::GateState::Rejected;
+                    node.status = NodeState::Failed;
+                    node.failure_kind = Some(NodeFailureKind::ApprovalRejected);
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node.clone());
+                    specs.push(event_spec(
+                        "G03",
+                        Some(&node.node_instance_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_gate_rejected(
+                            &(command.principal.principal_id()),
+                            &(command
+                                .decision_payload
+                                .as_ref()
+                                .map(VerifiedObjectRef::digest)),
+                            &(decision_fingerprint),
+                        ),
+                    ));
+                    specs.push(event_spec(
+                        "N13",
+                        Some(&node.node_instance_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_rejected(
+                            &(gate.gate_id),
+                            &(command
+                                .decision_payload
+                                .as_ref()
+                                .map(VerifiedObjectRef::digest)),
+                            &("human"),
+                        ),
+                    ));
+                    terminalize_run(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        RunState::Failed,
+                        Some(RunFailureKind::ApprovalRejected),
+                        "ApprovalRejected",
+                        now,
+                        &mut specs,
+                    )?;
+                    specs.push(event_spec(
+                        "R07",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_failed(&("ApprovalRejected"), &(Option::<()>::None)),
+                    ));
+                }
+            }
+            gate.deciding_principal = Some(command.principal.principal_id().to_owned());
+            gate.decision_payload_ref = payload_reference.map(JsonRef);
+            gate.resolution_source = Some(ApprovalResolutionSource::Human);
+            gate.decided_at = Some(now);
+            gate.decision_fingerprint = Some(decision_fingerprint);
+            gate.version.0 = gate
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            state.gates.insert(gate_key, gate.clone());
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            set_run_mutated(run, now)?;
+            append_batch(
                 &mut state,
-                    scope,
-                    output,
-                    ArtifactKind::NodeOutput,
-                    Some(&command.run_id),
-                    Some(&node.node_instance_id),
-                    None,
-                    0,
-                    now,
-                )?);
-                specs.push(event_spec(EventType::ApprovalGateApproved, "G02", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "approval_output_digest": output.digest(), "decision_fingerprint": decision_fingerprint})));
-                specs.push(event_spec(EventType::ApprovalApproved, "N12", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"gate_id": gate.gate_id, "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "approval_output_digest": output.digest(), "resolution_source": "human"})));
-                let node_id = node.node_instance_id.clone();
-                set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node);
-                frontier_reduce(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    &node_id,
-                    None,
-                    now,
-                    &mut specs,
-                )?;
-            }
-            ApprovalDecision::Reject => {
-                gate.status = crate::run::GateState::Rejected;
-                node.status = NodeState::Failed;
-                node.failure_kind = Some(NodeFailureKind::ApprovalRejected);
-                set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node.clone());
-                specs.push(event_spec(EventType::ApprovalGateRejected, "G03", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "decision_fingerprint": decision_fingerprint})));
-                specs.push(event_spec(
-                    EventType::ApprovalRejected,
-                    "N13",
-                    Some(&node.node_instance_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"gate_id": gate.gate_id, "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "resolution_source": "human"}),
-                ));
-                terminalize_run(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    RunState::Failed,
-                    Some(RunFailureKind::ApprovalRejected),
-                    "ApprovalRejected",
-                    now,
-                    &mut specs,
-                )?;
-                specs.push(event_spec(
-                    EventType::RunFailed,
-                    "R07",
-                    None,
-                    None,
-                    None,
-                    json!({"failure_kind": "ApprovalRejected"}),
-                ));
-            }
-        }
-        gate.deciding_principal = Some(command.principal.principal_id().to_owned());
-        gate.decision_payload_ref = payload_reference.map(JsonRef);
-        gate.resolution_source = Some(ApprovalResolutionSource::Human);
-        gate.decided_at = Some(now);
-        gate.decision_fingerprint = Some(decision_fingerprint);
-        gate.version.0 = gate
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        state.gates.insert(gate_key, gate.clone());
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Host,
-            command.principal.principal_id().to_owned(),
-            specs,
-        )?;
-        Ok(gate)
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Host,
+                command.principal.principal_id().to_owned(),
+                specs,
+            )?;
+            Ok(gate)
         })
     }
     async fn expire_approval(
@@ -4322,162 +5546,171 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: ExpireApproval,
     ) -> Result<ApprovalGate, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        let gate_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.gate_id.clone(),
-        );
-        let mut gate = state
-            .gates
-            .get(&gate_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if now < gate.expires_at {
-            return Err(StoreError::ExpiryNotDue {
-                database_now: now,
-                expires_at: gate.expires_at,
-            });
-        }
-        if gate.status != crate::run::GateState::Pending {
-            return Err(StoreError::ApprovalRaceLost);
-        }
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            gate.node_instance_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        let mut specs = Vec::new();
-        match gate.on_expiry {
-            crate::approval::ApprovalExpiryPolicy::Approve => {
-                let output = command
-                    .approval_output
-                    .as_ref()
-                    .ok_or(StoreError::ObjectNotVerified)?;
-                verified(&mut state, scope, output, now)?;
-                let expected = crate::approval::canonical_expiry_approval_result();
-                if output.media_type() != "application/json"
-                    || output.digest() != &digest(&expected)
-                    || output.size_bytes() != expected.len() as u64
-                {
-                    return Err(StoreError::ContractValidationApplied {
-                        code: "ApprovalPayloadInvalid".to_owned(),
-                    });
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            let gate_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.gate_id.clone(),
+            );
+            let mut gate = state
+                .gates
+                .get(&gate_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if now < gate.expires_at {
+                return Err(StoreError::ExpiryNotDue {
+                    database_now: now,
+                    expires_at: gate.expires_at,
+                });
+            }
+            if gate.status != crate::run::GateState::Pending {
+                return Err(StoreError::ApprovalRaceLost);
+            }
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                gate.node_instance_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let mut specs = Vec::new();
+            match gate.on_expiry {
+                crate::approval::ApprovalExpiryPolicy::Approve => {
+                    let output = command
+                        .approval_output
+                        .as_ref()
+                        .ok_or(StoreError::ObjectNotVerified)?;
+                    verified(&mut state, scope, output, now)?;
+                    let expected = crate::approval::canonical_expiry_approval_result();
+                    if output.media_type() != "application/json"
+                        || output.digest() != &digest(&expected)
+                        || output.size_bytes() != expected.len() as u64
+                    {
+                        return Err(StoreError::ContractValidationApplied {
+                            code: "ApprovalPayloadInvalid".to_owned(),
+                        });
+                    }
+                    gate.status = crate::run::GateState::ExpiredApproved;
+                    gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
+                    node.status = NodeState::Succeeded;
+                    node.result_ref = Some(json_ref(
+                        &mut state,
+                        scope,
+                        output,
+                        ArtifactKind::NodeOutput,
+                        Some(&command.run_id),
+                        Some(&node.node_instance_id),
+                        None,
+                        0,
+                        now,
+                    )?);
+                    set_node_mutated(&mut node, now)?;
+                    let node_id = node.node_instance_id.clone();
+                    state.nodes.insert(node_key, node);
+                    specs.push(event_spec(
+                        "G04",
+                        Some(&node_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_gate_expired_approved(
+                            &(gate.expires_at),
+                            &(now),
+                            &(output.digest()),
+                        ),
+                    ));
+                    specs.push(event_spec(
+                        "N14",
+                        Some(&node_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_expired_approved(
+                            &(gate.gate_id),
+                            &(gate.expires_at),
+                            &(output.digest()),
+                        ),
+                    ));
+                    frontier_reduce(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        &node_id,
+                        None,
+                        now,
+                        &mut specs,
+                    )?;
                 }
-                gate.status = crate::run::GateState::ExpiredApproved;
-                gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
-                node.status = NodeState::Succeeded;
-                node.result_ref = Some(json_ref(
+                crate::approval::ApprovalExpiryPolicy::Reject => {
+                    gate.status = crate::run::GateState::ExpiredRejected;
+                    gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
+                    node.status = NodeState::Failed;
+                    node.failure_kind = Some(NodeFailureKind::ApprovalExpiredRejected);
+                    set_node_mutated(&mut node, now)?;
+                    let node_id = node.node_instance_id.clone();
+                    state.nodes.insert(node_key, node);
+                    specs.push(event_spec(
+                        "G05",
+                        Some(&node_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_gate_expired_rejected(&(gate.expires_at), &(now)),
+                    ));
+                    specs.push(event_spec(
+                        "N15",
+                        Some(&node_id),
+                        None,
+                        Some(&gate.gate_id),
+                        event_payload::approval_expired_rejected(
+                            &(gate.gate_id),
+                            &(gate.expires_at),
+                        ),
+                    ));
+                    terminalize_run(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        RunState::Failed,
+                        Some(RunFailureKind::ApprovalExpiredRejected),
+                        "ApprovalExpiredRejected",
+                        now,
+                        &mut specs,
+                    )?;
+                    specs.push(event_spec(
+                        "R07",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_failed(
+                            &("ApprovalExpiredRejected"),
+                            &(Option::<()>::None),
+                        ),
+                    ));
+                }
+            }
+            gate.decided_at = Some(now);
+            gate.version.0 = gate
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            state.gates.insert(gate_key, gate.clone());
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            set_run_mutated(run, now)?;
+            append_batch(
                 &mut state,
-                    scope,
-                    output,
-                    ArtifactKind::NodeOutput,
-                    Some(&command.run_id),
-                    Some(&node.node_instance_id),
-                    None,
-                    0,
-                    now,
-                )?);
-                set_node_mutated(&mut node, now)?;
-                let node_id = node.node_instance_id.clone();
-                state.nodes.insert(node_key, node);
-                specs.push(event_spec(
-                    EventType::ApprovalGateExpiredApproved,
-                    "G04",
-                    Some(&node_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"expires_at": gate.expires_at, "database_now": now, "approval_output_digest": output.digest()}),
-                ));
-                specs.push(event_spec(
-                    EventType::ApprovalExpiredApproved,
-                    "N14",
-                    Some(&node_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"gate_id": gate.gate_id, "expires_at": gate.expires_at, "approval_output_digest": output.digest()}),
-                ));
-                frontier_reduce(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    &node_id,
-                    None,
-                    now,
-                    &mut specs,
-                )?;
-            }
-            crate::approval::ApprovalExpiryPolicy::Reject => {
-                gate.status = crate::run::GateState::ExpiredRejected;
-                gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
-                node.status = NodeState::Failed;
-                node.failure_kind = Some(NodeFailureKind::ApprovalExpiredRejected);
-                set_node_mutated(&mut node, now)?;
-                let node_id = node.node_instance_id.clone();
-                state.nodes.insert(node_key, node);
-                specs.push(event_spec(
-                    EventType::ApprovalGateExpiredRejected,
-                    "G05",
-                    Some(&node_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"expires_at": gate.expires_at, "database_now": now}),
-                ));
-                specs.push(event_spec(
-                    EventType::ApprovalExpiredRejected,
-                    "N15",
-                    Some(&node_id),
-                    None,
-                    Some(&gate.gate_id),
-                    json!({"gate_id": gate.gate_id, "expires_at": gate.expires_at}),
-                ));
-                terminalize_run(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    RunState::Failed,
-                    Some(RunFailureKind::ApprovalExpiredRejected),
-                    "ApprovalExpiredRejected",
-                    now,
-                    &mut specs,
-                )?;
-                specs.push(event_spec(
-                    EventType::RunFailed,
-                    "R07",
-                    None,
-                    None,
-                    None,
-                    json!({"failure_kind": "ApprovalExpiredRejected"}),
-                ));
-            }
-        }
-        gate.decided_at = Some(now);
-        gate.version.0 = gate
-            .version
-            .0
-            .checked_add(1)
-            .ok_or(StoreError::ArithmeticOverflow)?;
-        state.gates.insert(gate_key, gate.clone());
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Clock,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(gate)
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Clock,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(gate)
         })
     }
     async fn resolve_terminal_node(
@@ -4486,171 +5719,119 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: ResolveTerminalNode,
     ) -> Result<WorkflowRun, StoreError> {
         self.transaction(|mut state, now| {
-        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-        let node_key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let mut node = state
-            .nodes
-            .get(&node_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if node.version != command.expected_node_version || node.status != NodeState::Ready {
-            return Err(StoreError::CasConflict);
-        }
-        let mut specs = Vec::new();
-        let run = match node.kind {
-            NodeKind::Succeed => {
-                let output = command
-                    .output
-                    .as_ref()
-                    .ok_or(StoreError::ObjectNotVerified)?;
-                node.status = NodeState::Succeeded;
-                node.result_ref = Some(json_ref(
-                &mut state,
-                    scope,
-                    output,
-                    ArtifactKind::NodeOutput,
-                    Some(&command.run_id),
-                    Some(&command.node_id),
-                    None,
-                    0,
-                    now,
-                )?);
-                set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node);
-                specs.push(event_spec(
-                    EventType::SucceedNodeReached,
-                    "N16",
-                    Some(&command.node_id),
-                    None,
-                    None,
-                    json!({"output_digest": output.digest()}),
-                ));
-                let active = state.nodes.values().any(|candidate| {
-                    candidate.scope == *scope
-                        && candidate.run_id == command.run_id
-                        && !candidate.status.is_terminal()
-                });
-                if active {
-                    return Err(StoreError::IllegalTransition);
-                }
-                let result_ref = state
-                    .nodes
-                    .get(&(
-                        scope.clone(),
-                        command.run_id.clone(),
-                        command.node_id.clone(),
-                    ))
-                    .expect("node")
-                    .result_ref
-                    .clone();
-                let run = state
-                    .runs
-                    .get_mut(&(scope.clone(), command.run_id.clone()))
-                    .expect("run");
-                run.status = RunState::Succeeded;
-                run.output_ref = result_ref;
-                run.finished_at = Some(now);
-                set_run_mutated(run, now)?;
-                specs.push(event_spec(EventType::RunSucceeded, "R06", None, None, None, json!({"output_digest": output.digest(), "consumed_cost_units": run.budget_consumed})));
-                run.clone()
-            }
-            NodeKind::Fail => {
-                node.status = NodeState::Failed;
-                node.failure_kind = Some(NodeFailureKind::ExplicitFailNode);
-                set_node_mutated(&mut node, now)?;
-                state.nodes.insert(node_key, node);
-                specs.push(event_spec(
-                    EventType::FailNodeReached,
-                    "N17",
-                    Some(&command.node_id),
-                    None,
-                    None,
-                    json!({"code": "explicit_fail", "message_digest": digest(b"explicit fail")}),
-                ));
-                let run = terminalize_run(
-                    &mut state,
-                    scope,
-                    &command.run_id,
-                    RunState::Failed,
-                    Some(RunFailureKind::ExplicitFailNode),
-                    "ExplicitFailNode",
-                    now,
-                    &mut specs,
-                )?;
-                specs.push(event_spec(
-                    EventType::RunFailed,
-                    "R07",
-                    None,
-                    None,
-                    None,
-                    json!({"failure_kind": "ExplicitFailNode"}),
-                ));
-                run
-            }
-            _ => return Err(StoreError::IllegalTransition),
-        };
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(run)
-        })
-    }
-    async fn fail_contract(
-        &self,
-        scope: &ExecutionScope,
-        command: FailContract,
-    ) -> Result<WorkflowRun, StoreError> {
-        self.transaction(|mut state, now| {
             running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-            let key = (
+            let node_key = (
                 scope.clone(),
                 command.run_id.clone(),
                 command.node_id.clone(),
             );
-            let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
             if node.version != command.expected_node_version || node.status != NodeState::Ready {
                 return Err(StoreError::CasConflict);
             }
-            node.status = NodeState::ContractFailed;
-            node.failure_kind = Some(command.closed_failure_kind);
-            set_node_mutated(node, now)?;
-            let run_kind = run_failure(command.closed_failure_kind);
-            let mut specs = vec![event_spec(
-                EventType::NodeContractFailed,
-                "N46",
-                Some(&command.node_id),
-                None,
-                None,
-                json!({"failure_kind": command.closed_failure_kind}),
-            )];
-            let run = terminalize_run(
-                &mut state,
-                scope,
-                &command.run_id,
-                RunState::ContractFailed,
-                Some(run_kind),
-                "ContractFailed",
-                now,
-                &mut specs,
-            )?;
-            specs.push(event_spec(
-                EventType::RunContractFailed,
-                "R08",
-                None,
-                None,
-                None,
-                json!({"failure_kind": run_kind}),
-            ));
+            let mut specs = Vec::new();
+            let run = match node.kind {
+                NodeKind::Succeed => {
+                    let output = command
+                        .output
+                        .as_ref()
+                        .ok_or(StoreError::ObjectNotVerified)?;
+                    node.status = NodeState::Succeeded;
+                    node.result_ref = Some(json_ref(
+                        &mut state,
+                        scope,
+                        output,
+                        ArtifactKind::NodeOutput,
+                        Some(&command.run_id),
+                        Some(&command.node_id),
+                        None,
+                        0,
+                        now,
+                    )?);
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node);
+                    specs.push(event_spec(
+                        "N16",
+                        Some(&command.node_id),
+                        None,
+                        None,
+                        event_payload::succeed_node_reached(&(output.digest())),
+                    ));
+                    let active = state.nodes.values().any(|candidate| {
+                        candidate.scope == *scope
+                            && candidate.run_id == command.run_id
+                            && !candidate.status.is_terminal()
+                    });
+                    if active {
+                        return Err(StoreError::IllegalTransition);
+                    }
+                    let result_ref = state
+                        .nodes
+                        .get(&(
+                            scope.clone(),
+                            command.run_id.clone(),
+                            command.node_id.clone(),
+                        ))
+                        .expect("node")
+                        .result_ref
+                        .clone();
+                    let run = state
+                        .runs
+                        .get_mut(&(scope.clone(), command.run_id.clone()))
+                        .expect("run");
+                    run.status = RunState::Succeeded;
+                    run.output_ref = result_ref;
+                    run.finished_at = Some(now);
+                    set_run_mutated(run, now)?;
+                    specs.push(event_spec(
+                        "R06",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_succeeded(&(output.digest()), &(run.budget_consumed)),
+                    ));
+                    run.clone()
+                }
+                NodeKind::Fail => {
+                    node.status = NodeState::Failed;
+                    node.failure_kind = Some(NodeFailureKind::ExplicitFailNode);
+                    set_node_mutated(&mut node, now)?;
+                    state.nodes.insert(node_key, node);
+                    specs.push(event_spec(
+                        "N17",
+                        Some(&command.node_id),
+                        None,
+                        None,
+                        event_payload::fail_node_reached(
+                            &("explicit_fail"),
+                            &(digest(b"explicit fail")),
+                        ),
+                    ));
+                    let run = terminalize_run(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        RunState::Failed,
+                        Some(RunFailureKind::ExplicitFailNode),
+                        "ExplicitFailNode",
+                        now,
+                        &mut specs,
+                    )?;
+                    specs.push(event_spec(
+                        "R07",
+                        None,
+                        None,
+                        None,
+                        event_payload::run_failed(&("ExplicitFailNode"), &(Option::<()>::None)),
+                    ));
+                    run
+                }
+                _ => return Err(StoreError::IllegalTransition),
+            };
             append_batch(
                 &mut state,
                 scope,
@@ -4663,112 +5844,243 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             Ok(run)
         })
     }
+    async fn fail_contract(
+        &self,
+        scope: &ExecutionScope,
+        command: FailContract,
+    ) -> Result<WorkflowRun, StoreError> {
+        self.transaction(|mut state, now| {
+            let diagnostics = if let Some(diagnostics) = &command.diagnostics {
+                verified(&mut state, scope, diagnostics, now)?;
+                if diagnostics.media_type() != "application/json" {
+                    return Err(StoreError::DiagnosticsInvalid {
+                        path: "/".to_owned(),
+                        code: "media_type".to_owned(),
+                    });
+                }
+                let envelope: DiagnosticsEnvelope =
+                    serde_json::from_slice(diagnostics.verified_bytes()).map_err(|_| {
+                        StoreError::DiagnosticsInvalid {
+                            path: "/".to_owned(),
+                            code: "shape".to_owned(),
+                        }
+                    })?;
+                envelope.validate().map_err(|error| match error {
+                    DiagnosticsValidationError::Invalid { path, code } => {
+                        StoreError::DiagnosticsInvalid {
+                            path,
+                            code: code.to_owned(),
+                        }
+                    }
+                    DiagnosticsValidationError::TooLarge {
+                        limit_bytes,
+                        observed_bytes,
+                    } => StoreError::DiagnosticsTooLarge {
+                        limit_bytes: limit_bytes as u64,
+                        observed_bytes: observed_bytes as u64,
+                    },
+                })?;
+                Some(json_ref(
+                    &mut state,
+                    scope,
+                    diagnostics,
+                    ArtifactKind::Diagnostics,
+                    Some(&command.run_id),
+                    Some(&command.node_id),
+                    None,
+                    0,
+                    now,
+                )?)
+            } else {
+                None
+            };
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
+            if node.version != command.expected_node_version || node.status != NodeState::Ready {
+                return Err(StoreError::CasConflict);
+            }
+            node.status = NodeState::ContractFailed;
+            node.failure_kind = Some(command.closed_failure_kind);
+            node.failure_diagnostics_ref = diagnostics.clone();
+            set_node_mutated(node, now)?;
+            let run_kind = run_failure(command.closed_failure_kind);
+            let mut specs = vec![event_spec(
+                "N46",
+                Some(&command.node_id),
+                None,
+                None,
+                event_payload::node_contract_failed(
+                    &(Option::<()>::None),
+                    &(command.closed_failure_kind),
+                    &(command.diagnostics.as_ref().map(VerifiedObjectRef::digest)),
+                ),
+            )];
+            let run = terminalize_run(
+                &mut state,
+                scope,
+                &command.run_id,
+                RunState::ContractFailed,
+                Some(run_kind),
+                "ContractFailed",
+                now,
+                &mut specs,
+            )?;
+            state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run")
+                .failure_diagnostics_ref = diagnostics;
+            specs.push(event_spec(
+                "R08",
+                None,
+                None,
+                None,
+                event_payload::run_contract_failed(
+                    &(run_kind),
+                    &(command.diagnostics.as_ref().map(VerifiedObjectRef::digest)),
+                ),
+            ));
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
+                .cloned()
+                .unwrap_or(run))
+        })
+    }
     async fn cancel_run(
         &self,
         scope: &ExecutionScope,
         command: CancelRun,
     ) -> Result<CommandReceipt, StoreError> {
         self.transaction(|mut state, now| {
-        if command.principal.scope() != scope
-            || command.reason_code.is_empty()
-            || command.idempotency_token.len() < 16
-        {
-            return Err(StoreError::InvalidField);
-        }
-        let expected_gate_versions = command
-            .expected_pending_gate_versions
-            .iter()
-            .map(|gate| (gate.gate_id.as_str(), gate.version.0))
-            .collect::<Vec<_>>();
-        let request_fingerprint = fingerprint(
-            "cancel-v1",
-            scope,
-            &(
+            if command.principal.scope() != scope
+                || command.reason_code.is_empty()
+                || command.idempotency_token.len() < 16
+            {
+                return Err(StoreError::InvalidField);
+            }
+            let expected_gate_versions = command
+                .expected_pending_gate_versions
+                .iter()
+                .map(|gate| (gate.gate_id.as_str(), gate.version.0))
+                .collect::<Vec<_>>();
+            let request_fingerprint = fingerprint(
+                "cancel-v1",
+                scope,
+                &(
+                    &command.run_id,
+                    command.expected_run_version,
+                    &expected_gate_versions,
+                    command.principal.principal_id(),
+                    &command.reason_code,
+                ),
+            );
+            let receipt_key = (
+                scope.clone(),
+                CommandKindKey::Cancel,
+                command.idempotency_token.clone(),
+            );
+            if let Some(receipt) = state.receipts.get(&receipt_key) {
+                return if receipt.request_fingerprint == request_fingerprint {
+                    Ok(receipt.clone())
+                } else {
+                    Err(StoreError::IdempotencyConflict)
+                };
+            }
+            command_fence(&state, scope, &command.run_id, None, now, true)?;
+            let prior = state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if prior.version != command.expected_run_version || prior.status.is_terminal() {
+                return Err(StoreError::CancellationRaceLost);
+            }
+            let mut actual_gate_versions = state
+                .gates
+                .values()
+                .filter(|gate| {
+                    gate.scope == *scope
+                        && gate.run_id == command.run_id
+                        && gate.status == crate::run::GateState::Pending
+                })
+                .map(|gate| (gate.gate_id.as_str(), gate.version.0))
+                .collect::<Vec<_>>();
+            actual_gate_versions.sort_unstable();
+            let mut supplied_gate_versions = expected_gate_versions;
+            supplied_gate_versions.sort_unstable();
+            if actual_gate_versions != supplied_gate_versions {
+                return Err(StoreError::CancellationRaceLost);
+            }
+            let mut specs = Vec::new();
+            let run = terminalize_run(
+                &mut state,
+                scope,
                 &command.run_id,
-                command.expected_run_version,
-                &expected_gate_versions,
-                command.principal.principal_id(),
+                RunState::Cancelled,
+                None,
                 &command.reason_code,
-            ),
-        );
-        let receipt_key = (
-            scope.clone(),
-            CommandKindKey::Cancel,
-            command.idempotency_token.clone(),
-        );
-        if let Some(receipt) = state.receipts.get(&receipt_key) {
-            return if receipt.request_fingerprint == request_fingerprint {
-                Ok(receipt.clone())
-            } else {
-                Err(StoreError::IdempotencyConflict)
-            };
-        }
-        command_fence(&state, scope, &command.run_id, None, now, true)?;
-        let prior = state
-            .runs
-            .get(&(scope.clone(), command.run_id.clone()))
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if prior.version != command.expected_run_version || prior.status.is_terminal() {
-            return Err(StoreError::CancellationRaceLost);
-        }
-        let mut actual_gate_versions = state
-            .gates
-            .values()
-            .filter(|gate| {
-                gate.scope == *scope
-                    && gate.run_id == command.run_id
-                    && gate.status == crate::run::GateState::Pending
-            })
-            .map(|gate| (gate.gate_id.as_str(), gate.version.0))
-            .collect::<Vec<_>>();
-        actual_gate_versions.sort_unstable();
-        let mut supplied_gate_versions = expected_gate_versions;
-        supplied_gate_versions.sort_unstable();
-        if actual_gate_versions != supplied_gate_versions {
-            return Err(StoreError::CancellationRaceLost);
-        }
-        let mut specs = Vec::new();
-        let run = terminalize_run(
-            &mut state,
-            scope,
-            &command.run_id,
-            RunState::Cancelled,
-            None,
-            &command.reason_code,
-            now,
-            &mut specs,
-        )?;
-        specs.push(event_spec(EventType::RunCancelled, match prior.status { RunState::Pending => "R11", RunState::Running => "R12", _ => "R13" }, None, None, None, json!({"principal": command.principal.principal_id(), "reason_code": command.reason_code, "prior_status": prior.status})));
-        let (batch_id, first, last) = append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Host,
-            command.principal.principal_id().to_owned(),
-            specs,
-        )?;
-        let receipt = CommandReceipt {
-            scope: scope.clone(),
-            command_kind: CommandKind::CancelRun,
-            idempotency_token: command.idempotency_token,
-            request_fingerprint,
-            run_id: command.run_id.clone(),
-            outcome: CommandReceiptOutcome::CancelRunCommitted {
+                now,
+                &mut specs,
+            )?;
+            specs.push(event_spec(
+                match prior.status {
+                    RunState::Pending => "R11",
+                    RunState::Running => "R12",
+                    _ => "R13",
+                },
+                None,
+                None,
+                None,
+                event_payload::run_cancelled(
+                    &(command.principal.principal_id()),
+                    &(command.reason_code),
+                    &(prior.status),
+                ),
+            ));
+            let (batch_id, first, last) = append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Host,
+                command.principal.principal_id().to_owned(),
+                specs,
+            )?;
+            let receipt = CommandReceipt {
+                scope: scope.clone(),
+                command_kind: CommandKind::CancelRun,
+                idempotency_token: command.idempotency_token,
+                request_fingerprint,
                 run_id: command.run_id.clone(),
-                prior_status: prior.status,
-                status: RunState::Cancelled,
-                run_version: run.version,
-                batch_id: batch_id.clone(),
-                first_event_seq: first,
-                last_event_seq: last,
-            },
-            batch_id,
-            committed_at: now,
-        };
-        state.receipts.insert(receipt_key, receipt.clone());
-        Ok(receipt)
+                outcome: CommandReceiptOutcome::CancelRunCommitted {
+                    run_id: command.run_id.clone(),
+                    prior_status: prior.status,
+                    status: RunState::Cancelled,
+                    run_version: run.version,
+                    batch_id: batch_id.clone(),
+                    first_event_seq: first,
+                    last_event_seq: last,
+                },
+                batch_id,
+                committed_at: now,
+            };
+            state.receipts.insert(receipt_key, receipt.clone());
+            Ok(receipt)
         })
     }
     async fn expire_run_lifetime(
@@ -4811,7 +6123,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 &mut specs,
             )?;
             specs.push(event_spec(
-                EventType::RunCancelled,
                 match prior.status {
                     RunState::Pending => "R11",
                     RunState::Running => "R12",
@@ -4820,7 +6131,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 None,
                 None,
-                json!({"reason_code": "RunLifetimeExceeded", "prior_status": prior.status}),
+                event_payload::run_cancelled(
+                    &(Option::<()>::None),
+                    &("RunLifetimeExceeded"),
+                    &(prior.status),
+                ),
             ));
             append_batch(
                 &mut state,
@@ -4840,106 +6155,122 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: MarkCorruptStorage,
     ) -> Result<WorkflowRun, StoreError> {
         self.transaction(|mut state, now| {
-        if command.proof.scope() != scope
-            || command.proof.requested_digest() != &command.bad_ref.digest
-            || command.bad_ref.scope != *scope
-            || state.object_store_nonce.as_deref()
-                != Some(command.proof.store_instance_nonce())
-            || state
-                .artifact_refs
-                .get(&(scope.clone(), command.bad_ref.artifact_ref_id.clone()))
-                != Some(&command.bad_ref)
-        {
-            return Err(StoreError::InvalidFailedReadProof);
-        }
-        let prior = state
-            .runs
-            .get(&(scope.clone(), command.run_id.clone()))
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if prior.status == RunState::CorruptStorage {
-            return Ok(prior);
-        }
-        let proof_fingerprint = digest(&command.proof.fingerprint_material());
-        let mut specs = Vec::new();
-        if let Some(owner_node_id) = &command.owner_node_id {
-            if command.bad_ref.producer_node_id.as_ref() != Some(owner_node_id) {
+            if command.proof.scope() != scope
+                || command.proof.requested_digest() != &command.bad_ref.digest
+                || command.bad_ref.scope != *scope
+                || state.object_store_nonce.as_deref() != Some(command.proof.store_instance_nonce())
+                || state
+                    .artifact_refs
+                    .get(&(scope.clone(), command.bad_ref.artifact_ref_id.clone()))
+                    != Some(&command.bad_ref)
+            {
                 return Err(StoreError::InvalidFailedReadProof);
             }
-            let node_key = (
-                scope.clone(),
-                command.run_id.clone(),
-                owner_node_id.clone(),
-            );
-            let mut node = state
-                .nodes
-                .get(&node_key)
+            let prior = state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
-            let prior_status = node.status;
-            let transition = match prior_status {
-                NodeState::Ready => "N47",
-                NodeState::RetryWaiting => "N48",
-                NodeState::WaitingApproval => "N49",
-                NodeState::WaitingChildren => "N50",
-                NodeState::BlockedIncompatible => "N51",
-                NodeState::Succeeded => "N52",
-                NodeState::Failed => "N53",
-                NodeState::ContractFailed => "N54",
-                NodeState::RetriesExhausted => "N55",
-                NodeState::BudgetExhausted => "N56",
-                NodeState::Cancelled => "N57",
-                _ => return Err(StoreError::IllegalTransition),
-            };
-            node.status = NodeState::CorruptStorage;
-            node.active_attempt_id = None;
-            node.next_eligible_at = None;
-            node.budget_wait_amount = None;
-            set_node_mutated(&mut node, now)?;
-            state.nodes.insert(node_key, node);
+            if prior.status == RunState::CorruptStorage {
+                return Ok(prior);
+            }
+            let proof_fingerprint = digest(&command.proof.fingerprint_material());
+            let mut specs = Vec::new();
+            if let Some(owner_node_id) = &command.owner_node_id {
+                if command.bad_ref.producer_node_id.as_ref() != Some(owner_node_id) {
+                    return Err(StoreError::InvalidFailedReadProof);
+                }
+                let node_key = (scope.clone(), command.run_id.clone(), owner_node_id.clone());
+                let mut node = state
+                    .nodes
+                    .get(&node_key)
+                    .cloned()
+                    .ok_or(StoreError::NotFound)?;
+                let prior_status = node.status;
+                let transition = match prior_status {
+                    NodeState::Ready => "N47",
+                    NodeState::RetryWaiting => "N48",
+                    NodeState::WaitingApproval => "N49",
+                    NodeState::WaitingChildren => "N50",
+                    NodeState::BlockedIncompatible => "N51",
+                    NodeState::Succeeded => "N52",
+                    NodeState::Failed => "N53",
+                    NodeState::ContractFailed => "N54",
+                    NodeState::RetriesExhausted => "N55",
+                    NodeState::BudgetExhausted => "N56",
+                    NodeState::Cancelled => "N57",
+                    _ => return Err(StoreError::IllegalTransition),
+                };
+                node.status = NodeState::CorruptStorage;
+                node.active_attempt_id = None;
+                node.next_eligible_at = None;
+                node.budget_wait_amount = None;
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(node_key, node);
+                specs.push(event_spec(
+                    transition,
+                    Some(owner_node_id),
+                    None,
+                    None,
+                    event_payload::node_corrupt_storage(
+                        &(command.bad_ref.artifact_ref_id),
+                        &(command.bad_ref.digest),
+                        &(command.proof.error_class()),
+                        &(proof_fingerprint),
+                        &(prior_status),
+                    ),
+                ));
+            }
+            cancellation_cascade(
+                &mut state,
+                scope,
+                &command.run_id,
+                RunState::CorruptStorage,
+                "CorruptStorage",
+                now,
+                &mut specs,
+            )?;
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .expect("run");
+            run.status = RunState::CorruptStorage;
+            run.output_ref = None;
+            run.corrupt_bad_artifact_ref_id = Some(command.bad_ref.artifact_ref_id.clone());
+            run.corrupt_owner_node_id = command.owner_node_id;
+            run.corrupt_error_class = Some(command.proof.error_class());
+            run.corrupt_proof_fingerprint = Some(proof_fingerprint);
+            run.finished_at = Some(now);
+            set_run_mutated(run, now)?;
+            let returned = run.clone();
+            let store_instance_nonce_digest = digest(command.proof.store_instance_nonce());
+            let run_transition =
+                corruption_run_transition(prior.status).expect("CorruptStorage handled above");
             specs.push(event_spec(
-                EventType::NodeCorruptStorage,
-                transition,
-                Some(owner_node_id),
+                run_transition,
                 None,
                 None,
-                json!({"bad_artifact_ref_id": command.bad_ref.artifact_ref_id, "bad_digest": command.bad_ref.digest, "error_class": command.proof.error_class(), "corrupt_proof_fingerprint": proof_fingerprint, "prior_status": prior_status}),
+                None,
+                event_payload::run_corrupt_storage(
+                    &(command.bad_ref.artifact_ref_id),
+                    &(command.bad_ref.digest),
+                    &(command.proof.error_class()),
+                    &(returned.corrupt_proof_fingerprint),
+                    &(store_instance_nonce_digest),
+                    &(prior.status),
+                    &(returned.corrupt_owner_node_id),
+                ),
             ));
-        }
-        cancellation_cascade(
-            &mut state,
-            scope,
-            &command.run_id,
-            RunState::CorruptStorage,
-            "CorruptStorage",
-            now,
-            &mut specs,
-        )?;
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .expect("run");
-        run.status = RunState::CorruptStorage;
-        run.output_ref = None;
-        run.corrupt_bad_artifact_ref_id = Some(command.bad_ref.artifact_ref_id.clone());
-        run.corrupt_owner_node_id = command.owner_node_id;
-        run.corrupt_error_class = Some(command.proof.error_class());
-        run.corrupt_proof_fingerprint = Some(proof_fingerprint);
-        run.finished_at = Some(now);
-        set_run_mutated(run, now)?;
-        let returned = run.clone();
-        let store_instance_nonce_digest = digest(command.proof.store_instance_nonce());
-        specs.push(event_spec(EventType::RunCorruptStorage, "R15", None, None, None, json!({"bad_artifact_ref_id": command.bad_ref.artifact_ref_id, "bad_digest": command.bad_ref.digest, "error_class": command.proof.error_class(), "corrupt_proof_fingerprint": returned.corrupt_proof_fingerprint, "store_instance_nonce_digest": store_instance_nonce_digest, "prior_status": prior.status, "owner_node_id": returned.corrupt_owner_node_id})));
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Recovery,
-            "object-read".to_owned(),
-            specs,
-        )?;
-        Ok(returned)
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Recovery,
+                "object-read".to_owned(),
+                specs,
+            )?;
+            Ok(returned)
         })
     }
     async fn get_definition(
@@ -5498,23 +6829,33 @@ fn outcome_digest(outcome: &ActionOutcome) -> Digest {
             output,
             actual_cost_units,
             ..
-        } => json!({"kind": "success", "output": output, "cost": actual_cost_units}),
+        } => value_object([
+            ("kind", payload_value("success")),
+            ("output", payload_value(output)),
+            ("cost", payload_value(actual_cost_units)),
+        ]),
         ActionOutcome::Retryable {
             code,
             message,
             actual_cost_units,
             ..
-        } => {
-            json!({"kind": "retryable", "code": code, "message": message, "cost": actual_cost_units})
-        }
+        } => value_object([
+            ("kind", payload_value("retryable")),
+            ("code", payload_value(code)),
+            ("message", payload_value(message)),
+            ("cost", payload_value(actual_cost_units)),
+        ]),
         ActionOutcome::Permanent {
             code,
             message,
             actual_cost_units,
             ..
-        } => {
-            json!({"kind": "permanent", "code": code, "message": message, "cost": actual_cost_units})
-        }
+        } => value_object([
+            ("kind", payload_value("permanent")),
+            ("code", payload_value(code)),
+            ("message", payload_value(message)),
+            ("cost", payload_value(actual_cost_units)),
+        ]),
     };
     digest(&serde_jcs::to_vec(&value).expect("outcome projection serializes"))
 }
@@ -5564,7 +6905,6 @@ fn budget_settled_spec(
         .and_then(|value| value.checked_sub(run.budget_reserved.0))
         .ok_or(StoreError::ArithmeticOverflow)?;
     Ok(event_spec(
-        EventType::BudgetSettled,
         match attempt.status {
             AttemptState::Succeeded => "A02",
             AttemptState::RetryableFailed => "A03",
@@ -5579,7 +6919,14 @@ fn budget_settled_spec(
         Some(&attempt.node_instance_id),
         Some(&attempt.attempt_id),
         None,
-        json!({"ledger_seq": ledger.ledger_seq, "reservation_amount": attempt.reserved_cost, "consumed_amount": consumed, "released_amount": released.to_string(), "reason": ledger.reason, "available_after": available.to_string()}),
+        event_payload::budget_settled(
+            &(ledger.ledger_seq),
+            &(attempt.reserved_cost),
+            &(consumed),
+            &(released.to_string()),
+            &(ledger.reason),
+            &(available.to_string()),
+        ),
     ))
 }
 
@@ -5637,27 +6984,31 @@ fn timeout_specs(
 ) -> Result<Vec<EventSpec>, StoreError> {
     Ok(vec![
         event_spec(
-            EventType::AttemptTimedOut,
             "A06",
             Some(&attempt.node_instance_id),
             Some(&attempt.attempt_id),
             None,
-            json!({"deadline_at": attempt.deadline_at, "database_now": now, "charged_cost_units": reservation}),
+            event_payload::attempt_timed_out(&(attempt.deadline_at), &(now), &(reservation)),
         ),
         event_spec(
-            if exhausted {
-                EventType::NodeRetriesExhausted
-            } else {
-                EventType::NodeRetryScheduled
-            },
             if exhausted { "N25" } else { "N22" },
             Some(&attempt.node_instance_id),
             Some(&attempt.attempt_id),
             None,
             if exhausted {
-                json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": attempt.attempt_number, "cause": "timeout"})
+                event_payload::node_retries_exhausted(
+                    &(&attempt.attempt_id),
+                    &(attempt.attempt_number),
+                    &(attempt.attempt_number),
+                    &("timeout"),
+                )
             } else {
-                json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": next_eligible_at.ok_or(StoreError::CorruptControlPlane)?, "cause": "timeout"})
+                event_payload::node_retry_scheduled(
+                    &(&attempt.attempt_id),
+                    &(attempt.attempt_number),
+                    &(next_eligible_at.ok_or(StoreError::CorruptControlPlane)?),
+                    &("timeout"),
+                )
             },
         ),
         budget_settled_spec(state, scope, run_id, attempt)?,
@@ -5690,5 +7041,85 @@ fn run_failure(kind: NodeFailureKind) -> RunFailureKind {
         NodeFailureKind::MapBoundExceeded => RunFailureKind::MapBoundExceeded,
         NodeFailureKind::ApprovalPayloadInvalid => RunFailureKind::ApprovalPayloadInvalid,
         NodeFailureKind::ActionCostProtocolViolation => RunFailureKind::ActionCostProtocolViolation,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{corruption_run_transition, event_order, event_payload, event_spec, retry_at};
+    use crate::definition::{BackoffPolicy, RetryPolicy};
+    use crate::event::EventType;
+    use crate::ids::{Id, Timestamp};
+    use crate::run::RunState;
+
+    #[test]
+    fn exponential_backoff_overflow_caps_at_max_delay() {
+        let policy = RetryPolicy {
+            max_attempts: 100,
+            backoff: BackoffPolicy::Exponential {
+                initial_delay_ms: 86_400_000,
+                multiplier: 16,
+                max_delay_ms: 86_400_000,
+            },
+        };
+        assert_eq!(
+            retry_at(Timestamp(10), &policy, 100).unwrap(),
+            Timestamp(86_400_010)
+        );
+    }
+
+    #[test]
+    fn corruption_transition_is_selected_from_every_source_run_state() {
+        let cases = [
+            (RunState::Pending, "R14"),
+            (RunState::Running, "R15"),
+            (RunState::BlockedIncompatible, "R16"),
+            (RunState::Succeeded, "R17"),
+            (RunState::Failed, "R18"),
+            (RunState::ContractFailed, "R19"),
+            (RunState::RetriesExhausted, "R20"),
+            (RunState::BudgetExhausted, "R21"),
+            (RunState::Cancelled, "R22"),
+        ];
+        for (status, transition) in cases {
+            assert_eq!(corruption_run_transition(status), Some(transition));
+        }
+        assert_eq!(corruption_run_transition(RunState::CorruptStorage), None);
+    }
+
+    #[test]
+    fn recovery_event_sorter_uses_rank_item_index_and_attempt_number() {
+        let node = Id::new("node").unwrap();
+        let attempt_a = Id::new("attempt-z").unwrap();
+        let attempt_b = Id::new("attempt-a").unwrap();
+        let mut later_attempt = event_spec(
+            "A07",
+            Some(&node),
+            Some(&attempt_b),
+            None,
+            event_payload::attempt_outcome_unknown(&(1), &(2), &(1)),
+        );
+        later_attempt.topological_rank = 3;
+        later_attempt.map_item_index = 4;
+        later_attempt.attempt_number = 2;
+        let mut earlier_attempt = event_spec(
+            "A07",
+            Some(&node),
+            Some(&attempt_a),
+            None,
+            event_payload::attempt_outcome_unknown(&(1), &(2), &(1)),
+        );
+        earlier_attempt.topological_rank = 3;
+        earlier_attempt.map_item_index = 4;
+        earlier_attempt.attempt_number = 1;
+        assert!(
+            event_order(true, &earlier_attempt) < event_order(true, &later_attempt),
+            "attempt_number must precede attempt ID in recovery ordering"
+        );
+
+        let mut earlier_rank = later_attempt;
+        earlier_rank.topological_rank = 2;
+        earlier_rank.map_item_index = 99;
+        assert!(event_order(true, &earlier_rank) < event_order(true, &earlier_attempt));
     }
 }

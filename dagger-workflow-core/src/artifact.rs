@@ -104,6 +104,7 @@ pub struct VerifiedObjectRef {
     media_type: String,
     object_key: String,
     store_instance_nonce: Vec<u8>,
+    verified_bytes: Vec<u8>,
 }
 
 impl VerifiedObjectRef {
@@ -115,6 +116,7 @@ impl VerifiedObjectRef {
         media_type: String,
         object_key: String,
         store_instance_nonce: Vec<u8>,
+        verified_bytes: Vec<u8>,
     ) -> Self {
         Self {
             scope,
@@ -123,6 +125,7 @@ impl VerifiedObjectRef {
             media_type,
             object_key,
             store_instance_nonce,
+            verified_bytes,
         }
     }
 
@@ -151,6 +154,11 @@ impl VerifiedObjectRef {
     /// Returns the opaque object-store instance binding to the control plane.
     pub(crate) fn store_instance_nonce(&self) -> &[u8] {
         &self.store_instance_nonce
+    }
+
+    /// Returns the bytes authenticated by this in-process capability.
+    pub(crate) fn verified_bytes(&self) -> &[u8] {
+        &self.verified_bytes
     }
 }
 
