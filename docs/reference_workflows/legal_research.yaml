@@ -1,0 +1,303 @@
+# Reference fixture only. Every sha256 value below is a placeholder derived
+# from its fixture schema or action name; publication must resolve it to the
+# matching durable SchemaDocument or compatible mock implementation.
+definition_format_version: "0.1"
+definition_id: legal_research
+name: Bounded legal research
+description: >
+  Bounded legal research with at most two explicitly unrolled search rounds.
+  The frozen v0.1 binding model cannot carry the conditional second-round
+  value through reconvergence; see the companion README friction log.
+run_input_schema_digest: sha256:1077010822d9814e1013a656eb384b9cd6eb4ad82b83f236d55c436b2c9d8668
+run_output_schema_digest: sha256:53b429dc06ae3d59c1d5a42007d25d0bb1fecb7066244fbe83f97710f2b53088
+entry_node_id: generate_initial_queries
+nodes:
+  - id: generate_initial_queries
+    kind: Action
+    action:
+      name: legal.generate_initial_queries
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:dc3351ed439e12279a5add8e5dc4f1ee202a96d968dac9f64bc137f6961fe688
+      output_schema_digest: sha256:3bc730cc8bdce56c6d953e71477423ddfbf8a02acf46109b165749e480e39a2e
+      compatible_implementation_requirement: sha256:ffd232fb0576c5ca60bffb16688b23e9b1dc1fec97620679f1fcaa3ca0de53d6
+    bindings:
+      - target: /max_queries
+        source:
+          kind: constant
+          value: 3
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - search_initial_queries
+
+  - id: search_initial_queries
+    kind: Map
+    items:
+      kind: node_output
+      node_id: generate_initial_queries
+      pointer: /queries
+    max_items: 3
+    max_concurrency: 3
+    action:
+      name: legal.search
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:181b6e725c9a7618e5d6b54fbeb70cdf6b50a98f4c003bf4c2c6190920be721c
+      output_schema_digest: sha256:b1af05055550ab963f6e00d38ee21d9ca968d043ac108cf526fd3494fa7005fd
+      compatible_implementation_requirement: sha256:93a613c01a61fb59880163552c28074a2786ea461b7143faf8ec42deb5735659
+    bindings:
+      - target: /query
+        source:
+          kind: map_item
+          pointer: ""
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+      - target: /round
+        source:
+          kind: constant
+          value: 1
+    retry:
+      max_attempts: 3
+      backoff:
+        kind: exponential
+        initial_delay_ms: 500
+        multiplier: 2
+        max_delay_ms: 5000
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - summarize_initial_evidence
+
+  - id: summarize_initial_evidence
+    kind: Action
+    action:
+      name: legal.summarize_evidence
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:bb3c62030c6b988db2b99e7402a5760ab141bd959071b6a898509b4e65a7541f
+      output_schema_digest: sha256:661ace829ece59ad06f98ff3e760ff31522ea9f4f7ec8d5d629d015ddfd621b4
+      compatible_implementation_requirement: sha256:1c17a2623b2f0f05422d1d475ff0829d82bbfd88af84331fa9b03ce45cc9efa7
+    bindings:
+      - target: /evidence
+        source:
+          kind: node_output
+          node_id: search_initial_queries
+          pointer: ""
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - choose_second_round
+
+  - id: choose_second_round
+    kind: Choice
+    input:
+      kind: node_output
+      node_id: summarize_initial_evidence
+      pointer: ""
+    selector: /needs_second_round
+    cases:
+      - equals: true
+        next: generate_followup_queries
+    default: synthesize_report
+
+  - id: generate_followup_queries
+    kind: Action
+    action:
+      name: legal.generate_followup_queries
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:874a5311584a165f00acad684502e80dc27343072312903b25a2a080cd42b383
+      output_schema_digest: sha256:cb922083df3bd895653179e997fc6928b7f260b359d3189ab9a75d0d3de57f14
+      compatible_implementation_requirement: sha256:4268432b42a136dc195f8123fe61260c5f458e19d59317d159c7d99a0deee481
+    bindings:
+      - target: /gaps
+        source:
+          kind: node_output
+          node_id: summarize_initial_evidence
+          pointer: /gaps
+      - target: /max_queries
+        source:
+          kind: constant
+          value: 3
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - search_followup_queries
+
+  - id: search_followup_queries
+    kind: Map
+    items:
+      kind: node_output
+      node_id: generate_followup_queries
+      pointer: /queries
+    max_items: 3
+    max_concurrency: 3
+    action:
+      name: legal.search
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:181b6e725c9a7618e5d6b54fbeb70cdf6b50a98f4c003bf4c2c6190920be721c
+      output_schema_digest: sha256:b1af05055550ab963f6e00d38ee21d9ca968d043ac108cf526fd3494fa7005fd
+      compatible_implementation_requirement: sha256:93a613c01a61fb59880163552c28074a2786ea461b7143faf8ec42deb5735659
+    bindings:
+      - target: /query
+        source:
+          kind: map_item
+          pointer: ""
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+      - target: /round
+        source:
+          kind: constant
+          value: 2
+    retry:
+      max_attempts: 3
+      backoff:
+        kind: exponential
+        initial_delay_ms: 500
+        multiplier: 2
+        max_delay_ms: 5000
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - merge_second_round
+
+  - id: merge_second_round
+    kind: Action
+    action:
+      name: legal.merge_second_round
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:ecce6eed1c85f39621421376f494b8775cbdda60e8503eb2bca60eb0789f4d57
+      output_schema_digest: sha256:f6847a3d878c92a2c39f7d38d5a571aadfe6f5db46cf7629d8a7fdcc80379e5c
+      compatible_implementation_requirement: sha256:9b54ced231a32d25fd1351b2c1cff0141cd943fd4863e7ffded7c3f56b5fc2fc
+    bindings:
+      - target: /initial_summary
+        source:
+          kind: node_output
+          node_id: summarize_initial_evidence
+          pointer: ""
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+      - target: /second_round_evidence
+        source:
+          kind: node_output
+          node_id: search_followup_queries
+          pointer: ""
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - synthesize_report
+
+  - id: synthesize_report
+    kind: Action
+    action:
+      name: legal.synthesize_report
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:958b8d72f9ef1672f8e9d761c22cb4c465d2f972296bb796562d394380f47b61
+      output_schema_digest: sha256:605da8e415a1e38651a39422a523b199b8761ae06d9f913d287740ff49196b14
+      compatible_implementation_requirement: sha256:a704bfc55b74bd911b0de9705b02ac38fae99fe799871142d3085acbf9c5bf1b
+    bindings:
+      - target: /initial_summary
+        source:
+          kind: node_output
+          node_id: summarize_initial_evidence
+          pointer: ""
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+      - target: /second_round_binding_status
+        source:
+          kind: constant
+          value: unavailable_after_choice_reconvergence_in_v0_1
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 45000
+    declared_max_cost_units: "30"
+    next:
+      - validate_citations
+
+  - id: validate_citations
+    kind: Action
+    action:
+      name: legal.validate_citations
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:40b3f13eda1a2e06bae2567fcd0f2c47d1854c0f6c0fc4ae98243137851ac772
+      output_schema_digest: sha256:3c3a7549f805f84cc5cd950330904b3457900637847ff4639cb9fc5e4a8f6de8
+      compatible_implementation_requirement: sha256:ad75d9aa2de201bef8c0c79c733ad57750d6e434d5301a84f32a2a67aaa2fa32
+    bindings:
+      - target: /citation_claims
+        source:
+          kind: node_output
+          node_id: synthesize_report
+          pointer: /citation_claims
+      - target: /draft_report
+        source:
+          kind: node_output
+          node_id: synthesize_report
+          pointer: /draft_report
+      - target: /question
+        source:
+          kind: run_input
+          pointer: /legal_question
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - research_succeeded
+
+  - id: research_succeeded
+    kind: Succeed
+    output:
+      kind: node_output
+      node_id: validate_citations
+      pointer: /report_artifact_ref

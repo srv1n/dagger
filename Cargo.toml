@@ -8,6 +8,7 @@ rust-version = "1.74"
 
 [workspace]
 members = [
+    "dagger-workflow-core",
     "dagger-macros",
     "src/taskagent/task-core"
 ]
