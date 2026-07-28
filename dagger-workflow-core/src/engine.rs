@@ -10,8 +10,9 @@ use crate::run::{NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompletionObjects, PageRequest, RecordChoice, ReleaseRetry, ResolveTerminalNode, StartRun,
-    StoreError, TimeoutAttempt, WorkflowStore,
+    CompletionObjects, ExpireApproval, ExpireRunLifetime, PageRequest, RecordChoice,
+    RecoverAbandonedAttemptsForRun, ReleaseRetry, ResolveTerminalNode, ResumeCompatible, StartRun,
+    StoreError, SuspendIncompatible, TimeoutAttempt, WorkflowStore,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -148,6 +149,7 @@ where
             .lock()
             .expect("permit lock poisoned")
             .insert(scope.clone(), acquired.permit);
+        self.run_maintenance_scans(scope).await?;
         Ok(acquired.claim)
     }
 
@@ -195,7 +197,7 @@ where
     /// Executes one deterministic scheduler pass and returns committed work count.
     pub async fn tick(&self, scope: &ExecutionScope) -> Result<usize, EngineError> {
         let permit = self.permit(scope)?;
-        let mut changed = 0;
+        let mut changed = self.run_maintenance_scans(scope).await?;
         let retries = self
             .store
             .scan_due_retries(scope, first_page())
@@ -385,6 +387,130 @@ where
         Id::new(format!("{prefix}_{number:016x}")).expect("generated ID is valid")
     }
 
+    async fn run_maintenance_scans(&self, scope: &ExecutionScope) -> Result<usize, EngineError> {
+        let permit = self.permit(scope)?;
+        let mut changed = 0;
+        for run in self
+            .store
+            .scan_recovery_runs(scope, first_page())
+            .await?
+            .items
+        {
+            let recovered = self
+                .store
+                .recover_abandoned_attempts_for_run(
+                    scope,
+                    RecoverAbandonedAttemptsForRun {
+                        permit: permit.clone(),
+                        run_id: run.run_id,
+                    },
+                )
+                .await?;
+            changed += usize::from(!recovered.is_empty());
+        }
+        for run in self
+            .store
+            .scan_compatibility_rechecks(scope, first_page())
+            .await?
+            .items
+        {
+            let revision = self
+                .store
+                .get_revision(scope, &run.definition_id, &run.revision_hash)
+                .await?;
+            let evidence = self.registry.check_pins(&revision.action_pins);
+            match run.status {
+                crate::run::RunState::BlockedIncompatible
+                    if evidence.incompatible_reference_locations.is_empty() =>
+                {
+                    self.store
+                        .resume_compatible(
+                            scope,
+                            ResumeCompatible {
+                                permit: permit.clone(),
+                                run_id: run.run_id,
+                                availability_evidence: evidence,
+                            },
+                        )
+                        .await?;
+                    changed += 1;
+                }
+                crate::run::RunState::Pending | crate::run::RunState::Running
+                    if !evidence.incompatible_reference_locations.is_empty() =>
+                {
+                    let bytes = serde_jcs::to_vec(&serde_json::json!({
+                        "evidence_digest": evidence.evidence_digest,
+                        "incompatible_reference_locations":
+                            evidence.incompatible_reference_locations
+                    }))
+                    .map_err(|_| EngineError::ObjectWrite)?;
+                    let incompatibilities = self
+                        .object_store
+                        .put(scope, &bytes, "application/json")
+                        .await
+                        .map_err(|_| EngineError::ObjectWrite)?;
+                    self.store
+                        .suspend_incompatible(
+                            scope,
+                            SuspendIncompatible {
+                                permit: permit.clone(),
+                                run_id: run.run_id,
+                                incompatibilities,
+                                evidence,
+                            },
+                        )
+                        .await?;
+                    changed += 1;
+                }
+                _ => {}
+            }
+        }
+        for gate in self.store.scan_due_gates(scope, first_page()).await?.items {
+            let approval_output =
+                if gate.on_expiry == crate::approval::ApprovalExpiryPolicy::Approve {
+                    let bytes = crate::approval::canonical_expiry_approval_result();
+                    Some(
+                        self.object_store
+                            .put(scope, &bytes, "application/json")
+                            .await
+                            .map_err(|_| EngineError::ObjectWrite)?,
+                    )
+                } else {
+                    None
+                };
+            self.store
+                .expire_approval(
+                    scope,
+                    ExpireApproval {
+                        permit: permit.clone(),
+                        run_id: gate.run_id,
+                        gate_id: gate.gate_id,
+                        approval_output,
+                    },
+                )
+                .await?;
+            changed += 1;
+        }
+        for run in self
+            .store
+            .scan_due_run_lifetimes(scope, first_page())
+            .await?
+            .items
+        {
+            self.store
+                .expire_run_lifetime(
+                    scope,
+                    ExpireRunLifetime {
+                        permit: permit.clone(),
+                        run_id: run.run_id,
+                    },
+                )
+                .await?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
     async fn definition_for(
         &self,
         scope: &ExecutionScope,
@@ -568,7 +694,7 @@ where
                     edge_id: edge_id(
                         &run.revision_hash,
                         &node.definition_node_id,
-                        &format!("case:{index}"),
+                        &format!("case/{index}"),
                         target,
                     ),
                 });

@@ -22,6 +22,7 @@ use crate::run::{
 };
 use crate::scope::ExecutionScope;
 use crate::store::*;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
@@ -160,6 +161,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                 object.bytes.len() as u64,
                 object.media_type,
                 object.object_key,
+                self.nonce.clone(),
             ),
             bytes: object.bytes,
         })
@@ -192,6 +194,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                 bytes.len() as u64,
                 media_type.to_owned(),
                 existing.object_key.clone(),
+                self.nonce.clone(),
             ));
         }
         let object_key = format!(
@@ -214,12 +217,16 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
             bytes.len() as u64,
             media_type.to_owned(),
             object_key,
+            self.nonce.clone(),
         ))
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MemoryState {
+    object_store_nonce: Option<Vec<u8>>,
+    object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
+    artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,
     definitions: BTreeMap<(ExecutionScope, Id), DefinitionRecord>,
     revisions: BTreeMap<(ExecutionScope, Id, Digest), WorkflowRevision>,
     parsed_revisions: BTreeMap<(ExecutionScope, Id, Digest), PublishableDefinition>,
@@ -296,17 +303,121 @@ impl<C: Clock> InMemoryStore<C> {
     fn now(&self) -> Timestamp {
         self.clock.now()
     }
-}
 
-fn verified(scope: &ExecutionScope, object: &VerifiedObjectRef) -> Result<(), StoreError> {
-    if object.scope() != scope || object.object_key().is_empty() {
-        Err(StoreError::ObjectNotVerified)
-    } else {
-        Ok(())
+    fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&mut MemoryState, Timestamp) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut committed = self.state.lock().expect("store lock poisoned");
+        let now = self.clock.now();
+        let mut staged = committed.clone();
+        match operation(&mut staged, now) {
+            Ok(value) => {
+                *committed = staged;
+                Ok(value)
+            }
+            Err(error) => {
+                let event_capacity = matches!(
+                    &error,
+                    StoreError::RunLimitApplied { code }
+                        if code == "RunEventLimitExceeded"
+                );
+                if !event_capacity {
+                    return Err(error);
+                }
+                let affected = staged.runs.iter().find_map(|(key, run)| {
+                    committed
+                        .runs
+                        .get(key)
+                        .filter(|prior| prior.version != run.version || prior.status != run.status)
+                        .map(|_| key.clone())
+                });
+                if let Some((scope, run_id)) = affected {
+                    let mut capacity_state = committed.clone();
+                    let prior = capacity_state
+                        .runs
+                        .get(&(scope.clone(), run_id.clone()))
+                        .cloned()
+                        .ok_or(StoreError::NotFound)?;
+                    if !prior.status.is_terminal() {
+                        let mut specs = Vec::new();
+                        terminalize_run(
+                            &mut capacity_state,
+                            &scope,
+                            &run_id,
+                            RunState::Cancelled,
+                            None,
+                            "RunEventLimitExceeded",
+                            now,
+                            &mut specs,
+                        )?;
+                        let transition = match prior.status {
+                            RunState::Pending => "R11",
+                            RunState::Running => "R12",
+                            _ => "R13",
+                        };
+                        specs.push(event_spec(
+                            EventType::RunCancelled,
+                            transition,
+                            None,
+                            None,
+                            None,
+                            json!({"reason_code": "RunEventLimitExceeded", "prior_status": prior.status}),
+                        ));
+                        append_batch(
+                            &mut capacity_state,
+                            &scope,
+                            &run_id,
+                            now,
+                            EventActorKind::Clock,
+                            "event-capacity".to_owned(),
+                            specs,
+                        )?;
+                        *committed = capacity_state;
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 }
 
+fn verified(
+    state: &mut MemoryState,
+    scope: &ExecutionScope,
+    object: &VerifiedObjectRef,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    if object.scope() != scope || object.object_key().is_empty() {
+        return Err(StoreError::ObjectNotVerified);
+    }
+    match &state.object_store_nonce {
+        Some(nonce) if nonce.as_slice() != object.store_instance_nonce() => {
+            return Err(StoreError::ObjectNotVerified);
+        }
+        None => state.object_store_nonce = Some(object.store_instance_nonce().to_vec()),
+        Some(_) => {}
+    }
+    let key = (scope.clone(), object.digest().clone());
+    let record = crate::artifact::ObjectRecord {
+        scope: scope.clone(),
+        digest: object.digest().clone(),
+        size_bytes: object.size_bytes(),
+        object_key: object.object_key().to_owned(),
+        created_at: now,
+    };
+    if let Some(existing) = state.object_records.get(&key) {
+        if existing.size_bytes != record.size_bytes || existing.object_key != record.object_key {
+            return Err(StoreError::ArtifactMetadataConflict);
+        }
+    } else {
+        state.object_records.insert(key, record);
+    }
+    Ok(())
+}
+
 fn artifact(
+    state: &mut MemoryState,
     scope: &ExecutionScope,
     object: &VerifiedObjectRef,
     kind: ArtifactKind,
@@ -315,7 +426,8 @@ fn artifact(
     attempt_id: Option<&Id>,
     ordinal: u32,
     now: Timestamp,
-) -> ArtifactRef {
+) -> Result<ArtifactRef, StoreError> {
+    verified(state, scope, object, now)?;
     let id = artifact_ref_id(ArtifactRefIdentity {
         scope,
         digest: object.digest(),
@@ -325,7 +437,7 @@ fn artifact(
         producer_attempt_id: attempt_id,
         ordinal,
     });
-    ArtifactRef {
+    let reference = ArtifactRef {
         scope: scope.clone(),
         artifact_ref_id: id,
         digest: object.digest().clone(),
@@ -337,10 +449,20 @@ fn artifact(
         producer_attempt_id: attempt_id.cloned(),
         ordinal,
         created_at: now,
+    };
+    let key = (scope.clone(), reference.artifact_ref_id.clone());
+    if let Some(existing) = state.artifact_refs.get(&key) {
+        if existing != &reference {
+            return Err(StoreError::ArtifactMetadataConflict);
+        }
+    } else {
+        state.artifact_refs.insert(key, reference.clone());
     }
+    Ok(reference)
 }
 
 fn json_ref(
+    state: &mut MemoryState,
     scope: &ExecutionScope,
     object: &VerifiedObjectRef,
     kind: ArtifactKind,
@@ -350,17 +472,86 @@ fn json_ref(
     ordinal: u32,
     now: Timestamp,
 ) -> Result<JsonRef, StoreError> {
-    verified(scope, object)?;
     if object.media_type() != "application/json" {
         return Err(StoreError::InvalidField);
     }
     Ok(JsonRef(artifact(
-        scope, object, kind, run_id, node_id, attempt_id, ordinal, now,
-    )))
+        state, scope, object, kind, run_id, node_id, attempt_id, ordinal, now,
+    )?))
 }
 
 fn fingerprint<T: Serialize>(domain: &str, scope: &ExecutionScope, value: &T) -> Digest {
     let bytes = serde_jcs::to_vec(&(domain, scope, value)).expect("fingerprint input serializes");
+    digest(&bytes)
+}
+
+fn approval_decision_fingerprint(
+    scope: &ExecutionScope,
+    run_id: &Id,
+    gate_id: &Id,
+    decision: ApprovalDecision,
+    decision_payload: Option<&VerifiedObjectRef>,
+    approval_output: Option<&VerifiedObjectRef>,
+    principal: &crate::approval::AuthenticatedPrincipal,
+) -> Digest {
+    fn extend_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+        bytes.extend((value.len() as u64).to_be_bytes());
+        bytes.extend(value);
+    }
+    let mut bytes = Vec::new();
+    for value in [
+        "dagger-approval-decision-v1",
+        scope.tenant_id.as_str(),
+        scope.namespace.as_str(),
+        run_id.as_str(),
+        gate_id.as_str(),
+        match decision {
+            ApprovalDecision::Approve => "approve",
+            ApprovalDecision::Reject => "reject",
+        },
+        decision_payload.map_or("none", |object| object.digest().as_str()),
+        approval_output.map_or("none", |object| object.digest().as_str()),
+        principal.principal_id(),
+        principal.authentication_context_digest().as_str(),
+    ] {
+        extend_lp(&mut bytes, value.as_bytes());
+    }
+    digest(&bytes)
+}
+
+fn suspension_fingerprint(
+    scope: &ExecutionScope,
+    run_id: &Id,
+    incompatibilities: &VerifiedObjectRef,
+    evidence_digest: &Digest,
+) -> Digest {
+    fn extend_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+        bytes.extend((value.len() as u64).to_be_bytes());
+        bytes.extend(value);
+    }
+    let artifact_id = artifact_ref_id(ArtifactRefIdentity {
+        scope,
+        digest: incompatibilities.digest(),
+        kind: ArtifactKind::CompatibilityEvidence,
+        producer_run_id: Some(run_id),
+        producer_node_id: None,
+        producer_attempt_id: None,
+        ordinal: 0,
+    });
+    let mut bytes = Vec::new();
+    let size_bytes = incompatibilities.size_bytes().to_be_bytes();
+    for value in [
+        b"dagger-suspend-request-v1".as_slice(),
+        scope.tenant_id.as_str().as_bytes(),
+        scope.namespace.as_str().as_bytes(),
+        run_id.as_str().as_bytes(),
+        artifact_id.as_str().as_bytes(),
+        incompatibilities.digest().as_str().as_bytes(),
+        size_bytes.as_slice(),
+        evidence_digest.as_str().as_bytes(),
+    ] {
+        extend_lp(&mut bytes, value);
+    }
     digest(&bytes)
 }
 
@@ -404,7 +595,7 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
         | NodeDefinition::Approval { next, .. } => next
             .iter()
             .enumerate()
-            .map(|(index, target)| (format!("normal:{index}"), target.clone(), None))
+            .map(|(index, target)| (format!("next/{index}"), target.clone(), None))
             .collect(),
         NodeDefinition::Choice { cases, default, .. } => {
             let mut result = cases
@@ -415,7 +606,7 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
                         crate::definition::ChoiceCase::Equals { next, .. }
                         | crate::definition::ChoiceCase::In { next, .. } => next.clone(),
                     };
-                    (format!("case:{index}"), target, Some(index as u32))
+                    (format!("case/{index}"), target, Some(index as u32))
                 })
                 .collect::<Vec<_>>();
             result.push(("default".to_owned(), default.clone(), None));
@@ -470,11 +661,16 @@ fn retry_at(
             multiplier,
             max_delay_ms,
         } => {
-            let exponent = attempt_number.saturating_sub(1);
+            let exponent = attempt_number
+                .checked_sub(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
             let factor = u64::from(multiplier)
                 .checked_pow(exponent)
-                .unwrap_or(u64::MAX);
-            initial_delay_ms.saturating_mul(factor).min(max_delay_ms)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            initial_delay_ms
+                .checked_mul(factor)
+                .ok_or(StoreError::ArithmeticOverflow)?
+                .min(max_delay_ms)
         }
     };
     checked_add_time(now, delay)
@@ -501,8 +697,11 @@ fn event_spec(
     node: Option<&NodeInstanceId>,
     attempt: Option<&Id>,
     gate: Option<&Id>,
-    payload: Value,
+    mut payload: Value,
 ) -> EventSpec {
+    if let Value::Object(fields) = &mut payload {
+        fields.retain(|_, value| !value.is_null());
+    }
     EventSpec {
         event_type,
         transition: transition.to_owned(),
@@ -522,6 +721,129 @@ struct EventSpec {
     payload: Value,
 }
 
+fn event_order(spec: &EventSpec) -> (u8, String, String, u8, String) {
+    let run_event = spec.node.is_none() && spec.attempt.is_none() && spec.gate.is_none();
+    let category = if run_event {
+        5
+    } else if matches!(
+        spec.event_type,
+        EventType::EdgeSatisfied | EventType::EdgeSkipped
+    ) {
+        3
+    } else if matches!(
+        spec.event_type,
+        EventType::NodeBecameReady | EventType::NodeSkipped | EventType::NodeCancelled
+    ) {
+        4
+    } else if matches!(
+        spec.event_type,
+        EventType::MapChildCreated
+            | EventType::MapExpanded
+            | EventType::MapZeroItemsSucceeded
+            | EventType::MapSucceeded
+    ) {
+        2
+    } else {
+        1
+    };
+    let within_subject = match spec.event_type {
+        EventType::StaleCompletionObserved => 1,
+        EventType::NodeAttemptClaimed
+        | EventType::NodeSucceeded
+        | EventType::NodeRetryScheduled
+        | EventType::NodeFailed
+        | EventType::NodeContractFailed
+        | EventType::NodeRetriesExhausted
+        | EventType::NodeBudgetWaiting
+        | EventType::NodeBudgetExhausted
+        | EventType::ApprovalRequested
+        | EventType::ApprovalApproved
+        | EventType::ApprovalRejected
+        | EventType::ApprovalExpiredApproved
+        | EventType::ApprovalExpiredRejected => 2,
+        EventType::BudgetReserved
+        | EventType::BudgetSettled
+        | EventType::BudgetReservationRefused => 3,
+        _ => 0,
+    };
+    (
+        category,
+        spec.node
+            .as_ref()
+            .map_or_else(String::new, |id| id.as_str().to_owned()),
+        spec.attempt
+            .as_ref()
+            .or(spec.gate.as_ref())
+            .map_or_else(String::new, |id| id.as_str().to_owned()),
+        within_subject,
+        spec.transition.clone(),
+    )
+}
+
+fn event_reserve(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+) -> Result<u64, StoreError> {
+    let nonterminal_nodes = u64::try_from(
+        state
+            .nodes
+            .values()
+            .filter(|node| {
+                node.scope == *scope && node.run_id == *run_id && !node.status.is_terminal()
+            })
+            .count(),
+    )
+    .map_err(|_| StoreError::ArithmeticOverflow)?;
+    let started_attempts = u64::try_from(
+        state
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.scope == *scope
+                    && attempt.run_id == *run_id
+                    && attempt.status == AttemptState::Started
+            })
+            .count(),
+    )
+    .map_err(|_| StoreError::ArithmeticOverflow)?;
+    let pending_gates = u64::try_from(
+        state
+            .gates
+            .values()
+            .filter(|gate| {
+                gate.scope == *scope
+                    && gate.run_id == *run_id
+                    && gate.status == crate::run::GateState::Pending
+            })
+            .count(),
+    )
+    .map_err(|_| StoreError::ArithmeticOverflow)?;
+    let unobserved_attempts = u64::try_from(
+        state
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.scope == *scope
+                    && attempt.run_id == *run_id
+                    && !state.stale_observed.contains(&(
+                        scope.clone(),
+                        run_id.clone(),
+                        attempt.attempt_id.clone(),
+                    ))
+            })
+            .count(),
+    )
+    .map_err(|_| StoreError::ArithmeticOverflow)?;
+    1_u64
+        .checked_add(nonterminal_nodes)
+        .and_then(|value| value.checked_add(started_attempts.checked_mul(2)?))
+        .and_then(|value| value.checked_add(pending_gates))
+        .and_then(|value| value.checked_add(unobserved_attempts))
+        .and_then(|value| value.checked_add(2))
+        .ok_or(StoreError::ArithmeticOverflow)
+}
+
 fn append_batch(
     state: &mut MemoryState,
     scope: &ExecutionScope,
@@ -529,16 +851,46 @@ fn append_batch(
     now: Timestamp,
     actor_kind: EventActorKind,
     actor_id: String,
-    specs: Vec<EventSpec>,
+    mut specs: Vec<EventSpec>,
 ) -> Result<(Id, u64, u64), StoreError> {
+    for spec in &specs {
+        if !spec.payload.is_object()
+            || serde_jcs::to_vec(&spec.payload)
+                .map_err(|_| StoreError::InvalidField)?
+                .len()
+                > 65_536
+        {
+            return Err(StoreError::InvalidField);
+        }
+    }
+    if !specs
+        .iter()
+        .any(|spec| spec.event_type == EventType::RunCreated)
+    {
+        specs.sort_by_key(event_order);
+    }
     let run_key = (scope.clone(), run_id.clone());
-    let run = state.runs.get_mut(&run_key).ok_or(StoreError::NotFound)?;
+    let run = state.runs.get(&run_key).ok_or(StoreError::NotFound)?;
     let count = u64::try_from(specs.len()).map_err(|_| StoreError::ArithmeticOverflow)?;
     let last = run
         .last_event_seq
         .checked_add(count)
         .ok_or(StoreError::ArithmeticOverflow)?;
-    if last > run.limits.max_total_events {
+    let consumes_reserve = specs.iter().any(|spec| {
+        matches!(
+            spec.event_type,
+            EventType::RunCancelled
+                | EventType::StaleCompletionObserved
+                | EventType::RunCorruptStorage
+        )
+    });
+    let required = if consumes_reserve {
+        last
+    } else {
+        last.checked_add(event_reserve(state, scope, run_id)?)
+            .ok_or(StoreError::ArithmeticOverflow)?
+    };
+    if required > run.limits.max_total_events {
         return Err(StoreError::RunLimitApplied {
             code: "RunEventLimitExceeded".to_owned(),
         });
@@ -549,18 +901,23 @@ fn append_batch(
         .ok_or(StoreError::ArithmeticOverflow)?;
     let batch_id =
         Id::new(format!("batch_{:016x}", state.batch_counter)).expect("batch ID is valid");
-    let first = run.last_event_seq + 1;
-    let batch_count = specs.len() as u32;
-    let events = state.events.entry(run_key).or_default();
+    let first = run
+        .last_event_seq
+        .checked_add(1)
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    let batch_count = u32::try_from(specs.len()).map_err(|_| StoreError::ArithmeticOverflow)?;
+    let events = state.events.entry(run_key.clone()).or_default();
     for (index, spec) in specs.into_iter().enumerate() {
         events.push(WorkflowEvent {
             scope: scope.clone(),
             run_id: run_id.clone(),
-            event_seq: first + index as u64,
+            event_seq: first
+                .checked_add(u64::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?)
+                .ok_or(StoreError::ArithmeticOverflow)?,
             event_type: spec.event_type,
             transition_id: spec.transition,
             batch_id: batch_id.clone(),
-            batch_index: index as u32,
+            batch_index: u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?,
             batch_count,
             occurred_at: now,
             actor_kind,
@@ -571,7 +928,9 @@ fn append_batch(
             payload: spec.payload,
         });
     }
+    let run = state.runs.get_mut(&run_key).expect("run remains present");
     run.last_event_seq = last;
+    set_run_mutated(run, now)?;
     Ok((batch_id, first, last))
 }
 
@@ -594,6 +953,45 @@ fn permit_check(
     Ok(())
 }
 
+fn command_fence(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    permit: Option<&EnginePermit>,
+    now: Timestamp,
+    allow_blocked: bool,
+) -> Result<WorkflowRun, StoreError> {
+    if let Some(permit) = permit {
+        permit_check(state, scope, permit, now)?;
+    }
+    let run = state
+        .runs
+        .get(&(scope.clone(), run_id.clone()))
+        .cloned()
+        .ok_or(StoreError::NotFound)?;
+    if now < run.updated_at {
+        return Err(StoreError::ClockNonMonotonic);
+    }
+    if run.status == RunState::BlockedIncompatible && !allow_blocked {
+        return Err(StoreError::RunBlockedIncompatible);
+    }
+    Ok(run)
+}
+
+fn running_fence(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    permit: Option<&EnginePermit>,
+    now: Timestamp,
+) -> Result<WorkflowRun, StoreError> {
+    let run = command_fence(state, scope, run_id, permit, now, false)?;
+    if run.status != RunState::Running {
+        return Err(StoreError::IllegalTransition);
+    }
+    Ok(run)
+}
+
 fn set_run_mutated(run: &mut WorkflowRun, now: Timestamp) -> Result<(), StoreError> {
     run.version.0 = run
         .version
@@ -614,6 +1012,22 @@ fn set_node_mutated(node: &mut NodeRun, now: Timestamp) -> Result<(), StoreError
     Ok(())
 }
 
+fn bump_frontier_epoch(
+    state: &mut MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+) -> Result<(), StoreError> {
+    let run = state
+        .runs
+        .get_mut(&(scope.clone(), run_id.clone()))
+        .ok_or(StoreError::NotFound)?;
+    run.frontier_epoch = run
+        .frontier_epoch
+        .checked_add(1)
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    Ok(())
+}
+
 fn frontier_reduce(
     state: &mut MemoryState,
     scope: &ExecutionScope,
@@ -623,6 +1037,7 @@ fn frontier_reduce(
     now: Timestamp,
     specs: &mut Vec<EventSpec>,
 ) -> Result<(), StoreError> {
+    let mut frontier_changed = false;
     let mut edge_keys = state
         .edges
         .keys()
@@ -633,6 +1048,7 @@ fn frontier_reduce(
     for key in &edge_keys {
         let edge = state.edges.get_mut(key).expect("key captured");
         if edge.from_node_id == *source_node && edge.state == EdgeState::Dormant {
+            frontier_changed = true;
             let selected = selected_edge.map_or(true, |selected| selected == &edge.edge_id);
             edge.state = if selected {
                 EdgeState::Satisfied
@@ -640,7 +1056,25 @@ fn frontier_reduce(
                 EdgeState::Skipped
             };
             edge.resolved_at = Some(now);
-            edge.version.0 += 1;
+            edge.version.0 = edge
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            let payload = if selected {
+                json!({
+                    "edge_id": edge.edge_id,
+                    "from_node_id": edge.from_node_id,
+                    "to_node_id": edge.to_node_id
+                })
+            } else {
+                json!({
+                    "edge_id": edge.edge_id,
+                    "from_node_id": edge.from_node_id,
+                    "to_node_id": edge.to_node_id,
+                    "cause": "choice_unselected"
+                })
+            };
             specs.push(event_spec(
                 if selected {
                     EventType::EdgeSatisfied
@@ -651,12 +1085,7 @@ fn frontier_reduce(
                 Some(source_node),
                 None,
                 None,
-                json!({
-                    "edge_id": edge.edge_id,
-                    "from_node_id": edge.from_node_id,
-                    "to_node_id": edge.to_node_id,
-                    "cause": if selected { Value::Null } else { json!("choice_unselected") }
-                }),
+                payload,
             ));
         }
     }
@@ -683,11 +1112,18 @@ fn frontier_reduce(
             if incoming.iter().any(|edge| edge.state == EdgeState::Dormant) {
                 continue;
             }
-            let satisfied = incoming
-                .iter()
-                .filter(|edge| edge.state == EdgeState::Satisfied)
-                .count() as u32;
-            let skipped = incoming.len() as u32 - satisfied;
+            let satisfied = u32::try_from(
+                incoming
+                    .iter()
+                    .filter(|edge| edge.state == EdgeState::Satisfied)
+                    .count(),
+            )
+            .map_err(|_| StoreError::ArithmeticOverflow)?;
+            let incoming_count =
+                u32::try_from(incoming.len()).map_err(|_| StoreError::ArithmeticOverflow)?;
+            let skipped = incoming_count
+                .checked_sub(satisfied)
+                .ok_or(StoreError::ArithmeticOverflow)?;
             let key = (scope.clone(), run_id.clone(), pending_id.clone());
             let node = state.nodes.get_mut(&key).expect("pending node exists");
             node.incoming_satisfied = satisfied;
@@ -723,7 +1159,11 @@ fn frontier_reduce(
                     if edge.from_node_id == pending_id && edge.state == EdgeState::Dormant {
                         edge.state = EdgeState::Skipped;
                         edge.resolved_at = Some(now);
-                        edge.version.0 += 1;
+                        edge.version.0 = edge
+                            .version
+                            .0
+                            .checked_add(1)
+                            .ok_or(StoreError::ArithmeticOverflow)?;
                         specs.push(event_spec(
                             EventType::EdgeSkipped,
                             "E02",
@@ -741,19 +1181,15 @@ fn frontier_reduce(
                 }
             }
             changed = true;
+            frontier_changed = true;
         }
         if !changed {
             break;
         }
     }
-    let run = state
-        .runs
-        .get_mut(&(scope.clone(), run_id.clone()))
-        .ok_or(StoreError::NotFound)?;
-    run.frontier_epoch = run
-        .frontier_epoch
-        .checked_add(1)
-        .ok_or(StoreError::ArithmeticOverflow)?;
+    if frontier_changed {
+        bump_frontier_epoch(state, scope, run_id)?;
+    }
     Ok(())
 }
 
@@ -769,32 +1205,38 @@ fn settle(
     if attempt.settled_cost.is_some() {
         return Ok(());
     }
-    let run = state
-        .runs
-        .get_mut(&(scope.clone(), run_id.clone()))
-        .ok_or(StoreError::NotFound)?;
-    run.budget_reserved.0 = run
+    let run_key = (scope.clone(), run_id.clone());
+    let run_snapshot = state.runs.get(&run_key).ok_or(StoreError::NotFound)?;
+    let reserved_after = run_snapshot
         .budget_reserved
         .0
         .checked_sub(attempt.reserved_cost.0)
         .ok_or(StoreError::ArithmeticOverflow)?;
-    run.budget_consumed.0 = run
+    let consumed_after = run_snapshot
         .budget_consumed
         .0
         .checked_add(consumed.0)
         .ok_or(StoreError::ArithmeticOverflow)?;
-    if run.budget_consumed.0 + run.budget_reserved.0 > run.budget_limit.0 {
+    let allocated_after = consumed_after
+        .checked_add(reserved_after)
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    if allocated_after > run_snapshot.budget_limit.0 {
         return Err(StoreError::ArithmeticOverflow);
     }
+    let ledger_seq = u64::try_from(state.ledger.get(&run_key).map_or(0, Vec::len))
+        .map_err(|_| StoreError::ArithmeticOverflow)?
+        .checked_add(1)
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    let run = state.runs.get_mut(&run_key).expect("run remains present");
+    run.budget_reserved.0 = reserved_after;
+    run.budget_consumed.0 = consumed_after;
+    set_run_mutated(run, now)?;
     attempt.settled_cost = Some(consumed);
-    let ledger = state
-        .ledger
-        .entry((scope.clone(), run_id.clone()))
-        .or_default();
+    let ledger = state.ledger.entry(run_key).or_default();
     ledger.push(BudgetLedgerEntry {
         scope: scope.clone(),
         run_id: run_id.clone(),
-        ledger_seq: ledger.len() as u64 + 1,
+        ledger_seq,
         attempt_id: attempt.attempt_id.clone(),
         node_instance_id: attempt.node_instance_id.clone(),
         kind: if consumed == attempt.reserved_cost {
@@ -820,6 +1262,7 @@ fn cancellation_cascade(
     now: Timestamp,
     specs: &mut Vec<EventSpec>,
 ) -> Result<(), StoreError> {
+    let mut frontier_changed = false;
     let mut node_keys = state
         .nodes
         .keys()
@@ -832,6 +1275,7 @@ fn cancellation_cascade(
         if snapshot.status.is_terminal() {
             continue;
         }
+        frontier_changed = true;
         if let Some(attempt_id) = snapshot.active_attempt_id.clone() {
             let attempt_key = (scope.clone(), run_id.clone(), attempt_id.clone());
             if let Some(mut attempt) = state.attempts.remove(&attempt_key) {
@@ -856,14 +1300,7 @@ fn cancellation_cascade(
                         None,
                         json!({"reason_code": reason, "charged_cost_units": attempt.reserved_cost}),
                     ));
-                    specs.push(event_spec(
-                        EventType::BudgetSettled,
-                        "A08",
-                        Some(&snapshot.node_instance_id),
-                        Some(&attempt_id),
-                        None,
-                        json!({"reservation_amount": attempt.reserved_cost, "consumed_amount": attempt.reserved_cost, "released_amount": "0", "reason": "Cancelled", "ledger_seq": state.ledger.get(&(scope.clone(), run_id.clone())).map_or(0, Vec::len), "available_after": "0"}),
-                    ));
+                    specs.push(budget_settled_spec(state, scope, run_id, &attempt)?);
                 }
                 state.attempts.insert(attempt_key, attempt);
             }
@@ -903,7 +1340,11 @@ fn cancellation_cascade(
         gate.status = crate::run::GateState::Cancelled;
         gate.resolution_source = Some(ApprovalResolutionSource::Cancellation);
         gate.decided_at = Some(now);
-        gate.version.0 += 1;
+        gate.version.0 = gate
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         specs.push(event_spec(
             EventType::ApprovalGateCancelled,
             "G06",
@@ -912,6 +1353,9 @@ fn cancellation_cascade(
             Some(&gate.gate_id),
             json!({"terminal_run_status": terminal, "reason_code": reason}),
         ));
+    }
+    if frontier_changed {
+        bump_frontier_epoch(state, scope, run_id)?;
     }
     Ok(())
 }
@@ -938,15 +1382,75 @@ fn terminalize_run(
     Ok(run.clone())
 }
 
-fn page_bounds(page: &PageRequest) -> Result<usize, StoreError> {
+#[derive(Deserialize, Serialize)]
+struct MemoryCursor {
+    scope: ExecutionScope,
+    query: String,
+    cutoff: Timestamp,
+    last: Vec<String>,
+}
+
+fn scan_page_context(
+    page: &PageRequest,
+    scope: &ExecutionScope,
+    query: &str,
+    now: Timestamp,
+) -> Result<(usize, Timestamp, Vec<String>), StoreError> {
     if page.page_size == 0 || page.page_size > 1000 {
-        Err(StoreError::InvalidField)
-    } else if page.cursor.is_some() {
-        // The in-memory adapter deliberately uses single-page scans in v0.1 tests.
-        Err(StoreError::InvalidField)
-    } else {
-        Ok(page.page_size as usize)
+        return Err(StoreError::InvalidField);
     }
+    match &page.cursor {
+        Some(cursor) => {
+            let decoded: MemoryCursor =
+                serde_json::from_str(cursor.encoded()).map_err(|_| StoreError::InvalidField)?;
+            if decoded.scope != *scope || decoded.query != query {
+                return Err(StoreError::InvalidField);
+            }
+            Ok((page.page_size as usize, decoded.cutoff, decoded.last))
+        }
+        None => Ok((page.page_size as usize, now, Vec::new())),
+    }
+}
+
+fn next_scan_cursor(
+    scope: &ExecutionScope,
+    query: &str,
+    cutoff: Timestamp,
+    last: Vec<String>,
+) -> Result<ScanCursor, StoreError> {
+    serde_jcs::to_string(&MemoryCursor {
+        scope: scope.clone(),
+        query: query.to_owned(),
+        cutoff,
+        last,
+    })
+    .map(ScanCursor::new)
+    .map_err(|_| StoreError::TransactionFailed)
+}
+
+fn finish_scan_page<T>(
+    mut items: Vec<T>,
+    limit: usize,
+    scope: &ExecutionScope,
+    query: &str,
+    cutoff: Timestamp,
+    key: impl Fn(&T) -> Vec<String>,
+) -> Result<Page<T>, StoreError> {
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|item| next_scan_cursor(scope, query, cutoff, key(item)))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Page { items, next_cursor })
+}
+
+fn timestamp_cursor_key(timestamp: Timestamp) -> String {
+    format!("{:016x}", (timestamp.0 as u64) ^ (1_u64 << 63))
 }
 
 impl<C: Clock> WorkflowStore for InMemoryStore<C> {
@@ -955,307 +1459,341 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         command: CreateDefinition,
     ) -> Result<DefinitionRecord, StoreError> {
-        if command.principal.scope() != scope
-            || !valid_metadata(&command.display_name, &command.description)
-        {
-            return Err(StoreError::InvalidField);
-        }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        let key = (scope.clone(), command.definition_id.clone());
-        if state.definitions.contains_key(&key) {
-            return Err(StoreError::AlreadyExists);
-        }
-        let record = DefinitionRecord {
-            scope: scope.clone(),
-            definition_id: command.definition_id,
-            display_name: command.display_name,
-            description: command.description,
-            created_at: now,
-            created_by: command.principal.principal_id().to_owned(),
-            latest_revision_hash: None,
-            version: Version(1),
-        };
-        state.definitions.insert(key, record.clone());
-        Ok(record)
+        self.transaction(|state, now| {
+            if command.principal.scope() != scope
+                || !valid_metadata(&command.display_name, &command.description)
+            {
+                return Err(StoreError::InvalidField);
+            }
+            let key = (scope.clone(), command.definition_id.clone());
+            if state.definitions.contains_key(&key) {
+                return Err(StoreError::AlreadyExists);
+            }
+            let record = DefinitionRecord {
+                scope: scope.clone(),
+                definition_id: command.definition_id,
+                display_name: command.display_name,
+                description: command.description,
+                created_at: now,
+                created_by: command.principal.principal_id().to_owned(),
+                latest_revision_hash: None,
+                version: Version(1),
+            };
+            state.definitions.insert(key, record.clone());
+            Ok(record)
+        })
     }
-
     async fn update_definition_metadata(
         &self,
         scope: &ExecutionScope,
         command: UpdateDefinitionMetadata,
     ) -> Result<DefinitionRecord, StoreError> {
-        if !valid_metadata(&command.display_name, &command.description) {
-            return Err(StoreError::InvalidField);
-        }
-        let mut state = self.state.lock().expect("store lock poisoned");
-        let record = state
-            .definitions
-            .get_mut(&(scope.clone(), command.definition_id))
-            .ok_or(StoreError::NotFound)?;
-        if record.version != command.expected_version {
-            return Err(StoreError::CasConflict);
-        }
-        record.display_name = command.display_name;
-        record.description = command.description;
-        record.version.0 += 1;
-        Ok(record.clone())
+        self.transaction(|state, _now| {
+            if !valid_metadata(&command.display_name, &command.description) {
+                return Err(StoreError::InvalidField);
+            }
+            let record = state
+                .definitions
+                .get_mut(&(scope.clone(), command.definition_id))
+                .ok_or(StoreError::NotFound)?;
+            if record.version != command.expected_version {
+                return Err(StoreError::CasConflict);
+            }
+            record.display_name = command.display_name;
+            record.description = command.description;
+            record.version.0 = record
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            Ok(record.clone())
+        })
     }
-
     async fn publish_revision(
         &self,
         scope: &ExecutionScope,
         command: PublishRevision,
     ) -> Result<WorkflowRevision, StoreError> {
-        if command.principal.scope() != scope {
-            return Err(StoreError::InvalidField);
-        }
-        verified(scope, &command.canonical_definition)?;
-        verified(scope, &command.run_input_schema)?;
-        verified(scope, &command.run_output_schema)?;
-        if command.parsed_revision.definition.definition_id != command.definition_id {
-            return Err(StoreError::RevisionDefinitionIdMismatch);
-        }
-        let revision_hash = command.canonical_definition.digest().clone();
-        if command.parsed_revision.definition.run_input_schema_digest
-            != *command.run_input_schema.digest()
-            || command.parsed_revision.definition.run_output_schema_digest
-                != *command.run_output_schema.digest()
-        {
-            return Err(StoreError::DigestMismatch);
-        }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        let definition_key = (scope.clone(), command.definition_id.clone());
-        let definition = state
-            .definitions
-            .get(&definition_key)
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if definition.version != command.expected_definition_version {
-            return Err(StoreError::CasConflict);
-        }
-        let revision_key = (
-            scope.clone(),
-            command.definition_id.clone(),
-            revision_hash.clone(),
-        );
-        if let Some(existing) = state.revisions.get(&revision_key) {
-            return Ok(existing.clone());
-        }
-        let canonical_definition_ref = json_ref(
-            scope,
-            &command.canonical_definition,
-            ArtifactKind::Definition,
-            None,
-            None,
-            None,
-            0,
-            now,
-        )?;
-        let run_input_schema_ref = json_ref(
-            scope,
-            &command.run_input_schema,
-            ArtifactKind::SchemaDocument,
-            None,
-            None,
-            None,
-            0,
-            now,
-        )?;
-        let run_output_schema_ref = json_ref(
-            scope,
-            &command.run_output_schema,
-            ArtifactKind::SchemaDocument,
-            None,
-            None,
-            None,
-            1,
-            now,
-        )?;
-        let extracted = crate::definition::extract_action_pins(&command.parsed_revision.definition);
-        let mut pins = Vec::with_capacity(extracted.len());
-        for pin in extracted {
-            let schemas = command
-                .resolved_action_schema_objects
-                .get(&pin.reference_location)
-                .ok_or(StoreError::NotFound)?;
-            if schemas.input_schema.digest() != &pin.input_schema_digest
-                || schemas.output_schema.digest() != &pin.output_schema_digest
+        self.transaction(|mut state, now| {
+            if command.principal.scope() != scope {
+                return Err(StoreError::InvalidField);
+            }
+            verified(&mut state, scope, &command.canonical_definition, now)?;
+            verified(&mut state, scope, &command.run_input_schema, now)?;
+            verified(&mut state, scope, &command.run_output_schema, now)?;
+            if command.parsed_revision.definition.definition_id != command.definition_id {
+                return Err(StoreError::RevisionDefinitionIdMismatch);
+            }
+            let revision_hash = command.canonical_definition.digest().clone();
+            if command.parsed_revision.definition.run_input_schema_digest
+                != *command.run_input_schema.digest()
+                || command.parsed_revision.definition.run_output_schema_digest
+                    != *command.run_output_schema.digest()
             {
                 return Err(StoreError::DigestMismatch);
             }
-            pins.push(ActionPin {
-                reference_location: pin.reference_location,
-                name: pin.name,
-                contract_version: pin.contract_version,
-                input_schema_digest: pin.input_schema_digest,
-                output_schema_digest: pin.output_schema_digest,
-                compatible_implementation_requirement: pin.compatible_implementation_requirement,
-                input_schema_ref: json_ref(
-                    scope,
-                    &schemas.input_schema,
-                    ArtifactKind::SchemaDocument,
-                    None,
-                    None,
-                    None,
-                    0,
-                    now,
-                )?,
-                output_schema_ref: json_ref(
-                    scope,
-                    &schemas.output_schema,
-                    ArtifactKind::SchemaDocument,
-                    None,
-                    None,
-                    None,
-                    1,
-                    now,
-                )?,
-            });
-        }
-        let revision = WorkflowRevision {
-            scope: scope.clone(),
-            definition_id: command.definition_id.clone(),
-            revision_hash: revision_hash.clone(),
-            definition_format_version: "0.1".to_owned(),
-            canonical_definition_ref,
-            run_input_schema_ref,
-            run_output_schema_ref,
-            run_input_schema_digest: command
-                .parsed_revision
-                .definition
-                .run_input_schema_digest
-                .clone(),
-            run_output_schema_digest: command
-                .parsed_revision
-                .definition
-                .run_output_schema_digest
-                .clone(),
-            entry_node_id: command.parsed_revision.definition.entry_node_id.clone(),
-            node_count: command.parsed_revision.definition.nodes.len() as u32,
-            node_topological_ranks: command.parsed_revision.topological_ranks.clone(),
-            action_pins: pins,
-            published_at: now,
-            published_by: command.principal.principal_id().to_owned(),
-        };
-        state
-            .parsed_revisions
-            .insert(revision_key.clone(), command.parsed_revision);
-        state.revisions.insert(revision_key, revision.clone());
-        let definition = state
-            .definitions
-            .get_mut(&definition_key)
-            .expect("definition remains present");
-        definition.latest_revision_hash = Some(revision_hash);
-        definition.version.0 += 1;
-        Ok(revision)
+            let definition_key = (scope.clone(), command.definition_id.clone());
+            let definition = state
+                .definitions
+                .get(&definition_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if definition.version != command.expected_definition_version {
+                return Err(StoreError::CasConflict);
+            }
+            let revision_key = (
+                scope.clone(),
+                command.definition_id.clone(),
+                revision_hash.clone(),
+            );
+            if let Some(existing) = state.revisions.get(&revision_key) {
+                return Ok(existing.clone());
+            }
+            let canonical_definition_ref = json_ref(
+                &mut state,
+                scope,
+                &command.canonical_definition,
+                ArtifactKind::Definition,
+                None,
+                None,
+                None,
+                0,
+                now,
+            )?;
+            let run_input_schema_ref = json_ref(
+                &mut state,
+                scope,
+                &command.run_input_schema,
+                ArtifactKind::SchemaDocument,
+                None,
+                None,
+                None,
+                0,
+                now,
+            )?;
+            let run_output_schema_ref = json_ref(
+                &mut state,
+                scope,
+                &command.run_output_schema,
+                ArtifactKind::SchemaDocument,
+                None,
+                None,
+                None,
+                1,
+                now,
+            )?;
+            let extracted =
+                crate::definition::extract_action_pins(&command.parsed_revision.definition);
+            let mut pins = Vec::with_capacity(extracted.len());
+            for pin in extracted {
+                let schemas = command
+                    .resolved_action_schema_objects
+                    .get(&pin.reference_location)
+                    .ok_or(StoreError::NotFound)?;
+                if schemas.input_schema.digest() != &pin.input_schema_digest
+                    || schemas.output_schema.digest() != &pin.output_schema_digest
+                {
+                    return Err(StoreError::DigestMismatch);
+                }
+                pins.push(ActionPin {
+                    reference_location: pin.reference_location,
+                    name: pin.name,
+                    contract_version: pin.contract_version,
+                    input_schema_digest: pin.input_schema_digest,
+                    output_schema_digest: pin.output_schema_digest,
+                    compatible_implementation_requirement: pin
+                        .compatible_implementation_requirement,
+                    input_schema_ref: json_ref(
+                        &mut state,
+                        scope,
+                        &schemas.input_schema,
+                        ArtifactKind::SchemaDocument,
+                        None,
+                        None,
+                        None,
+                        0,
+                        now,
+                    )?,
+                    output_schema_ref: json_ref(
+                        &mut state,
+                        scope,
+                        &schemas.output_schema,
+                        ArtifactKind::SchemaDocument,
+                        None,
+                        None,
+                        None,
+                        1,
+                        now,
+                    )?,
+                });
+            }
+            let revision = WorkflowRevision {
+                scope: scope.clone(),
+                definition_id: command.definition_id.clone(),
+                revision_hash: revision_hash.clone(),
+                definition_format_version: "0.1".to_owned(),
+                canonical_definition_ref,
+                run_input_schema_ref,
+                run_output_schema_ref,
+                run_input_schema_digest: command
+                    .parsed_revision
+                    .definition
+                    .run_input_schema_digest
+                    .clone(),
+                run_output_schema_digest: command
+                    .parsed_revision
+                    .definition
+                    .run_output_schema_digest
+                    .clone(),
+                entry_node_id: command.parsed_revision.definition.entry_node_id.clone(),
+                node_count: u32::try_from(command.parsed_revision.definition.nodes.len())
+                    .map_err(|_| StoreError::ArithmeticOverflow)?,
+                node_topological_ranks: command.parsed_revision.topological_ranks.clone(),
+                action_pins: pins,
+                published_at: now,
+                published_by: command.principal.principal_id().to_owned(),
+            };
+            state
+                .parsed_revisions
+                .insert(revision_key.clone(), command.parsed_revision);
+            state.revisions.insert(revision_key, revision.clone());
+            let definition = state
+                .definitions
+                .get_mut(&definition_key)
+                .expect("definition remains present");
+            definition.latest_revision_hash = Some(revision_hash);
+            definition.version.0 = definition
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            Ok(revision)
+        })
     }
-
     async fn acquire_engine_claim(
         &self,
         scope: &ExecutionScope,
         instance_id: Id,
     ) -> Result<AcquiredEngineClaim, StoreError> {
-        let now = self.now();
-        let raw = entropy()?;
-        let mut state = self.state.lock().expect("store lock poisoned");
-        let (generation, version) = match state.claims.get(scope) {
-            Some(stored) => {
-                if now < stored.claim.heartbeat_at {
-                    return Err(StoreError::ClockNonMonotonic);
+        self.transaction(|state, now| {
+            let raw = entropy()?;
+            let (generation, version) = match state.claims.get(scope) {
+                Some(stored) => {
+                    if now < stored.claim.heartbeat_at {
+                        return Err(StoreError::ClockNonMonotonic);
+                    }
+                    if stored.claim.expires_at > now {
+                        return Err(StoreError::EngineAlreadyLive {
+                            owner: stored.claim.instance_id.clone(),
+                            expires_at: stored.claim.expires_at,
+                        });
+                    }
+                    (
+                        stored
+                            .claim
+                            .generation
+                            .checked_add(1)
+                            .ok_or(StoreError::ArithmeticOverflow)?,
+                        stored
+                            .claim
+                            .version
+                            .0
+                            .checked_add(1)
+                            .ok_or(StoreError::ArithmeticOverflow)?,
+                    )
                 }
-                if stored.claim.expires_at > now {
-                    return Err(StoreError::EngineAlreadyLive {
-                        owner: stored.claim.instance_id.clone(),
-                        expires_at: stored.claim.expires_at,
-                    });
-                }
-                (stored.claim.generation + 1, stored.claim.version.0 + 1)
-            }
-            None => (1, 1),
-        };
-        let claim = EngineClaim {
-            scope: scope.clone(),
-            control_plane_id: "default".to_owned(),
-            instance_id: instance_id.clone(),
-            generation,
-            claimed_at: now,
-            heartbeat_at: now,
-            expires_at: checked_add_time(now, CLAIM_LIFETIME_MS as u64)?,
-            version: Version(version),
-        };
-        let permit = EnginePermit::mint(instance_id, generation, raw);
-        state.claims.insert(
-            scope.clone(),
-            StoredClaim {
-                claim: claim.clone(),
-                token_digest: digest(permit.session_token()),
-                released_token_digest: None,
-            },
-        );
-        Ok(AcquiredEngineClaim { claim, permit })
+                None => (1, 1),
+            };
+            let claim = EngineClaim {
+                scope: scope.clone(),
+                control_plane_id: "scheduler".to_owned(),
+                instance_id: instance_id.clone(),
+                generation,
+                claimed_at: now,
+                heartbeat_at: now,
+                expires_at: checked_add_time(now, CLAIM_LIFETIME_MS as u64)?,
+                version: Version(version),
+            };
+            let permit = EnginePermit::mint(instance_id, generation, raw);
+            state.claims.insert(
+                scope.clone(),
+                StoredClaim {
+                    claim: claim.clone(),
+                    token_digest: digest(permit.session_token()),
+                    released_token_digest: None,
+                },
+            );
+            Ok(AcquiredEngineClaim { claim, permit })
+        })
     }
-
     async fn heartbeat_engine_claim(
         &self,
         scope: &ExecutionScope,
         permit: &EnginePermit,
     ) -> Result<EngineClaim, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, permit, now)?;
-        let stored = state.claims.get_mut(scope).expect("checked claim");
-        if now < stored.claim.heartbeat_at {
-            return Err(StoreError::ClockNonMonotonic);
-        }
-        stored.claim.heartbeat_at = now;
-        stored.claim.expires_at = checked_add_time(now, CLAIM_LIFETIME_MS as u64)?;
-        stored.claim.version.0 += 1;
-        Ok(stored.claim.clone())
+        self.transaction(|state, now| {
+            permit_check(&state, scope, permit, now)?;
+            let stored = state.claims.get_mut(scope).expect("checked claim");
+            if now < stored.claim.heartbeat_at {
+                return Err(StoreError::ClockNonMonotonic);
+            }
+            stored.claim.heartbeat_at = now;
+            stored.claim.expires_at = checked_add_time(now, CLAIM_LIFETIME_MS as u64)?;
+            stored.claim.version.0 = stored
+                .claim
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            Ok(stored.claim.clone())
+        })
     }
-
     async fn release_engine_claim(
         &self,
         scope: &ExecutionScope,
         permit: &EnginePermit,
     ) -> Result<(), StoreError> {
-        let now = self.now();
-        let candidate_digest = digest(permit.session_token());
-        let mut state = self.state.lock().expect("store lock poisoned");
-        let stored = state
-            .claims
-            .get_mut(scope)
-            .ok_or(StoreError::EngineClaimLost)?;
-        let same = stored.claim.instance_id == *permit.instance_id()
-            && stored.claim.generation == permit.generation()
-            && stored.token_digest == candidate_digest;
-        if !same {
-            return Err(StoreError::EngineClaimLost);
-        }
-        if stored.claim.expires_at <= now
-            && stored.released_token_digest.as_ref() == Some(&candidate_digest)
-        {
-            return Ok(());
-        }
-        if stored.claim.expires_at <= now {
-            return Err(StoreError::EngineClaimLost);
-        }
-        stored.claim.expires_at = now;
-        stored.claim.version.0 += 1;
-        stored.released_token_digest = Some(candidate_digest);
-        Ok(())
+        self.transaction(|state, now| {
+            let candidate_digest = digest(permit.session_token());
+            let stored = state
+                .claims
+                .get_mut(scope)
+                .ok_or(StoreError::EngineClaimLost)?;
+            let same = stored.claim.instance_id == *permit.instance_id()
+                && stored.claim.generation == permit.generation()
+                && stored.token_digest == candidate_digest;
+            if !same {
+                return Err(StoreError::EngineClaimLost);
+            }
+            if stored.claim.expires_at <= now
+                && stored.released_token_digest.as_ref() == Some(&candidate_digest)
+            {
+                return Ok(());
+            }
+            if stored.claim.expires_at <= now {
+                return Err(StoreError::EngineClaimLost);
+            }
+            stored.claim.expires_at = now;
+            stored.claim.version.0 = stored
+                .claim
+                .version
+                .0
+                .checked_add(1)
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            stored.released_token_digest = Some(candidate_digest);
+            Ok(())
+        })
     }
-
     async fn create_run(
         &self,
         scope: &ExecutionScope,
         command: CreateRun,
     ) -> Result<CommandReceipt, StoreError> {
+        self.transaction(|mut state, now| {
         if command.principal.scope() != scope || command.idempotency_token.len() < 16 {
             return Err(StoreError::InvalidField);
         }
-        verified(scope, &command.input)?;
+        verified(&mut state, scope, &command.input, now)?;
         if command.input.media_type() != "application/json" || !validate_limits(&command.limits) {
             return Err(StoreError::RunLimitsInvalid);
         }
@@ -1282,8 +1820,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 principal: command.principal.principal_id(),
             },
         );
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
         let receipt_key = (
             scope.clone(),
             CommandKindKey::Create,
@@ -1311,10 +1847,23 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .get(&revision_key)
             .cloned()
             .ok_or(StoreError::NotFound)?;
+        let static_node_count = u64::try_from(parsed.definition.nodes.len())
+            .map_err(|_| StoreError::ArithmeticOverflow)?;
         let creation_event_count = 1_u64
-            .checked_add(parsed.definition.nodes.len() as u64)
+            .checked_add(static_node_count)
             .ok_or(StoreError::ArithmeticOverflow)?;
-        if command.limits.max_total_events < creation_event_count + 2 {
+        let creation_reserve = 1_u64
+            .checked_add(
+                u64::try_from(parsed.definition.nodes.len())
+                    .map_err(|_| StoreError::ArithmeticOverflow)?,
+            )
+            .and_then(|value| value.checked_add(2))
+            .ok_or(StoreError::ArithmeticOverflow)?;
+        if command.limits.max_total_events
+            < creation_event_count
+                .checked_add(creation_reserve)
+                .ok_or(StoreError::ArithmeticOverflow)?
+        {
             return Err(StoreError::RunLimitsInvalid);
         }
         let run_key = (scope.clone(), command.run_id.clone());
@@ -1323,6 +1872,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         }
         let lifetime_deadline_at = checked_add_time(now, command.limits.max_run_lifetime_ms)?;
         let input_ref = json_ref(
+                &mut state,
             scope,
             &command.input,
             ArtifactKind::RunInput,
@@ -1385,7 +1935,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         )];
         for node in &parsed.definition.nodes {
             for (label, target, case_index) in outgoing(node) {
-                *incoming.entry(target.clone()).or_default() += 1;
+                let count = incoming.entry(target.clone()).or_default();
+                *count = count
+                    .checked_add(1)
+                    .ok_or(StoreError::ArithmeticOverflow)?;
                 let source = node_id(node);
                 let id = edge_id(&revision.revision_hash, source, &label, &target);
                 state.edges.insert(
@@ -1449,6 +2002,20 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 updated_at: now,
                 version: Version(1),
             };
+            let payload = if ready {
+                json!({
+                    "definition_node_id": id,
+                    "kind": node.kind,
+                    "topological_rank": node.topological_rank
+                })
+            } else {
+                json!({
+                    "definition_node_id": id,
+                    "kind": node.kind,
+                    "incoming_total": count,
+                    "topological_rank": node.topological_rank
+                })
+            };
             specs.push(event_spec(
                 if ready {
                     EventType::NodeCreatedReady
@@ -1459,12 +2026,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 Some(&id),
                 None,
                 None,
-                json!({
-                    "definition_node_id": id,
-                    "kind": node.kind,
-                    "incoming_total": count,
-                    "topological_rank": node.topological_rank
-                }),
+                payload,
             ));
             state
                 .nodes
@@ -1483,7 +2045,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .runs
             .get_mut(&(scope.clone(), command.run_id.clone()))
             .expect("run");
-        run.version.0 += 1;
+        set_run_mutated(run, now)?;
         let receipt = CommandReceipt {
             scope: scope.clone(),
             command_kind: CommandKind::CreateRun,
@@ -1503,16 +2065,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         };
         state.receipts.insert(receipt_key, receipt.clone());
         Ok(receipt)
+        })
     }
-
     async fn start_run(
         &self,
         scope: &ExecutionScope,
         command: StartRun,
     ) -> Result<WorkflowRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        command_fence(&state, scope, &command.run_id, Some(&command.permit), now, false)?;
         if !command
             .compatibility_evidence
             .incompatible_reference_locations
@@ -1549,30 +2110,25 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             )],
         )?;
         Ok(state.runs.get(&key).expect("run").clone())
+        })
     }
-
     async fn suspend_incompatible(
         &self,
         scope: &ExecutionScope,
         command: SuspendIncompatible,
     ) -> Result<WorkflowRun, StoreError> {
-        verified(scope, &command.incompatibilities)?;
+        self.transaction(|mut state, now| {
+        permit_check(&state, scope, &command.permit, now)?;
+        verified(&mut state, scope, &command.incompatibilities, now)?;
         if command.incompatibilities.size_bytes() > 65_536 {
             return Err(StoreError::EvidenceInvalid);
         }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
         let key = (scope.clone(), command.run_id.clone());
-        let suspension_fingerprint = fingerprint(
-            "suspend-v1",
+        let suspension_fingerprint = suspension_fingerprint(
             scope,
-            &(
-                &command.run_id,
-                command.incompatibilities.digest(),
-                command.incompatibilities.size_bytes(),
-                &command.evidence.evidence_digest,
-            ),
+            &command.run_id,
+            &command.incompatibilities,
+            &command.evidence.evidence_digest,
         );
         let current = state.runs.get(&key).cloned().ok_or(StoreError::NotFound)?;
         if current.status == RunState::BlockedIncompatible
@@ -1596,6 +2152,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             return Err(StoreError::CurrentGenerationAttemptPresent);
         }
         let incompatibilities_ref = json_ref(
+                &mut state,
             scope,
             &command.incompatibilities,
             ArtifactKind::CompatibilityEvidence,
@@ -1612,6 +2169,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .cloned()
             .collect::<BTreeSet<_>>();
         let mut specs = Vec::new();
+        let mut frontier_changed = false;
         for node in state.nodes.values_mut().filter(|node| {
             node.scope == *scope
                 && node.run_id == command.run_id
@@ -1631,6 +2189,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     incompatible.contains(&location)
                 }
         }) {
+            frontier_changed = true;
             let prior = node.status;
             node.blocked_from_status = Some(match prior {
                 NodeState::Pending => BlockedFromState::Pending,
@@ -1659,6 +2218,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     "required_semantic_digest": command.evidence.evidence_digest
                 }),
             ));
+        }
+        if frontier_changed {
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
         }
         let run = state.runs.get_mut(&key).expect("run exists");
         run.status = RunState::BlockedIncompatible;
@@ -1691,16 +2253,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(state.runs.get(&key).expect("run").clone())
+        })
     }
-
     async fn resume_compatible(
         &self,
         scope: &ExecutionScope,
         command: ResumeCompatible,
     ) -> Result<WorkflowRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        command_fence(&state, scope, &command.run_id, Some(&command.permit), now, true)?;
         if !command
             .availability_evidence
             .incompatible_reference_locations
@@ -1718,11 +2279,13 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             return Err(StoreError::IllegalTransition);
         }
         let mut specs = Vec::new();
+        let mut frontier_changed = false;
         for node in state.nodes.values_mut().filter(|node| {
             node.scope == *scope
                 && node.run_id == command.run_id
                 && node.status == NodeState::BlockedIncompatible
         }) {
+            frontier_changed = true;
             let restored = match node.blocked_from_status.take() {
                 Some(BlockedFromState::Pending) => NodeState::Pending,
                 Some(BlockedFromState::Ready) => NodeState::Ready,
@@ -1747,6 +2310,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 json!({"restored_status": restored, "available_semantic_digest": command.availability_evidence.evidence_digest}),
             ));
         }
+        if frontier_changed {
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+        }
         let run = state.runs.get_mut(&key).expect("run");
         run.status = RunState::Running;
         run.blocked_incompatibilities_ref = None;
@@ -1770,20 +2336,19 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(state.runs.get(&key).expect("run").clone())
+        })
     }
-
     async fn claim_node_attempt(
         &self,
         scope: &ExecutionScope,
         command: ClaimNodeAttempt,
     ) -> Result<ClaimNodeAttemptResult, StoreError> {
-        verified(scope, &command.bound_input)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        verified(&mut state, scope, &command.bound_input, now)?;
         if command.bound_input.media_type() != "application/json" {
             return Err(StoreError::InvalidField);
         }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
         let run_key = (scope.clone(), command.run_id.clone());
         let run_snapshot = state
             .runs
@@ -1820,8 +2385,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .get(&node_key)
             .cloned()
             .ok_or(StoreError::NotFound)?;
+        let source_status = node.status;
         if node.version != command.expected_node_version
             || !matches!(node.status, NodeState::Ready | NodeState::BudgetWaiting)
+            || node.active_attempt_id.is_some()
         {
             return Err(StoreError::CasConflict);
         }
@@ -1905,10 +2472,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .ok_or(StoreError::ArithmeticOverflow)?;
         if available < declared_max.0 {
             if declared_max.0 <= limit_minus_consumed {
+                if source_status == NodeState::BudgetWaiting
+                    && node.budget_wait_amount == Some(declared_max)
+                {
+                    return Ok(ClaimNodeAttemptResult::BudgetWaitingApplied(node));
+                }
                 node.status = NodeState::BudgetWaiting;
                 node.budget_wait_amount = Some(declared_max);
                 set_node_mutated(&mut node, now)?;
                 state.nodes.insert(node_key, node.clone());
+                bump_frontier_epoch(&mut state, scope, &command.run_id)?;
                 let run = state.runs.get_mut(&run_key).expect("run");
                 set_run_mutated(run, now)?;
                 append_batch(
@@ -1937,11 +2510,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             let mut specs = vec![
                 event_spec(
                     EventType::NodeBudgetExhausted,
-                    if run_snapshot.budget_reserved.0 == 0 {
-                        "N27"
-                    } else {
-                        "N60"
-                    },
+                    if source_status == NodeState::BudgetWaiting { "N60" } else { "N27" },
                     Some(&command.node_id),
                     None,
                     None,
@@ -1949,7 +2518,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 ),
                 event_spec(
                     EventType::BudgetReservationRefused,
-                    "N27",
+                    if source_status == NodeState::BudgetWaiting { "N60" } else { "N27" },
                     Some(&command.node_id),
                     None,
                     None,
@@ -1988,6 +2557,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         let credential = CompletionCredential::from_minted_bytes(entropy()?);
         let deadline_at = checked_add_time(now, timeout_ms)?;
         let bound_input_ref = json_ref(
+                &mut state,
             scope,
             &command.bound_input,
             ArtifactKind::ActionInvocationInput,
@@ -2023,7 +2593,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             binding_derivation_digest: command.binding_derivation_digest,
             created_at: now,
         };
-        let attempt_number = node.attempt_count + 1;
+        let attempt_number = node
+            .attempt_count
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         let attempt = NodeAttempt {
             scope: scope.clone(),
             run_id: command.run_id.clone(),
@@ -2071,8 +2644,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             ),
             invocation.clone(),
         );
+        bump_frontier_epoch(&mut state, scope, &command.run_id)?;
         let run = state.runs.get_mut(&run_key).expect("run");
-        run.total_attempt_count += 1;
+        run.total_attempt_count = run
+            .total_attempt_count
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         run.budget_reserved.0 = run
             .budget_reserved
             .0
@@ -2089,10 +2666,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         }
         set_run_mutated(run, now)?;
         let ledger_key = (scope.clone(), command.run_id.clone());
-        let ledger_seq = state
-            .ledger
-            .get(&ledger_key)
-            .map_or(1, |entries| entries.len() as u64 + 1);
+        let ledger_seq = u64::try_from(state.ledger.get(&ledger_key).map_or(0, Vec::len))
+            .map_err(|_| StoreError::ArithmeticOverflow)?
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         state
             .ledger
             .entry(ledger_key.clone())
@@ -2110,7 +2687,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 reason: BudgetLedgerReason::Started,
                 created_at: now,
             });
-        let reserve_ledger_seq = state.ledger.get(&ledger_key).map_or(0, Vec::len);
+        let available_after = available
+            .checked_sub(declared_max.0)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         append_batch(
             &mut state,
             scope,
@@ -2141,7 +2720,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     Some(&command.node_id),
                     Some(&attempt.attempt_id),
                     None,
-                    json!({"ledger_seq": reserve_ledger_seq, "amount": declared_max, "available_after": (available - declared_max.0).to_string()}),
+                    json!({"ledger_seq": ledger_seq, "amount": declared_max, "available_after": available_after.to_string()}),
                 ),
             ],
         )?;
@@ -2149,19 +2728,18 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             invocation,
             completion_credential: credential,
         })
+        })
     }
-
     async fn complete_attempt(
         &self,
         scope: &ExecutionScope,
         command: CompleteAttempt,
     ) -> Result<CompleteAttemptResult, StoreError> {
+        self.transaction(|mut state, now| {
         command
             .submitted_outcome
             .validate()
             .map_err(|_| StoreError::InvalidField)?;
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
         let attempt_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -2217,6 +2795,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             state.attempts.insert(attempt_key, attempt.clone());
             return Ok(CompleteAttemptResult::AlreadyObserved(attempt));
         }
+        running_fence(&state, scope, &command.run_id, None, now)?;
         let node_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -2242,10 +2821,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             attempt.status = AttemptState::Stale;
             attempt.finished_at = Some(now);
             state.attempts.insert(attempt_key, attempt.clone());
-            let stale_ledger_seq = state
-                .ledger
-                .get(&(scope.clone(), command.run_id.clone()))
-                .map_or(0, Vec::len);
+            let settled = budget_settled_spec(&state, scope, &command.run_id, &attempt)?;
             append_batch(
                 &mut state,
                 scope,
@@ -2262,14 +2838,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         json!({"active_attempt_id": node.active_attempt_id, "submitted_outcome_category": outcome_category(&command.submitted_outcome), "submitted_payload_digest": outcome_digest(&command.submitted_outcome), "charged_cost_units": reservation}),
                     ),
-                    event_spec(
-                        EventType::BudgetSettled,
-                        "A09",
-                        Some(&command.node_id),
-                        Some(&command.attempt_id),
-                        None,
-                        json!({"ledger_seq": stale_ledger_seq, "reservation_amount": reservation, "consumed_amount": reservation, "released_amount": "0", "reason": "Stale", "available_after": "0"}),
-                    ),
+                    settled,
                 ],
             )?;
             return Ok(CompleteAttemptResult::StaleRecorded(attempt));
@@ -2285,7 +2854,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             return Err(StoreError::AttemptFenced);
         }
         if let Some(diagnostics) = &command.objects.diagnostics {
-            verified(scope, diagnostics)?;
+            verified(&mut state, scope, diagnostics, now)?;
             if diagnostics.media_type() != "application/json" {
                 state.attempts.insert(attempt_key, attempt);
                 return Err(StoreError::DiagnosticsInvalid {
@@ -2307,7 +2876,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .output
                 .as_ref()
                 .ok_or(StoreError::ObjectNotVerified)?;
-            verified(scope, output)?;
+            verified(&mut state, scope, output, now)?;
             if output.media_type() != "application/json"
                 || artifacts.len() != command.objects.artifacts.len()
             {
@@ -2315,28 +2884,33 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 return Err(StoreError::ObjectNotVerified);
             }
             for object in &command.objects.artifacts {
-                verified(scope, object)?;
+                verified(&mut state, scope, object, now)?;
             }
             let run = state
                 .runs
                 .get(&(scope.clone(), command.run_id.clone()))
                 .expect("run");
-            if artifacts.len() as u64 > run.limits.max_artifacts_per_attempt {
+            if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
+                > run.limits.max_artifacts_per_attempt
+            {
                 state.attempts.insert(attempt_key, attempt);
                 return Err(StoreError::RunLimitApplied {
                     code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
                 });
             }
+            let artifact_bytes =
+                command
+                    .objects
+                    .artifacts
+                    .iter()
+                    .try_fold(0_u64, |total, object| {
+                        total
+                            .checked_add(object.size_bytes())
+                            .ok_or(StoreError::ArithmeticOverflow)
+                    })?;
             let charged_bytes = output
                 .size_bytes()
-                .checked_add(
-                    command
-                        .objects
-                        .artifacts
-                        .iter()
-                        .map(VerifiedObjectRef::size_bytes)
-                        .sum::<u64>(),
-                )
+                .checked_add(artifact_bytes)
                 .ok_or(StoreError::ArithmeticOverflow)?;
             if run
                 .aggregate_object_bytes
@@ -2354,7 +2928,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             let reservation = attempt.reserved_cost;
             let (attempt, exhausted) =
                 timeout_active(&mut state, scope, &command.run_id, &mut node, attempt, now)?;
-            let mut specs = timeout_specs(&attempt, reservation, now, exhausted);
+            state.attempts.insert(attempt_key.clone(), attempt.clone());
+            state.nodes.insert(node_key.clone(), node.clone());
+            let mut specs = timeout_specs(&state, scope, &command.run_id, &attempt, reservation, now, exhausted, node.next_eligible_at)?;
             if exhausted {
                 terminalize_run(
                     &mut state,
@@ -2432,7 +3008,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             set_node_mutated(&mut node, now)?;
             specs.push(event_spec(EventType::AttemptContractFailed, "A05", Some(&command.node_id), Some(&command.attempt_id), None, json!({"charged_cost_units": charged, "failure_kind": "ActionCostProtocolViolation"})));
             specs.push(event_spec(EventType::NodeContractFailed, "N21", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "failure_kind": "ActionCostProtocolViolation"})));
-            specs.push(budget_settled_spec(&attempt));
+            specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
             state.nodes.insert(node_key, node);
             state.attempts.insert(attempt_key, attempt);
             let run = terminalize_run(
@@ -2479,12 +3055,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .get(&(scope.clone(), command.run_id.clone()))
                     .expect("run")
                     .clone();
-                if artifacts.len() as u64 > run_snapshot.limits.max_artifacts_per_attempt {
+                if u64::try_from(artifacts.len())
+                    .map_err(|_| StoreError::ArithmeticOverflow)?
+                    > run_snapshot.limits.max_artifacts_per_attempt
+                {
                     return Err(StoreError::RunLimitApplied {
                         code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
                     });
                 }
                 let output_ref = json_ref(
+                &mut state,
                     scope,
                     output,
                     ArtifactKind::NodeOutput,
@@ -2496,25 +3076,27 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 )?;
                 let mut refs = Vec::new();
                 for (index, object) in command.objects.artifacts.iter().enumerate() {
-                    verified(scope, object)?;
+                    verified(&mut state, scope, object, now)?;
                     refs.push(artifact(
+                        &mut state,
                         scope,
                         object,
                         ArtifactKind::ActionArtifact,
                         Some(&command.run_id),
                         Some(&command.node_id),
                         Some(&command.attempt_id),
-                        index as u32,
+                        u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?,
                         now,
-                    ));
+                    )?);
                 }
-                let bytes = output.size_bytes()
-                    + command
-                        .objects
-                        .artifacts
-                        .iter()
-                        .map(VerifiedObjectRef::size_bytes)
-                        .sum::<u64>();
+                let bytes = command.objects.artifacts.iter().try_fold(
+                    output.size_bytes(),
+                    |total, object| {
+                        total
+                            .checked_add(object.size_bytes())
+                            .ok_or(StoreError::ArithmeticOverflow)
+                    },
+                )?;
                 let run = state
                     .runs
                     .get_mut(&(scope.clone(), command.run_id.clone()))
@@ -2539,7 +3121,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 set_node_mutated(&mut node, now)?;
                 specs.push(event_spec(EventType::AttemptSucceeded, "A02", Some(&command.node_id), Some(&command.attempt_id), None, json!({"actual_cost_units": actual, "output_digest": output.digest(), "artifact_digests": refs.iter().map(|reference| reference.digest.clone()).collect::<Vec<_>>()})));
                 specs.push(event_spec(EventType::NodeSucceeded, "N18", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "output_digest": output.digest(), "artifact_digests": refs.iter().map(|reference| reference.digest.clone()).collect::<Vec<_>>()})));
-                specs.push(budget_settled_spec(&attempt));
+                specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
                 state.nodes.insert(node_key, node);
                 state.attempts.insert(attempt_key, attempt.clone());
                 frontier_reduce(
@@ -2587,7 +3169,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     node.active_attempt_id = None;
                     set_node_mutated(&mut node, now)?;
                     specs.push(event_spec(EventType::NodeRetriesExhausted, "N24", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": retry.max_attempts, "cause": "retryable"})));
-                    specs.push(budget_settled_spec(&attempt));
+                    specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
                     let run = terminalize_run(
@@ -2620,7 +3202,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     let returned = node.clone();
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
-                    specs.push(budget_settled_spec(&attempt));
+                    specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
                     append_batch(
                         &mut state,
                         scope,
@@ -2651,7 +3233,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     json!({"actual_cost_units": actual, "error_code": code}),
                 ));
                 specs.push(event_spec(EventType::NodeFailed, "N20", Some(&command.node_id), Some(&command.attempt_id), None, json!({"attempt_id": command.attempt_id, "failure_kind": "ActionPermanent", "error_code": code})));
-                specs.push(budget_settled_spec(&attempt));
+                specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
                 state.nodes.insert(node_key, node);
                 state.attempts.insert(attempt_key, attempt.clone());
                 let run = terminalize_run(
@@ -2684,16 +3266,19 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 Ok(CompleteAttemptResult::TerminalRun(run))
             }
         }
+        })
     }
-
     async fn timeout_attempt(
         &self,
         scope: &ExecutionScope,
         command: TimeoutAttempt,
     ) -> Result<NodeAttempt, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        let fenced_run =
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        if fenced_run.status != RunState::Running {
+            return Err(StoreError::IllegalTransition);
+        }
         let attempt_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -2703,6 +3288,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .attempts
             .remove(&attempt_key)
             .ok_or(StoreError::NotFound)?;
+        if attempt.status != AttemptState::Started || attempt.node_instance_id != command.node_id {
+            return Err(StoreError::AttemptFenced);
+        }
         if attempt.deadline_at > now {
             let deadline = attempt.deadline_at;
             state.attempts.insert(attempt_key, attempt);
@@ -2728,7 +3316,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         let reservation = attempt.reserved_cost;
         let (attempt, exhausted) =
             timeout_active(&mut state, scope, &command.run_id, &mut node, attempt, now)?;
-        let mut specs = timeout_specs(&attempt, reservation, now, exhausted);
+        let mut specs = timeout_specs(&state, scope, &command.run_id, &attempt, reservation, now, exhausted, node.next_eligible_at)?;
         state.attempts.insert(attempt_key, attempt.clone());
         state.nodes.insert(node_key, node);
         if exhausted {
@@ -2754,16 +3342,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(attempt)
+        })
     }
-
     async fn recover_abandoned_attempts_for_run(
         &self,
         scope: &ExecutionScope,
         command: RecoverAbandonedAttemptsForRun,
     ) -> Result<Vec<NodeAttempt>, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
         let mut keys = state
             .attempts
             .iter()
@@ -2801,11 +3388,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         }) {
             return Err(StoreError::CurrentGenerationAttemptPresent);
         }
+        let definition = state
+            .run_definitions
+            .get(&(scope.clone(), command.run_id.clone()))
+            .cloned()
+            .ok_or(StoreError::CorruptControlPlane)?;
         let mut recovered = Vec::new();
+        let mut rows = Vec::new();
         let mut specs = Vec::new();
-        let mut exhausted_primary: Option<NodeAttempt> = None;
         for key in keys {
-            let mut attempt = state.attempts.remove(&key).expect("key");
+            let mut attempt = state.attempts.remove(&key).expect("frozen key remains present");
             let reservation = attempt.reserved_cost;
             settle(
                 &mut state,
@@ -2823,36 +3415,58 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 command.run_id.clone(),
                 attempt.node_instance_id.clone(),
             );
-            let mut node = state
+            let node = state
                 .nodes
                 .get(&node_key)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
-            let definition = state
-                .run_definitions
-                .get(&(scope.clone(), command.run_id.clone()))
-                .expect("definition");
-            let (_, retry, _, _) =
-                action_config(definition, &node).ok_or(StoreError::CorruptControlPlane)?;
-            if attempt.attempt_number >= retry.max_attempts {
-                node.status = NodeState::RetriesExhausted;
-                if exhausted_primary.is_none() {
-                    exhausted_primary = Some(attempt.clone());
-                }
-            } else {
-                node.status = NodeState::RetryWaiting;
-                node.next_eligible_at = Some(retry_at(now, retry, attempt.attempt_number)?);
+            if node.active_attempt_id.as_ref() != Some(&attempt.attempt_id) {
+                return Err(StoreError::AttemptFenced);
             }
-            node.active_attempt_id = None;
-            set_node_mutated(&mut node, now)?;
+            let (_, retry, _, _) =
+                action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
+            let exhausted = attempt.attempt_number >= retry.max_attempts;
             specs.push(event_spec(EventType::AttemptOutcomeUnknown, "A07", Some(&attempt.node_instance_id), Some(&attempt.attempt_id), None, json!({"dead_engine_generation": attempt.engine_generation, "recovery_generation": command.permit.generation(), "charged_cost_units": reservation})));
-            specs.push(event_spec(if node.status == NodeState::RetriesExhausted { EventType::NodeRetriesExhausted } else { EventType::NodeRetryScheduled }, if node.status == NodeState::RetriesExhausted { "N26" } else { "N23" }, Some(&node.node_instance_id), Some(&attempt.attempt_id), None, json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": node.next_eligible_at, "cause": "unknown"})));
-            specs.push(budget_settled_spec(&attempt));
-            state.nodes.insert(node_key, node);
-            state.attempts.insert(key, attempt.clone());
-            recovered.push(attempt);
+            specs.push(budget_settled_spec(&state, scope, &command.run_id, &attempt)?);
+            state.attempts.insert(key.clone(), attempt.clone());
+            recovered.push(attempt.clone());
+            rows.push((key, node_key, attempt, node, exhausted, retry.clone()));
         }
-        if let Some(primary) = exhausted_primary {
+        let exhausted_primary = rows.iter().position(|row| row.4);
+        if let Some(primary_index) = exhausted_primary {
+            let primary = rows[primary_index].2.clone();
+            let primary_max_attempts = rows[primary_index].5.max_attempts;
+            for (index, (_, node_key, attempt, mut node, _, retry)) in
+                rows.into_iter().enumerate()
+            {
+                node.active_attempt_id = None;
+                node.next_eligible_at = None;
+                node.budget_wait_amount = None;
+                if index == primary_index {
+                    node.status = NodeState::RetriesExhausted;
+                    specs.push(event_spec(
+                        EventType::NodeRetriesExhausted,
+                        "N26",
+                        Some(&node.node_instance_id),
+                        Some(&attempt.attempt_id),
+                        None,
+                        json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": retry.max_attempts, "cause": "unknown"}),
+                    ));
+                } else {
+                    let prior = node.status;
+                    node.status = NodeState::Cancelled;
+                    specs.push(event_spec(
+                        EventType::NodeCancelled,
+                        "N66",
+                        Some(&node.node_instance_id),
+                        None,
+                        None,
+                        json!({"prior_status": prior, "terminal_run_status": RunState::RetriesExhausted, "reason_code": "RetriesExhausted"}),
+                    ));
+                }
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(node_key, node);
+            }
             terminalize_run(
                 &mut state,
                 scope,
@@ -2869,8 +3483,25 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 None,
                 None,
-                json!({"node_instance_id": primary.node_instance_id, "attempt_id": primary.attempt_id, "max_attempts": primary.attempt_number}),
+                json!({"node_instance_id": primary.node_instance_id, "attempt_id": primary.attempt_id, "max_attempts": primary_max_attempts}),
             ));
+        } else {
+            for (_, node_key, attempt, mut node, _, retry) in rows {
+                let next_eligible_at = retry_at(now, &retry, attempt.attempt_number)?;
+                node.status = NodeState::RetryWaiting;
+                node.active_attempt_id = None;
+                node.next_eligible_at = Some(next_eligible_at);
+                set_node_mutated(&mut node, now)?;
+                specs.push(event_spec(
+                    EventType::NodeRetryScheduled,
+                    "N23",
+                    Some(&node.node_instance_id),
+                    Some(&attempt.attempt_id),
+                    None,
+                    json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": next_eligible_at, "cause": "unknown"}),
+                ));
+                state.nodes.insert(node_key, node);
+            }
         }
         if !specs.is_empty() {
             append_batch(
@@ -2884,71 +3515,72 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             )?;
         }
         Ok(recovered)
+        })
     }
-
     async fn release_retry(
         &self,
         scope: &ExecutionScope,
         command: ReleaseRetry,
     ) -> Result<NodeRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
-        let key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
-        if node.version != command.expected_node_version || node.status != NodeState::RetryWaiting {
-            return Err(StoreError::CasConflict);
-        }
-        let eligible = node
-            .next_eligible_at
-            .ok_or(StoreError::CorruptControlPlane)?;
-        if now < eligible {
-            return Err(StoreError::RetryNotDue {
-                database_now: now,
-                next_eligible_at: eligible,
-            });
-        }
-        node.status = NodeState::Ready;
-        node.next_eligible_at = None;
-        set_node_mutated(node, now)?;
-        let returned = node.clone();
-        let run = state
-            .runs
-            .get_mut(&(scope.clone(), command.run_id.clone()))
-            .ok_or(StoreError::NotFound)?;
-        set_run_mutated(run, now)?;
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Clock,
-            command.permit.instance_id().as_str().to_owned(),
-            vec![event_spec(
-                EventType::NodeRetryEligible,
-                "N04",
-                Some(&command.node_id),
-                None,
-                None,
-                json!({"next_eligible_at": eligible, "database_now": now}),
-            )],
-        )?;
-        Ok(returned)
+        self.transaction(|mut state, now| {
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
+            if node.version != command.expected_node_version
+                || node.status != NodeState::RetryWaiting
+            {
+                return Err(StoreError::CasConflict);
+            }
+            let eligible = node
+                .next_eligible_at
+                .ok_or(StoreError::CorruptControlPlane)?;
+            if now < eligible {
+                return Err(StoreError::RetryNotDue {
+                    database_now: now,
+                    next_eligible_at: eligible,
+                });
+            }
+            node.status = NodeState::Ready;
+            node.next_eligible_at = None;
+            set_node_mutated(node, now)?;
+            let returned = node.clone();
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+            let run = state
+                .runs
+                .get_mut(&(scope.clone(), command.run_id.clone()))
+                .ok_or(StoreError::NotFound)?;
+            set_run_mutated(run, now)?;
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Clock,
+                command.permit.instance_id().as_str().to_owned(),
+                vec![event_spec(
+                    EventType::NodeRetryEligible,
+                    "N04",
+                    Some(&command.node_id),
+                    None,
+                    None,
+                    json!({"next_eligible_at": eligible, "database_now": now}),
+                )],
+            )?;
+            Ok(returned)
+        })
     }
-
     async fn record_choice(
         &self,
         scope: &ExecutionScope,
         command: RecordChoice,
     ) -> Result<NodeRun, StoreError> {
-        verified(scope, &command.input)?;
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        verified(&mut state, scope, &command.input, now)?;
         let key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3009,7 +3641,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             .expect("run")
                             .revision_hash,
                         &node.definition_node_id,
-                        &format!("case:{index}"),
+                        &format!("case/{index}"),
                         target,
                     ),
                 });
@@ -3051,6 +3683,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         }
         node.status = NodeState::Succeeded;
         node.choice_input_ref = Some(json_ref(
+                &mut state,
             scope,
             &command.input,
             ArtifactKind::ChoiceInput,
@@ -3063,13 +3696,21 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         node.choice_selected_case = Some(command.selection.clone());
         set_node_mutated(&mut node, now)?;
         state.nodes.insert(key, node.clone());
+        let choice_payload = match &command.selection {
+            ChoiceSelection::Case { case_index, .. } => {
+                json!({"choice_input_digest": command.input.digest(), "selector_value_digest": command.evaluated_selector_digest, "selection_kind": "case", "case_index": case_index, "edge_id": selected})
+            }
+            ChoiceSelection::Default { .. } => {
+                json!({"choice_input_digest": command.input.digest(), "selector_value_digest": command.evaluated_selector_digest, "selection_kind": "default", "edge_id": selected})
+            }
+        };
         let mut specs = vec![event_spec(
             EventType::ChoiceSelected,
             "N09",
             Some(&command.node_id),
             None,
             None,
-            json!({"choice_input_digest": command.input.digest(), "selector_value_digest": command.evaluated_selector_digest, "selection_kind": command.selection, "edge_id": selected}),
+            choice_payload,
         )];
         frontier_reduce(
             &mut state,
@@ -3095,17 +3736,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(node)
+        })
     }
-
     async fn expand_map(
         &self,
         scope: &ExecutionScope,
         command: ExpandMap,
     ) -> Result<NodeRun, StoreError> {
-        verified(scope, &command.input)?;
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        verified(&mut state, scope, &command.input, now)?;
         let key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3131,22 +3771,29 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .get(&run_key)
             .cloned()
             .ok_or(StoreError::NotFound)?;
-        if run.dynamic_node_count + command.ordered_items.len() as u64
-            > run.limits.max_dynamic_node_instances
-        {
+        let added_nodes = u64::try_from(command.ordered_items.len())
+            .map_err(|_| StoreError::ArithmeticOverflow)?;
+        let dynamic_after = run
+            .dynamic_node_count
+            .checked_add(added_nodes)
+            .ok_or(StoreError::ArithmeticOverflow)?;
+        if dynamic_after > run.limits.max_dynamic_node_instances {
             return Err(StoreError::RunLimitApplied {
                 code: "RunDynamicNodeLimitExceeded".to_owned(),
             });
         }
         let definition = state.run_definitions.get(&run_key).expect("definition");
-        let max_items = definition
+        let (max_items, max_concurrency) = definition
             .definition
             .nodes
             .iter()
             .find_map(|candidate| match candidate {
-                NodeDefinition::Map { id, max_items, .. } if id == &node.definition_node_id => {
-                    Some(*max_items)
-                }
+                NodeDefinition::Map {
+                    id,
+                    max_items,
+                    max_concurrency,
+                    ..
+                } if id == &node.definition_node_id => Some((*max_items, *max_concurrency)),
                 _ => None,
             })
             .ok_or(StoreError::CorruptControlPlane)?;
@@ -3156,6 +3803,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             });
         }
         node.map_input_ref = Some(json_ref(
+                &mut state,
             scope,
             &command.input,
             ArtifactKind::MapInput,
@@ -3166,7 +3814,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             now,
         )?);
         node.map_expansion_digest = Some(command.expansion_digest.clone());
-        node.map_child_count = Some(command.ordered_items.len() as u32);
+        node.map_child_count = Some(
+            u32::try_from(command.ordered_items.len())
+                .map_err(|_| StoreError::ArithmeticOverflow)?,
+        );
         let mut specs = Vec::new();
         if command.ordered_items.is_empty() {
             node.status = NodeState::Succeeded;
@@ -3226,9 +3877,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 specs.push(event_spec(EventType::MapChildCreated, "N02M", Some(&item.child_id), None, None, json!({"parent_map_instance_id": command.map_node_id, "item_index": item.index, "item_digest": item.item_digest, "topological_rank": child.topological_rank})));
                 state.nodes.insert(child_key, child);
             }
-            specs.push(event_spec(EventType::MapExpanded, "N06", Some(&command.map_node_id), None, None, json!({"map_input_digest": command.input.digest(), "expansion_digest": command.expansion_digest, "child_count": node.map_child_count, "max_concurrency": 0})));
+            specs.push(event_spec(EventType::MapExpanded, "N06", Some(&command.map_node_id), None, None, json!({"map_input_digest": command.input.digest(), "expansion_digest": command.expansion_digest, "child_count": node.map_child_count, "max_concurrency": max_concurrency})));
+            bump_frontier_epoch(&mut state, scope, &command.run_id)?;
         }
-        run.dynamic_node_count += node.map_child_count.unwrap_or_default() as u64;
+        run.dynamic_node_count = dynamic_after;
         run.aggregate_object_bytes = run
             .aggregate_object_bytes
             .checked_add(command.input.size_bytes())
@@ -3245,17 +3897,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(node)
+        })
     }
-
     async fn complete_map(
         &self,
         scope: &ExecutionScope,
         command: CompleteMap,
     ) -> Result<NodeRun, StoreError> {
-        verified(scope, &command.aggregate)?;
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        verified(&mut state, scope, &command.aggregate, now)?;
         let key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3285,6 +3936,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         }
         node.status = NodeState::Succeeded;
         node.result_ref = Some(json_ref(
+                &mut state,
             scope,
             &command.aggregate,
             ArtifactKind::MapAggregate,
@@ -3317,7 +3969,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .runs
             .get_mut(&(scope.clone(), command.run_id.clone()))
             .expect("run");
-        run.aggregate_object_bytes += command.aggregate.size_bytes();
+        run.aggregate_object_bytes = run
+            .aggregate_object_bytes
+            .checked_add(command.aggregate.size_bytes())
+            .ok_or(StoreError::ArithmeticOverflow)?;
         set_run_mutated(run, now)?;
         append_batch(
             &mut state,
@@ -3329,17 +3984,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(node)
+        })
     }
-
     async fn request_approval(
         &self,
         scope: &ExecutionScope,
         command: RequestApproval,
     ) -> Result<ApprovalGate, StoreError> {
-        verified(scope, &command.request)?;
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+        verified(&mut state, scope, &command.request, now)?;
         let gate_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3385,6 +4039,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             gate_id: command.gate_id.clone(),
             node_instance_id: command.node_id.clone(),
             request_ref: json_ref(
+                &mut state,
                 scope,
                 &command.request,
                 ArtifactKind::ApprovalRequest,
@@ -3410,6 +4065,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         set_node_mutated(&mut node, now)?;
         state.nodes.insert(node_key, node);
         state.gates.insert(gate_key, gate.clone());
+        bump_frontier_epoch(&mut state, scope, &command.run_id)?;
+        let authorization_policy_digest = digest(
+            &serde_jcs::to_vec(&gate.authorization_policy)
+                .map_err(|_| StoreError::TransactionFailed)?,
+        );
         let run = state
             .runs
             .get_mut(&(scope.clone(), command.run_id.clone()))
@@ -3429,7 +4089,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     Some(&command.node_id),
                     None,
                     Some(&command.gate_id),
-                    json!({"gate_id": command.gate_id, "request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": digest(b"policy")}),
+                    json!({"gate_id": command.gate_id, "request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": authorization_policy_digest}),
                 ),
                 event_spec(
                     EventType::ApprovalGateCreated,
@@ -3437,23 +4097,22 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     Some(&command.node_id),
                     None,
                     Some(&gate.gate_id),
-                    json!({"request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": digest(b"policy")}),
+                    json!({"request_digest": command.request.digest(), "expires_at": gate.expires_at, "on_expiry": gate.on_expiry, "authorization_policy_digest": authorization_policy_digest}),
                 ),
             ],
         )?;
         Ok(gate)
+        })
     }
-
     async fn decide_approval(
         &self,
         scope: &ExecutionScope,
         command: DecideApproval,
     ) -> Result<ApprovalGate, StoreError> {
+        self.transaction(|mut state, now| {
         if command.principal.scope() != scope {
             return Err(StoreError::ApprovalUnauthorized);
         }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
         let gate_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3477,9 +4136,35 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         if !authorized {
             return Err(StoreError::ApprovalUnauthorized);
         }
-        if gate.status != crate::run::GateState::Pending {
-            return Err(StoreError::ApprovalAlreadyResolved);
+        if let Some(payload) = &command.decision_payload {
+            verified(&mut state, scope, payload, now)?;
+            if payload.media_type() != "application/json" {
+                return Err(StoreError::ObjectNotVerified);
+            }
         }
+        if let Some(output) = &command.approval_output {
+            verified(&mut state, scope, output, now)?;
+        }
+        if command.decision == ApprovalDecision::Reject && command.approval_output.is_some() {
+            return Err(StoreError::InvalidField);
+        }
+        let decision_fingerprint = approval_decision_fingerprint(
+            scope,
+            &command.run_id,
+            &command.gate_id,
+            command.decision,
+            command.decision_payload.as_ref(),
+            command.approval_output.as_ref(),
+            &command.principal,
+        );
+        if gate.status != crate::run::GateState::Pending {
+            return if gate.decision_fingerprint.as_ref() == Some(&decision_fingerprint) {
+                Ok(gate)
+            } else {
+                Err(StoreError::ApprovalAlreadyResolved)
+            };
+        }
+        running_fence(&state, scope, &command.run_id, None, now)?;
         if gate.version != command.expected_gate_version
             || state
                 .runs
@@ -3497,30 +4182,37 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         );
         let mut node = state.nodes.get(&node_key).cloned().expect("gate node");
         let mut specs = Vec::new();
+        let payload_reference = command
+            .decision_payload
+            .as_ref()
+            .map(|payload| {
+                artifact(
+                    &mut state,
+                    scope,
+                    payload,
+                    ArtifactKind::ApprovalDecisionPayload,
+                    Some(&command.run_id),
+                    Some(&node.node_instance_id),
+                    None,
+                    0,
+                    now,
+                )
+            })
+            .transpose()?;
+        let payload_value = payload_reference
+            .as_ref()
+            .map(|reference| crate::artifact::ArtifactRefValue {
+                artifact_ref_id: reference.artifact_ref_id.clone(),
+                digest: reference.digest.clone(),
+                size_bytes: reference.size_bytes.to_string(),
+                media_type: reference.media_type.clone(),
+            });
         match command.decision {
             ApprovalDecision::Approve => {
                 let output = command
                     .approval_output
                     .as_ref()
                     .ok_or(StoreError::ObjectNotVerified)?;
-                let payload_value = command.decision_payload.as_ref().map(|payload| {
-                    let reference = artifact(
-                        scope,
-                        payload,
-                        ArtifactKind::ApprovalDecisionPayload,
-                        Some(&command.run_id),
-                        Some(&node.node_instance_id),
-                        None,
-                        0,
-                        now,
-                    );
-                    crate::artifact::ArtifactRefValue {
-                        artifact_ref_id: reference.artifact_ref_id,
-                        digest: reference.digest,
-                        size_bytes: reference.size_bytes.to_string(),
-                        media_type: reference.media_type,
-                    }
-                });
                 let expected = crate::approval::canonical_human_approval_result(
                     payload_value,
                     &command.principal,
@@ -3536,6 +4228,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 gate.status = crate::run::GateState::Approved;
                 node.status = NodeState::Succeeded;
                 node.result_ref = Some(json_ref(
+                &mut state,
                     scope,
                     output,
                     ArtifactKind::NodeOutput,
@@ -3545,8 +4238,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     0,
                     now,
                 )?);
-                specs.push(event_spec(EventType::ApprovalGateApproved, "G02", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "approval_output_digest": output.digest(), "decision_fingerprint": digest(b"decision")})));
-                specs.push(event_spec(EventType::ApprovalApproved, "N12", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"gate_id": gate.gate_id, "approval_output_digest": output.digest(), "resolution_source": "human"})));
+                specs.push(event_spec(EventType::ApprovalGateApproved, "G02", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "approval_output_digest": output.digest(), "decision_fingerprint": decision_fingerprint})));
+                specs.push(event_spec(EventType::ApprovalApproved, "N12", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"gate_id": gate.gate_id, "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "approval_output_digest": output.digest(), "resolution_source": "human"})));
                 let node_id = node.node_instance_id.clone();
                 set_node_mutated(&mut node, now)?;
                 state.nodes.insert(node_key, node);
@@ -3566,14 +4259,14 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 node.failure_kind = Some(NodeFailureKind::ApprovalRejected);
                 set_node_mutated(&mut node, now)?;
                 state.nodes.insert(node_key, node.clone());
-                specs.push(event_spec(EventType::ApprovalGateRejected, "G03", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "decision_fingerprint": digest(b"decision")})));
+                specs.push(event_spec(EventType::ApprovalGateRejected, "G03", Some(&node.node_instance_id), None, Some(&gate.gate_id), json!({"principal": command.principal.principal_id(), "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "decision_fingerprint": decision_fingerprint})));
                 specs.push(event_spec(
                     EventType::ApprovalRejected,
                     "N13",
                     Some(&node.node_instance_id),
                     None,
                     Some(&gate.gate_id),
-                    json!({"gate_id": gate.gate_id, "resolution_source": "human"}),
+                    json!({"gate_id": gate.gate_id, "decision_payload_digest": command.decision_payload.as_ref().map(VerifiedObjectRef::digest), "resolution_source": "human"}),
                 ));
                 terminalize_run(
                     &mut state,
@@ -3596,9 +4289,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             }
         }
         gate.deciding_principal = Some(command.principal.principal_id().to_owned());
+        gate.decision_payload_ref = payload_reference.map(JsonRef);
         gate.resolution_source = Some(ApprovalResolutionSource::Human);
         gate.decided_at = Some(now);
-        gate.version.0 += 1;
+        gate.decision_fingerprint = Some(decision_fingerprint);
+        gate.version.0 = gate
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         state.gates.insert(gate_key, gate.clone());
         let run = state
             .runs
@@ -3615,16 +4314,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(gate)
+        })
     }
-
     async fn expire_approval(
         &self,
         scope: &ExecutionScope,
         command: ExpireApproval,
     ) -> Result<ApprovalGate, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
         let gate_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3661,7 +4359,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .approval_output
                     .as_ref()
                     .ok_or(StoreError::ObjectNotVerified)?;
-                verified(scope, output)?;
+                verified(&mut state, scope, output, now)?;
                 let expected = crate::approval::canonical_expiry_approval_result();
                 if output.media_type() != "application/json"
                     || output.digest() != &digest(&expected)
@@ -3675,6 +4373,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
                 node.status = NodeState::Succeeded;
                 node.result_ref = Some(json_ref(
+                &mut state,
                     scope,
                     output,
                     ArtifactKind::NodeOutput,
@@ -3758,7 +4457,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             }
         }
         gate.decided_at = Some(now);
-        gate.version.0 += 1;
+        gate.version.0 = gate
+            .version
+            .0
+            .checked_add(1)
+            .ok_or(StoreError::ArithmeticOverflow)?;
         state.gates.insert(gate_key, gate.clone());
         let run = state
             .runs
@@ -3775,16 +4478,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(gate)
+        })
     }
-
     async fn resolve_terminal_node(
         &self,
         scope: &ExecutionScope,
         command: ResolveTerminalNode,
     ) -> Result<WorkflowRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
+        self.transaction(|mut state, now| {
+        running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
         let node_key = (
             scope.clone(),
             command.run_id.clone(),
@@ -3807,6 +4509,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .ok_or(StoreError::ObjectNotVerified)?;
                 node.status = NodeState::Succeeded;
                 node.result_ref = Some(json_ref(
+                &mut state,
                     scope,
                     output,
                     ArtifactKind::NodeOutput,
@@ -3900,72 +4603,72 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(run)
+        })
     }
-
     async fn fail_contract(
         &self,
         scope: &ExecutionScope,
         command: FailContract,
     ) -> Result<WorkflowRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
-        let key = (
-            scope.clone(),
-            command.run_id.clone(),
-            command.node_id.clone(),
-        );
-        let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
-        if node.version != command.expected_node_version || node.status != NodeState::Ready {
-            return Err(StoreError::CasConflict);
-        }
-        node.status = NodeState::ContractFailed;
-        node.failure_kind = Some(command.closed_failure_kind);
-        set_node_mutated(node, now)?;
-        let run_kind = run_failure(command.closed_failure_kind);
-        let mut specs = vec![event_spec(
-            EventType::NodeContractFailed,
-            "N46",
-            Some(&command.node_id),
-            None,
-            None,
-            json!({"failure_kind": command.closed_failure_kind}),
-        )];
-        let run = terminalize_run(
-            &mut state,
-            scope,
-            &command.run_id,
-            RunState::ContractFailed,
-            Some(run_kind),
-            "ContractFailed",
-            now,
-            &mut specs,
-        )?;
-        specs.push(event_spec(
-            EventType::RunContractFailed,
-            "R08",
-            None,
-            None,
-            None,
-            json!({"failure_kind": run_kind}),
-        ));
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Engine,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(run)
+        self.transaction(|mut state, now| {
+            running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
+            let key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.node_id.clone(),
+            );
+            let node = state.nodes.get_mut(&key).ok_or(StoreError::NotFound)?;
+            if node.version != command.expected_node_version || node.status != NodeState::Ready {
+                return Err(StoreError::CasConflict);
+            }
+            node.status = NodeState::ContractFailed;
+            node.failure_kind = Some(command.closed_failure_kind);
+            set_node_mutated(node, now)?;
+            let run_kind = run_failure(command.closed_failure_kind);
+            let mut specs = vec![event_spec(
+                EventType::NodeContractFailed,
+                "N46",
+                Some(&command.node_id),
+                None,
+                None,
+                json!({"failure_kind": command.closed_failure_kind}),
+            )];
+            let run = terminalize_run(
+                &mut state,
+                scope,
+                &command.run_id,
+                RunState::ContractFailed,
+                Some(run_kind),
+                "ContractFailed",
+                now,
+                &mut specs,
+            )?;
+            specs.push(event_spec(
+                EventType::RunContractFailed,
+                "R08",
+                None,
+                None,
+                None,
+                json!({"failure_kind": run_kind}),
+            ));
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Engine,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(run)
+        })
     }
-
     async fn cancel_run(
         &self,
         scope: &ExecutionScope,
         command: CancelRun,
     ) -> Result<CommandReceipt, StoreError> {
+        self.transaction(|mut state, now| {
         if command.principal.scope() != scope
             || command.reason_code.is_empty()
             || command.idempotency_token.len() < 16
@@ -3988,8 +4691,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 &command.reason_code,
             ),
         );
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
         let receipt_key = (
             scope.clone(),
             CommandKindKey::Cancel,
@@ -4002,6 +4703,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 Err(StoreError::IdempotencyConflict)
             };
         }
+        command_fence(&state, scope, &command.run_id, None, now, true)?;
         let prior = state
             .runs
             .get(&(scope.clone(), command.run_id.clone()))
@@ -4067,78 +4769,89 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         };
         state.receipts.insert(receipt_key, receipt.clone());
         Ok(receipt)
+        })
     }
-
     async fn expire_run_lifetime(
         &self,
         scope: &ExecutionScope,
         command: ExpireRunLifetime,
     ) -> Result<WorkflowRun, StoreError> {
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
-        permit_check(&state, scope, &command.permit, now)?;
-        let prior = state
-            .runs
-            .get(&(scope.clone(), command.run_id.clone()))
-            .cloned()
-            .ok_or(StoreError::NotFound)?;
-        if prior.status.is_terminal() {
-            return Ok(prior);
-        }
-        if now < prior.lifetime_deadline_at {
-            return Err(StoreError::LifetimeNotDue {
-                database_now: now,
-                lifetime_deadline_at: prior.lifetime_deadline_at,
-            });
-        }
-        let mut specs = Vec::new();
-        let run = terminalize_run(
-            &mut state,
-            scope,
-            &command.run_id,
-            RunState::Cancelled,
-            None,
-            "RunLifetimeExceeded",
-            now,
-            &mut specs,
-        )?;
-        specs.push(event_spec(
-            EventType::RunCancelled,
-            match prior.status {
-                RunState::Pending => "R11",
-                RunState::Running => "R12",
-                _ => "R13",
-            },
-            None,
-            None,
-            None,
-            json!({"reason_code": "RunLifetimeExceeded", "prior_status": prior.status}),
-        ));
-        append_batch(
-            &mut state,
-            scope,
-            &command.run_id,
-            now,
-            EventActorKind::Clock,
-            command.permit.instance_id().as_str().to_owned(),
-            specs,
-        )?;
-        Ok(run)
+        self.transaction(|mut state, now| {
+            command_fence(
+                &state,
+                scope,
+                &command.run_id,
+                Some(&command.permit),
+                now,
+                true,
+            )?;
+            let prior = state
+                .runs
+                .get(&(scope.clone(), command.run_id.clone()))
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if prior.status.is_terminal() {
+                return Ok(prior);
+            }
+            if now < prior.lifetime_deadline_at {
+                return Err(StoreError::LifetimeNotDue {
+                    database_now: now,
+                    lifetime_deadline_at: prior.lifetime_deadline_at,
+                });
+            }
+            let mut specs = Vec::new();
+            let run = terminalize_run(
+                &mut state,
+                scope,
+                &command.run_id,
+                RunState::Cancelled,
+                None,
+                "RunLifetimeExceeded",
+                now,
+                &mut specs,
+            )?;
+            specs.push(event_spec(
+                EventType::RunCancelled,
+                match prior.status {
+                    RunState::Pending => "R11",
+                    RunState::Running => "R12",
+                    _ => "R13",
+                },
+                None,
+                None,
+                None,
+                json!({"reason_code": "RunLifetimeExceeded", "prior_status": prior.status}),
+            ));
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::Clock,
+                command.permit.instance_id().as_str().to_owned(),
+                specs,
+            )?;
+            Ok(run)
+        })
     }
-
     async fn mark_corrupt_storage(
         &self,
         scope: &ExecutionScope,
         command: MarkCorruptStorage,
     ) -> Result<WorkflowRun, StoreError> {
+        self.transaction(|mut state, now| {
         if command.proof.scope() != scope
             || command.proof.requested_digest() != &command.bad_ref.digest
             || command.bad_ref.scope != *scope
+            || state.object_store_nonce.as_deref()
+                != Some(command.proof.store_instance_nonce())
+            || state
+                .artifact_refs
+                .get(&(scope.clone(), command.bad_ref.artifact_ref_id.clone()))
+                != Some(&command.bad_ref)
         {
             return Err(StoreError::InvalidFailedReadProof);
         }
-        let now = self.now();
-        let mut state = self.state.lock().expect("store lock poisoned");
         let prior = state
             .runs
             .get(&(scope.clone(), command.run_id.clone()))
@@ -4147,7 +4860,52 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         if prior.status == RunState::CorruptStorage {
             return Ok(prior);
         }
+        let proof_fingerprint = digest(&command.proof.fingerprint_material());
         let mut specs = Vec::new();
+        if let Some(owner_node_id) = &command.owner_node_id {
+            if command.bad_ref.producer_node_id.as_ref() != Some(owner_node_id) {
+                return Err(StoreError::InvalidFailedReadProof);
+            }
+            let node_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                owner_node_id.clone(),
+            );
+            let mut node = state
+                .nodes
+                .get(&node_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            let prior_status = node.status;
+            let transition = match prior_status {
+                NodeState::Ready => "N47",
+                NodeState::RetryWaiting => "N48",
+                NodeState::WaitingApproval => "N49",
+                NodeState::WaitingChildren => "N50",
+                NodeState::BlockedIncompatible => "N51",
+                NodeState::Succeeded => "N52",
+                NodeState::Failed => "N53",
+                NodeState::ContractFailed => "N54",
+                NodeState::RetriesExhausted => "N55",
+                NodeState::BudgetExhausted => "N56",
+                NodeState::Cancelled => "N57",
+                _ => return Err(StoreError::IllegalTransition),
+            };
+            node.status = NodeState::CorruptStorage;
+            node.active_attempt_id = None;
+            node.next_eligible_at = None;
+            node.budget_wait_amount = None;
+            set_node_mutated(&mut node, now)?;
+            state.nodes.insert(node_key, node);
+            specs.push(event_spec(
+                EventType::NodeCorruptStorage,
+                transition,
+                Some(owner_node_id),
+                None,
+                None,
+                json!({"bad_artifact_ref_id": command.bad_ref.artifact_ref_id, "bad_digest": command.bad_ref.digest, "error_class": command.proof.error_class(), "corrupt_proof_fingerprint": proof_fingerprint, "prior_status": prior_status}),
+            ));
+        }
         cancellation_cascade(
             &mut state,
             scope,
@@ -4166,11 +4924,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         run.corrupt_bad_artifact_ref_id = Some(command.bad_ref.artifact_ref_id.clone());
         run.corrupt_owner_node_id = command.owner_node_id;
         run.corrupt_error_class = Some(command.proof.error_class());
-        run.corrupt_proof_fingerprint = Some(digest(&command.proof.fingerprint_material()));
+        run.corrupt_proof_fingerprint = Some(proof_fingerprint);
         run.finished_at = Some(now);
         set_run_mutated(run, now)?;
         let returned = run.clone();
-        specs.push(event_spec(EventType::RunCorruptStorage, "R15", None, None, None, json!({"bad_artifact_ref_id": command.bad_ref.artifact_ref_id, "bad_digest": command.bad_ref.digest, "error_class": command.proof.error_class(), "corrupt_proof_fingerprint": returned.corrupt_proof_fingerprint, "prior_status": prior.status})));
+        let store_instance_nonce_digest = digest(command.proof.store_instance_nonce());
+        specs.push(event_spec(EventType::RunCorruptStorage, "R15", None, None, None, json!({"bad_artifact_ref_id": command.bad_ref.artifact_ref_id, "bad_digest": command.bad_ref.digest, "error_class": command.proof.error_class(), "corrupt_proof_fingerprint": returned.corrupt_proof_fingerprint, "store_instance_nonce_digest": store_instance_nonce_digest, "prior_status": prior.status, "owner_node_id": returned.corrupt_owner_node_id})));
         append_batch(
             &mut state,
             scope,
@@ -4181,8 +4940,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             specs,
         )?;
         Ok(returned)
+        })
     }
-
     async fn get_definition(
         &self,
         scope: &ExecutionScope,
@@ -4341,18 +5100,33 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let limit = page_bounds(&page)?;
         let state = self.state.lock().expect("store lock poisoned");
-        Ok(Page {
-            items: state
-                .runs
-                .values()
-                .filter(|run| run.scope == *scope)
-                .take(limit)
-                .cloned()
-                .collect(),
-            next_cursor: None,
-        })
+        let query = "list_runs";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
+        let mut items = state
+            .runs
+            .values()
+            .filter(|run| {
+                run.scope == *scope
+                    && run.created_at <= cutoff
+                    && (last.is_empty() || vec![run.run_id.as_str().to_owned()] > last)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|run| run.run_id.clone());
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|run| {
+                    next_scan_cursor(scope, query, cutoff, vec![run.run_id.as_str().to_owned()])
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
     }
 
     async fn list_nodes(
@@ -4361,18 +5135,42 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         run_id: &Id,
         page: PageRequest,
     ) -> Result<Page<NodeRun>, StoreError> {
-        let limit = page_bounds(&page)?;
         let state = self.state.lock().expect("store lock poisoned");
-        Ok(Page {
-            items: state
-                .nodes
-                .values()
-                .filter(|node| node.scope == *scope && node.run_id == *run_id)
-                .take(limit)
-                .cloned()
-                .collect(),
-            next_cursor: None,
-        })
+        let query = format!("list_nodes:{}", run_id.as_str());
+        let (limit, cutoff, last) = scan_page_context(&page, scope, &query, self.now())?;
+        if !state.runs.contains_key(&(scope.clone(), run_id.clone())) {
+            return Err(StoreError::NotFound);
+        }
+        let mut items = state
+            .nodes
+            .values()
+            .filter(|node| {
+                node.scope == *scope
+                    && node.run_id == *run_id
+                    && node.created_at <= cutoff
+                    && (last.is_empty() || vec![node.node_instance_id.as_str().to_owned()] > last)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|node| node.node_instance_id.clone());
+        let has_more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if has_more {
+            items
+                .last()
+                .map(|node| {
+                    next_scan_cursor(
+                        scope,
+                        &query,
+                        cutoff,
+                        vec![node.node_instance_id.as_str().to_owned()],
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
     }
 
     async fn list_events_after(
@@ -4420,7 +5218,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<NodeRun>, StoreError> {
-        scan_nodes(&self.state, scope, page, |node| {
+        scan_nodes(&self.state, &self.clock, scope, page, "ready", |node| {
             node.status == NodeState::Ready
         })
     }
@@ -4430,9 +5228,14 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<NodeRun>, StoreError> {
-        scan_nodes(&self.state, scope, page, |node| {
-            node.status == NodeState::BudgetWaiting
-        })
+        scan_nodes(
+            &self.state,
+            &self.clock,
+            scope,
+            page,
+            "budget_waiters",
+            |node| node.status == NodeState::BudgetWaiting,
+        )
     }
 
     async fn scan_due_deadlines(
@@ -4440,16 +5243,17 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<NodeAttempt>, StoreError> {
-        let limit = page_bounds(&page)?;
-        let now = self.now();
         let state = self.state.lock().expect("store lock poisoned");
+        let query = "due_deadlines";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
         let mut items = state
             .attempts
             .values()
             .filter(|attempt| {
                 attempt.scope == *scope
                     && attempt.status == AttemptState::Started
-                    && attempt.deadline_at <= now
+                    && attempt.started_at <= cutoff
+                    && attempt.deadline_at <= cutoff
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -4461,11 +5265,18 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 attempt.attempt_id.clone(),
             )
         });
-        items.truncate(limit);
-        Ok(Page {
-            items,
-            next_cursor: None,
-        })
+        let key = |attempt: &NodeAttempt| {
+            vec![
+                timestamp_cursor_key(attempt.deadline_at),
+                attempt.run_id.as_str().to_owned(),
+                attempt.node_instance_id.as_str().to_owned(),
+                attempt.attempt_id.as_str().to_owned(),
+            ]
+        };
+        if !last.is_empty() {
+            items.retain(|attempt| key(attempt) > last);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, key)
     }
 
     async fn scan_due_retries(
@@ -4473,11 +5284,14 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<NodeRun>, StoreError> {
-        let now = self.now();
-        scan_nodes(&self.state, scope, page, |node| {
-            node.status == NodeState::RetryWaiting
-                && node.next_eligible_at.is_some_and(|due| due <= now)
-        })
+        scan_nodes(
+            &self.state,
+            &self.clock,
+            scope,
+            page,
+            "due_retries",
+            |node| node.status == NodeState::RetryWaiting && node.next_eligible_at.is_some(),
+        )
     }
 
     async fn scan_recovery_runs(
@@ -4485,8 +5299,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let limit = page_bounds(&page)?;
         let state = self.state.lock().expect("store lock poisoned");
+        let query = "recovery_runs";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
         let generation = state
             .claims
             .get(scope)
@@ -4498,16 +5313,18 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 attempt.scope == *scope
                     && attempt.status == AttemptState::Started
                     && attempt.engine_generation < generation
+                    && attempt.started_at <= cutoff
             })
             .map(|attempt| attempt.run_id.clone())
             .collect::<BTreeSet<_>>();
-        Ok(Page {
-            items: ids
-                .into_iter()
-                .filter_map(|run_id| state.runs.get(&(scope.clone(), run_id)).cloned())
-                .take(limit)
-                .collect(),
-            next_cursor: None,
+        let mut items = ids
+            .into_iter()
+            .filter_map(|run_id| state.runs.get(&(scope.clone(), run_id)).cloned())
+            .filter(|run| last.is_empty() || vec![run.run_id.as_str().to_owned()] > last)
+            .collect::<Vec<_>>();
+        items.sort_by_key(|run| run.run_id.clone());
+        finish_scan_page(items, limit, scope, query, cutoff, |run| {
+            vec![run.run_id.as_str().to_owned()]
         })
     }
 
@@ -4516,24 +5333,33 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let limit = page_bounds(&page)?;
         let state = self.state.lock().expect("store lock poisoned");
-        Ok(Page {
-            items: state
-                .runs
-                .values()
-                .filter(|run| {
-                    run.scope == *scope
-                        && matches!(
-                            run.status,
-                            RunState::Pending | RunState::Running | RunState::BlockedIncompatible
-                        )
-                })
-                .take(limit)
-                .cloned()
-                .collect(),
-            next_cursor: None,
-        })
+        let query = "compatibility_rechecks";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
+        let mut items = state
+            .runs
+            .values()
+            .filter(|run| {
+                run.scope == *scope
+                    && run.updated_at <= cutoff
+                    && matches!(
+                        run.status,
+                        RunState::Pending | RunState::Running | RunState::BlockedIncompatible
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by_key(|run| (run.updated_at, run.run_id.clone()));
+        let key = |run: &WorkflowRun| {
+            vec![
+                timestamp_cursor_key(run.updated_at),
+                run.run_id.as_str().to_owned(),
+            ]
+        };
+        if !last.is_empty() {
+            items.retain(|run| key(run) > last);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, key)
     }
 
     async fn scan_due_gates(
@@ -4541,25 +5367,31 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<ApprovalGate>, StoreError> {
-        let limit = page_bounds(&page)?;
-        let now = self.now();
         let state = self.state.lock().expect("store lock poisoned");
+        let query = "due_gates";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
         let mut items = state
             .gates
             .values()
             .filter(|gate| {
                 gate.scope == *scope
                     && gate.status == crate::run::GateState::Pending
-                    && gate.expires_at <= now
+                    && gate.expires_at <= cutoff
             })
             .cloned()
             .collect::<Vec<_>>();
         items.sort_by_key(|gate| (gate.expires_at, gate.run_id.clone(), gate.gate_id.clone()));
-        items.truncate(limit);
-        Ok(Page {
-            items,
-            next_cursor: None,
-        })
+        let key = |gate: &ApprovalGate| {
+            vec![
+                timestamp_cursor_key(gate.expires_at),
+                gate.run_id.as_str().to_owned(),
+                gate.gate_id.as_str().to_owned(),
+            ]
+        };
+        if !last.is_empty() {
+            items.retain(|gate| key(gate) > last);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, key)
     }
 
     async fn scan_due_run_lifetimes(
@@ -4567,40 +5399,52 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let limit = page_bounds(&page)?;
-        let now = self.now();
         let state = self.state.lock().expect("store lock poisoned");
+        let query = "due_run_lifetimes";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, self.now())?;
         let mut items = state
             .runs
             .values()
             .filter(|run| {
-                run.scope == *scope && !run.status.is_terminal() && run.lifetime_deadline_at <= now
+                run.scope == *scope
+                    && !run.status.is_terminal()
+                    && run.lifetime_deadline_at <= cutoff
             })
             .cloned()
             .collect::<Vec<_>>();
         items.sort_by_key(|run| (run.lifetime_deadline_at, run.run_id.clone()));
-        items.truncate(limit);
-        Ok(Page {
-            items,
-            next_cursor: None,
-        })
+        let key = |run: &WorkflowRun| {
+            vec![
+                timestamp_cursor_key(run.lifetime_deadline_at),
+                run.run_id.as_str().to_owned(),
+            ]
+        };
+        if !last.is_empty() {
+            items.retain(|run| key(run) > last);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, key)
     }
 }
 
-fn scan_nodes(
+fn scan_nodes<C: Clock>(
     mutex: &Mutex<MemoryState>,
+    clock: &Arc<C>,
     scope: &ExecutionScope,
     page: PageRequest,
+    query: &str,
     predicate: impl Fn(&NodeRun) -> bool,
 ) -> Result<Page<NodeRun>, StoreError> {
-    let limit = page_bounds(&page)?;
     let state = mutex.lock().expect("store lock poisoned");
+    let (limit, cutoff, last) = scan_page_context(&page, scope, query, clock.now())?;
     let mut items = state
         .nodes
         .values()
         .filter(|node| {
             node.scope == *scope
                 && predicate(node)
+                && node.updated_at <= cutoff
+                && (query != "due_retries"
+                    || node.next_eligible_at.is_some_and(|due| due <= cutoff))
                 && state
                     .runs
                     .get(&(scope.clone(), node.run_id.clone()))
@@ -4609,11 +5453,35 @@ fn scan_nodes(
         .cloned()
         .collect::<Vec<_>>();
     items.sort_by_key(|node| (node.run_id.clone(), node.node_instance_id.clone()));
+    if !last.is_empty() {
+        items.retain(|node| {
+            vec![
+                node.run_id.as_str().to_owned(),
+                node.node_instance_id.as_str().to_owned(),
+            ] > last
+        });
+    }
+    let has_more = items.len() > limit;
     items.truncate(limit);
-    Ok(Page {
-        items,
-        next_cursor: None,
-    })
+    let next_cursor = if has_more {
+        items
+            .last()
+            .map(|node| {
+                next_scan_cursor(
+                    scope,
+                    query,
+                    cutoff,
+                    vec![
+                        node.run_id.as_str().to_owned(),
+                        node.node_instance_id.as_str().to_owned(),
+                    ],
+                )
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(Page { items, next_cursor })
 }
 
 fn outcome_category(outcome: &ActionOutcome) -> &'static str {
@@ -4665,20 +5533,54 @@ fn outcome_cost_reason(outcome: &ActionOutcome) -> (CostUnits, BudgetLedgerReaso
     }
 }
 
-fn budget_settled_spec(attempt: &NodeAttempt) -> EventSpec {
-    event_spec(
+fn budget_settled_spec(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    attempt: &NodeAttempt,
+) -> Result<EventSpec, StoreError> {
+    let ledger = state
+        .ledger
+        .get(&(scope.clone(), run_id.clone()))
+        .and_then(|entries| entries.last())
+        .filter(|entry| entry.attempt_id == attempt.attempt_id)
+        .ok_or(StoreError::CorruptControlPlane)?;
+    let run = state
+        .runs
+        .get(&(scope.clone(), run_id.clone()))
+        .ok_or(StoreError::NotFound)?;
+    let consumed = attempt
+        .settled_cost
+        .ok_or(StoreError::CorruptControlPlane)?;
+    let released = attempt
+        .reserved_cost
+        .0
+        .checked_sub(consumed.0)
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    let available = run
+        .budget_limit
+        .0
+        .checked_sub(run.budget_consumed.0)
+        .and_then(|value| value.checked_sub(run.budget_reserved.0))
+        .ok_or(StoreError::ArithmeticOverflow)?;
+    Ok(event_spec(
         EventType::BudgetSettled,
         match attempt.status {
             AttemptState::Succeeded => "A02",
             AttemptState::RetryableFailed => "A03",
             AttemptState::PermanentFailed => "A04",
-            _ => "A05",
+            AttemptState::ContractFailed => "A05",
+            AttemptState::TimedOut => "A06",
+            AttemptState::UnknownOutcome => "A07",
+            AttemptState::Cancelled => "A08",
+            AttemptState::Stale => "A09",
+            AttemptState::Started => return Err(StoreError::IllegalTransition),
         },
         Some(&attempt.node_instance_id),
         Some(&attempt.attempt_id),
         None,
-        json!({"ledger_seq": 0, "reservation_amount": attempt.reserved_cost, "consumed_amount": attempt.settled_cost, "released_amount": attempt.reserved_cost.0.saturating_sub(attempt.settled_cost.unwrap_or(CostUnits(0)).0).to_string(), "reason": "settled", "available_after": "0"}),
-    )
+        json!({"ledger_seq": ledger.ledger_seq, "reservation_amount": attempt.reserved_cost, "consumed_amount": consumed, "released_amount": released.to_string(), "reason": ledger.reason, "available_after": available.to_string()}),
+    ))
 }
 
 fn timeout_active(
@@ -4724,12 +5626,16 @@ fn timeout_active(
 }
 
 fn timeout_specs(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
     attempt: &NodeAttempt,
     reservation: CostUnits,
     now: Timestamp,
     exhausted: bool,
-) -> Vec<EventSpec> {
-    vec![
+    next_eligible_at: Option<Timestamp>,
+) -> Result<Vec<EventSpec>, StoreError> {
+    Ok(vec![
         event_spec(
             EventType::AttemptTimedOut,
             "A06",
@@ -4748,10 +5654,14 @@ fn timeout_specs(
             Some(&attempt.node_instance_id),
             Some(&attempt.attempt_id),
             None,
-            json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "cause": "timeout"}),
+            if exhausted {
+                json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "max_attempts": attempt.attempt_number, "cause": "timeout"})
+            } else {
+                json!({"attempt_id": attempt.attempt_id, "attempt_number": attempt.attempt_number, "next_eligible_at": next_eligible_at.ok_or(StoreError::CorruptControlPlane)?, "cause": "timeout"})
+            },
         ),
-        budget_settled_spec(attempt),
-    ]
+        budget_settled_spec(state, scope, run_id, attempt)?,
+    ])
 }
 
 fn run_failure(kind: NodeFailureKind) -> RunFailureKind {
