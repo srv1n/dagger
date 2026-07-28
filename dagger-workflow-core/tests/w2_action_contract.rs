@@ -1,15 +1,16 @@
 use dagger_workflow_core::action::{
-    check_compatibility, fixtures, invoke_registered_at, ActionContext, ActionDescriptor,
-    ActionInvocation, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
-    CanonicalBoundInput, CompatibilityMismatch, CompletionCredential, DiagnosticFact,
-    DiagnosticScalar, DiagnosticsEnvelope, DiagnosticsValidationError, InMemoryActionRegistry,
-    InvocationError, WorkflowAction,
+    check_compatibility, compatibility_evidence_digest, fixtures, invoke_registered_at,
+    ActionContext, ActionDescriptor, ActionInvocation, ActionOutcome, ActionRegistry, BudgetHandle,
+    CancellationSource, CanonicalBoundInput, CompatibilityMismatch, CompletionCredential,
+    DiagnosticFact, DiagnosticScalar, DiagnosticsEnvelope, DiagnosticsValidationError,
+    InMemoryActionRegistry, InvocationError, WorkflowAction,
 };
 use dagger_workflow_core::artifact::{ArtifactKind, ArtifactRef, JsonRef};
 use dagger_workflow_core::definition::ActionPin;
-use dagger_workflow_core::ids::{idempotency_key, CostUnits, Digest, Id, Timestamp};
+use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use serde_json::json;
+use sha2::{Digest as _, Sha256};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
@@ -26,7 +27,11 @@ fn scope() -> ExecutionScope {
 }
 
 fn digest(label: &str) -> Digest {
-    Digest(format!("sha256:{label:0<64}"))
+    Digest::new(format!("sha256:{:x}", Sha256::digest(label.as_bytes()))).unwrap()
+}
+
+fn id(value: &str) -> Id {
+    Id::new(value).unwrap()
 }
 
 fn descriptor() -> ActionDescriptor {
@@ -42,7 +47,7 @@ fn descriptor() -> ActionDescriptor {
 fn pin(descriptor: &ActionDescriptor) -> ActionPin {
     let artifact = ArtifactRef {
         scope: scope(),
-        artifact_ref_id: Id("schema".to_owned()),
+        artifact_ref_id: id("schema"),
         digest: descriptor.input_schema_digest.clone(),
         size_bytes: 0,
         media_type: "application/json".to_owned(),
@@ -72,14 +77,14 @@ fn context(
     cancellation: Arc<dyn dagger_workflow_core::action::CancellationToken>,
 ) -> ActionContext {
     let scope = scope();
-    let run = Id("run".to_owned());
-    let node = Id("node".to_owned());
+    let run = id("run");
+    let node = id("node");
     ActionContext::new(
         scope,
         run,
         digest("revision"),
         node,
-        Id("attempt".to_owned()),
+        id("attempt"),
         1,
         CompletionCredential::from_minted_bytes([7; 32]),
         Timestamp(deadline),
@@ -93,10 +98,10 @@ fn context(
 fn invocation(descriptor: &ActionDescriptor, input: &CanonicalBoundInput) -> ActionInvocation {
     ActionInvocation {
         scope: scope(),
-        run_id: Id("run".to_owned()),
-        invocation_id: Id("attempt".to_owned()),
-        node_instance_id: Id("node".to_owned()),
-        attempt_id: Id("attempt".to_owned()),
+        run_id: id("run"),
+        invocation_id: id("attempt"),
+        node_instance_id: id("node"),
+        attempt_id: id("attempt"),
         action_reference_location: "node".to_owned(),
         action_name: descriptor.name.clone(),
         contract_version: descriptor.contract_version.clone(),
@@ -108,7 +113,7 @@ fn invocation(descriptor: &ActionDescriptor, input: &CanonicalBoundInput) -> Act
             .clone(),
         bound_input_ref: JsonRef(ArtifactRef {
             scope: scope(),
-            artifact_ref_id: Id("input".to_owned()),
+            artifact_ref_id: id("input"),
             digest: input.digest().clone(),
             size_bytes: input.bytes().len() as u64,
             media_type: "application/json".to_owned(),
@@ -218,6 +223,17 @@ fn registration_lookup_and_every_pin_dimension_are_exact() {
 }
 
 #[test]
+fn compatibility_evidence_uses_known_rfc8785_bytes() {
+    let value = serde_json::json!({"z": [3, 2], "a": {"b": true, "a": null}});
+    let canonical = serde_jcs::to_vec(&value).unwrap();
+    assert_eq!(canonical, br#"{"a":{"a":null,"b":true},"z":[3,2]}"#);
+    assert_eq!(
+        compatibility_evidence_digest(&value).as_str(),
+        "sha256:d570148de3398d16b58b6267438ad1656f50352cfd66da2432a3c5f3a4b7a8c7"
+    );
+}
+
+#[test]
 fn expired_deadline_prevents_action_delivery() {
     let descriptor = descriptor();
     let called = Arc::new(AtomicBool::new(false));
@@ -267,6 +283,71 @@ fn cancellation_is_observed_during_invocation() {
 }
 
 #[test]
+fn invocation_delivers_the_exact_bound_input_bytes() {
+    let descriptor = descriptor();
+    let registry = InMemoryActionRegistry::new();
+    registry
+        .register(Arc::new(TestAction {
+            descriptor: descriptor.clone(),
+            called: Arc::new(AtomicBool::new(false)),
+            cancel_source: None,
+        }))
+        .unwrap();
+    let input = CanonicalBoundInput::from_canonical_bytes(b"{\"z\":1,\"a\":[true,false]}".to_vec());
+    let outcome = block_on(invoke_registered_at(
+        &registry,
+        &invocation(&descriptor, &input),
+        context(100, CancellationSource::new().token()),
+        &input,
+        Timestamp(1),
+    ))
+    .unwrap();
+    assert!(
+        matches!(outcome, ActionOutcome::Success { output, .. } if output == json!({"exact_bytes": input.bytes().to_vec()}))
+    );
+}
+
+#[test]
+fn invocation_rejects_bound_ref_digest_and_size_contradictions() {
+    let descriptor = descriptor();
+    let called = Arc::new(AtomicBool::new(false));
+    let registry = InMemoryActionRegistry::new();
+    registry
+        .register(Arc::new(TestAction {
+            descriptor: descriptor.clone(),
+            called: called.clone(),
+            cancel_source: None,
+        }))
+        .unwrap();
+    let input = CanonicalBoundInput::from_canonical_bytes(br#"{"x":1}"#.to_vec());
+    let mut contradictory_digest = invocation(&descriptor, &input);
+    contradictory_digest.bound_input_ref.0.digest = digest("other-object");
+    assert!(matches!(
+        block_on(invoke_registered_at(
+            &registry,
+            &contradictory_digest,
+            context(100, CancellationSource::new().token()),
+            &input,
+            Timestamp(1)
+        )),
+        Err(InvocationError::BoundInputDigestMismatch { .. })
+    ));
+    let mut contradictory_size = invocation(&descriptor, &input);
+    contradictory_size.bound_input_ref.0.size_bytes += 1;
+    assert!(matches!(
+        block_on(invoke_registered_at(
+            &registry,
+            &contradictory_size,
+            context(100, CancellationSource::new().token()),
+            &input,
+            Timestamp(1)
+        )),
+        Err(InvocationError::BoundInputSizeMismatch { .. })
+    ));
+    assert!(!called.load(Ordering::Acquire));
+}
+
+#[test]
 fn oversized_diagnostics_are_closed_rejections() {
     let facts = (0..34)
         .map(|index| DiagnosticFact {
@@ -309,10 +390,10 @@ fn idempotency_key_is_stable_across_attempt_ids() {
     let source = CancellationSource::new();
     let first = ActionContext::new(
         scope(),
-        Id("run".to_owned()),
+        id("run"),
         digest("revision"),
-        Id("node".to_owned()),
-        Id("attempt-1".to_owned()),
+        id("node"),
+        id("attempt-1"),
         1,
         CompletionCredential::from_minted_bytes([1; 32]),
         Timestamp(100),
@@ -323,10 +404,10 @@ fn idempotency_key_is_stable_across_attempt_ids() {
     );
     let second = ActionContext::new(
         scope(),
-        Id("run".to_owned()),
+        id("run"),
         digest("revision"),
-        Id("node".to_owned()),
-        Id("attempt-2".to_owned()),
+        id("node"),
+        id("attempt-2"),
         2,
         CompletionCredential::from_minted_bytes([2; 32]),
         Timestamp(100),

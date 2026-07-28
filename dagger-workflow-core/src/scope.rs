@@ -1,10 +1,10 @@
 //! Scope-confined key types from contract sections 1.1, 1.13, and 16.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::marker::PhantomData;
 
 /// A validated tenant or namespace component. Contract section 1.1.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ScopeAtom(String);
 
@@ -33,6 +33,16 @@ impl ScopeAtom {
     /// Returns the validated atom text. Contract section 1.1.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ScopeAtom {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)
+            .and_then(|value| Self::new(value).map_err(serde::de::Error::custom))
     }
 }
 
