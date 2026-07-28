@@ -481,7 +481,7 @@ pub struct DefinitionValidationError {
 /// Validates syntax and all mandatory semantic constraints. Contract section 14.2.
 pub fn validate_definition(
     definition: &WorkflowDefinition,
-) -> Result<ValidatedDefinition, Vec<DefinitionValidationError>> {
+) -> Result<UnresolvedDefinition, Vec<DefinitionValidationError>> {
     let normalized = match normalize_definition(definition.clone()) {
         Ok(value) => value,
         Err(error) => return Err(vec![error]),
@@ -591,7 +591,7 @@ pub fn validate_definition(
     }
     validate_bindings(&normalized, &edges, &mut errors);
     if errors.is_empty() {
-        Ok(ValidatedDefinition {
+        Ok(UnresolvedDefinition {
             definition: normalized,
             topological_ranks: ranks,
         })
@@ -600,13 +600,374 @@ pub fn validate_definition(
     }
 }
 
-/// A definition that passed the full publication validation phase. Contract section 14.2.
+/// A definition that passed only local structural and semantic validation.
+///
+/// This value is deliberately not publishable: publication must still resolve
+/// every schema document, literal artifact, and action registry pin. Contract
+/// sections 5.2, 8.3, 13.1, 13.2, and 14.3.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ValidatedDefinition {
+pub struct UnresolvedDefinition {
     /// Normalized typed definition. Contract section 13.1.
     pub definition: WorkflowDefinition,
     /// Canonical Kahn ranks keyed by node ID. Contract section 1.5.
     pub topological_ranks: BTreeMap<Id, TopologicalRank>,
+}
+
+/// A schema document supplied by publication's external resolution boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublicationSchemaDocument {
+    /// Digest under which the document was durably resolved.
+    pub digest: Digest,
+    /// The supported-subset schema JSON.
+    pub value: Value,
+}
+
+/// External facts required to turn a locally valid definition into a revision.
+///
+/// W3/W6 provide durable implementations; tests and authoring tools may use an
+/// in-memory resolver. No external lookup is performed during stage 1.
+pub trait PublicationResolver {
+    /// Resolves a durable supported-subset schema document by its exact digest.
+    fn schema_document(&self, digest: &Digest) -> Option<PublicationSchemaDocument>;
+    /// Confirms a literal ArtifactRef exists with its exact identity and metadata.
+    fn artifact_exists(&self, artifact_ref_id: &Id, digest: &Digest, media_type: &str) -> bool;
+    /// Confirms one complete five-field action pin is available in the registry.
+    fn action_pin_available(&self, pin: &ExtractedActionPin) -> bool;
+}
+
+/// A definition that is safe to hand to `publish_revision`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublishableDefinition {
+    /// Locally normalized definition and canonical ranks.
+    pub definition: WorkflowDefinition,
+    /// Canonical Kahn ranks keyed by node ID.
+    pub topological_ranks: BTreeMap<Id, TopologicalRank>,
+}
+
+/// Resolves publication-only dependencies and returns a publishable revision.
+///
+/// This is intentionally a second stage. A successful `validate_definition`
+/// result alone does not certify publishability.
+pub fn resolve_publication(
+    unresolved: UnresolvedDefinition,
+    resolver: &dyn PublicationResolver,
+) -> Result<PublishableDefinition, Vec<DefinitionValidationError>> {
+    let mut errors = Vec::new();
+    let mut schemas = BTreeMap::new();
+    require_publication_schema(
+        resolver,
+        &unresolved.definition.run_input_schema_digest,
+        "/run_input_schema_digest".to_owned(),
+        &mut schemas,
+        &mut errors,
+    );
+    require_publication_schema(
+        resolver,
+        &unresolved.definition.run_output_schema_digest,
+        "/run_output_schema_digest".to_owned(),
+        &mut schemas,
+        &mut errors,
+    );
+    for pin in extract_action_pins(&unresolved.definition) {
+        require_publication_schema(
+            resolver,
+            &pin.input_schema_digest,
+            format!(
+                "/nodes/{}/action/input_schema_digest",
+                pin.reference_location
+            ),
+            &mut schemas,
+            &mut errors,
+        );
+        require_publication_schema(
+            resolver,
+            &pin.output_schema_digest,
+            format!(
+                "/nodes/{}/action/output_schema_digest",
+                pin.reference_location
+            ),
+            &mut schemas,
+            &mut errors,
+        );
+        if !resolver.action_pin_available(&pin) {
+            errors.push(error(
+                ValidationErrorKind::SchemaPinUnresolved,
+                format!("/nodes/{}/action", pin.reference_location),
+                "the exact five-field action pin is unavailable in the registry",
+                &["register a matching action implementation"],
+            ));
+        }
+    }
+    for node in &unresolved.definition.nodes {
+        validate_publication_artifacts(node, resolver, &mut errors);
+    }
+    if errors.is_empty() {
+        validate_publication_bindings(&unresolved.definition, &schemas, &mut errors);
+    }
+    if errors.is_empty() {
+        Ok(PublishableDefinition {
+            definition: unresolved.definition,
+            topological_ranks: unresolved.topological_ranks,
+        })
+    } else {
+        Err(errors)
+    }
+}
+
+fn require_publication_schema(
+    resolver: &dyn PublicationResolver,
+    digest: &Digest,
+    path: String,
+    schemas: &mut BTreeMap<Digest, Value>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    match resolver.schema_document(digest) {
+        Some(document) if document.digest == *digest => {
+            let canonical = serde_jcs::to_vec(&document.value).ok();
+            if canonical.as_deref().map(revision_hash) != Some(digest.clone()) {
+                errors.push(error(
+                    ValidationErrorKind::SchemaPinUnresolved,
+                    path,
+                    "schema document bytes do not match its pinned digest",
+                    &["store the exact supported-subset schema document"],
+                ));
+            } else {
+                schemas.insert(digest.clone(), document.value);
+            }
+        }
+        _ => errors.push(error(
+            ValidationErrorKind::SchemaPinUnresolved,
+            path,
+            "pinned schema document is unavailable",
+            &["register the exact schema document"],
+        )),
+    }
+}
+
+fn validate_publication_artifacts(
+    node: &NodeDefinition,
+    resolver: &dyn PublicationResolver,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    let id = node_id(node);
+    let mut check_source = |source: &BindingSource| {
+        if let BindingSource::ArtifactRef {
+            source:
+                ArtifactLocator::Literal {
+                    artifact_ref_id,
+                    digest,
+                    media_type,
+                },
+        } = source
+        {
+            if !resolver.artifact_exists(artifact_ref_id, digest, media_type) {
+                errors.push(error(
+                    ValidationErrorKind::ArtifactLocatorInvalid,
+                    format!("/nodes/{}/source", id.as_str()),
+                    "literal ArtifactRef does not resolve under the publication scope",
+                    &["register the exact ArtifactRef"],
+                ));
+            }
+        }
+    };
+    match node {
+        NodeDefinition::Action { bindings, .. } => bindings
+            .iter()
+            .for_each(|binding| check_source(&binding.source)),
+        NodeDefinition::Map {
+            items, bindings, ..
+        } => {
+            check_source(items);
+            for binding in bindings {
+                if let MapBindingSource::ArtifactRef {
+                    source:
+                        ArtifactLocator::Literal {
+                            artifact_ref_id,
+                            digest,
+                            media_type,
+                        },
+                } = &binding.source
+                {
+                    if !resolver.artifact_exists(artifact_ref_id, digest, media_type) {
+                        errors.push(error(
+                            ValidationErrorKind::ArtifactLocatorInvalid,
+                            format!("/nodes/{}/bindings", id.as_str()),
+                            "literal ArtifactRef does not resolve under the publication scope",
+                            &["register the exact ArtifactRef"],
+                        ));
+                    }
+                }
+            }
+        }
+        NodeDefinition::Choice { input, .. }
+        | NodeDefinition::Approval { request: input, .. }
+        | NodeDefinition::Succeed { output: input, .. } => check_source(input),
+        NodeDefinition::Fail { .. } => {}
+    }
+}
+
+fn validate_publication_bindings(
+    definition: &WorkflowDefinition,
+    schemas: &BTreeMap<Digest, Value>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    for node in &definition.nodes {
+        let (action, bindings): (
+            Option<&ActionReference>,
+            Vec<(&str, Option<&Value>, Option<&BindingSource>)>,
+        ) = match node {
+            NodeDefinition::Action {
+                action, bindings, ..
+            } => (
+                Some(action),
+                bindings
+                    .iter()
+                    .map(|binding| match &binding.source {
+                        BindingSource::Constant { value } => {
+                            (binding.target.as_str(), Some(value), None)
+                        }
+                        source => (binding.target.as_str(), None, Some(source)),
+                    })
+                    .collect(),
+            ),
+            NodeDefinition::Map {
+                action, bindings, ..
+            } => (
+                Some(action),
+                bindings
+                    .iter()
+                    .map(|binding| match &binding.source {
+                        MapBindingSource::Constant { value } => {
+                            (binding.target.as_str(), Some(value), None)
+                        }
+                        _ => (binding.target.as_str(), None, None),
+                    })
+                    .collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+        let Some(action) = action else { continue };
+        let Some(input_schema) = schemas.get(&action.input_schema_digest) else {
+            continue;
+        };
+        let required = input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str);
+        for leaf in required {
+            let target = format!("/{leaf}");
+            if !bindings.iter().any(|(bound, _, _)| *bound == target) {
+                errors.push(error(
+                    ValidationErrorKind::BindingTargetInvalid,
+                    format!("/nodes/{}/bindings", node_id(node).as_str()),
+                    format!("required input leaf `{leaf}` has no binding"),
+                    &["bind every required leaf"],
+                ));
+            }
+        }
+        for (target, constant, source) in bindings {
+            let Some(target_schema) = schema_at_pointer(input_schema, target) else {
+                continue;
+            };
+            if let Some(value) = constant {
+                if !json_value_matches_schema(value, target_schema) {
+                    errors.push(error(
+                        ValidationErrorKind::BindingTypeMismatch,
+                        format!("/nodes/{}/bindings", node_id(node).as_str()),
+                        format!(
+                            "constant bound at `{target}` is not assignable to the target schema"
+                        ),
+                        &["use a value accepted by the target schema"],
+                    ));
+                }
+            } else if let Some(source) = source {
+                match binding_source_schema(definition, schemas, source) {
+                    Some(source_schema) if schemas_are_assignable(source_schema, target_schema) => {
+                    }
+                    _ => errors.push(error(
+                        ValidationErrorKind::BindingTypeMismatch,
+                        format!("/nodes/{}/bindings", node_id(node).as_str()),
+                        format!(
+                            "source bound at `{target}` is not assignable to the target schema"
+                        ),
+                        &["use a schema-compatible source"],
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn binding_source_schema<'a>(
+    definition: &'a WorkflowDefinition,
+    schemas: &'a BTreeMap<Digest, Value>,
+    source: &BindingSource,
+) -> Option<&'a Value> {
+    match source {
+        BindingSource::RunInput { pointer } => {
+            schema_at_pointer(schemas.get(&definition.run_input_schema_digest)?, pointer)
+        }
+        BindingSource::NodeOutput {
+            node_id: source_node_id,
+            pointer,
+        } => {
+            let source_node = definition
+                .nodes
+                .iter()
+                .find(|candidate| node_id(candidate) == source_node_id)?;
+            let output_digest = match source_node {
+                NodeDefinition::Action { action, .. } | NodeDefinition::Map { action, .. } => {
+                    &action.output_schema_digest
+                }
+                _ => return None,
+            };
+            schema_at_pointer(schemas.get(output_digest)?, pointer)
+        }
+        BindingSource::Constant { .. } | BindingSource::ArtifactRef { .. } => None,
+    }
+}
+
+fn schemas_are_assignable(source: &Value, target: &Value) -> bool {
+    match (
+        source.get("type").and_then(Value::as_str),
+        target.get("type").and_then(Value::as_str),
+    ) {
+        (_, None) | (None, _) => true,
+        (Some("integer"), Some("number")) => true,
+        (Some(source), Some(target)) => source == target,
+    }
+}
+
+fn schema_at_pointer<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
+    if pointer.is_empty() {
+        return Some(schema);
+    }
+    pointer
+        .strip_prefix('/')?
+        .split('/')
+        .try_fold(schema, |current, segment| {
+            let segment = segment.replace("~1", "/").replace("~0", "~");
+            current
+                .get("properties")?
+                .get(&segment)
+                .or_else(|| current.get("items"))
+        })
+}
+
+fn json_value_matches_schema(value: &Value, schema: &Value) -> bool {
+    match schema.get("type").and_then(Value::as_str) {
+        None => true,
+        Some("null") => value.is_null(),
+        Some("boolean") => value.is_boolean(),
+        Some("string") => value.is_string(),
+        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
+        Some("number") => value.is_number(),
+        Some("array") => value.is_array(),
+        Some("object") => value.is_object(),
+        _ => false,
+    }
 }
 
 /// Expands schema defaults into a normalized typed definition. Contract section 14.2.
@@ -663,10 +1024,11 @@ pub fn canonical_definition_json(
 
 /// Computes the revision digest from canonical definition bytes. Contract section 13.1.
 pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
-    Digest(format!(
+    Digest::new(format!(
         "sha256:{}",
         hex(&Sha256::digest(canonical_definition))
     ))
+    .expect("SHA-256 output is valid")
 }
 
 /// Computes lexical Kahn topological ranks. Contract section 1.5.

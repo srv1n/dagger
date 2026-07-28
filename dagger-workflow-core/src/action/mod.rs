@@ -677,7 +677,7 @@ impl ActionRegistry for InMemoryActionRegistry {
             .map(|entry| entry.reference_location.clone())
             .collect();
         CompatibilityReport {
-            evidence_digest: digest_serialized(&evidence),
+            evidence_digest: compatibility_evidence_digest(&evidence),
             incompatible_reference_locations,
             evidence,
         }
@@ -840,6 +840,18 @@ pub async fn invoke_registered_at(
             database_now,
         });
     }
+    if invocation.bound_input_ref.0.digest != invocation.bound_input_digest {
+        return Err(InvocationError::BoundInputDigestMismatch {
+            expected: invocation.bound_input_ref.0.digest.clone(),
+            actual: invocation.bound_input_digest.clone(),
+        });
+    }
+    if invocation.bound_input_ref.0.size_bytes != invocation.bound_input_size_bytes {
+        return Err(InvocationError::BoundInputSizeMismatch {
+            expected: invocation.bound_input_ref.0.size_bytes,
+            actual: invocation.bound_input_size_bytes,
+        });
+    }
     if canonical_bound_input.digest != invocation.bound_input_digest {
         return Err(InvocationError::BoundInputDigestMismatch {
             expected: invocation.bound_input_digest.clone(),
@@ -893,11 +905,12 @@ pub async fn invoke_registered_at(
 
 fn digest_bytes(bytes: &[u8]) -> Digest {
     let hash = Sha256::digest(bytes);
-    Digest(format!("sha256:{hash:x}"))
+    Digest::new(format!("sha256:{hash:x}")).expect("SHA-256 output is valid")
 }
 
-fn digest_serialized<T: Serialize>(value: &T) -> Digest {
-    let bytes = serde_json::to_vec(value).expect("compatibility evidence is serializable");
+/// Hashes compatibility evidence over RFC 8785 canonical JSON bytes.
+pub fn compatibility_evidence_digest<T: Serialize>(value: &T) -> Digest {
+    let bytes = serde_jcs::to_vec(value).expect("compatibility evidence is serializable");
     digest_bytes(&bytes)
 }
 

@@ -1,7 +1,10 @@
 use dagger_workflow_core::definition::{
-    canonical_definition_json, parse_json_definition, parse_yaml_definition, revision_hash,
-    validate_definition, ValidationErrorKind,
+    canonical_definition_json, parse_json_definition, parse_yaml_definition, resolve_publication,
+    revision_hash, validate_definition, PublicationResolver, PublicationSchemaDocument,
+    ValidationErrorKind,
 };
+use dagger_workflow_core::ids::Digest;
+use std::collections::BTreeMap;
 
 const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -27,12 +30,74 @@ fn reference_workflows_parse_and_validate() {
         );
         let text = std::fs::read_to_string(path).unwrap();
         let definition = parse_yaml_definition(&text).unwrap();
-        validate_definition(&definition).unwrap();
+        let unresolved = validate_definition(&definition).unwrap();
+        assert!(
+            resolve_publication(unresolved, &EmptyResolver).is_err(),
+            "README fixtures are deliberately non-publishable without schemas and registry pins"
+        );
+    }
+}
+
+struct EmptyResolver;
+impl PublicationResolver for EmptyResolver {
+    fn schema_document(&self, _: &Digest) -> Option<PublicationSchemaDocument> {
+        None
+    }
+    fn artifact_exists(&self, _: &dagger_workflow_core::ids::Id, _: &Digest, _: &str) -> bool {
+        false
+    }
+    fn action_pin_available(
+        &self,
+        _: &dagger_workflow_core::definition::ExtractedActionPin,
+    ) -> bool {
+        false
+    }
+}
+
+struct FakeResolver {
+    schemas: BTreeMap<Digest, serde_json::Value>,
+}
+impl PublicationResolver for FakeResolver {
+    fn schema_document(&self, digest: &Digest) -> Option<PublicationSchemaDocument> {
+        self.schemas
+            .get(digest)
+            .cloned()
+            .map(|value| PublicationSchemaDocument {
+                digest: digest.clone(),
+                value,
+            })
+    }
+    fn artifact_exists(&self, _: &dagger_workflow_core::ids::Id, _: &Digest, _: &str) -> bool {
+        true
+    }
+    fn action_pin_available(
+        &self,
+        _: &dagger_workflow_core::definition::ExtractedActionPin,
+    ) -> bool {
+        true
     }
 }
 
 #[test]
+fn publication_requires_external_resolution_then_accepts_matching_fakes() {
+    let schema = serde_json::json!({"type":"object"});
+    let digest = revision_hash(&serde_jcs::to_vec(&schema).unwrap());
+    let definition = parse_json_definition(&valid().replace(DIGEST, digest.as_str())).unwrap();
+    let unresolved = validate_definition(&definition).unwrap();
+    assert!(resolve_publication(unresolved.clone(), &EmptyResolver).is_err());
+    let mut schemas = BTreeMap::new();
+    schemas.insert(digest, schema);
+    assert!(resolve_publication(unresolved, &FakeResolver { schemas }).is_ok());
+}
+
+#[test]
 fn canonical_hash_ignores_authoring_noise_but_not_array_order() {
+    let known_rfc8785_value: serde_json::Value =
+        serde_json::from_str(r#"{"nested":{"z":false,"a":null},"b":1,"a":"€"}"#).unwrap();
+    assert_eq!(
+        serde_jcs::to_vec(&known_rfc8785_value).unwrap(),
+        "{\"a\":\"€\",\"b\":1,\"nested\":{\"a\":null,\"z\":false}}".as_bytes()
+    );
     let json = valid();
     let a = parse_json_definition(&json).unwrap();
     let yaml = format!(
@@ -63,6 +128,43 @@ fn canonical_hash_ignores_authoring_noise_but_not_array_order() {
 }
 
 #[test]
+fn yaml_aliases_and_json_key_reordering_normalize_to_identical_canonical_bytes() {
+    let yaml = format!(
+        r#"
+definition_format_version: "0.1"
+definition_id: example
+name: Example
+run_input_schema_digest: &digest {DIGEST}
+run_output_schema_digest: *digest
+entry_node_id: work
+nodes:
+  - kind: Action
+    id: work
+    action:
+      name: example.action
+      contract_version: v1
+      input_schema_digest: *digest
+      output_schema_digest: *digest
+      compatible_implementation_requirement: *digest
+    bindings: []
+    retry: {{ max_attempts: 1, backoff: {{ kind: fixed, delay_ms: 0 }} }}
+    timeout: {{ timeout_ms: 1 }}
+    declared_max_cost_units: "0"
+    next: [done]
+  - output: {{ kind: constant, value: null }}
+    id: done
+    kind: Succeed
+"#
+    );
+    let json = parse_json_definition(&valid()).unwrap();
+    let aliased = parse_yaml_definition(&yaml).unwrap();
+    assert_eq!(
+        canonical_definition_json(&json).unwrap(),
+        canonical_definition_json(&aliased).unwrap()
+    );
+}
+
+#[test]
 fn invalid_definition_table_is_actionable() {
     let duplicate = valid().replace("\"id\":\"done\"", "\"id\":\"work\"");
     assert_eq!(
@@ -81,7 +183,7 @@ fn invalid_definition_table_is_actionable() {
 }
 
 #[test]
-fn friction_attempts_are_rejected_by_the_closed_format_or_semantics() {
+fn friction_1_reconverged_node_output_is_rejected() {
     // 1: a post-Choice reconvergence consumer cannot use a branch-only output.
     let reconvergence = format!(
         r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","entry_node_id":"choose","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"next":"branch"}}],"default":"join"}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
@@ -90,29 +192,81 @@ fn friction_attempts_are_rejected_by_the_closed_format_or_semantics() {
         invalid_kind(&reconvergence),
         ValidationErrorKind::BindingSourceInvalid
     );
+}
 
-    // 2–10: an implicit Start, composite value inputs, Map child subworkflow,
-    // schema-ref shortcut, trigger, approval-output extension, rejection edge,
-    // catch, and action-trait fields are rejected rather than silently accepted.
-    for forbidden in [
+fn rejected_extension(document: String, field: &str) {
+    let error = parse_json_definition(&document)
+        .expect_err("closed format must reject this authoring construct");
+    assert_eq!(error.kind, ValidationErrorKind::UnknownField, "{field}");
+}
+
+#[test]
+fn friction_2_virtual_start_is_not_a_definition_node() {
+    rejected_extension(
+        valid().replace(
+            "\"entry_node_id\"",
+            "\"start\":{\"kind\":\"Start\"},\"entry_node_id\"",
+        ),
         "start",
-        "inputs",
-        "subworkflow",
-        "schema_ref",
-        "trigger",
-        "approval_output",
-        "on_reject",
-        "catch",
-        "llm_backed",
-    ] {
-        let attempt = valid().replace(
+    );
+}
+#[test]
+fn friction_3_composite_value_source_is_not_bindings() {
+    rejected_extension(
+        valid().replace(
             "\"bindings\":[]",
-            &format!("\"{forbidden}\":true,\"bindings\":[]"),
-        );
-        let error = parse_json_definition(&attempt).expect_err("extension must be rejected");
-        assert_eq!(error.kind, ValidationErrorKind::UnknownField, "{forbidden}");
-        assert!(!error.valid_alternatives.is_empty());
-    }
+            "\"inputs\":[{\"target\":\"/x\"}],\"bindings\":[]",
+        ),
+        "inputs",
+    );
+}
+#[test]
+fn friction_4_map_cannot_embed_a_subworkflow() {
+    rejected_extension(valid().replace("\"kind\":\"Action\"", "\"kind\":\"Map\",\"items\":{\"kind\":\"constant\",\"value\":[]},\"max_items\":1,\"max_concurrency\":1,\"subworkflow\":{}"), "subworkflow");
+}
+#[test]
+fn friction_6_schedule_trigger_is_host_owned() {
+    rejected_extension(
+        valid().replace(
+            "\"entry_node_id\"",
+            "\"trigger\":{\"cron\":\"* * * * *\"},\"entry_node_id\"",
+        ),
+        "trigger",
+    );
+}
+#[test]
+fn friction_7_approval_output_cannot_be_author_defined() {
+    rejected_extension(
+        valid().replace(
+            "\"bindings\":[]",
+            "\"approval_output\":{\"report\":true},\"bindings\":[]",
+        ),
+        "approval_output",
+    );
+}
+#[test]
+fn friction_8_approval_rejection_has_no_graph_edge() {
+    rejected_extension(
+        valid().replace(
+            "\"bindings\":[]",
+            "\"on_reject\":[\"failed\"],\"bindings\":[]",
+        ),
+        "on_reject",
+    );
+}
+#[test]
+fn friction_9_action_catch_edges_are_not_authorable() {
+    rejected_extension(
+        valid().replace("\"bindings\":[]", "\"catch\":[\"cleanup\"],\"bindings\":[]"),
+        "catch",
+    );
+}
+#[test]
+fn friction_10_execution_traits_are_registry_metadata() {
+    rejected_extension(
+        valid().replace("\"bindings\":[]", "\"llm_backed\":true,\"bindings\":[]"),
+        "llm_backed",
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 use crate::action::{ActionInvocation, ActionOutcome, CompatibilityReport, CompletionCredential};
 use crate::approval::{ApprovalDecision, ApprovalGate, AuthenticatedPrincipal};
 use crate::artifact::{ArtifactRef, FailedReadProof, VerifiedObjectRef};
-use crate::definition::{ValidatedDefinition, ValidationErrorKind};
+use crate::definition::{PublishableDefinition, ValidationErrorKind};
 use crate::event::WorkflowEvent;
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp, Version};
 use crate::revision::WorkflowRevision;
@@ -179,11 +179,11 @@ pub enum StoreError {
     /// A parameter is malformed before domain evaluation. Contract section 5.5.
     #[error("invalid field")]
     InvalidField,
-    /// Publication or creation validation failed before a run existed. Contract section 5.5.
-    #[error("contract validation failed at {path}: {message}")]
-    ContractValidation {
+    /// Publication validation failed before a revision existed. Contract section 5.5.
+    #[error("revision invalid at {path}: {message}")]
+    RevisionInvalid {
         /// Closed validation category. Contract section 5.5.
-        kind: ValidationErrorKind,
+        code: ValidationErrorKind,
         /// Bounded document path. Contract section 5.5.
         path: String,
         /// Bounded corrective message. Contract section 5.5.
@@ -191,9 +191,24 @@ pub enum StoreError {
         /// Bounded alternatives. Contract section 5.5.
         valid_alternatives: Vec<String>,
     },
+    /// Creation validation failed before a run existed. Contract section 5.5.
+    #[error("contract validation failed at {path}: {message}")]
+    ContractValidation {
+        /// Closed validation category.
+        kind: ValidationErrorKind,
+        /// Bounded document path.
+        path: String,
+        /// Bounded corrective message.
+        message: String,
+        /// Bounded alternatives.
+        valid_alternatives: Vec<String>,
+    },
     /// Runtime validation atomically produced ContractFailed. Contract section 5.5.
     #[error("contract validation applied")]
-    ContractValidationApplied,
+    ContractValidationApplied {
+        /// Closed runtime validation failure that was durably applied.
+        code: String,
+    },
     /// The blocked-run command fence rejected the command. Contract section 5.5.
     #[error("run is blocked incompatible")]
     RunBlockedIncompatible,
@@ -202,10 +217,18 @@ pub enum StoreError {
     RunLimitsInvalid,
     /// A durable run limit terminalized the run. Contract section 5.5.
     #[error("run limit applied")]
-    RunLimitApplied,
+    RunLimitApplied {
+        /// Closed run-limit failure that was durably applied.
+        code: String,
+    },
     /// A non-expired engine claim exists. Contract section 5.5.
     #[error("engine already live")]
-    EngineAlreadyLive,
+    EngineAlreadyLive {
+        /// Current scoped engine owner label.
+        owner: Id,
+        /// Database-clock expiry of the current live claim.
+        expires_at: Timestamp,
+    },
     /// The permit no longer owns the generation. Contract section 5.5.
     #[error("engine claim lost")]
     EngineClaimLost,
@@ -217,7 +240,10 @@ pub enum StoreError {
     IncompatiblePins,
     /// Resume evidence remains incompatible. Contract section 5.5.
     #[error("still incompatible")]
-    StillIncompatible,
+    StillIncompatible {
+        /// Exact pin locations that remain unavailable.
+        pins: Vec<String>,
+    },
     /// Compatibility evidence is malformed or oversized. Contract section 5.5.
     #[error("compatibility evidence invalid")]
     EvidenceInvalid,
@@ -252,21 +278,38 @@ pub enum StoreError {
     /// Recovery encountered a current-generation attempt. Contract section 5.5.
     #[error("current generation attempt present")]
     CurrentGenerationAttemptPresent,
-    /// A Map concurrency slot is temporarily unavailable. Contract section 5.5.
-    #[error("map concurrency limited")]
-    MapConcurrencyLimited,
     /// The attempt deadline is not due. Contract section 5.5.
     #[error("deadline not due")]
-    DeadlineNotDue,
+    DeadlineNotDue {
+        /// Database time observed inside the rejected transaction.
+        database_now: Timestamp,
+        /// Persisted attempt deadline.
+        deadline: Timestamp,
+    },
     /// The retry timestamp is not due. Contract section 5.5.
     #[error("retry not due")]
-    RetryNotDue,
+    RetryNotDue {
+        /// Database time observed inside the rejected transaction.
+        database_now: Timestamp,
+        /// Persisted next retry eligibility time.
+        next_eligible_at: Timestamp,
+    },
     /// The gate expiry is not due. Contract section 5.5.
     #[error("expiry not due")]
-    ExpiryNotDue,
+    ExpiryNotDue {
+        /// Database time observed inside the rejected transaction.
+        database_now: Timestamp,
+        /// Persisted approval expiry.
+        expires_at: Timestamp,
+    },
     /// The run lifetime is not due. Contract section 5.5.
     #[error("lifetime not due")]
-    LifetimeNotDue,
+    LifetimeNotDue {
+        /// Database time observed inside the rejected transaction.
+        database_now: Timestamp,
+        /// Persisted run lifetime deadline.
+        lifetime_deadline_at: Timestamp,
+    },
     /// The authenticated principal is unauthorized. Contract section 5.5.
     #[error("approval unauthorized")]
     ApprovalUnauthorized,
@@ -373,7 +416,7 @@ pub struct PublishRevision {
     /// Schema objects keyed by action reference location. Contract section 5.2.
     pub resolved_action_schema_objects: BTreeMap<String, ResolvedActionSchemas>,
     /// Fully validated parsed revision. Contract section 5.2.
-    pub parsed_revision: ValidatedDefinition,
+    pub parsed_revision: PublishableDefinition,
     /// Authenticated publishing principal. Contract section 5.2.
     pub principal: AuthenticatedPrincipal,
 }
@@ -461,6 +504,8 @@ pub enum ClaimNodeAttemptResult {
     },
     /// Reservation-only shortage persisted BudgetWaiting. Contract section 5.3.
     BudgetWaitingApplied(NodeRun),
+    /// A Map concurrency slot is temporarily unavailable; no state changed. Contract section 5.3.
+    MapConcurrencyLimited,
     /// Permanent budget exhaustion terminalized the run. Contract section 5.3.
     BudgetExhaustedApplied(WorkflowRun),
     /// A run-limit outcome was atomically applied. Contract section 5.3.
@@ -522,7 +567,7 @@ pub struct TimeoutAttempt {
 }
 
 /// Parameters for one-run abandoned-attempt recovery. Contract section 5.3.
-pub struct RecoverUnknownAttempts {
+pub struct RecoverAbandonedAttemptsForRun {
     /// Live engine permit. Contract section 5.3.
     pub permit: EnginePermit,
     /// Run ID. Contract section 5.3.
@@ -849,10 +894,10 @@ pub trait WorkflowStore: Send + Sync {
     ) -> Result<NodeAttempt, StoreError>;
 
     /// Recovers the complete lower-generation Started set for one run. Contract section 5.3.
-    async fn recover_unknown_attempts(
+    async fn recover_abandoned_attempts_for_run(
         &self,
         scope: &ExecutionScope,
-        command: RecoverUnknownAttempts,
+        command: RecoverAbandonedAttemptsForRun,
     ) -> Result<Vec<NodeAttempt>, StoreError>;
 
     /// Releases a due persisted retry to Ready. Contract section 5.3.

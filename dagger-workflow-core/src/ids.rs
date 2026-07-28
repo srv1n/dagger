@@ -5,21 +5,110 @@ use crate::scope::ExecutionScope;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
-macro_rules! string_newtype {
-    ($name:ident, $doc:literal, $section:literal) => {
-        #[doc = concat!($doc, " Contract section ", $section, ".")]
-        #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub String);
-    };
+/// An opaque case-sensitive entity identifier. Contract section 1.1.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct Id(pub(crate) String);
+
+impl Id {
+    /// Validates and constructs an ID.
+    pub fn new(value: impl Into<String>) -> Result<Self, IdError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(IdError::Empty);
+        }
+        if value.len() > 128 {
+            return Err(IdError::TooLong);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the opaque ID text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-string_newtype!(Id, "An opaque case-sensitive entity identifier.", "1.1");
-string_newtype!(
-    Digest,
-    "A lowercase SHA-256 digest with its algorithm prefix.",
-    "1.1"
-);
+impl TryFrom<String> for Id {
+    type Error = IdError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)
+            .and_then(|value| Self::new(value).map_err(serde::de::Error::custom))
+    }
+}
+
+/// An ID validation failure. Contract section 1.1.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum IdError {
+    /// The input contains no bytes.
+    #[error("ID is empty")]
+    Empty,
+    /// The input exceeds the contract byte limit.
+    #[error("ID exceeds 128 bytes")]
+    TooLong,
+}
+
+/// A lowercase SHA-256 digest with its algorithm prefix. Contract section 1.1.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct Digest(pub(crate) String);
+
+impl Digest {
+    /// Validates and constructs a SHA-256 digest.
+    pub fn new(value: impl Into<String>) -> Result<Self, DigestError> {
+        let value = value.into();
+        let valid = value.len() == 71
+            && value.starts_with("sha256:")
+            && value.as_bytes()[7..].iter().all(u8::is_ascii_hexdigit)
+            && value.as_bytes()[7..]
+                .iter()
+                .all(|byte| !byte.is_ascii_uppercase());
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(DigestError::Invalid)
+        }
+    }
+
+    /// Returns the canonical digest text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Digest {
+    type Error = DigestError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for Digest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)
+            .and_then(|value| Self::new(value).map_err(serde::de::Error::custom))
+    }
+}
+
+/// A digest validation failure. Contract section 1.1.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("digest must be sha256: followed by 64 lowercase hexadecimal characters")]
+pub enum DigestError {
+    /// The input is not canonical `sha256:` plus lowercase hexadecimal.
+    Invalid,
+}
 
 /// A database-clock UTC Unix epoch millisecond value. Contract section 1.1.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -101,7 +190,7 @@ pub fn edge_id(
     bytes.extend(lp(_from_node_id.0.as_bytes()));
     bytes.extend(lp(_edge_label.as_bytes()));
     bytes.extend(lp(_to_node_id.0.as_bytes()));
-    Id(format!("edge_{}", hex(&Sha256::digest(bytes))))
+    Id::new(format!("edge_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
 /// Derives the typed content-use identifier. Contract section 1.10.
@@ -123,7 +212,7 @@ pub fn artifact_ref_id(_identity: ArtifactRefIdentity<'_>) -> Id {
             .map(|value| value.0.as_bytes()),
     ));
     bytes.extend(lp(&_identity.ordinal.to_be_bytes()));
-    Id(format!("artifact_{}", hex(&Sha256::digest(bytes))))
+    Id::new(format!("artifact_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
 /// Derives a static logical node's external idempotency key. Contract section 7.1.
@@ -149,7 +238,7 @@ pub fn map_child_idempotency_key(
     bytes.extend(lp(b"map-child"));
     bytes.extend(lp(_map_parent_node_instance_id.0.as_bytes()));
     bytes.extend(lp(&_map_item_index.to_be_bytes()));
-    bytes.extend(lp(&digest_bytes(_map_item_digest)));
+    bytes.extend(lp(_map_item_digest.as_str().as_bytes()));
     format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
 }
 
@@ -163,9 +252,9 @@ pub fn map_child_id(
     let mut bytes = lp(b"dagger-map-child-v1");
     bytes.extend(lp(_run_id.0.as_bytes()));
     bytes.extend(lp(_map_node_instance_id.0.as_bytes()));
-    bytes.extend(lp(&_item_index.to_be_bytes()));
-    bytes.extend(lp(&digest_bytes(_item_digest)));
-    Id(format!("mapchild_{}", hex(&Sha256::digest(bytes))))
+    bytes.extend(&_item_index.to_be_bytes());
+    bytes.extend(digest_bytes(_item_digest));
+    Id::new(format!("mapchild_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
 /// Derives the ordered Map expansion digest. Contract section 10.1.
@@ -176,7 +265,7 @@ pub fn map_expansion_digest(_children: &[MapChildIdentity]) -> Digest {
         bytes.extend(lp(&digest_bytes(&child.item_digest)));
         bytes.extend(lp(child.child_id.0.as_bytes()));
     }
-    Digest(format!("sha256:{}", hex(&Sha256::digest(bytes))))
+    Digest::new(format!("sha256:{}", hex(&Sha256::digest(bytes)))).expect("SHA-256 output is valid")
 }
 
 fn lp(value: &[u8]) -> Vec<u8> {
