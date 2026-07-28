@@ -59,6 +59,9 @@ fn object_store_is_content_addressed_and_scope_confined() {
         assert_eq!(first.digest(), other_scope.digest());
         assert_ne!(first.scope(), other_scope.scope());
         assert_eq!(store.get(&a, first.digest()).await.unwrap().bytes, b"same");
+        let foreign = InMemoryObjectStore::new(Arc::new(TestClock::new(Timestamp(100))));
+        let foreign_ref = foreign.put(&a, b"same", "application/json").await.unwrap();
+        assert_ne!(first, foreign_ref);
     });
 }
 
@@ -85,6 +88,7 @@ fn singleton_claim_rejects_live_peer_and_increments_takeover_generation() {
             .acquire_engine_claim(&execution_scope, id("engine-a"))
             .await
             .unwrap();
+        assert_eq!(first.claim.control_plane_id, "scheduler");
         assert!(matches!(
             store
                 .acquire_engine_claim(&execution_scope, id("engine-b"))
@@ -132,6 +136,8 @@ fn virtual_clock_has_no_wall_time_dependency() {
     assert_eq!(clock.advance_ms(25).unwrap(), Timestamp(15));
     clock.set(Timestamp(7));
     assert_eq!(clock.now(), Timestamp(7));
+    clock.set(Timestamp(-20));
+    assert_eq!(clock.now(), Timestamp(-20));
 }
 
 #[cfg(feature = "conformance")]
@@ -175,6 +181,13 @@ fn reusable_conformance_suite_runs_against_memory_adapter() {
             )
             .await
             .unwrap(),
+            dagger_workflow_core::conformance::CASE_COUNT
+        );
+        assert_eq!(
+            dagger_workflow_core::conformance::CASE_NAMES
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             dagger_workflow_core::conformance::CASE_COUNT
         );
     });

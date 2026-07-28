@@ -791,6 +791,16 @@ pub struct MarkCorruptStorage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScanCursor(String);
 
+impl ScanCursor {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn encoded(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Keyset page request. Contract section 5.4.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageRequest {

@@ -103,6 +103,7 @@ pub struct VerifiedObjectRef {
     size_bytes: u64,
     media_type: String,
     object_key: String,
+    store_instance_nonce: Vec<u8>,
 }
 
 impl VerifiedObjectRef {
@@ -113,6 +114,7 @@ impl VerifiedObjectRef {
         size_bytes: u64,
         media_type: String,
         object_key: String,
+        store_instance_nonce: Vec<u8>,
     ) -> Self {
         Self {
             scope,
@@ -120,6 +122,7 @@ impl VerifiedObjectRef {
             size_bytes,
             media_type,
             object_key,
+            store_instance_nonce,
         }
     }
 
@@ -143,6 +146,11 @@ impl VerifiedObjectRef {
     /// Returns the store-private key to the implementing control-plane store.
     pub(crate) fn object_key(&self) -> &str {
         &self.object_key
+    }
+
+    /// Returns the opaque object-store instance binding to the control plane.
+    pub(crate) fn store_instance_nonce(&self) -> &[u8] {
+        &self.store_instance_nonce
     }
 }
 
@@ -203,6 +211,11 @@ impl FailedReadProof {
     /// Returns the requested digest to the control-plane verifier.
     pub(crate) fn requested_digest(&self) -> &Digest {
         &self.requested_digest
+    }
+
+    /// Returns the object-store instance binding to the control-plane verifier.
+    pub(crate) fn store_instance_nonce(&self) -> &[u8] {
+        &self.store_instance_nonce
     }
 
     /// Returns a stable persistence-safe proof fingerprint.
