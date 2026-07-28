@@ -5,21 +5,25 @@ use crate::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
     AuthenticatedPrincipal, DecisionAuthorizationPolicy,
 };
-use crate::artifact::{ObjectStore, ObjectStoreError};
+use crate::artifact::{ObjectStore, ObjectStoreError, VerifiedObjectRef};
 use crate::definition::{
     ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
     PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
 };
-use crate::ids::{CostUnits, Digest, Id, TopologicalRank, Version};
+use crate::ids::{
+    map_child_id, map_expansion_digest, CostUnits, Digest, Id, MapChildIdentity, TopologicalRank,
+    Version,
+};
 use crate::run::{AttemptState, NodeState, RunLimits, RunState};
 use crate::scope::ExecutionScope;
 use crate::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
-    CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EventPageRequest,
-    PublishRevision, RequestApproval, ResolveTerminalNode, ResolvedActionSchemas, StartRun,
-    StoreError, SuspendIncompatible, WorkflowStore,
+    CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EnginePermit, EventPageRequest,
+    ExpandMap, OrderedMapItem, PageRequest, PublishRevision, ReleaseRetry, RequestApproval,
+    ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, SuspendIncompatible,
+    WorkflowStore,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
@@ -64,8 +68,8 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "due_completion_times_out",
     "timeout_observation_order",
     "blocked_run_host_command_fence",
-    "corruption_transition_by_source_state",
-    "multi_attempt_recovery_sorter",
+    "expand_map_recomputes_identity",
+    "map_concurrency_admission",
     "exponential_backoff_cap",
 ];
 
@@ -906,6 +910,29 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                         allowed_role_ids: Vec::new(),
                     },
                 },
+                next: vec![id("action")],
+            },
+            NodeDefinition::Action {
+                id: id("action"),
+                action: ActionReference {
+                    name: "approval.action".to_owned(),
+                    contract_version: "1".to_owned(),
+                    input_schema_digest: schema.digest().clone(),
+                    output_schema_digest: schema.digest().clone(),
+                    compatible_implementation_requirement: schema.digest().clone(),
+                },
+                bindings: vec![Binding {
+                    target: String::new(),
+                    source: BindingSource::RunInput {
+                        pointer: String::new(),
+                    },
+                }],
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                declared_max_cost_units: CostUnits(1),
                 next: vec![id("succeed")],
             },
             NodeDefinition::Succeed {
@@ -936,12 +963,19 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                 canonical_definition: canonical.clone(),
                 run_input_schema: schema.clone(),
                 run_output_schema: schema.clone(),
-                resolved_action_schema_objects: BTreeMap::new(),
+                resolved_action_schema_objects: BTreeMap::from([(
+                    "action".to_owned(),
+                    ResolvedActionSchemas {
+                        input_schema: schema.clone(),
+                        output_schema: schema.clone(),
+                    },
+                )]),
                 parsed_revision: PublishableDefinition {
                     definition,
                     topological_ranks: BTreeMap::from([
                         (id("approval"), TopologicalRank(0)),
-                        (id("succeed"), TopologicalRank(1)),
+                        (id("action"), TopologicalRank(1)),
+                        (id("succeed"), TopologicalRank(2)),
                     ]),
                 },
                 principal: creator.clone(),
@@ -1057,11 +1091,6 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
         approval_output: Some(output),
         principal: approver,
     };
-    adapter
-        .store()
-        .decide_approval(scope, decide(output.clone(), approver.clone()))
-        .await
-        .map_err(|_| failure(37, "initial approval failed"))?;
     let incompatibilities = adapter
         .objects()
         .put(scope, br#"{"missing":["synthetic"]}"#, "application/json")
@@ -1077,7 +1106,7 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                 incompatibilities,
                 evidence: CompatibilityReport {
                     evidence_digest: schema.digest().clone(),
-                    incompatible_reference_locations: vec!["synthetic".to_owned()],
+                    incompatible_reference_locations: vec!["action".to_owned()],
                     evidence: Vec::new(),
                 },
             },
@@ -1096,70 +1125,513 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
     Ok(())
 }
 
-async fn corruption_transition_by_source_state<A: ConformanceAdapter>(
-    _adapter: &A,
-    _scope_a: &ExecutionScope,
+struct MapConformanceFixture {
+    permit: EnginePermit,
+    input: VerifiedObjectRef,
+    ordered_items: Vec<OrderedMapItem>,
+    expansion_digest: Digest,
+}
+
+async fn prepare_map_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    item_count: u32,
+    max_concurrency: u32,
+    retry: RetryPolicy,
+) -> Result<MapConformanceFixture, ConformanceFailure> {
+    let schema = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(case, "Map schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        format!("map-case-{case}"),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "Map principal construction failed"))?;
+    let definition_id = id(&format!("map-definition-{case}"));
+    let run_id = id(&format!("map-run-{case}"));
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: definition_id.clone(),
+                display_name: format!("map-case-{case}"),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map definition creation failed"))?;
+    let values = (0..item_count).map(Value::from).collect::<Vec<_>>();
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: definition_id.clone(),
+        name: format!("map-case-{case}"),
+        description: String::new(),
+        run_input_schema_digest: schema.digest().clone(),
+        run_output_schema_digest: schema.digest().clone(),
+        entry_node_id: id("map"),
+        nodes: vec![
+            NodeDefinition::Map {
+                id: id("map"),
+                items: BindingSource::Constant {
+                    value: Value::Array(values.clone()),
+                },
+                max_items: item_count.max(1),
+                max_concurrency,
+                action: ActionReference {
+                    name: format!("map.action.{case}"),
+                    contract_version: "1".to_owned(),
+                    input_schema_digest: schema.digest().clone(),
+                    output_schema_digest: schema.digest().clone(),
+                    compatible_implementation_requirement: schema.digest().clone(),
+                },
+                bindings: vec![crate::definition::MapBinding {
+                    target: String::new(),
+                    source: crate::definition::MapBindingSource::MapItem {
+                        pointer: String::new(),
+                    },
+                }],
+                retry,
+                timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![id("succeed")],
+            },
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::NodeOutput {
+                    node_id: id("map"),
+                    pointer: String::new(),
+                },
+            },
+        ],
+    };
+    let canonical = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&definition)
+                .map_err(|_| failure(case, "Map definition encoding failed"))?,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "Map definition publication failed"))?;
+    adapter
+        .store()
+        .publish_revision(
+            scope,
+            PublishRevision {
+                definition_id: definition_id.clone(),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical.clone(),
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::from([(
+                    "map/map_action".to_owned(),
+                    ResolvedActionSchemas {
+                        input_schema: schema.clone(),
+                        output_schema: schema.clone(),
+                    },
+                )]),
+                parsed_revision: PublishableDefinition {
+                    definition,
+                    topological_ranks: BTreeMap::from([
+                        (id("map"), TopologicalRank(0)),
+                        (id("succeed"), TopologicalRank(1)),
+                    ]),
+                },
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map revision publication failed"))?;
+    let run_input = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(case, "Map run input publication failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: run_id.clone(),
+                definition_id,
+                revision_hash: canonical.digest().clone(),
+                input: run_input,
+                budget_limit: CostUnits(1_000),
+                limits: RunLimits {
+                    max_dynamic_node_instances: 100,
+                    max_total_attempts: 200,
+                    max_total_events: 2_000,
+                    max_inline_json_bytes_per_value: 10_000,
+                    max_artifacts_per_attempt: 10,
+                    max_aggregate_object_bytes_per_run: 1_000_000,
+                    max_run_lifetime_ms: 31_536_000_000,
+                },
+                principal,
+                idempotency_token: format!("map-case-{case}-create"),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map run creation failed"))?;
+    let claim = adapter
+        .store()
+        .acquire_engine_claim(scope, id(&format!("map-engine-{case}")))
+        .await
+        .map_err(|_| failure(case, "Map engine claim failed"))?;
+    adapter
+        .store()
+        .start_run(
+            scope,
+            StartRun {
+                permit: claim.permit.clone(),
+                run_id: run_id.clone(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map run start failed"))?;
+    let input_bytes = serde_jcs::to_vec(&values)
+        .map_err(|_| failure(case, "Map expansion input encoding failed"))?;
+    let input = adapter
+        .objects()
+        .put(scope, &input_bytes, "application/json")
+        .await
+        .map_err(|_| failure(case, "Map expansion input publication failed"))?;
+    let mut identities = Vec::new();
+    let mut ordered_items = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let index = index as u32;
+        let item = adapter
+            .objects()
+            .put(
+                scope,
+                &serde_jcs::to_vec(value).map_err(|_| failure(case, "Map item encoding failed"))?,
+                "application/json",
+            )
+            .await
+            .map_err(|_| failure(case, "Map item digesting failed"))?;
+        let child_id = map_child_id(&run_id, &id("map"), index, item.digest());
+        identities.push(MapChildIdentity {
+            item_index: index,
+            item_digest: item.digest().clone(),
+            child_id: child_id.clone(),
+        });
+        ordered_items.push(OrderedMapItem {
+            index,
+            item_digest: item.digest().clone(),
+            child_id,
+        });
+    }
+    Ok(MapConformanceFixture {
+        permit: claim.permit,
+        input,
+        ordered_items,
+        expansion_digest: map_expansion_digest(&identities),
+    })
+}
+
+async fn expand_map_recomputes_identity<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
-    let cases = [
-        (RunState::Pending, "R14"),
-        (RunState::Running, "R15"),
-        (RunState::BlockedIncompatible, "R16"),
-        (RunState::Succeeded, "R17"),
-        (RunState::Failed, "R18"),
-        (RunState::ContractFailed, "R19"),
-        (RunState::RetriesExhausted, "R20"),
-        (RunState::BudgetExhausted, "R21"),
-        (RunState::Cancelled, "R22"),
-    ];
-    if cases.into_iter().any(|(status, expected)| {
-        crate::memory::corruption_run_transition(status) != Some(expected)
-    }) {
-        return Err(failure(
-            38,
-            "corruption transition did not match source state",
-        ));
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        38,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    if !matches!(
+        adapter
+            .store()
+            .expand_map(
+                scope,
+                ExpandMap {
+                    permit: fixture.permit,
+                    run_id: id("map-run-38"),
+                    map_node_id: id("map"),
+                    expected_node_version: Version(1),
+                    input: fixture.input,
+                    ordered_items: Vec::new(),
+                    expansion_digest: map_expansion_digest(&[]),
+                },
+            )
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ) {
+        return Err(failure(38, "forged empty Map expansion was accepted"));
     }
     Ok(())
 }
 
-async fn multi_attempt_recovery_sorter<A: ConformanceAdapter>(
-    _adapter: &A,
-    _scope_a: &ExecutionScope,
+async fn map_concurrency_admission<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
-    let node = id("node");
-    let earlier_attempt = id("attempt-z");
-    let later_attempt = id("attempt-a");
-    let earlier = crate::memory::recovery_subject_order_key(3, 4, &node, 1, &earlier_attempt);
-    let later = crate::memory::recovery_subject_order_key(3, 4, &node, 2, &later_attempt);
-    let earlier_rank = crate::memory::recovery_subject_order_key(2, 99, &node, 99, &later_attempt);
-    if !(earlier < later && earlier_rank < earlier) {
-        return Err(failure(
-            39,
-            "recovery sorter ignored rank or attempt number",
-        ));
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        39,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: id("map-run-39"),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items,
+                expansion_digest: fixture.expansion_digest,
+            },
+        )
+        .await
+        .map_err(|_| failure(39, "valid Map expansion failed"))?;
+    let children = adapter
+        .store()
+        .list_nodes(
+            scope,
+            &id("map-run-39"),
+            PageRequest {
+                cursor: None,
+                page_size: 100,
+            },
+        )
+        .await
+        .map_err(|_| failure(39, "Map children read failed"))?
+        .items
+        .into_iter()
+        .filter(|node| node.parent_map_instance_id.is_some())
+        .collect::<Vec<_>>();
+    let first = &children[0];
+    let second = &children[1];
+    if !matches!(
+        adapter
+            .store()
+            .claim_node_attempt(
+                scope,
+                ClaimNodeAttempt {
+                    permit: fixture.permit.clone(),
+                    run_id: id("map-run-39"),
+                    node_id: first.node_instance_id.clone(),
+                    expected_node_version: first.version,
+                    attempt_id: id("map-attempt-first"),
+                    worker_id: id("worker"),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.input.digest().clone(),
+                },
+            )
+            .await,
+        Ok(ClaimNodeAttemptResult::Claimed { .. })
+    ) {
+        return Err(failure(39, "first Map child was not admitted"));
+    }
+    if !matches!(
+        adapter
+            .store()
+            .claim_node_attempt(
+                scope,
+                ClaimNodeAttempt {
+                    permit: fixture.permit,
+                    run_id: id("map-run-39"),
+                    node_id: second.node_instance_id.clone(),
+                    expected_node_version: second.version,
+                    attempt_id: id("map-attempt-second"),
+                    worker_id: id("worker"),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.input.digest().clone(),
+                },
+            )
+            .await,
+        Ok(ClaimNodeAttemptResult::MapConcurrencyLimited)
+    ) {
+        return Err(failure(39, "Map concurrency cap admitted a sibling"));
     }
     Ok(())
 }
 
 async fn exponential_backoff_cap<A: ConformanceAdapter>(
-    _adapter: &A,
-    _scope_a: &ExecutionScope,
+    adapter: &A,
+    scope: &ExecutionScope,
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
-    let policy = RetryPolicy {
-        max_attempts: 100,
-        backoff: BackoffPolicy::Exponential {
-            initial_delay_ms: 86_400_000,
-            multiplier: 16,
-            max_delay_ms: 86_400_000,
+    let delay = 86_400_000_i64;
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        40,
+        1,
+        1,
+        RetryPolicy {
+            max_attempts: 100,
+            backoff: BackoffPolicy::Exponential {
+                initial_delay_ms: delay as u64,
+                multiplier: 16,
+                max_delay_ms: delay as u64,
+            },
         },
-    };
-    if crate::memory::retry_at(crate::ids::Timestamp(10), &policy, 100)
-        != Ok(crate::ids::Timestamp(86_400_010))
-    {
-        return Err(failure(40, "overflowing exponential backoff did not cap"));
+    )
+    .await?;
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: id("map-run-40"),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items,
+                expansion_digest: fixture.expansion_digest,
+            },
+        )
+        .await
+        .map_err(|_| failure(40, "backoff Map expansion failed"))?;
+    let child_id = adapter
+        .store()
+        .list_nodes(
+            scope,
+            &id("map-run-40"),
+            PageRequest {
+                cursor: None,
+                page_size: 100,
+            },
+        )
+        .await
+        .map_err(|_| failure(40, "backoff child read failed"))?
+        .items
+        .into_iter()
+        .find(|node| node.parent_map_instance_id.is_some())
+        .ok_or_else(|| failure(40, "backoff child missing"))?
+        .node_instance_id;
+    let mut permit = fixture.permit;
+    for attempt_number in 1..100 {
+        let node = adapter
+            .store()
+            .get_node(scope, &id("map-run-40"), &child_id)
+            .await
+            .map_err(|_| failure(40, "backoff node read failed"))?;
+        let attempt_id = id(&format!("backoff-attempt-{attempt_number}"));
+        let claimed = adapter
+            .store()
+            .claim_node_attempt(
+                scope,
+                ClaimNodeAttempt {
+                    permit: permit.clone(),
+                    run_id: id("map-run-40"),
+                    node_id: child_id.clone(),
+                    expected_node_version: node.version,
+                    attempt_id: attempt_id.clone(),
+                    worker_id: id("worker"),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.input.digest().clone(),
+                },
+            )
+            .await
+            .map_err(|_| failure(40, "backoff attempt claim failed"))?;
+        let credential = match claimed {
+            ClaimNodeAttemptResult::Claimed {
+                completion_credential,
+                ..
+            } => completion_credential,
+            _ => return Err(failure(40, "backoff attempt was not claimed")),
+        };
+        adapter
+            .store()
+            .complete_attempt(
+                scope,
+                CompleteAttempt {
+                    completion_credential: credential,
+                    run_id: id("map-run-40"),
+                    node_id: child_id.clone(),
+                    attempt_id,
+                    submitted_outcome: ActionOutcome::retryable(
+                        "conformance.retry".to_owned(),
+                        "retry".to_owned(),
+                        None,
+                        CostUnits(0),
+                    )
+                    .map_err(|_| failure(40, "backoff outcome invalid"))?,
+                    objects: CompletionObjects {
+                        output: None,
+                        artifacts: Vec::new(),
+                        diagnostics: None,
+                    },
+                },
+            )
+            .await
+            .map_err(|_| failure(40, "backoff completion failed"))?;
+        let waiting = adapter
+            .store()
+            .get_node(scope, &id("map-run-40"), &child_id)
+            .await
+            .map_err(|_| failure(40, "backoff wait read failed"))?;
+        let attempt = adapter
+            .store()
+            .get_attempt(
+                scope,
+                &id("map-run-40"),
+                &id(&format!("backoff-attempt-{attempt_number}")),
+            )
+            .await
+            .map_err(|_| failure(40, "backoff attempt read failed"))?;
+        if waiting.next_eligible_at
+            != attempt
+                .finished_at
+                .and_then(|finished| finished.0.checked_add(delay).map(crate::ids::Timestamp))
+        {
+            return Err(failure(40, "exponential backoff did not cap"));
+        }
+        if attempt_number < 99 {
+            adapter.advance_clock_ms(delay);
+            permit = adapter
+                .store()
+                .acquire_engine_claim(scope, id("map-engine-40"))
+                .await
+                .map_err(|_| failure(40, "backoff engine takeover failed"))?
+                .permit;
+            adapter
+                .store()
+                .release_retry(
+                    scope,
+                    ReleaseRetry {
+                        permit: permit.clone(),
+                        run_id: id("map-run-40"),
+                        node_id: child_id.clone(),
+                        expected_node_version: waiting.version,
+                    },
+                )
+                .await
+                .map_err(|_| failure(40, "backoff retry release failed"))?;
+        }
     }
     Ok(())
 }
@@ -1240,13 +1712,10 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         blocked_run_host_command_fence
     );
     run_fixture!(
-        "corruption_transition_by_source_state",
-        corruption_transition_by_source_state
+        "expand_map_recomputes_identity",
+        expand_map_recomputes_identity
     );
-    run_fixture!(
-        "multi_attempt_recovery_sorter",
-        multi_attempt_recovery_sorter
-    );
+    run_fixture!("map_concurrency_admission", map_concurrency_admission);
     run_fixture!("exponential_backoff_cap", exponential_backoff_cap);
     results
 }

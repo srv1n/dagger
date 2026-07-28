@@ -624,6 +624,7 @@ pub struct RecordChoice {
 }
 
 /// One validated ordered Map expansion item. Contract section 5.3.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrderedMapItem {
     /// Zero-based item index. Contract section 10.1.
     pub index: u32,
