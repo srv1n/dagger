@@ -510,3 +510,65 @@ pub struct WorkflowRunView {
     /// Present only for a conforming Running run. Contract section 5.4.
     pub operational: Option<RunOperationalView>,
 }
+
+impl RunState {
+    /// Returns whether no ordinary workflow transition can leave this state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed
+                | Self::ContractFailed
+                | Self::RetriesExhausted
+                | Self::BudgetExhausted
+                | Self::Cancelled
+                | Self::CorruptStorage
+        )
+    }
+}
+
+impl NodeState {
+    /// Returns whether the node has reached an ordinary terminal state.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed
+                | Self::ContractFailed
+                | Self::RetriesExhausted
+                | Self::BudgetExhausted
+                | Self::Cancelled
+                | Self::CorruptStorage
+                | Self::Skipped
+        )
+    }
+}
+
+impl RunOperationalCounts {
+    /// Derives the closed operational phase from one consistent snapshot.
+    pub fn phase(&self) -> Option<OperationalPhase> {
+        let categories = [
+            self.ready > 0 || self.running_attempts > 0,
+            self.budget_waiting > 0,
+            self.pending_approvals > 0,
+            self.retry_waiting > 0,
+            self.maps_waiting_children > 0,
+        ];
+        let active = categories.iter().filter(|present| **present).count();
+        if active == 0 {
+            None
+        } else if active > 1 {
+            Some(OperationalPhase::Mixed)
+        } else if categories[0] {
+            Some(OperationalPhase::Executing)
+        } else if categories[1] {
+            Some(OperationalPhase::AwaitingBudget)
+        } else if categories[2] {
+            Some(OperationalPhase::AwaitingApproval)
+        } else if categories[3] {
+            Some(OperationalPhase::RetryDelay)
+        } else {
+            Some(OperationalPhase::WaitingChildren)
+        }
+    }
+}
