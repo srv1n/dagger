@@ -14,8 +14,9 @@ use crate::definition::{ActionPin, BackoffPolicy, NodeDefinition, PublishableDef
 use crate::engine::Clock;
 use crate::event::{EventActorKind, EventType, WorkflowEvent};
 use crate::ids::{
-    artifact_ref_id, edge_id, idempotency_key, map_child_id, ArtifactRefIdentity, CostUnits,
-    Digest, Id, NodeInstanceId, Timestamp, Version,
+    artifact_ref_id, edge_id, idempotency_key, map_child_id, map_expansion_digest,
+    ArtifactRefIdentity, CostUnits, Digest, Id, MapChildIdentity, NodeInstanceId, Timestamp,
+    Version,
 };
 use crate::revision::WorkflowRevision;
 use crate::run::{
@@ -369,7 +370,7 @@ impl<C: Clock> InMemoryStore<C> {
                             None,
                             None,
                             event_payload::run_cancelled(
-                                &(Option::<()>::None),
+                                &(Option::<&str>::None),
                                 &("RunEventLimitExceeded"),
                                 &(prior.status),
                             ),
@@ -663,6 +664,87 @@ fn action_config<'a>(
         })
 }
 
+fn validate_bound_artifact_refs(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    definition: &PublishableDefinition,
+    node: &NodeRun,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    let targets = definition
+        .definition
+        .nodes
+        .iter()
+        .find_map(|candidate| match candidate {
+            NodeDefinition::Action { id, bindings, .. } if id == &node.definition_node_id => Some(
+                bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        matches!(
+                            &binding.source,
+                            crate::definition::BindingSource::ArtifactRef { .. }
+                        )
+                        .then_some(binding.target.as_str())
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            NodeDefinition::Map { id, bindings, .. }
+                if id == &node.definition_node_id && node.parent_map_instance_id.is_some() =>
+            {
+                Some(
+                    bindings
+                        .iter()
+                        .filter_map(|binding| {
+                            matches!(
+                                &binding.source,
+                                crate::definition::MapBindingSource::ArtifactRef { .. }
+                            )
+                            .then_some(binding.target.as_str())
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        })
+        .ok_or(StoreError::CorruptControlPlane)?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let bound: Value =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::ContractValidationApplied {
+            code: "BindingTypeMismatch".to_owned(),
+        })?;
+    for target in targets {
+        let value = bound
+            .pointer(target)
+            .ok_or_else(|| StoreError::ContractValidationApplied {
+                code: "BindingTypeMismatch".to_owned(),
+            })?
+            .clone();
+        let projected: crate::artifact::ArtifactRefValue =
+            serde_json::from_value(value).map_err(|_| StoreError::ContractValidationApplied {
+                code: "BindingTypeMismatch".to_owned(),
+            })?;
+        let Some(reference) = state
+            .artifact_refs
+            .get(&(scope.clone(), projected.artifact_ref_id.clone()))
+        else {
+            return Err(StoreError::ContractValidationApplied {
+                code: "BindingTypeMismatch".to_owned(),
+            });
+        };
+        if reference.digest != projected.digest
+            || reference.size_bytes.to_string() != projected.size_bytes
+            || reference.media_type != projected.media_type
+        {
+            return Err(StoreError::ContractValidationApplied {
+                code: "BindingTypeMismatch".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn retry_at(
     now: Timestamp,
     policy: &crate::definition::RetryPolicy,
@@ -910,12 +992,12 @@ fn typed_event_payload(
 }
 
 macro_rules! payload_constructors {
-    ($( $function:ident => $variant:ident ( $( $field:ident ),+ ) );+ $(;)?) => {
+    ($( $function:ident => $variant:ident ( $( $field:ident : $field_type:ty ),+ ) );+ $(;)?) => {
         mod event_payload {
             use super::*;
             $(
                 #[allow(dead_code)]
-                pub(super) fn $function($( $field: impl Serialize ),+) -> TypedEventPayload {
+                pub(super) fn $function($( $field: $field_type ),+) -> TypedEventPayload {
                     typed_event_payload(
                         EventType::$variant,
                         [$( (stringify!($field), payload_value($field)) ),+],
@@ -927,71 +1009,71 @@ macro_rules! payload_constructors {
 }
 
 payload_constructors! {
-    run_created => RunCreated(definition_id, revision_hash, input_digest, budget_limit, limits, create_request_fingerprint);
-    node_created_pending => NodeCreatedPending(definition_node_id, kind, incoming_total, topological_rank);
-    node_created_ready => NodeCreatedReady(definition_node_id, kind, topological_rank);
-    run_started => RunStarted(revision_hash, compatibility_evidence_digest);
-    run_blocked_incompatible => RunBlockedIncompatible(incompatibilities_digest, incompatible_reference_locations, suspension_fingerprint);
-    node_blocked_incompatible => NodeBlockedIncompatible(blocked_from_status, action_reference_location, required_semantic_digest);
-    run_resumed_compatible => RunResumedCompatible(compatibility_evidence_digest);
-    node_resumed_compatible => NodeResumedCompatible(restored_status, available_semantic_digest);
-    run_succeeded => RunSucceeded(output_digest, consumed_cost_units);
-    run_failed => RunFailed(failure_kind, diagnostics_digest);
-    run_contract_failed => RunContractFailed(failure_kind, diagnostics_digest);
-    run_retries_exhausted => RunRetriesExhausted(node_instance_id, attempt_id, max_attempts);
-    run_budget_exhausted => RunBudgetExhausted(node_instance_id, requested, available, limit_minus_consumed, permanently_infeasible);
-    run_cancelled => RunCancelled(principal, reason_code, prior_status);
-    run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id, bad_digest, error_class, corrupt_proof_fingerprint, store_instance_nonce_digest, prior_status, owner_node_id);
-    node_became_ready => NodeBecameReady(incoming_satisfied, incoming_skipped, incoming_total);
-    node_retry_eligible => NodeRetryEligible(next_eligible_at, database_now);
-    node_attempt_claimed => NodeAttemptClaimed(attempt_id, invocation_id, attempt_number, worker_id);
-    attempt_started => AttemptStarted(attempt_number, worker_id, engine_generation, deadline_at, declared_max_cost_units, idempotency_key_digest, bound_input_digest, completion_credential_digest);
-    budget_reserved => BudgetReserved(ledger_seq, amount, available_after);
-    map_child_created => MapChildCreated(parent_map_instance_id, item_index, item_digest, topological_rank);
-    map_expanded => MapExpanded(map_input_digest, expansion_digest, child_count, max_concurrency);
-    map_zero_items_succeeded => MapZeroItemsSucceeded(map_input_digest, expansion_digest, aggregate_digest);
-    map_succeeded => MapSucceeded(child_count, aggregate_digest);
-    choice_selected => ChoiceSelected(choice_input_digest, selector_value_digest, selection_kind, case_index, edge_id);
-    approval_requested => ApprovalRequested(gate_id, request_digest, expires_at, on_expiry, authorization_policy_digest);
-    approval_approved => ApprovalApproved(gate_id, decision_payload_digest, approval_output_digest, resolution_source);
-    approval_rejected => ApprovalRejected(gate_id, decision_payload_digest, resolution_source);
-    approval_expired_approved => ApprovalExpiredApproved(gate_id, expires_at, approval_output_digest);
-    approval_expired_rejected => ApprovalExpiredRejected(gate_id, expires_at);
-    succeed_node_reached => SucceedNodeReached(output_digest);
-    fail_node_reached => FailNodeReached(code, message_digest);
-    node_succeeded => NodeSucceeded(attempt_id, output_digest, artifact_digests);
-    node_retry_scheduled => NodeRetryScheduled(attempt_id, attempt_number, next_eligible_at, cause);
-    node_failed => NodeFailed(attempt_id, failure_kind, error_code, diagnostics_digest);
-    node_contract_failed => NodeContractFailed(attempt_id, failure_kind, diagnostics_digest);
-    node_retries_exhausted => NodeRetriesExhausted(attempt_id, attempt_number, max_attempts, cause);
-    node_budget_waiting => NodeBudgetWaiting(requested, available, consumed, reserved, limit);
-    node_budget_exhausted => NodeBudgetExhausted(requested, available, limit_minus_consumed);
-    node_skipped => NodeSkipped(incoming_skipped, incoming_total);
-    node_cancelled => NodeCancelled(prior_status, terminal_run_status, reason_code);
-    map_failed_fast => MapFailedFast(failed_child_id, child_failure_kind);
-    map_contract_failed => MapContractFailed(failure_kind, failed_child_id);
-    map_retries_exhausted => MapRetriesExhausted(failed_child_id, attempt_id, max_attempts);
-    map_budget_exhausted => MapBudgetExhausted(failed_child_id, requested, available);
-    node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id, bad_digest, error_class, corrupt_proof_fingerprint, prior_status);
-    attempt_succeeded => AttemptSucceeded(actual_cost_units, output_digest, artifact_digests);
-    attempt_retryable_failed => AttemptRetryableFailed(actual_cost_units, error_code, diagnostics_digest);
-    attempt_permanent_failed => AttemptPermanentFailed(actual_cost_units, error_code, diagnostics_digest);
-    attempt_contract_failed => AttemptContractFailed(charged_cost_units, failure_kind, diagnostics_digest);
-    attempt_timed_out => AttemptTimedOut(deadline_at, database_now, charged_cost_units);
-    attempt_outcome_unknown => AttemptOutcomeUnknown(dead_engine_generation, recovery_generation, charged_cost_units);
-    attempt_cancelled => AttemptCancelled(reason_code, charged_cost_units);
-    attempt_marked_stale => AttemptMarkedStale(active_attempt_id, submitted_outcome_category, submitted_payload_digest, charged_cost_units);
-    stale_completion_observed => StaleCompletionObserved(immutable_terminal_state, submitted_outcome_category, submitted_payload_digest, database_arrival_at);
-    budget_settled => BudgetSettled(ledger_seq, reservation_amount, consumed_amount, released_amount, reason, available_after);
-    budget_reservation_refused => BudgetReservationRefused(requested, consumed, reserved, limit, available, permanently_infeasible);
-    approval_gate_created => ApprovalGateCreated(request_digest, expires_at, on_expiry, authorization_policy_digest);
-    approval_gate_approved => ApprovalGateApproved(principal, decision_payload_digest, approval_output_digest, decision_fingerprint);
-    approval_gate_rejected => ApprovalGateRejected(principal, decision_payload_digest, decision_fingerprint);
-    approval_gate_expired_approved => ApprovalGateExpiredApproved(expires_at, database_now, approval_output_digest);
-    approval_gate_expired_rejected => ApprovalGateExpiredRejected(expires_at, database_now);
-    approval_gate_cancelled => ApprovalGateCancelled(terminal_run_status, reason_code);
-    edge_satisfied => EdgeSatisfied(edge_id, from_node_id, to_node_id);
-    edge_skipped => EdgeSkipped(edge_id, from_node_id, to_node_id, cause);
+    run_created => RunCreated(definition_id: &Id, revision_hash: &Digest, input_digest: &Digest, budget_limit: &CostUnits, limits: &crate::run::RunLimits, create_request_fingerprint: &Digest);
+    node_created_pending => NodeCreatedPending(definition_node_id: &Id, kind: &NodeKind, incoming_total: &u32, topological_rank: &crate::ids::TopologicalRank);
+    node_created_ready => NodeCreatedReady(definition_node_id: &Id, kind: &NodeKind, topological_rank: &crate::ids::TopologicalRank);
+    run_started => RunStarted(revision_hash: &Digest, compatibility_evidence_digest: &Digest);
+    run_blocked_incompatible => RunBlockedIncompatible(incompatibilities_digest: &Digest, incompatible_reference_locations: &Vec<String>, suspension_fingerprint: &Digest);
+    node_blocked_incompatible => NodeBlockedIncompatible(blocked_from_status: &NodeState, action_reference_location: &Id, required_semantic_digest: &Digest);
+    run_resumed_compatible => RunResumedCompatible(compatibility_evidence_digest: &Digest);
+    node_resumed_compatible => NodeResumedCompatible(restored_status: &NodeState, available_semantic_digest: &Digest);
+    run_succeeded => RunSucceeded(output_digest: &Digest, consumed_cost_units: &CostUnits);
+    run_failed => RunFailed(failure_kind: &RunFailureKind, diagnostics_digest: &Option<&Digest>);
+    run_contract_failed => RunContractFailed(failure_kind: &RunFailureKind, diagnostics_digest: &Option<&Digest>);
+    run_retries_exhausted => RunRetriesExhausted(node_instance_id: &Id, attempt_id: &Id, max_attempts: &u32);
+    run_budget_exhausted => RunBudgetExhausted(node_instance_id: &Id, requested: &CostUnits, available: &str, limit_minus_consumed: &str, permanently_infeasible: &bool);
+    run_cancelled => RunCancelled(principal: &Option<&str>, reason_code: &str, prior_status: &RunState);
+    run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Option<Digest>, store_instance_nonce_digest: &Digest, prior_status: &RunState, owner_node_id: &Option<Id>);
+    node_became_ready => NodeBecameReady(incoming_satisfied: &u32, incoming_skipped: &u32, incoming_total: &u32);
+    node_retry_eligible => NodeRetryEligible(next_eligible_at: &Timestamp, database_now: &Timestamp);
+    node_attempt_claimed => NodeAttemptClaimed(attempt_id: &Id, invocation_id: &Id, attempt_number: &u32, worker_id: &Id);
+    attempt_started => AttemptStarted(attempt_number: &u32, worker_id: &Id, engine_generation: &u64, deadline_at: &Timestamp, declared_max_cost_units: &CostUnits, idempotency_key_digest: &Digest, bound_input_digest: &Digest, completion_credential_digest: &Digest);
+    budget_reserved => BudgetReserved(ledger_seq: &u64, amount: &CostUnits, available_after: &str);
+    map_child_created => MapChildCreated(parent_map_instance_id: &Id, item_index: &u32, item_digest: &Digest, topological_rank: &crate::ids::TopologicalRank);
+    map_expanded => MapExpanded(map_input_digest: &Digest, expansion_digest: &Digest, child_count: &Option<u32>, max_concurrency: &u32);
+    map_zero_items_succeeded => MapZeroItemsSucceeded(map_input_digest: &Digest, expansion_digest: &Digest, aggregate_digest: &Digest);
+    map_succeeded => MapSucceeded(child_count: &Option<u32>, aggregate_digest: &Digest);
+    choice_selected => ChoiceSelected(choice_input_digest: &Digest, selector_value_digest: &Digest, selection_kind: &str, case_index: &Option<u32>, edge_id: &Id);
+    approval_requested => ApprovalRequested(gate_id: &Id, request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
+    approval_approved => ApprovalApproved(gate_id: &Id, decision_payload_digest: &Option<&Digest>, approval_output_digest: &Digest, resolution_source: &str);
+    approval_rejected => ApprovalRejected(gate_id: &Id, decision_payload_digest: &Option<&Digest>, resolution_source: &str);
+    approval_expired_approved => ApprovalExpiredApproved(gate_id: &Id, expires_at: &Timestamp, approval_output_digest: &Digest);
+    approval_expired_rejected => ApprovalExpiredRejected(gate_id: &Id, expires_at: &Timestamp);
+    succeed_node_reached => SucceedNodeReached(output_digest: &Digest);
+    fail_node_reached => FailNodeReached(code: &str, message_digest: &Digest);
+    node_succeeded => NodeSucceeded(attempt_id: &Id, output_digest: &Digest, artifact_digests: &Vec<Digest>);
+    node_retry_scheduled => NodeRetryScheduled(attempt_id: &Id, attempt_number: &u32, next_eligible_at: &Option<Timestamp>, cause: &str);
+    node_failed => NodeFailed(attempt_id: &Id, failure_kind: &NodeFailureKind, error_code: &str, diagnostics_digest: &Option<&Digest>);
+    node_contract_failed => NodeContractFailed(attempt_id: &Option<&Id>, failure_kind: &NodeFailureKind, diagnostics_digest: &Option<&Digest>);
+    node_retries_exhausted => NodeRetriesExhausted(attempt_id: &Id, attempt_number: &u32, max_attempts: &u32, cause: &str);
+    node_budget_waiting => NodeBudgetWaiting(requested: &CostUnits, available: &str, consumed: &CostUnits, reserved: &CostUnits, limit: &CostUnits);
+    node_budget_exhausted => NodeBudgetExhausted(requested: &CostUnits, available: &str, limit_minus_consumed: &str);
+    node_skipped => NodeSkipped(incoming_skipped: &u32, incoming_total: &u32);
+    node_cancelled => NodeCancelled(prior_status: &NodeState, terminal_run_status: &RunState, reason_code: &str);
+    map_failed_fast => MapFailedFast(failed_child_id: &Id, child_failure_kind: &NodeFailureKind);
+    map_contract_failed => MapContractFailed(failure_kind: &NodeFailureKind, failed_child_id: &Option<Id>);
+    map_retries_exhausted => MapRetriesExhausted(failed_child_id: &Id, attempt_id: &Id, max_attempts: &u32);
+    map_budget_exhausted => MapBudgetExhausted(failed_child_id: &Id, requested: &CostUnits, available: &str);
+    node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Digest, prior_status: &NodeState);
+    attempt_succeeded => AttemptSucceeded(actual_cost_units: &CostUnits, output_digest: &Digest, artifact_digests: &Vec<Digest>);
+    attempt_retryable_failed => AttemptRetryableFailed(actual_cost_units: &CostUnits, error_code: &str, diagnostics_digest: &Option<&Digest>);
+    attempt_permanent_failed => AttemptPermanentFailed(actual_cost_units: &CostUnits, error_code: &str, diagnostics_digest: &Option<&Digest>);
+    attempt_contract_failed => AttemptContractFailed(charged_cost_units: &CostUnits, failure_kind: &NodeFailureKind, diagnostics_digest: &Option<&Digest>);
+    attempt_timed_out => AttemptTimedOut(deadline_at: &Timestamp, database_now: &Timestamp, charged_cost_units: &CostUnits);
+    attempt_outcome_unknown => AttemptOutcomeUnknown(dead_engine_generation: &u64, recovery_generation: &u64, charged_cost_units: &CostUnits);
+    attempt_cancelled => AttemptCancelled(reason_code: &str, charged_cost_units: &CostUnits);
+    attempt_marked_stale => AttemptMarkedStale(active_attempt_id: &Option<Id>, submitted_outcome_category: &str, submitted_payload_digest: &Digest, charged_cost_units: &CostUnits);
+    stale_completion_observed => StaleCompletionObserved(immutable_terminal_state: &AttemptState, submitted_outcome_category: &str, submitted_payload_digest: &Digest, database_arrival_at: &Timestamp);
+    budget_settled => BudgetSettled(ledger_seq: &u64, reservation_amount: &CostUnits, consumed_amount: &CostUnits, released_amount: &str, reason: &BudgetLedgerReason, available_after: &str);
+    budget_reservation_refused => BudgetReservationRefused(requested: &CostUnits, consumed: &CostUnits, reserved: &CostUnits, limit: &CostUnits, available: &str, permanently_infeasible: &bool);
+    approval_gate_created => ApprovalGateCreated(request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
+    approval_gate_approved => ApprovalGateApproved(principal: &str, decision_payload_digest: &Option<&Digest>, approval_output_digest: &Digest, decision_fingerprint: &Digest);
+    approval_gate_rejected => ApprovalGateRejected(principal: &str, decision_payload_digest: &Option<&Digest>, decision_fingerprint: &Digest);
+    approval_gate_expired_approved => ApprovalGateExpiredApproved(expires_at: &Timestamp, database_now: &Timestamp, approval_output_digest: &Digest);
+    approval_gate_expired_rejected => ApprovalGateExpiredRejected(expires_at: &Timestamp, database_now: &Timestamp);
+    approval_gate_cancelled => ApprovalGateCancelled(terminal_run_status: &RunState, reason_code: &str);
+    edge_satisfied => EdgeSatisfied(edge_id: &Id, from_node_id: &Id, to_node_id: &Id);
+    edge_skipped => EdgeSkipped(edge_id: &Id, from_node_id: &Id, to_node_id: &Id, cause: &str);
 }
 
 fn event_spec(
@@ -1310,6 +1392,39 @@ fn event_payload_is_closed(event_type: EventType, payload: &Value) -> bool {
         && fields
             .keys()
             .all(|field| required.contains(&field.as_str()) || optional.contains(&field.as_str()))
+        && fields
+            .iter()
+            .all(|(field, value)| event_payload_field_type_is_valid(field, value))
+}
+
+fn event_payload_field_type_is_valid(field: &str, value: &Value) -> bool {
+    match field {
+        "incompatible_reference_locations" | "artifact_digests" => value
+            .as_array()
+            .is_some_and(|values| values.iter().all(Value::is_string)),
+        "limits" => value.is_object(),
+        "permanently_infeasible" => value.is_boolean(),
+        "incoming_total"
+        | "incoming_satisfied"
+        | "incoming_skipped"
+        | "topological_rank"
+        | "max_attempts"
+        | "attempt_number"
+        | "engine_generation"
+        | "deadline_at"
+        | "next_eligible_at"
+        | "database_now"
+        | "ledger_seq"
+        | "item_index"
+        | "child_count"
+        | "max_concurrency"
+        | "case_index"
+        | "expires_at"
+        | "database_arrival_at"
+        | "dead_engine_generation"
+        | "recovery_generation" => value.is_number(),
+        _ => value.is_string(),
+    }
 }
 
 fn event_order(
@@ -2060,7 +2175,7 @@ fn apply_map_contract_failure(
         Some(map_node_id),
         None,
         None,
-        event_payload::map_contract_failed(&(failure_kind), &(Option::<()>::None)),
+        event_payload::map_contract_failed(&(failure_kind), &(Option::<Id>::None)),
     )];
     let run_kind = run_failure(failure_kind);
     terminalize_run(
@@ -2078,7 +2193,7 @@ fn apply_map_contract_failure(
         None,
         None,
         None,
-        event_payload::run_contract_failed(&(run_kind), &(Option::<()>::None)),
+        event_payload::run_contract_failed(&(run_kind), &(Option::<&Digest>::None)),
     ));
     append_batch(
         state,
@@ -3125,10 +3240,54 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .get(&run_key)
                 .cloned()
                 .ok_or(StoreError::CorruptControlPlane)?;
+            validate_bound_artifact_refs(
+                &state,
+                scope,
+                &definition,
+                &node,
+                command.bound_input.verified_bytes(),
+            )?;
             let (action, retry, timeout_ms, declared_max) =
                 action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
             if node.attempt_count >= retry.max_attempts {
                 return Err(StoreError::IllegalTransition);
+            }
+            if let Some(parent_map_id) = &node.parent_map_instance_id {
+                let max_concurrency = definition
+                    .definition
+                    .nodes
+                    .iter()
+                    .find_map(|candidate| match candidate {
+                        NodeDefinition::Map {
+                            id,
+                            max_concurrency,
+                            ..
+                        } if id == &node.definition_node_id => Some(*max_concurrency),
+                        _ => None,
+                    })
+                    .ok_or(StoreError::CorruptControlPlane)?;
+                let started_siblings = state
+                    .attempts
+                    .values()
+                    .filter(|attempt| {
+                        attempt.scope == *scope
+                            && attempt.run_id == command.run_id
+                            && attempt.status == AttemptState::Started
+                            && state
+                                .nodes
+                                .get(&(
+                                    scope.clone(),
+                                    command.run_id.clone(),
+                                    attempt.node_instance_id.clone(),
+                                ))
+                                .is_some_and(|candidate| {
+                                    candidate.parent_map_instance_id.as_ref() == Some(parent_map_id)
+                                })
+                    })
+                    .count();
+                if started_siblings >= max_concurrency as usize {
+                    return Ok(ClaimNodeAttemptResult::MapConcurrencyLimited);
+                }
             }
             if state.attempts.contains_key(&(
                 scope.clone(),
@@ -3148,9 +3307,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     None,
                     event_payload::node_contract_failed(
-                        &(Option::<()>::None),
-                        &("RunAttemptLimitExceeded"),
-                        &(Option::<()>::None),
+                        &(Option::<&Id>::None),
+                        &(NodeFailureKind::RunAttemptLimitExceeded),
+                        &(Option::<&Digest>::None),
                     ),
                 )];
                 node.status = NodeState::ContractFailed;
@@ -3174,8 +3333,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     None,
                     event_payload::run_contract_failed(
-                        &("RunAttemptLimitExceeded"),
-                        &(Option::<()>::None),
+                        &(RunFailureKind::RunAttemptLimitExceeded),
+                        &(Option::<&Digest>::None),
                     ),
                 ));
                 append_batch(
@@ -3809,8 +3968,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     event_payload::attempt_contract_failed(
                         &(charged),
-                        &("ActionCostProtocolViolation"),
-                        &(Option::<()>::None),
+                        &(NodeFailureKind::ActionCostProtocolViolation),
+                        &(Option::<&Digest>::None),
                     ),
                 ));
                 specs.push(event_spec(
@@ -3819,9 +3978,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     Some(&command.attempt_id),
                     None,
                     event_payload::node_contract_failed(
-                        &(command.attempt_id),
-                        &("ActionCostProtocolViolation"),
-                        &(Option::<()>::None),
+                        &(Some(&command.attempt_id)),
+                        &(NodeFailureKind::ActionCostProtocolViolation),
+                        &(Option::<&Digest>::None),
                     ),
                 ));
                 specs.push(budget_settled_spec(
@@ -3848,8 +4007,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     None,
                     event_payload::run_contract_failed(
-                        &("ActionCostProtocolViolation"),
-                        &(Option::<()>::None),
+                        &(RunFailureKind::ActionCostProtocolViolation),
+                        &(Option::<&Digest>::None),
                     ),
                 ));
                 append_batch(
@@ -4017,7 +4176,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         event_payload::attempt_retryable_failed(
                             &(actual),
                             &(code),
-                            &(Option::<()>::None),
+                            &(Option::<&Digest>::None),
                         ),
                     ));
                     if attempt.attempt_number >= retry.max_attempts {
@@ -4130,7 +4289,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         event_payload::attempt_permanent_failed(
                             &(actual),
                             &(code),
-                            &(Option::<()>::None),
+                            &(Option::<&Digest>::None),
                         ),
                     ));
                     specs.push(event_spec(
@@ -4140,9 +4299,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         event_payload::node_failed(
                             &(command.attempt_id),
-                            &("ActionPermanent"),
+                            &(NodeFailureKind::ActionPermanent),
                             &(code),
-                            &(Option::<()>::None),
+                            &(Option::<&Digest>::None),
                         ),
                     ));
                     specs.push(budget_settled_spec(
@@ -4168,7 +4327,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         None,
                         None,
-                        event_payload::run_failed(&("ActionPermanent"), &(Option::<()>::None)),
+                        event_payload::run_failed(
+                            &(RunFailureKind::ActionPermanent),
+                            &(Option::<&Digest>::None),
+                        ),
                     ));
                     append_batch(
                         &mut state,
@@ -4470,7 +4632,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         event_payload::node_retry_scheduled(
                             &(attempt.attempt_id),
                             &(attempt.attempt_number),
-                            &(next_eligible_at),
+                            &(Some(next_eligible_at)),
                             &("unknown"),
                         ),
                     ));
@@ -4683,14 +4845,14 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     &(command.input.digest()),
                     &(&command.evaluated_selector_digest),
                     &("case"),
-                    &(case_index),
+                    &(Some(*case_index)),
                     &(&selected),
                 ),
                 ChoiceSelection::Default { .. } => event_payload::choice_selected(
                     &(command.input.digest()),
                     &(&command.evaluated_selector_digest),
                     &("default"),
-                    &(Option::<()>::None),
+                    &(Option::<u32>::None),
                     &(&selected),
                 ),
             };
@@ -4735,6 +4897,59 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         self.transaction(|mut state, now| {
             running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
             verified(&mut state, scope, &command.input, now)?;
+            if command.input.media_type() != "application/json" {
+                return Err(StoreError::ContractValidationApplied {
+                    code: "MapInputInvalid".to_owned(),
+                });
+            }
+            let input_value: Value = serde_json::from_slice(command.input.verified_bytes())
+                .map_err(|_| StoreError::ContractValidationApplied {
+                    code: "MapInputInvalid".to_owned(),
+                })?;
+            let input_items =
+                input_value
+                    .as_array()
+                    .ok_or_else(|| StoreError::ContractValidationApplied {
+                        code: "MapInputInvalid".to_owned(),
+                    })?;
+            if serde_jcs::to_vec(&input_value).map_err(|_| {
+                StoreError::ContractValidationApplied {
+                    code: "MapInputInvalid".to_owned(),
+                }
+            })? != command.input.verified_bytes()
+            {
+                return Err(StoreError::ContractValidationApplied {
+                    code: "MapInputInvalid".to_owned(),
+                });
+            }
+            let mut recomputed_items = Vec::with_capacity(input_items.len());
+            let mut recomputed_identities = Vec::with_capacity(input_items.len());
+            for (index, item) in input_items.iter().enumerate() {
+                let index = u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?;
+                let item_digest = digest(&serde_jcs::to_vec(item).map_err(|_| {
+                    StoreError::ContractValidationApplied {
+                        code: "MapInputInvalid".to_owned(),
+                    }
+                })?);
+                let child_id =
+                    map_child_id(&command.run_id, &command.map_node_id, index, &item_digest);
+                recomputed_identities.push(MapChildIdentity {
+                    item_index: index,
+                    item_digest: item_digest.clone(),
+                    child_id: child_id.clone(),
+                });
+                recomputed_items.push(OrderedMapItem {
+                    index,
+                    item_digest,
+                    child_id,
+                });
+            }
+            let recomputed_expansion_digest = map_expansion_digest(&recomputed_identities);
+            if command.ordered_items != recomputed_items
+                || command.expansion_digest != recomputed_expansion_digest
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
             let key = (
                 scope.clone(),
                 command.run_id.clone(),
@@ -5508,7 +5723,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         None,
                         None,
-                        event_payload::run_failed(&("ApprovalRejected"), &(Option::<()>::None)),
+                        event_payload::run_failed(
+                            &(RunFailureKind::ApprovalRejected),
+                            &(Option::<&Digest>::None),
+                        ),
                     ));
                 }
             }
@@ -5683,8 +5901,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         None,
                         event_payload::run_failed(
-                            &("ApprovalExpiredRejected"),
-                            &(Option::<()>::None),
+                            &(RunFailureKind::ApprovalExpiredRejected),
+                            &(Option::<&Digest>::None),
                         ),
                     ));
                 }
@@ -5826,7 +6044,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         None,
                         None,
-                        event_payload::run_failed(&("ExplicitFailNode"), &(Option::<()>::None)),
+                        event_payload::run_failed(
+                            &(RunFailureKind::ExplicitFailNode),
+                            &(Option::<&Digest>::None),
+                        ),
                     ));
                     run
                 }
@@ -5915,7 +6136,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 None,
                 event_payload::node_contract_failed(
-                    &(Option::<()>::None),
+                    &(Option::<&Id>::None),
                     &(command.closed_failure_kind),
                     &(command.diagnostics.as_ref().map(VerifiedObjectRef::digest)),
                 ),
@@ -6047,7 +6268,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 None,
                 event_payload::run_cancelled(
-                    &(command.principal.principal_id()),
+                    &(Some(command.principal.principal_id())),
                     &(command.reason_code),
                     &(prior.status),
                 ),
@@ -6132,7 +6353,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 None,
                 event_payload::run_cancelled(
-                    &(Option::<()>::None),
+                    &(Option::<&str>::None),
                     &("RunLifetimeExceeded"),
                     &(prior.status),
                 ),
@@ -6177,15 +6398,32 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             let proof_fingerprint = digest(&command.proof.fingerprint_material());
             let mut specs = Vec::new();
             if let Some(owner_node_id) = &command.owner_node_id {
-                if command.bad_ref.producer_node_id.as_ref() != Some(owner_node_id) {
-                    return Err(StoreError::InvalidFailedReadProof);
-                }
                 let node_key = (scope.clone(), command.run_id.clone(), owner_node_id.clone());
                 let mut node = state
                     .nodes
                     .get(&node_key)
                     .cloned()
                     .ok_or(StoreError::NotFound)?;
+                let directly_owned =
+                    command.bad_ref.producer_node_id.as_ref() == Some(owner_node_id);
+                let child_output_owned_by_map = node.status == NodeState::WaitingChildren
+                    && command
+                        .bad_ref
+                        .producer_node_id
+                        .as_ref()
+                        .and_then(|producer_node_id| {
+                            state.nodes.get(&(
+                                scope.clone(),
+                                command.run_id.clone(),
+                                producer_node_id.clone(),
+                            ))
+                        })
+                        .is_some_and(|producer| {
+                            producer.parent_map_instance_id.as_ref() == Some(owner_node_id)
+                        });
+                if !directly_owned && !child_output_owned_by_map {
+                    return Err(StoreError::InvalidFailedReadProof);
+                }
                 let prior_status = node.status;
                 let transition = match prior_status {
                     NodeState::Ready => "N47",
@@ -7006,7 +7244,7 @@ fn timeout_specs(
                 event_payload::node_retry_scheduled(
                     &(&attempt.attempt_id),
                     &(attempt.attempt_number),
-                    &(next_eligible_at.ok_or(StoreError::CorruptControlPlane)?),
+                    &(Some(next_eligible_at.ok_or(StoreError::CorruptControlPlane)?)),
                     &("timeout"),
                 )
             },
@@ -7048,8 +7286,7 @@ fn run_failure(kind: NodeFailureKind) -> RunFailureKind {
 mod tests {
     use super::{corruption_run_transition, event_order, event_payload, event_spec, retry_at};
     use crate::definition::{BackoffPolicy, RetryPolicy};
-    use crate::event::EventType;
-    use crate::ids::{Id, Timestamp};
+    use crate::ids::{CostUnits, Id, Timestamp};
     use crate::run::RunState;
 
     #[test]
@@ -7097,7 +7334,7 @@ mod tests {
             Some(&node),
             Some(&attempt_b),
             None,
-            event_payload::attempt_outcome_unknown(&(1), &(2), &(1)),
+            event_payload::attempt_outcome_unknown(&(1), &(2), &(CostUnits(1))),
         );
         later_attempt.topological_rank = 3;
         later_attempt.map_item_index = 4;
@@ -7107,7 +7344,7 @@ mod tests {
             Some(&node),
             Some(&attempt_a),
             None,
-            event_payload::attempt_outcome_unknown(&(1), &(2), &(1)),
+            event_payload::attempt_outcome_unknown(&(1), &(2), &(CostUnits(1))),
         );
         earlier_attempt.topological_rank = 3;
         earlier_attempt.map_item_index = 4;

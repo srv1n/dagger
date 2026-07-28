@@ -3,20 +3,20 @@
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
 };
-use crate::artifact::ObjectStore;
+use crate::artifact::{ArtifactRefValue, ObjectStore};
 use crate::definition::{
-    Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource, NodeDefinition,
-    WorkflowDefinition,
+    ArtifactLocator, Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource,
+    NodeDefinition, WorkflowDefinition,
 };
 use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChildIdentity};
 use crate::run::{NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime, OrderedMapItem,
-    PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun, ReleaseRetry, RequestApproval,
-    ResolveTerminalNode, ResumeCompatible, StartRun, StoreError, SuspendIncompatible,
-    TimeoutAttempt, WorkflowStore,
+    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
+    MarkCorruptStorage, OrderedMapItem, PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun,
+    ReleaseRetry, RequestApproval, ResolveTerminalNode, ResumeCompatible, StartRun, StoreError,
+    SuspendIncompatible, TimeoutAttempt, WorkflowStore,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -30,6 +30,12 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
 use crate::ids::Timestamp;
+
+#[derive(serde::Serialize)]
+struct IncompatibilityEvidenceDocument<'a> {
+    evidence_digest: &'a Digest,
+    incompatible_reference_locations: &'a [String],
+}
 
 /// Store-observed clock used for every durable time comparison.
 pub trait Clock: Send + Sync {
@@ -451,11 +457,11 @@ where
                 crate::run::RunState::Pending | crate::run::RunState::Running
                     if !evidence.incompatible_reference_locations.is_empty() =>
                 {
-                    let bytes = serde_jcs::to_vec(&serde_json::json!({
-                        "evidence_digest": evidence.evidence_digest,
-                        "incompatible_reference_locations":
-                            evidence.incompatible_reference_locations
-                    }))
+                    let bytes = serde_jcs::to_vec(&IncompatibilityEvidenceDocument {
+                        evidence_digest: &evidence.evidence_digest,
+                        incompatible_reference_locations: &evidence
+                            .incompatible_reference_locations,
+                    })
                     .map_err(|_| EngineError::ObjectWrite)?;
                     let incompatibilities = self
                         .object_store
@@ -491,7 +497,8 @@ where
                 } else {
                     None
                 };
-            self.store
+            match self
+                .store
                 .expire_approval(
                     scope,
                     ExpireApproval {
@@ -501,8 +508,12 @@ where
                         approval_output,
                     },
                 )
-                .await?;
-            changed += 1;
+                .await
+            {
+                Ok(_) => changed += 1,
+                Err(StoreError::ApprovalRaceLost) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         for run in self
             .store
@@ -708,7 +719,9 @@ where
                     }
                 }
                 MapBindingSource::MapIndex => Value::from(index),
-                MapBindingSource::ArtifactRef { .. } => return Err(EngineError::Binding),
+                MapBindingSource::ArtifactRef { source } => {
+                    self.resolve_artifact_locator(scope, run, source).await?
+                }
             };
             set_pointer(&mut target, &binding.target, value)?;
         }
@@ -741,8 +754,71 @@ where
                     .map_err(|_| EngineError::ObjectRead)?;
                 select_json(&object.bytes, pointer)
             }
-            BindingSource::ArtifactRef { .. } => Err(EngineError::Binding),
+            BindingSource::ArtifactRef { source } => {
+                self.resolve_artifact_locator(scope, run, source).await
+            }
         }
+    }
+
+    async fn resolve_artifact_locator(
+        &self,
+        scope: &ExecutionScope,
+        run: &crate::run::WorkflowRun,
+        source: &ArtifactLocator,
+    ) -> Result<Value, EngineError> {
+        let value = match source {
+            ArtifactLocator::Literal {
+                artifact_ref_id,
+                digest,
+                media_type,
+            } => {
+                let object = self
+                    .object_store
+                    .get(scope, digest)
+                    .await
+                    .map_err(|_| EngineError::ObjectRead)?;
+                if object.reference.media_type() != media_type {
+                    return Err(EngineError::Binding);
+                }
+                ArtifactRefValue {
+                    artifact_ref_id: artifact_ref_id.clone(),
+                    digest: digest.clone(),
+                    size_bytes: object.reference.size_bytes().to_string(),
+                    media_type: media_type.clone(),
+                }
+            }
+            ArtifactLocator::RunInput { pointer } => {
+                let object = self
+                    .object_store
+                    .get(scope, &run.input_ref.0.digest)
+                    .await
+                    .map_err(|_| EngineError::ObjectRead)?;
+                serde_json::from_value(select_json(&object.bytes, pointer)?)
+                    .map_err(|_| EngineError::Binding)?
+            }
+            ArtifactLocator::NodeOutput { node_id, pointer } => {
+                let node = self.store.get_node(scope, &run.run_id, node_id).await?;
+                let output = node.result_ref.ok_or(EngineError::Binding)?;
+                let object = self
+                    .object_store
+                    .get(scope, &output.0.digest)
+                    .await
+                    .map_err(|_| EngineError::ObjectRead)?;
+                serde_json::from_value(select_json(&object.bytes, pointer)?)
+                    .map_err(|_| EngineError::Binding)?
+            }
+        };
+        let object = self
+            .object_store
+            .get(scope, &value.digest)
+            .await
+            .map_err(|_| EngineError::ObjectRead)?;
+        if object.reference.size_bytes().to_string() != value.size_bytes
+            || object.reference.media_type() != value.media_type
+        {
+            return Err(EngineError::Binding);
+        }
+        serde_json::to_value(value).map_err(|_| EngineError::Binding)
     }
 
     async fn execute_choice(
@@ -960,16 +1036,32 @@ where
                 }
                 children.sort_by_key(|child| child.map_item_index);
                 let mut values: Vec<Value> = Vec::with_capacity(children.len());
-                for child in children {
-                    let output = child.result_ref.ok_or(EngineError::Binding)?;
-                    let object = self
-                        .object_store
-                        .get(scope, &output.0.digest)
-                        .await
-                        .map_err(|_| EngineError::ObjectRead)?;
+                for child in &children {
+                    let output = child.result_ref.clone().ok_or(EngineError::Binding)?;
+                    let object = match self.object_store.get(scope, &output.0.digest).await {
+                        Ok(object) => object,
+                        Err(error) => {
+                            self.store
+                                .mark_corrupt_storage(
+                                    scope,
+                                    MarkCorruptStorage {
+                                        run_id: run.run_id.clone(),
+                                        bad_ref: output.0,
+                                        proof: error.proof,
+                                        owner_node_id: Some(parent.node_instance_id.clone()),
+                                    },
+                                )
+                                .await?;
+                            changed += 1;
+                            break;
+                        }
+                    };
                     values.push(
                         serde_json::from_slice(&object.bytes).map_err(|_| EngineError::Binding)?,
                     );
+                }
+                if values.len() != children.len() {
+                    continue;
                 }
                 let bytes = serde_jcs::to_vec(&values).map_err(|_| EngineError::Binding)?;
                 let aggregate = self

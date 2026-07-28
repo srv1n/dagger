@@ -6,11 +6,13 @@ use dagger_workflow_core::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
     AuthenticatedPrincipal, DecisionAuthorizationPolicy,
 };
-use dagger_workflow_core::artifact::ObjectStore;
+use dagger_workflow_core::artifact::{
+    ObjectReadError, ObjectStore, ObjectStoreError, VerifiedObject, VerifiedObjectRef,
+};
 use dagger_workflow_core::definition::{
-    ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, MapBinding,
-    MapBindingSource, NodeDefinition, PublishableDefinition, RetryPolicy, TimeoutPolicy,
-    WorkflowDefinition,
+    ActionReference, ApprovalGateConfig, ArtifactLocator, BackoffPolicy, Binding, BindingSource,
+    MapBinding, MapBindingSource, NodeDefinition, PublishableDefinition, RetryPolicy,
+    TimeoutPolicy, WorkflowDefinition,
 };
 use dagger_workflow_core::engine::{EngineConfig, TestClock, WorkflowEngine};
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
@@ -28,11 +30,12 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Condvar, Mutex,
 };
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
+use std::time::Duration;
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
     struct ThreadWake(thread::Thread);
@@ -232,6 +235,204 @@ impl WorkflowAction for RetryOnce {
                 ActionOutcome::success(value, Vec::new(), CostUnits(1), None).unwrap()
             }
         })
+    }
+}
+
+struct SerialProbe {
+    descriptor: ActionDescriptor,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    calls: AtomicUsize,
+}
+
+impl WorkflowAction for SerialProbe {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _context: ActionContext,
+        canonical_bound_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.max_active.fetch_max(active, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(10));
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            let value: Value = serde_json::from_slice(canonical_bound_input).unwrap();
+            ActionOutcome::success(value, Vec::new(), CostUnits(1), None).unwrap()
+        })
+    }
+}
+
+struct BlockingExpiryStore {
+    inner: Arc<InMemoryObjectStore<TestClock>>,
+    armed: AtomicBool,
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl BlockingExpiryStore {
+    fn new(inner: Arc<InMemoryObjectStore<TestClock>>) -> Self {
+        Self {
+            inner,
+            armed: AtomicBool::new(false),
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    fn wait_until_blocked(&self) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.0)
+            .unwrap();
+        assert!(
+            !timeout.timed_out() && state.0,
+            "expiry put was not reached"
+        );
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+impl ObjectStore for BlockingExpiryStore {
+    async fn put(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        if self.armed.swap(false, Ordering::AcqRel)
+            && bytes == dagger_workflow_core::approval::canonical_expiry_approval_result()
+        {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+        self.inner.put(scope, bytes, media_type).await
+    }
+
+    async fn get(
+        &self,
+        scope: &ExecutionScope,
+        digest: &Digest,
+    ) -> Result<VerifiedObject, ObjectReadError> {
+        self.inner.get(scope, digest).await
+    }
+
+    async fn publish_if_absent(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        self.inner.publish_if_absent(scope, bytes, media_type).await
+    }
+}
+
+struct CorruptingOutputStore {
+    inner: Arc<InMemoryObjectStore<TestClock>>,
+    target: Vec<u8>,
+    matching_puts: AtomicUsize,
+}
+
+impl ObjectStore for CorruptingOutputStore {
+    async fn put(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        let reference = self.inner.put(scope, bytes, media_type).await?;
+        if bytes == self.target && self.matching_puts.fetch_add(1, Ordering::AcqRel) == 1 {
+            assert!(self
+                .inner
+                .corrupt_bytes(scope, reference.digest(), b"corrupt".to_vec()));
+        }
+        Ok(reference)
+    }
+
+    async fn get(
+        &self,
+        scope: &ExecutionScope,
+        digest: &Digest,
+    ) -> Result<VerifiedObject, ObjectReadError> {
+        self.inner.get(scope, digest).await
+    }
+
+    async fn publish_if_absent(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        self.inner.publish_if_absent(scope, bytes, media_type).await
+    }
+}
+
+fn map_workflow(
+    definition_id: &str,
+    descriptor: &ActionDescriptor,
+    items: Value,
+    max_items: u32,
+    max_concurrency: u32,
+    bindings: Vec<MapBinding>,
+) -> WorkflowDefinition {
+    WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: id(definition_id),
+        name: definition_id.to_owned(),
+        description: String::new(),
+        run_input_schema_digest: hash(b"{}"),
+        run_output_schema_digest: hash(b"{}"),
+        entry_node_id: id("map"),
+        nodes: vec![
+            NodeDefinition::Map {
+                id: id("map"),
+                items: BindingSource::Constant { value: items },
+                max_items,
+                max_concurrency,
+                action: ActionReference {
+                    name: descriptor.name.clone(),
+                    contract_version: descriptor.contract_version.clone(),
+                    input_schema_digest: descriptor.input_schema_digest.clone(),
+                    output_schema_digest: descriptor.output_schema_digest.clone(),
+                    compatible_implementation_requirement: descriptor
+                        .implementation_compatibility_digest
+                        .clone(),
+                },
+                bindings,
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![id("succeed")],
+            },
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::NodeOutput {
+                    node_id: id("map"),
+                    pointer: String::new(),
+                },
+            },
+        ],
     }
 }
 
@@ -1018,6 +1219,139 @@ fn approval_expiry_advances_downstream_frontier_through_engine_ticks() {
 }
 
 #[test]
+fn approval_decision_winning_between_due_scan_and_expiry_is_benign() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(1_500)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let inner = Arc::new(InMemoryObjectStore::new(clock.clone()));
+        let objects = Arc::new(BlockingExpiryStore::new(inner.clone()));
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("approval-race-definition"),
+            name: "approval-race".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(b"{}"),
+            run_output_schema_digest: hash(b"{}"),
+            entry_node_id: id("approval"),
+            nodes: vec![
+                NodeDefinition::Approval {
+                    id: id("approval"),
+                    request: BindingSource::RunInput {
+                        pointer: String::new(),
+                    },
+                    gate: ApprovalGateConfig {
+                        expires_after_ms: 50,
+                        on_expiry: ApprovalExpiryPolicy::Approve,
+                        authorization: DecisionAuthorizationPolicy {
+                            allowed_principal_ids: vec!["approver".to_owned()],
+                            allowed_role_ids: Vec::new(),
+                        },
+                    },
+                    next: vec![id("succeed")],
+                },
+                NodeDefinition::Succeed {
+                    id: id("succeed"),
+                    output: BindingSource::NodeOutput {
+                        node_id: id("approval"),
+                        pointer: String::new(),
+                    },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &inner,
+            &execution_scope,
+            definition,
+            "approval-race-run",
+            10_000,
+        )
+        .await;
+        let engine = Arc::new(
+            WorkflowEngine::new(
+                store.clone(),
+                objects.clone(),
+                Arc::new(InMemoryActionRegistry::new()),
+                EngineConfig {
+                    instance_id: id("approval-race-engine"),
+                    max_concurrency: 1,
+                },
+            )
+            .unwrap(),
+        );
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("approval-race-run"))
+            .await
+            .unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        let approval_node = store
+            .get_node(&execution_scope, &id("approval-race-run"), &id("approval"))
+            .await
+            .unwrap();
+        let gate_id = approval_node.approval_gate_id.unwrap();
+        let gate = store
+            .get_gate(&execution_scope, &id("approval-race-run"), &gate_id)
+            .await
+            .unwrap();
+        clock.advance_ms(51).unwrap();
+        objects.arm();
+        let tick_engine = engine.clone();
+        let tick_scope = execution_scope.clone();
+        let tick_thread = thread::spawn(move || block_on(tick_engine.tick(&tick_scope)));
+        objects.wait_until_blocked();
+        let principal = AuthenticatedPrincipal::mint(
+            execution_scope.clone(),
+            "approver".to_owned(),
+            Vec::new(),
+            hash(b"approval-race-auth"),
+        )
+        .unwrap();
+        let approval_output = inner
+            .put(
+                &execution_scope,
+                &canonical_human_approval_result(None, &principal),
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let run = store
+            .get_run(&execution_scope, &id("approval-race-run"))
+            .await
+            .unwrap()
+            .run;
+        store
+            .decide_approval(
+                &execution_scope,
+                DecideApproval {
+                    run_id: id("approval-race-run"),
+                    gate_id,
+                    expected_run_version: run.version,
+                    expected_gate_version: gate.version,
+                    decision: ApprovalDecision::Approve,
+                    decision_payload: None,
+                    approval_output: Some(approval_output),
+                    principal,
+                },
+            )
+            .await
+            .unwrap();
+        objects.release();
+        assert!(tick_thread.join().unwrap().is_ok());
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("approval-race-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Succeeded
+        );
+    });
+}
+
+#[test]
 fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
     block_on(async {
         let execution_scope = scope();
@@ -1146,6 +1480,314 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
                 {"index": 1, "item": {"value": 1}}
             ])
         );
+    });
+}
+
+#[test]
+fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(3_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = ActionDescriptor {
+            name: "fixture.serial-map".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(b"{}"),
+            output_schema_digest: hash(b"{}"),
+            implementation_compatibility_digest: hash(b"serial-map-implementation"),
+        };
+        let definition = map_workflow(
+            "serial-map-definition",
+            &descriptor,
+            json!([0, 1, 2]),
+            3,
+            1,
+            vec![
+                MapBinding {
+                    target: "/item".to_owned(),
+                    source: MapBindingSource::MapItem {
+                        pointer: String::new(),
+                    },
+                },
+                MapBinding {
+                    target: "/index".to_owned(),
+                    source: MapBindingSource::MapIndex,
+                },
+            ],
+        );
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "serial-map-run",
+            100_000,
+        )
+        .await;
+        let action = Arc::new(SerialProbe {
+            descriptor,
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+        });
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry.register(action.clone()).unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("serial-map-engine"),
+                max_concurrency: 3,
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("serial-map-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 12).await.unwrap();
+        assert_eq!(action.calls.load(Ordering::Acquire), 3);
+        assert_eq!(action.max_active.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("serial-map-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Succeeded
+        );
+    });
+}
+
+#[test]
+fn map_child_accepts_literal_artifact_ref_binding() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(4_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let seed = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("artifact-seed-definition"),
+            name: "artifact-seed".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(b"{}"),
+            run_output_schema_digest: hash(b"{}"),
+            entry_node_id: id("succeed"),
+            nodes: vec![NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::Constant { value: json!({}) },
+            }],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            seed,
+            "artifact-seed-run",
+            100_000,
+        )
+        .await;
+        let seed_run = store
+            .get_run(&execution_scope, &id("artifact-seed-run"))
+            .await
+            .unwrap()
+            .run;
+        let seed_revision = store
+            .get_revision(
+                &execution_scope,
+                &seed_run.definition_id,
+                &seed_run.revision_hash,
+            )
+            .await
+            .unwrap();
+        let literal = seed_revision.run_input_schema_ref.0;
+        let descriptor = ActionDescriptor {
+            name: "fixture.artifact-map".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(b"{}"),
+            output_schema_digest: hash(b"{}"),
+            implementation_compatibility_digest: hash(b"artifact-map-implementation"),
+        };
+        let definition = map_workflow(
+            "artifact-map-definition",
+            &descriptor,
+            json!([0]),
+            1,
+            1,
+            vec![MapBinding {
+                target: "/artifact".to_owned(),
+                source: MapBindingSource::ArtifactRef {
+                    source: ArtifactLocator::Literal {
+                        artifact_ref_id: literal.artifact_ref_id.clone(),
+                        digest: literal.digest.clone(),
+                        media_type: literal.media_type.clone(),
+                    },
+                },
+            }],
+        );
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "artifact-map-run",
+            100_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(RetryOnce {
+                descriptor,
+                fail: AtomicBool::new(false),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects.clone(),
+            registry,
+            EngineConfig {
+                instance_id: id("artifact-map-engine"),
+                max_concurrency: 2,
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("artifact-map-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        let parent = store
+            .get_node(&execution_scope, &id("artifact-map-run"), &id("map"))
+            .await
+            .unwrap();
+        let aggregate = objects
+            .get(
+                &execution_scope,
+                &parent.result_ref.as_ref().unwrap().0.digest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&aggregate.bytes).unwrap(),
+            json!([{
+                "artifact": {
+                    "artifact_ref_id": literal.artifact_ref_id,
+                    "digest": literal.digest,
+                    "media_type": literal.media_type,
+                    "size_bytes": literal.size_bytes.to_string()
+                }
+            }])
+        );
+    });
+}
+
+#[test]
+fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(4_500)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let inner = Arc::new(InMemoryObjectStore::new(clock));
+        let objects = Arc::new(CorruptingOutputStore {
+            inner: inner.clone(),
+            target: serde_jcs::to_vec(&json!({"index": 0, "item": {"value": 2}})).unwrap(),
+            matching_puts: AtomicUsize::new(0),
+        });
+        let descriptor = ActionDescriptor {
+            name: "fixture.corrupt-map".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(b"{}"),
+            output_schema_digest: hash(b"{}"),
+            implementation_compatibility_digest: hash(b"corrupt-map-implementation"),
+        };
+        let definition = map_workflow(
+            "corrupt-map-definition",
+            &descriptor,
+            json!([{"value": 2}]),
+            1,
+            1,
+            vec![
+                MapBinding {
+                    target: "/item".to_owned(),
+                    source: MapBindingSource::MapItem {
+                        pointer: String::new(),
+                    },
+                },
+                MapBinding {
+                    target: "/index".to_owned(),
+                    source: MapBindingSource::MapIndex,
+                },
+            ],
+        );
+        prepare_definition(
+            &store,
+            &inner,
+            &execution_scope,
+            definition,
+            "corrupt-map-run",
+            100_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(RetryOnce {
+                descriptor,
+                fail: AtomicBool::new(false),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("corrupt-map-engine"),
+                max_concurrency: 1,
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("corrupt-map-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 6).await.unwrap();
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("corrupt-map-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::CorruptStorage
+        );
+        let parent = store
+            .get_node(&execution_scope, &id("corrupt-map-run"), &id("map"))
+            .await
+            .unwrap();
+        assert_eq!(
+            parent.status,
+            dagger_workflow_core::run::NodeState::CorruptStorage
+        );
+        let events = store
+            .list_events_after(
+                &execution_scope,
+                &id("corrupt-map-run"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1_000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(events.iter().any(|event| event.transition_id == "N50"));
+        assert!(events.iter().any(|event| event.transition_id == "R15"));
     });
 }
 
