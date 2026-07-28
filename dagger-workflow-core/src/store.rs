@@ -44,20 +44,39 @@ pub struct EnginePermit {
 }
 
 impl std::fmt::Debug for EnginePermit {
-    fn fmt(&self, _formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnginePermit")
+            .field("instance_id", &self.instance_id)
+            .field("generation", &self.generation)
+            .field("session_token", &"<redacted>")
+            .finish()
     }
 }
 
 impl EnginePermit {
     /// Returns the non-secret engine label. Contract section 6.
     pub fn instance_id(&self) -> &Id {
-        todo!()
+        &self.instance_id
     }
 
     /// Returns the fenced engine generation. Contract section 6.
     pub fn generation(&self) -> u64 {
-        todo!()
+        self.generation
+    }
+
+    /// Mints a store-owned permit from exactly 256 bits of entropy.
+    pub(crate) fn mint(instance_id: Id, generation: u64, token: [u8; 32]) -> Self {
+        Self {
+            instance_id,
+            generation,
+            session_token: token.to_vec(),
+        }
+    }
+
+    /// Returns the raw capability only to store implementations.
+    pub(crate) fn session_token(&self) -> &[u8] {
+        &self.session_token
     }
 }
 

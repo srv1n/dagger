@@ -9,10 +9,13 @@ pub mod action;
 pub mod approval;
 pub mod artifact;
 pub mod budget;
+#[cfg(feature = "conformance")]
+pub mod conformance;
 pub mod definition;
 pub mod engine;
 pub mod event;
 pub mod ids;
+pub mod memory;
 pub mod revision;
 pub mod run;
 pub mod scope;

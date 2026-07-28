@@ -61,32 +61,48 @@ pub struct AuthenticatedPrincipal {
 impl AuthenticatedPrincipal {
     /// Mints a scope-bound principal from host-authenticated facts. Contract section 16.1.
     pub fn mint(
-        _scope: ExecutionScope,
-        _principal_id: String,
-        _role_ids: Vec<String>,
-        _authentication_context_digest: Digest,
+        scope: ExecutionScope,
+        principal_id: String,
+        mut role_ids: Vec<String>,
+        authentication_context_digest: Digest,
     ) -> Result<Self, PrincipalError> {
-        todo!()
+        if principal_id.is_empty() || principal_id.len() > 256 {
+            return Err(PrincipalError::InvalidPrincipalId);
+        }
+        if role_ids
+            .iter()
+            .any(|role| role.is_empty() || role.len() > 256)
+        {
+            return Err(PrincipalError::InvalidRoleId);
+        }
+        role_ids.sort();
+        role_ids.dedup();
+        Ok(Self {
+            scope,
+            principal_id,
+            role_ids,
+            authentication_context_digest,
+        })
     }
 
     /// Returns the bound scope. Contract section 16.1.
     pub fn scope(&self) -> &ExecutionScope {
-        todo!()
+        &self.scope
     }
 
     /// Returns the authenticated principal ID. Contract section 3.5.
     pub fn principal_id(&self) -> &str {
-        todo!()
+        &self.principal_id
     }
 
     /// Returns the authenticated role IDs. Contract section 3.5.
     pub fn role_ids(&self) -> &[String] {
-        todo!()
+        &self.role_ids
     }
 
     /// Returns the authentication-context digest. Contract section 3.5.
     pub fn authentication_context_digest(&self) -> &Digest {
-        todo!()
+        &self.authentication_context_digest
     }
 }
 
@@ -162,13 +178,25 @@ pub enum ApprovalResultSource {
 
 /// Constructs the canonical human approval result bytes. Contract section 3.5.
 pub fn canonical_human_approval_result(
-    _payload_ref: Option<crate::artifact::ArtifactRefValue>,
-    _principal: &AuthenticatedPrincipal,
+    payload_ref: Option<crate::artifact::ArtifactRefValue>,
+    principal: &AuthenticatedPrincipal,
 ) -> Vec<u8> {
-    todo!()
+    serde_jcs::to_vec(&ApprovalResult {
+        decision: ApprovalDecision::Approve,
+        source: ApprovalResultSource::Human,
+        payload_ref,
+        principal: Some(principal.principal_id().to_owned()),
+    })
+    .expect("closed approval result serializes")
 }
 
 /// Constructs the canonical expiry approval result bytes. Contract section 3.5.
 pub fn canonical_expiry_approval_result() -> Vec<u8> {
-    todo!()
+    serde_jcs::to_vec(&ApprovalResult {
+        decision: ApprovalDecision::Approve,
+        source: ApprovalResultSource::Expiry,
+        payload_ref: None,
+        principal: None,
+    })
+    .expect("closed approval result serializes")
 }

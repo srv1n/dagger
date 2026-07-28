@@ -106,21 +106,43 @@ pub struct VerifiedObjectRef {
 }
 
 impl VerifiedObjectRef {
+    /// Constructs a verified capability for an object-store implementation.
+    pub(crate) fn new(
+        scope: ExecutionScope,
+        digest: Digest,
+        size_bytes: u64,
+        media_type: String,
+        object_key: String,
+    ) -> Self {
+        Self {
+            scope,
+            digest,
+            size_bytes,
+            media_type,
+            object_key,
+        }
+    }
+
     /// Returns the capability scope. Contract section 5.1.
     pub fn scope(&self) -> &ExecutionScope {
-        todo!()
+        &self.scope
     }
     /// Returns the verified content digest. Contract section 5.1.
     pub fn digest(&self) -> &Digest {
-        todo!()
+        &self.digest
     }
     /// Returns the verified byte length. Contract section 5.1.
     pub fn size_bytes(&self) -> u64 {
-        todo!()
+        self.size_bytes
     }
     /// Returns the normalized media type. Contract section 5.1.
     pub fn media_type(&self) -> &str {
-        todo!()
+        &self.media_type
+    }
+
+    /// Returns the store-private key to the implementing control-plane store.
+    pub(crate) fn object_key(&self) -> &str {
+        &self.object_key
     }
 }
 
@@ -146,9 +168,59 @@ pub struct FailedReadProof {
 }
 
 impl FailedReadProof {
+    /// Mints a failed-read capability inside an object-store implementation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mint(
+        scope: ExecutionScope,
+        requested_digest: Digest,
+        error_class: FailedReadClass,
+        observed_digest: Option<Digest>,
+        store_instance_nonce: Vec<u8>,
+        proof_nonce: Vec<u8>,
+        checked_at: Timestamp,
+    ) -> Self {
+        Self {
+            scope,
+            requested_digest,
+            error_class,
+            observed_digest,
+            store_instance_nonce,
+            proof_nonce,
+            checked_at,
+        }
+    }
+
     /// Returns the closed read-failure class. Contract section 1.1.
     pub fn error_class(&self) -> FailedReadClass {
-        todo!()
+        self.error_class
+    }
+
+    /// Returns the proof scope to the control-plane verifier.
+    pub(crate) fn scope(&self) -> &ExecutionScope {
+        &self.scope
+    }
+
+    /// Returns the requested digest to the control-plane verifier.
+    pub(crate) fn requested_digest(&self) -> &Digest {
+        &self.requested_digest
+    }
+
+    /// Returns a stable persistence-safe proof fingerprint.
+    pub(crate) fn fingerprint_material(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(self.scope.tenant_id.as_str().as_bytes());
+        bytes.push(0);
+        bytes.extend(self.scope.namespace.as_str().as_bytes());
+        bytes.push(0);
+        bytes.extend(self.requested_digest.as_str().as_bytes());
+        bytes.push(self.error_class as u8);
+        if let Some(observed) = &self.observed_digest {
+            bytes.extend(observed.as_str().as_bytes());
+        }
+        bytes.extend(&self.store_instance_nonce);
+        bytes.extend(&self.proof_nonce);
+        bytes.extend(self.checked_at.0.to_be_bytes());
+        bytes
     }
 }
 
