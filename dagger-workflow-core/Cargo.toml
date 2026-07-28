@@ -7,6 +7,7 @@ rust-version = "1.74"
 [features]
 default = []
 conformance = []
+sqlite = ["dep:sqlx"]
 
 [dependencies]
 serde = { version = "1.0.197", features = ["derive"] }
@@ -15,3 +16,8 @@ serde-saphyr = { version = "1.0.0-rc.1", default-features = false, features = ["
 serde_jcs = "0.2"
 sha2 = "0.10"
 thiserror = "1.0"
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.0"
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread"] }

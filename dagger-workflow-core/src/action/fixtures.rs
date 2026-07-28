@@ -127,10 +127,20 @@ pub fn descriptor(name: &str) -> ActionDescriptor {
     ActionDescriptor {
         name: name.to_owned(),
         contract_version: "fixture-0.1".to_owned(),
-        input_schema_digest: fixture_digest(name, "input-schema"),
-        output_schema_digest: fixture_digest(name, "output-schema"),
+        input_schema_digest: fixture_schema_digest(),
+        output_schema_digest: fixture_schema_digest(),
         implementation_compatibility_digest: fixture_digest(name, "implementation"),
     }
+}
+
+/// Returns the exact permissive schema used by the deterministic fixtures.
+pub fn fixture_schema() -> Value {
+    json!({})
+}
+
+/// Returns the digest of [`fixture_schema`]'s canonical bytes.
+pub fn fixture_schema_digest() -> crate::ids::Digest {
+    digest_bytes(&serde_jcs::to_vec(&fixture_schema()).expect("fixture schema is canonical JSON"))
 }
 
 fn fixture_outcome(
@@ -170,7 +180,10 @@ fn fixture_outcome(
         "legal.summarize_evidence" | "legal.merge_second_round" => json!({
             "findings": [format!("finding-{marker}")],
             "gaps": [format!("gap-{marker}")],
-            "needs_second_round": bytes.first().is_some_and(|byte| byte % 2 == 0)
+            "needs_second_round": input
+                .get("question")
+                .and_then(Value::as_str)
+                .is_some_and(|question| question.contains("second-round"))
         }),
         "legal.synthesize_report" => json!({
             "draft_report": format!("draft-report-{marker}"),

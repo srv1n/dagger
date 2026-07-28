@@ -9,11 +9,11 @@ use crate::definition::{
     NodeDefinition, WorkflowDefinition,
 };
 use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChildIdentity};
-use crate::run::{NodeKind, NodeRun};
+use crate::run::{NodeFailureKind, NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
+    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime, FailContract,
     MarkCorruptStorage, OrderedMapItem, PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun,
     ReleaseRetry, RequestApproval, ResolveTerminalNode, ResumeCompatible, StartRun, StoreError,
     SuspendIncompatible, TimeoutAttempt, WorkflowStore,
@@ -930,20 +930,43 @@ where
                 child_id,
             });
         }
-        self.store
+        match self
+            .store
             .expand_map(
                 scope,
                 ExpandMap {
                     permit: permit.clone(),
-                    run_id: node.run_id,
-                    map_node_id: node.node_instance_id,
+                    run_id: node.run_id.clone(),
+                    map_node_id: node.node_instance_id.clone(),
                     expected_node_version: node.version,
                     input,
                     ordered_items,
                     expansion_digest: map_expansion_digest(&identities),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(_) => {}
+            // Map cardinality is a runtime contract failure, not a scheduler error. The
+            // expansion command validates the untrusted ordered child set; the engine owns
+            // the N46/R08 transition for the still-Ready Map node.
+            Err(StoreError::ContractValidationApplied { code }) if code == "MapBoundExceeded" => {
+                self.store
+                    .fail_contract(
+                        scope,
+                        FailContract {
+                            permit: permit.clone(),
+                            run_id: node.run_id,
+                            node_id: node.node_instance_id,
+                            expected_node_version: node.version,
+                            closed_failure_kind: NodeFailureKind::MapBoundExceeded,
+                            diagnostics: None,
+                        },
+                    )
+                    .await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 

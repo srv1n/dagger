@@ -1,14 +1,11 @@
-//! Deterministic in-memory implementations of the frozen store boundaries.
+//! Deterministic transaction-local implementations of the frozen store boundaries.
 
 use crate::action::{
     ActionInvocation, ActionOutcome, CompletionCredential, DiagnosticsEnvelope,
     DiagnosticsValidationError,
 };
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalResolutionSource};
-use crate::artifact::{
-    ArtifactKind, ArtifactMetadataConflict, ArtifactRef, FailedReadClass, FailedReadProof, JsonRef,
-    ObjectReadError, ObjectStore, ObjectStoreError, VerifiedObject, VerifiedObjectRef,
-};
+use crate::artifact::{ArtifactKind, ArtifactRef, FailedReadClass, JsonRef, VerifiedObjectRef};
 use crate::budget::{BudgetLedgerEntry, BudgetLedgerKind, BudgetLedgerReason};
 use crate::definition::{ActionPin, BackoffPolicy, NodeDefinition, PublishableDefinition};
 use crate::engine::Clock;
@@ -64,232 +61,100 @@ fn valid_metadata(display_name: &str, description: &str) -> bool {
     !display_name.is_empty() && display_name.len() <= 200 && description.len() <= 4_000
 }
 
-/// Scope-confined content-addressed volatile object storage.
-pub struct InMemoryObjectStore<C> {
-    clock: Arc<C>,
-    nonce: Vec<u8>,
-    objects: Mutex<BTreeMap<(ExecutionScope, Digest), MemoryObject>>,
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ReducerState {
+    pub(crate) object_store_nonce: Option<Vec<u8>>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) verified_object_bytes: BTreeMap<(ExecutionScope, Digest), Vec<u8>>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) definitions: BTreeMap<(ExecutionScope, Id), DefinitionRecord>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) revisions: BTreeMap<(ExecutionScope, Id, Digest), WorkflowRevision>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) parsed_revisions: BTreeMap<(ExecutionScope, Id, Digest), PublishableDefinition>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) claims: BTreeMap<ExecutionScope, StoredClaim>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) runs: BTreeMap<(ExecutionScope, Id), WorkflowRun>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) run_definitions: BTreeMap<(ExecutionScope, Id), PublishableDefinition>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) nodes: BTreeMap<(ExecutionScope, Id, NodeInstanceId), NodeRun>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) edges: BTreeMap<(ExecutionScope, Id, Id), EdgeFact>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) attempts: BTreeMap<(ExecutionScope, Id, Id), NodeAttempt>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) invocations: BTreeMap<(ExecutionScope, Id, Id), ActionInvocation>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) gates: BTreeMap<(ExecutionScope, Id, Id), ApprovalGate>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) receipts: BTreeMap<(ExecutionScope, CommandKindKey, String), CommandReceipt>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) events: BTreeMap<(ExecutionScope, Id), Vec<WorkflowEvent>>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) ledger: BTreeMap<(ExecutionScope, Id), Vec<BudgetLedgerEntry>>,
+    pub(crate) stale_observed: BTreeSet<(ExecutionScope, Id, Id)>,
+    pub(crate) batch_counter: u64,
 }
 
-#[derive(Clone)]
-struct MemoryObject {
-    bytes: Vec<u8>,
-    media_type: String,
-    object_key: String,
-}
+mod map_as_sequence {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
 
-impl<C: Clock> InMemoryObjectStore<C> {
-    /// Creates an empty object store using the supplied store clock.
-    pub fn new(clock: Arc<C>) -> Self {
-        Self {
-            clock,
-            nonce: entropy().unwrap_or([0x5a; 32]).to_vec(),
-            objects: Mutex::new(BTreeMap::new()),
-        }
+    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
+        map: &BTreeMap<K, V>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        map.iter().collect::<Vec<_>>().serialize(serializer)
     }
 
-    /// Test-only corruption hook that replaces committed bytes without metadata changes.
-    pub fn corrupt_bytes(
-        &self,
-        scope: &ExecutionScope,
-        object_digest: &Digest,
-        bytes: Vec<u8>,
-    ) -> bool {
-        let mut objects = self.objects.lock().expect("object lock poisoned");
-        if let Some(object) = objects.get_mut(&(scope.clone(), object_digest.clone())) {
-            object.bytes = bytes;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn proof(
-        &self,
-        scope: &ExecutionScope,
-        requested: &Digest,
-        class: FailedReadClass,
-        observed: Option<Digest>,
-    ) -> FailedReadProof {
-        FailedReadProof::mint(
-            scope.clone(),
-            requested.clone(),
-            class,
-            observed,
-            self.nonce.clone(),
-            entropy().unwrap_or([0xa5; 32]).to_vec(),
-            self.clock.now(),
-        )
-    }
-}
-
-impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
-    async fn put(
-        &self,
-        scope: &ExecutionScope,
-        bytes: &[u8],
-        media_type: &str,
-    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
-        self.publish_if_absent(scope, bytes, media_type).await
-    }
-
-    async fn get(
-        &self,
-        scope: &ExecutionScope,
-        requested: &Digest,
-    ) -> Result<VerifiedObject, ObjectReadError> {
-        let object = self
-            .objects
-            .lock()
-            .expect("object lock poisoned")
-            .get(&(scope.clone(), requested.clone()))
-            .cloned()
-            .ok_or_else(|| ObjectReadError {
-                proof: self.proof(scope, requested, FailedReadClass::Missing, None),
-            })?;
-        let observed = digest(&object.bytes);
-        if &observed != requested {
-            return Err(ObjectReadError {
-                proof: self.proof(
-                    scope,
-                    requested,
-                    FailedReadClass::DigestInvalid,
-                    Some(observed),
-                ),
-            });
-        }
-        Ok(VerifiedObject {
-            reference: VerifiedObjectRef::new(
-                scope.clone(),
-                requested.clone(),
-                object.bytes.len() as u64,
-                object.media_type,
-                object.object_key,
-                self.nonce.clone(),
-                object.bytes.clone(),
-            ),
-            bytes: object.bytes,
-        })
-    }
-
-    async fn publish_if_absent(
-        &self,
-        scope: &ExecutionScope,
-        bytes: &[u8],
-        media_type: &str,
-    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
-        if media_type.is_empty() || media_type.len() > 255 {
-            return Err(ObjectStoreError::InvalidField);
-        }
-        let object_digest = digest(bytes);
-        let key = (scope.clone(), object_digest.clone());
-        let mut objects = self.objects.lock().expect("object lock poisoned");
-        if let Some(existing) = objects.get(&key) {
-            if existing.bytes != bytes || existing.media_type != media_type {
-                return Err(ArtifactMetadataConflict {
-                    digest: object_digest,
-                    existing_size_bytes: existing.bytes.len() as u64,
-                    candidate_size_bytes: bytes.len() as u64,
-                }
-                .into());
-            }
-            return Ok(VerifiedObjectRef::new(
-                scope.clone(),
-                key.1,
-                bytes.len() as u64,
-                media_type.to_owned(),
-                existing.object_key.clone(),
-                self.nonce.clone(),
-                bytes.to_vec(),
-            ));
-        }
-        let object_key = format!(
-            "{}/{}/{}",
-            scope.tenant_id.as_str(),
-            scope.namespace.as_str(),
-            object_digest.as_str()
-        );
-        objects.insert(
-            key,
-            MemoryObject {
-                bytes: bytes.to_vec(),
-                media_type: media_type.to_owned(),
-                object_key: object_key.clone(),
-            },
-        );
-        Ok(VerifiedObjectRef::new(
-            scope.clone(),
-            object_digest,
-            bytes.len() as u64,
-            media_type.to_owned(),
-            object_key,
-            self.nonce.clone(),
-            bytes.to_vec(),
-        ))
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Vec::<(K, V)>::deserialize(deserializer)
+            .map(Vec::into_iter)
+            .map(Iterator::collect)
     }
 }
 
-#[derive(Clone, Default)]
-struct MemoryState {
-    object_store_nonce: Option<Vec<u8>>,
-    object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
-    verified_object_bytes: BTreeMap<(ExecutionScope, Digest), Vec<u8>>,
-    artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,
-    definitions: BTreeMap<(ExecutionScope, Id), DefinitionRecord>,
-    revisions: BTreeMap<(ExecutionScope, Id, Digest), WorkflowRevision>,
-    parsed_revisions: BTreeMap<(ExecutionScope, Id, Digest), PublishableDefinition>,
-    claims: BTreeMap<ExecutionScope, StoredClaim>,
-    runs: BTreeMap<(ExecutionScope, Id), WorkflowRun>,
-    run_definitions: BTreeMap<(ExecutionScope, Id), PublishableDefinition>,
-    nodes: BTreeMap<(ExecutionScope, Id, NodeInstanceId), NodeRun>,
-    edges: BTreeMap<(ExecutionScope, Id, Id), EdgeFact>,
-    attempts: BTreeMap<(ExecutionScope, Id, Id), NodeAttempt>,
-    invocations: BTreeMap<(ExecutionScope, Id, Id), ActionInvocation>,
-    gates: BTreeMap<(ExecutionScope, Id, Id), ApprovalGate>,
-    receipts: BTreeMap<(ExecutionScope, CommandKindKey, String), CommandReceipt>,
-    events: BTreeMap<(ExecutionScope, Id), Vec<WorkflowEvent>>,
-    ledger: BTreeMap<(ExecutionScope, Id), Vec<BudgetLedgerEntry>>,
-    stale_observed: BTreeSet<(ExecutionScope, Id, Id)>,
-    batch_counter: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CommandKindKey {
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub(crate) enum CommandKindKey {
     Create,
     Cancel,
 }
 
-#[derive(Clone)]
-struct StoredClaim {
-    claim: EngineClaim,
-    token_digest: Digest,
-    released_token_digest: Option<Digest>,
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct StoredClaim {
+    pub(crate) claim: EngineClaim,
+    pub(crate) token_digest: Digest,
+    pub(crate) released_token_digest: Option<Digest>,
 }
 
-/// Transactional volatile implementation of the real [`WorkflowStore`] trait.
-pub struct InMemoryStore<C> {
+/// Transactional transaction-local implementation of the real [`WorkflowStore`] trait.
+pub struct ReducerStore<C> {
     clock: Arc<C>,
-    state: Mutex<MemoryState>,
+    state: Mutex<ReducerState>,
 }
 
-impl<C: Clock> InMemoryStore<C> {
-    /// Creates an empty control-plane store using one database-equivalent clock.
-    pub fn new(clock: Arc<C>) -> Self {
+impl<C: Clock> ReducerStore<C> {
+    pub(crate) fn from_state(clock: Arc<C>, state: ReducerState) -> Self {
         Self {
             clock,
-            state: Mutex::new(MemoryState::default()),
+            state: Mutex::new(state),
         }
     }
 
-    /// Returns the immutable budget ledger for conformance and diagnostics.
-    pub fn budget_ledger(&self, scope: &ExecutionScope, run_id: &Id) -> Vec<BudgetLedgerEntry> {
-        self.state
-            .lock()
-            .expect("store lock poisoned")
-            .ledger
-            .get(&(scope.clone(), run_id.clone()))
-            .cloned()
-            .unwrap_or_default()
+    pub(crate) fn snapshot(&self) -> ReducerState {
+        self.state.lock().expect("store lock poisoned").clone()
     }
 
     /// Returns exact registered object metadata for conformance diagnostics.
@@ -304,29 +169,13 @@ impl<C: Clock> InMemoryStore<C> {
             .collect()
     }
 
-    /// Returns one immutable invocation.
-    pub fn get_invocation(
-        &self,
-        scope: &ExecutionScope,
-        run_id: &Id,
-        invocation_id: &Id,
-    ) -> Result<ActionInvocation, StoreError> {
-        self.state
-            .lock()
-            .expect("store lock poisoned")
-            .invocations
-            .get(&(scope.clone(), run_id.clone(), invocation_id.clone()))
-            .cloned()
-            .ok_or(StoreError::NotFound)
-    }
-
     fn now(&self) -> Timestamp {
         self.clock.now()
     }
 
     fn transaction<T>(
         &self,
-        operation: impl FnOnce(&mut MemoryState, Timestamp) -> Result<T, StoreError>,
+        operation: impl FnOnce(&mut ReducerState, Timestamp) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         let mut committed = self.state.lock().expect("store lock poisoned");
         let now = self.clock.now();
@@ -406,7 +255,7 @@ impl<C: Clock> InMemoryStore<C> {
 }
 
 fn verified(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     object: &VerifiedObjectRef,
     now: Timestamp,
@@ -444,7 +293,7 @@ fn verified(
 }
 
 fn artifact(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     object: &VerifiedObjectRef,
     kind: ArtifactKind,
@@ -489,7 +338,7 @@ fn artifact(
 }
 
 fn json_ref(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     object: &VerifiedObjectRef,
     kind: ArtifactKind,
@@ -677,7 +526,7 @@ fn action_config<'a>(
 }
 
 fn validate_bound_artifact_refs(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     definition: &PublishableDefinition,
     node: &NodeRun,
@@ -925,7 +774,7 @@ fn supported_pattern_matches(pattern: &str, value: &str) -> bool {
             b'[' | b'(' | b'{' | b'*' | b'+' | b'?' | b'|' | b'\\' | b'.'
         )
     }) {
-        // Publication already validated the Rust-regex syntax. The volatile
+        // Publication already validated the Rust-regex syntax. The transaction-local
         // adapter fails closed for patterns outside its literal fast path.
         return false;
     }
@@ -1556,7 +1405,7 @@ pub(crate) fn recovery_subject_order_key(
 }
 
 fn event_reserve(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
 ) -> Result<u64, StoreError> {
@@ -1620,7 +1469,7 @@ fn event_reserve(
 }
 
 fn append_batch(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     now: Timestamp,
@@ -1731,7 +1580,7 @@ fn append_batch(
 }
 
 fn permit_check(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     permit: &EnginePermit,
     now: Timestamp,
@@ -1750,7 +1599,7 @@ fn permit_check(
 }
 
 fn command_fence(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     permit: Option<&EnginePermit>,
@@ -1775,7 +1624,7 @@ fn command_fence(
 }
 
 fn running_fence(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     permit: Option<&EnginePermit>,
@@ -1809,7 +1658,7 @@ fn set_node_mutated(node: &mut NodeRun, now: Timestamp) -> Result<(), StoreError
 }
 
 fn bump_frontier_epoch(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
 ) -> Result<(), StoreError> {
@@ -1825,7 +1674,7 @@ fn bump_frontier_epoch(
 }
 
 fn frontier_reduce(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     source_node: &Id,
@@ -1982,7 +1831,7 @@ fn frontier_reduce(
 }
 
 fn settle(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     attempt: &mut NodeAttempt,
@@ -2042,7 +1891,7 @@ fn settle(
 }
 
 fn cancellation_cascade(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     terminal: RunState,
@@ -2146,7 +1995,7 @@ fn cancellation_cascade(
 }
 
 fn terminalize_run(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     status: RunState,
@@ -2168,7 +2017,7 @@ fn terminalize_run(
 }
 
 fn apply_map_contract_failure(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     map_node_id: &Id,
@@ -2290,7 +2139,7 @@ fn timestamp_cursor_key(timestamp: Timestamp) -> String {
     format!("{:016x}", (timestamp.0 as u64) ^ (1_u64 << 63))
 }
 
-impl<C: Clock> WorkflowStore for InMemoryStore<C> {
+impl<C: Clock> WorkflowStore for ReducerStore<C> {
     async fn create_definition(
         &self,
         scope: &ExecutionScope,
@@ -7073,7 +6922,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
 }
 
 fn scan_nodes<C: Clock>(
-    mutex: &Mutex<MemoryState>,
+    mutex: &Mutex<ReducerState>,
     clock: &Arc<C>,
     scope: &ExecutionScope,
     page: PageRequest,
@@ -7190,7 +7039,7 @@ fn outcome_cost_reason(outcome: &ActionOutcome) -> (CostUnits, BudgetLedgerReaso
 }
 
 fn budget_settled_spec(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     attempt: &NodeAttempt,
@@ -7246,7 +7095,7 @@ fn budget_settled_spec(
 }
 
 fn timeout_active(
-    state: &mut MemoryState,
+    state: &mut ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     node: &mut NodeRun,
@@ -7288,7 +7137,7 @@ fn timeout_active(
 }
 
 fn timeout_specs(
-    state: &MemoryState,
+    state: &ReducerState,
     scope: &ExecutionScope,
     run_id: &Id,
     attempt: &NodeAttempt,

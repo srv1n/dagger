@@ -19,4 +19,6 @@ pub mod memory;
 pub mod revision;
 pub mod run;
 pub mod scope;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 pub mod store;
