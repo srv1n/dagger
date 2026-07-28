@@ -1,6 +1,6 @@
 use dagger_workflow_core::action::{
-    ActionContext, ActionDescriptor, ActionOutcome, ActionRegistry, CompatibilityReport,
-    InMemoryActionRegistry, WorkflowAction,
+    ActionContext, ActionDescriptor, ActionOutcome, ActionRegistry, ArtifactOutput,
+    CompatibilityReport, InMemoryActionRegistry, WorkflowAction,
 };
 use dagger_workflow_core::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
@@ -21,8 +21,9 @@ use dagger_workflow_core::run::{AttemptState, RunLimits, RunState};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CreateDefinition, CreateRun, DecideApproval,
-    EventPageRequest, PageRequest, PublishRevision, RequestApproval, ResolvedActionSchemas,
-    StartRun, SuspendIncompatible, TimeoutAttempt, WorkflowStore,
+    EventPageRequest, MarkCorruptStorage, PageRequest, PublishRevision, RequestApproval,
+    ResolvedActionSchemas, StartRun, StoreError, SuspendIncompatible, TimeoutAttempt,
+    WorkflowStore,
 };
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
@@ -240,9 +241,64 @@ impl WorkflowAction for RetryOnce {
 
 struct SerialProbe {
     descriptor: ActionDescriptor,
-    active: AtomicUsize,
-    max_active: AtomicUsize,
-    calls: AtomicUsize,
+    state: Mutex<(usize, usize)>,
+    changed: Condvar,
+}
+
+struct ArtifactReturning {
+    descriptor: ActionDescriptor,
+    artifact: VerifiedObjectRef,
+}
+
+impl WorkflowAction for ArtifactReturning {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _context: ActionContext,
+        canonical_bound_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let value: Value = serde_json::from_slice(canonical_bound_input).unwrap();
+            ActionOutcome::success(
+                value,
+                vec![ArtifactOutput {
+                    media_type: self.artifact.media_type().to_owned(),
+                    object: self.artifact.clone(),
+                }],
+                CostUnits(1),
+                None,
+            )
+            .unwrap()
+        })
+    }
+}
+
+impl SerialProbe {
+    fn wait_until_started(&self, expected: usize) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(2), |state| state.0 < expected)
+            .unwrap();
+        assert!(
+            !timeout.timed_out() && state.0 == expected,
+            "serial action invocation {expected} was not observed"
+        );
+    }
+
+    fn release(&self, expected: usize) {
+        let mut state = self.state.lock().unwrap();
+        assert_eq!(state.0, expected);
+        state.1 = expected;
+        self.changed.notify_all();
+    }
+
+    fn calls(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
 }
 
 impl WorkflowAction for SerialProbe {
@@ -256,11 +312,14 @@ impl WorkflowAction for SerialProbe {
         canonical_bound_input: &'a [u8],
     ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
-            self.max_active.fetch_max(active, Ordering::AcqRel);
-            thread::sleep(Duration::from_millis(10));
-            self.active.fetch_sub(1, Ordering::AcqRel);
+            let mut state = self.state.lock().unwrap();
+            state.0 += 1;
+            let invocation = state.0;
+            self.changed.notify_all();
+            while state.1 < invocation {
+                state = self.changed.wait(state).unwrap();
+            }
+            drop(state);
             let value: Value = serde_json::from_slice(canonical_bound_input).unwrap();
             ActionOutcome::success(value, Vec::new(), CostUnits(1), None).unwrap()
         })
@@ -431,6 +490,72 @@ fn map_workflow(
                     node_id: id("map"),
                     pointer: String::new(),
                 },
+            },
+        ],
+    }
+}
+
+fn two_map_workflow(definition_id: &str, descriptor: &ActionDescriptor) -> WorkflowDefinition {
+    let action = ActionReference {
+        name: descriptor.name.clone(),
+        contract_version: descriptor.contract_version.clone(),
+        input_schema_digest: descriptor.input_schema_digest.clone(),
+        output_schema_digest: descriptor.output_schema_digest.clone(),
+        compatible_implementation_requirement: descriptor
+            .implementation_compatibility_digest
+            .clone(),
+    };
+    let map = |map_id: &str, value: u64| NodeDefinition::Map {
+        id: id(map_id),
+        items: BindingSource::Constant {
+            value: json!([value]),
+        },
+        max_items: 1,
+        max_concurrency: 1,
+        action: action.clone(),
+        bindings: vec![MapBinding {
+            target: "/item".to_owned(),
+            source: MapBindingSource::MapItem {
+                pointer: String::new(),
+            },
+        }],
+        retry: RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+        timeout: TimeoutPolicy { timeout_ms: 1_000 },
+        declared_max_cost_units: CostUnits(1),
+        next: vec![id("succeed")],
+    };
+    WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: id(definition_id),
+        name: definition_id.to_owned(),
+        description: String::new(),
+        run_input_schema_digest: hash(b"{}"),
+        run_output_schema_digest: hash(b"{}"),
+        entry_node_id: id("fanout"),
+        nodes: vec![
+            NodeDefinition::Action {
+                id: id("fanout"),
+                action: action.clone(),
+                bindings: vec![Binding {
+                    target: String::new(),
+                    source: BindingSource::Constant { value: json!({}) },
+                }],
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![id("map-a"), id("map-b")],
+            },
+            map("map-a", 2),
+            map("map-b", 3),
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::Constant { value: json!({}) },
             },
         ],
     }
@@ -1527,9 +1652,8 @@ fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
         .await;
         let action = Arc::new(SerialProbe {
             descriptor,
-            active: AtomicUsize::new(0),
-            max_active: AtomicUsize::new(0),
-            calls: AtomicUsize::new(0),
+            state: Mutex::new((0, 0)),
+            changed: Condvar::new(),
         });
         let registry = Arc::new(InMemoryActionRegistry::new());
         registry.register(action.clone()).unwrap();
@@ -1548,9 +1672,45 @@ fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
             .start(&execution_scope, &id("serial-map-run"))
             .await
             .unwrap();
-        engine.run_until_idle(&execution_scope, 12).await.unwrap();
-        assert_eq!(action.calls.load(Ordering::Acquire), 3);
-        assert_eq!(action.max_active.load(Ordering::Acquire), 1);
+        engine.tick(&execution_scope).await.unwrap();
+        for invocation in 1..=3 {
+            thread::scope(|thread_scope| {
+                let handle = thread_scope.spawn(|| {
+                    block_on(engine.tick(&execution_scope)).unwrap();
+                });
+                action.wait_until_started(invocation);
+                let children = block_on(store.list_nodes(
+                    &execution_scope,
+                    &id("serial-map-run"),
+                    PageRequest {
+                        cursor: None,
+                        page_size: 100,
+                    },
+                ))
+                .unwrap()
+                .items
+                .into_iter()
+                .filter(|node| node.parent_map_instance_id.as_ref() == Some(&id("map")))
+                .collect::<Vec<_>>();
+                let mut started = 0;
+                for child in children {
+                    if let Some(attempt_id) = child.active_attempt_id {
+                        let attempt = block_on(store.get_attempt(
+                            &execution_scope,
+                            &id("serial-map-run"),
+                            &attempt_id,
+                        ))
+                        .unwrap();
+                        started += usize::from(attempt.status == AttemptState::Started);
+                    }
+                }
+                assert_eq!(started, 1, "invocation {invocation} violated Map cap");
+                action.release(invocation);
+                handle.join().unwrap();
+            });
+        }
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        assert_eq!(action.calls(), 3);
         assert_eq!(
             store
                 .get_run(&execution_scope, &id("serial-map-run"))
@@ -1688,7 +1848,7 @@ fn map_child_accepts_literal_artifact_ref_binding() {
 }
 
 #[test]
-fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
+fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
     block_on(async {
         let execution_scope = scope();
         let clock = Arc::new(TestClock::new(Timestamp(4_500)));
@@ -1696,7 +1856,7 @@ fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
         let inner = Arc::new(InMemoryObjectStore::new(clock));
         let objects = Arc::new(CorruptingOutputStore {
             inner: inner.clone(),
-            target: serde_jcs::to_vec(&json!({"index": 0, "item": {"value": 2}})).unwrap(),
+            target: serde_jcs::to_vec(&json!({"item": {"value": 2}})).unwrap(),
             matching_puts: AtomicUsize::new(0),
         });
         let descriptor = ActionDescriptor {
@@ -1709,21 +1869,15 @@ fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
         let definition = map_workflow(
             "corrupt-map-definition",
             &descriptor,
-            json!([{"value": 2}]),
+            json!([{"value": 2}, {"value": 2}]),
+            2,
             1,
-            1,
-            vec![
-                MapBinding {
-                    target: "/item".to_owned(),
-                    source: MapBindingSource::MapItem {
-                        pointer: String::new(),
-                    },
+            vec![MapBinding {
+                target: "/item".to_owned(),
+                source: MapBindingSource::MapItem {
+                    pointer: String::new(),
                 },
-                MapBinding {
-                    target: "/index".to_owned(),
-                    source: MapBindingSource::MapIndex,
-                },
-            ],
+            }],
         );
         prepare_definition(
             &store,
@@ -1734,11 +1888,19 @@ fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
             100_000,
         )
         .await;
+        let unrelated_artifact = inner
+            .put(
+                &execution_scope,
+                br#"{"not":"the consumed result"}"#,
+                "application/json",
+            )
+            .await
+            .unwrap();
         let registry = Arc::new(InMemoryActionRegistry::new());
         registry
-            .register(Arc::new(RetryOnce {
+            .register(Arc::new(ArtifactReturning {
                 descriptor,
-                fail: AtomicBool::new(false),
+                artifact: unrelated_artifact,
             }))
             .unwrap();
         let engine = WorkflowEngine::new(
@@ -1756,7 +1918,92 @@ fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
             .start(&execution_scope, &id("corrupt-map-run"))
             .await
             .unwrap();
-        engine.run_until_idle(&execution_scope, 6).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        let nodes = store
+            .list_nodes(
+                &execution_scope,
+                &id("corrupt-map-run"),
+                PageRequest {
+                    cursor: None,
+                    page_size: 100,
+                },
+            )
+            .await
+            .unwrap()
+            .items;
+        let child = nodes
+            .iter()
+            .find(|node| {
+                node.parent_map_instance_id.as_ref() == Some(&id("map"))
+                    && node.status == dagger_workflow_core::run::NodeState::Succeeded
+            })
+            .unwrap();
+        let events = store
+            .list_events_after(
+                &execution_scope,
+                &id("corrupt-map-run"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1_000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        let attempt_id = events
+            .iter()
+            .find(|event| {
+                event.node_instance_id.as_ref() == Some(&child.node_instance_id)
+                    && event.attempt_id.is_some()
+            })
+            .and_then(|event| event.attempt_id.clone())
+            .unwrap();
+        let attempt = store
+            .get_attempt(&execution_scope, &id("corrupt-map-run"), &attempt_id)
+            .await
+            .unwrap();
+        let other = attempt.artifact_refs[0].clone();
+        assert!(inner.corrupt_bytes(
+            &execution_scope,
+            &other.digest,
+            b"corrupt-artifact".to_vec()
+        ));
+        let other_failure = inner
+            .get(&execution_scope, &other.digest)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            store
+                .mark_corrupt_storage(
+                    &execution_scope,
+                    MarkCorruptStorage {
+                        run_id: id("corrupt-map-run"),
+                        bad_ref: other,
+                        proof: other_failure.proof,
+                        owner_node_id: Some(id("map")),
+                    },
+                )
+                .await,
+            Err(StoreError::InvalidFailedReadProof)
+        ));
+        let consumed = child.result_ref.as_ref().unwrap().0.clone();
+        let consumed_failure = inner
+            .get(&execution_scope, &consumed.digest)
+            .await
+            .unwrap_err();
+        store
+            .mark_corrupt_storage(
+                &execution_scope,
+                MarkCorruptStorage {
+                    run_id: id("corrupt-map-run"),
+                    bad_ref: consumed,
+                    proof: consumed_failure.proof,
+                    owner_node_id: Some(id("map")),
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .get_run(&execution_scope, &id("corrupt-map-run"))
@@ -1788,6 +2035,83 @@ fn corrupt_map_child_output_marks_waiting_parent_and_run_corrupt() {
             .unwrap();
         assert!(events.iter().any(|event| event.transition_id == "N50"));
         assert!(events.iter().any(|event| event.transition_id == "R15"));
+    });
+}
+
+#[test]
+fn corrupting_one_map_does_not_complete_another_from_a_stale_snapshot() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(4_750)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let inner = Arc::new(InMemoryObjectStore::new(clock));
+        let objects = Arc::new(CorruptingOutputStore {
+            inner: inner.clone(),
+            target: serde_jcs::to_vec(&json!({"item": 2})).unwrap(),
+            matching_puts: AtomicUsize::new(0),
+        });
+        let descriptor = ActionDescriptor {
+            name: "fixture.two-map-corruption".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(b"{}"),
+            output_schema_digest: hash(b"{}"),
+            implementation_compatibility_digest: hash(b"two-map-corruption-implementation"),
+        };
+        prepare_definition(
+            &store,
+            &inner,
+            &execution_scope,
+            two_map_workflow("two-map-corruption-definition", &descriptor),
+            "two-map-corruption-run",
+            100_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(RetryOnce {
+                descriptor,
+                fail: AtomicBool::new(false),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("two-map-corruption-engine"),
+                max_concurrency: 2,
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("two-map-corruption-run"))
+            .await
+            .unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("two-map-corruption-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::CorruptStorage
+        );
+        assert_eq!(
+            store
+                .get_node(
+                    &execution_scope,
+                    &id("two-map-corruption-run"),
+                    &id("map-b"),
+                )
+                .await
+                .unwrap()
+                .status,
+            dagger_workflow_core::run::NodeState::Cancelled
+        );
     });
 }
 
