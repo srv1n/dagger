@@ -2,9 +2,11 @@
 
 use crate::approval::{ApprovalExpiryPolicy, DecisionAuthorizationPolicy};
 use crate::ids::{CostUnits, Digest, Id, TopologicalRank};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use sha2::{Digest as _, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The strict, normalized workflow definition document. Contract section 14.1.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -150,6 +152,23 @@ pub struct ActionPin {
     pub input_schema_ref: crate::artifact::JsonRef,
     /// Durable supported-subset output schema ref. Contract section 1.3.
     pub output_schema_ref: crate::artifact::JsonRef,
+}
+
+/// An action pin extracted from a validated definition before durable schema refs exist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractedActionPin {
+    /// Node ID or `node_id/map_action`; this is the durable pin key.
+    pub reference_location: String,
+    /// Registry action name.
+    pub name: String,
+    /// Pinned action contract version.
+    pub contract_version: String,
+    /// Pinned action input schema digest.
+    pub input_schema_digest: Digest,
+    /// Pinned action output schema digest.
+    pub output_schema_digest: Digest,
+    /// Exact semantic implementation requirement.
+    pub compatible_implementation_requirement: Digest,
 }
 
 /// A timeout policy for one attempt. Contract section 14.1.
@@ -388,6 +407,63 @@ pub enum ValidationErrorKind {
     ApprovalAuthorizationInvalid,
 }
 
+/// Parses one JSON definition through the strict definition boundary.
+pub fn parse_json_definition(input: &str) -> Result<WorkflowDefinition, DefinitionValidationError> {
+    let value: NoDuplicateJson =
+        serde_json::from_str(input).map_err(|error| parse_error("$", error.to_string()))?;
+    serde_json::from_value(value.0).map_err(|error| parse_error("$", error.to_string()))
+}
+
+/// Parses one YAML definition through the swappable internal YAML seam.
+pub fn parse_yaml_definition(input: &str) -> Result<WorkflowDefinition, DefinitionValidationError> {
+    yaml::parse(input)
+}
+
+/// Returns the normative Draft 2020-12 schema embedded in the frozen contract.
+///
+/// Keeping this verbatim source-of-truth extraction avoids a hand-maintained schema
+/// drifting from the frozen contract while the crate has no schema-code generator.
+pub fn definition_json_schema() -> String {
+    const CONTRACT: &str = include_str!("../../../docs/WORKFLOW_CORE_CONTRACT.md");
+    let marker = "### 14.1 Normative schema\n\n```json\n";
+    let start = CONTRACT
+        .find(marker)
+        .expect("frozen contract has definition schema")
+        + marker.len();
+    let end = CONTRACT[start..]
+        .find("\n```\n")
+        .expect("frozen schema fence")
+        + start;
+    CONTRACT[start..end].to_owned()
+}
+
+/// Extracts every executable action pin in deterministic reference-location order.
+pub fn extract_action_pins(definition: &WorkflowDefinition) -> Vec<ExtractedActionPin> {
+    let mut pins = definition
+        .nodes
+        .iter()
+        .filter_map(|node| match node {
+            NodeDefinition::Action { id, action, .. } => Some((id.0.clone(), action)),
+            NodeDefinition::Map { id, action, .. } => {
+                Some((format!("{}/map_action", id.0), action))
+            }
+            _ => None,
+        })
+        .map(|(reference_location, action)| ExtractedActionPin {
+            reference_location,
+            name: action.name.clone(),
+            contract_version: action.contract_version.clone(),
+            input_schema_digest: action.input_schema_digest.clone(),
+            output_schema_digest: action.output_schema_digest.clone(),
+            compatible_implementation_requirement: action
+                .compatible_implementation_requirement
+                .clone(),
+        })
+        .collect::<Vec<_>>();
+    pins.sort_by(|left, right| left.reference_location.cmp(&right.reference_location));
+    pins
+}
+
 /// One LLM-correctable definition validation failure. Contract section 5.5.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("{kind:?} at {path}: {message}")]
@@ -404,9 +480,124 @@ pub struct DefinitionValidationError {
 
 /// Validates syntax and all mandatory semantic constraints. Contract section 14.2.
 pub fn validate_definition(
-    _definition: &WorkflowDefinition,
+    definition: &WorkflowDefinition,
 ) -> Result<ValidatedDefinition, Vec<DefinitionValidationError>> {
-    todo!()
+    let normalized = match normalize_definition(definition.clone()) {
+        Ok(value) => value,
+        Err(error) => return Err(vec![error]),
+    };
+    let mut errors = Vec::new();
+    validate_root(&normalized, &mut errors);
+    let ids: BTreeMap<_, _> = normalized
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| (node_id(node).clone(), i))
+        .collect();
+    if ids.len() != normalized.nodes.len() {
+        let mut seen = BTreeSet::new();
+        for node in &normalized.nodes {
+            if !seen.insert(node_id(node).clone()) {
+                errors.push(error(
+                    ValidationErrorKind::DuplicateNodeId,
+                    format!("/nodes/{}/id", node_id(node).0),
+                    "node IDs must be unique",
+                    &["choose a new unique node id"],
+                ));
+            }
+        }
+    }
+    if !ids.contains_key(&normalized.entry_node_id) {
+        errors.push(error(
+            ValidationErrorKind::MissingNode,
+            "/entry_node_id",
+            "entry_node_id must name one declared node",
+            &["use an existing node id"],
+        ));
+    }
+    let edges: BTreeMap<Id, Vec<(String, Id)>> = normalized
+        .nodes
+        .iter()
+        .map(|node| (node_id(node).clone(), outgoing(node)))
+        .collect();
+    for node in &normalized.nodes {
+        for (label, target) in edges.get(node_id(node)).into_iter().flatten() {
+            if !ids.contains_key(target) {
+                errors.push(error(
+                    ValidationErrorKind::MissingNode,
+                    format!("/nodes/{}/{}", node_id(node).0, label),
+                    format!("target `{}` does not exist", target.0),
+                    &["use an existing node id"],
+                ));
+            }
+        }
+        validate_node(node, &ids, &mut errors);
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let ranks = match ranks_from_edges(&normalized, &edges) {
+        Ok(ranks) => ranks,
+        Err(error) => {
+            errors.push(error);
+            BTreeMap::new()
+        }
+    };
+    let reachable = reachable(&normalized.entry_node_id, &edges);
+    for node in &normalized.nodes {
+        if !reachable.contains(node_id(node)) {
+            errors.push(error(
+                ValidationErrorKind::UnreachableNode,
+                format!("/nodes/{}/id", node_id(node).0),
+                "every node must be reachable from entry_node_id",
+                &[
+                    "add an incoming edge from the reachable graph",
+                    "remove the node",
+                ],
+            ));
+        }
+    }
+    let succeeds: Vec<_> = normalized
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(node, NodeDefinition::Succeed { .. }) && reachable.contains(node_id(node))
+        })
+        .collect();
+    if succeeds.len() != 1 {
+        errors.push(error(
+            ValidationErrorKind::InvalidSucceedCount,
+            "/nodes",
+            "exactly one reachable Succeed node is required",
+            &[
+                "add one reachable Succeed node",
+                "remove extra Succeed nodes",
+            ],
+        ));
+    }
+    for node in &normalized.nodes {
+        if !matches!(
+            node,
+            NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. }
+        ) && outgoing(node).is_empty()
+        {
+            errors.push(error(
+                ValidationErrorKind::UnterminatedPath,
+                format!("/nodes/{}/next", node_id(node).0),
+                "every non-terminal node must have an outgoing target",
+                &["add a target ending in Succeed or Fail"],
+            ));
+        }
+    }
+    validate_bindings(&normalized, &edges, &mut errors);
+    if errors.is_empty() {
+        Ok(ValidatedDefinition {
+            definition: normalized,
+            topological_ranks: ranks,
+        })
+    } else {
+        Err(errors)
+    }
 }
 
 /// A definition that passed the full publication validation phase. Contract section 14.2.
@@ -420,26 +611,800 @@ pub struct ValidatedDefinition {
 
 /// Expands schema defaults into a normalized typed definition. Contract section 14.2.
 pub fn normalize_definition(
-    _definition: WorkflowDefinition,
+    mut definition: WorkflowDefinition,
 ) -> Result<WorkflowDefinition, DefinitionValidationError> {
-    todo!()
+    if definition.definition_format_version != "0.1" {
+        return Err(error(
+            ValidationErrorKind::InvalidField,
+            "/definition_format_version",
+            "definition_format_version must be exactly `0.1`",
+            &["0.1"],
+        ));
+    }
+    if definition.description.len() > 4000 {
+        return Err(error(
+            ValidationErrorKind::InvalidField,
+            "/description",
+            "description is limited to 4000 UTF-8 bytes",
+            &["shorten description"],
+        ));
+    }
+    // Serde applies both v0.1 defaults; assigning explicitly documents the invariant.
+    if definition.description.is_empty() {
+        definition.description = String::new();
+    }
+    for node in &mut definition.nodes {
+        if let NodeDefinition::Approval { gate, .. } = node {
+            if matches!(gate.on_expiry, ApprovalExpiryPolicy::Reject) {
+                gate.on_expiry = ApprovalExpiryPolicy::Reject;
+            }
+        }
+    }
+    Ok(definition)
 }
 
 /// Produces RFC 8785 canonical definition bytes. Contract section 13.1.
 pub fn canonical_definition_json(
-    _definition: &WorkflowDefinition,
+    definition: &WorkflowDefinition,
 ) -> Result<Vec<u8>, DefinitionValidationError> {
-    todo!()
+    let normalized = normalize_definition(definition.clone())?;
+    let bytes =
+        serde_jcs::to_vec(&normalized).map_err(|error| parse_error("$", error.to_string()))?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err(error(
+            ValidationErrorKind::DefinitionTooLarge,
+            "$",
+            "canonical definition exceeds the 4 MiB limit",
+            &["reduce definition size"],
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Computes the revision digest from canonical definition bytes. Contract section 13.1.
-pub fn revision_hash(_canonical_definition: &[u8]) -> Digest {
-    todo!()
+pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
+    Digest(format!(
+        "sha256:{}",
+        hex(&Sha256::digest(canonical_definition))
+    ))
 }
 
 /// Computes lexical Kahn topological ranks. Contract section 1.5.
 pub fn canonical_topological_ranks(
-    _definition: &WorkflowDefinition,
+    definition: &WorkflowDefinition,
 ) -> Result<BTreeMap<Id, TopologicalRank>, DefinitionValidationError> {
-    todo!()
+    let edges = definition
+        .nodes
+        .iter()
+        .map(|node| (node_id(node).clone(), outgoing(node)))
+        .collect();
+    ranks_from_edges(definition, &edges)
+}
+
+mod yaml {
+    use super::*;
+    /// The only parser-specific seam; no parser values or errors escape it.
+    pub(super) fn parse(input: &str) -> Result<WorkflowDefinition, DefinitionValidationError> {
+        if input.len() > 4 * 1024 * 1024 {
+            return Err(error(
+                ValidationErrorKind::DefinitionTooLarge,
+                "$",
+                "YAML input exceeds the 4 MiB definition limit",
+                &["reduce definition size"],
+            ));
+        }
+        let options = serde_saphyr::options! {
+            budget: serde_saphyr::budget! { max_documents: 1, max_events: 100_000, max_nodes: 20_000, max_depth: 64, max_aliases: 128, max_anchors: 128, max_total_scalar_bytes: 4 * 1024 * 1024 },
+            duplicate_keys: serde_saphyr::DuplicateKeyPolicy::Error,
+            merge_keys: serde_saphyr::MergeKeyPolicy::Error,
+            strict_booleans: true,
+            alias_limits: serde_saphyr::alias_limits! { max_total_replayed_events: 20_000, max_replay_stack_depth: 32, max_alias_expansions_per_anchor: 32 },
+        };
+        serde_saphyr::from_str_with_options(input, options)
+            .map_err(|error| parse_error("$", error.to_string()))
+    }
+}
+
+fn error(
+    kind: ValidationErrorKind,
+    path: impl Into<String>,
+    message: impl Into<String>,
+    alternatives: &[&str],
+) -> DefinitionValidationError {
+    DefinitionValidationError {
+        kind,
+        path: path.into(),
+        message: message.into(),
+        valid_alternatives: alternatives
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect(),
+    }
+}
+fn parse_error(path: impl Into<String>, message: String) -> DefinitionValidationError {
+    let kind = if message.contains("unknown field") {
+        ValidationErrorKind::UnknownField
+    } else {
+        ValidationErrorKind::InvalidField
+    };
+    error(
+        kind,
+        path,
+        format!("invalid definition syntax: {message}"),
+        &["use the closed definition schema"],
+    )
+}
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn node_id(node: &NodeDefinition) -> &Id {
+    match node {
+        NodeDefinition::Action { id, .. }
+        | NodeDefinition::Map { id, .. }
+        | NodeDefinition::Choice { id, .. }
+        | NodeDefinition::Approval { id, .. }
+        | NodeDefinition::Succeed { id, .. }
+        | NodeDefinition::Fail { id, .. } => id,
+    }
+}
+fn outgoing(node: &NodeDefinition) -> Vec<(String, Id)> {
+    match node {
+        NodeDefinition::Action { next, .. }
+        | NodeDefinition::Map { next, .. }
+        | NodeDefinition::Approval { next, .. } => next
+            .iter()
+            .enumerate()
+            .map(|(index, target)| (format!("next/{index}"), target.clone()))
+            .collect(),
+        NodeDefinition::Choice { cases, default, .. } => cases
+            .iter()
+            .enumerate()
+            .map(|(index, case)| (format!("case/{index}"), case_target(case).clone()))
+            .chain(std::iter::once(("default".to_owned(), default.clone())))
+            .collect(),
+        NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
+    }
+}
+fn case_target(case: &ChoiceCase) -> &Id {
+    match case {
+        ChoiceCase::Equals { next, .. } | ChoiceCase::In { next, .. } => next,
+    }
+}
+
+fn validate_root(definition: &WorkflowDefinition, errors: &mut Vec<DefinitionValidationError>) {
+    if !valid_id(&definition.definition_id.0) {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            "/definition_id",
+            "definition_id must be 1–128 bytes and match the ID grammar",
+            &["use letters/digits followed by . _ : or -"],
+        ));
+    }
+    if definition.name.is_empty() || definition.name.len() > 200 {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            "/name",
+            "name must be 1–200 UTF-8 bytes",
+            &["provide a non-empty shorter name"],
+        ));
+    }
+    if definition.nodes.is_empty() || definition.nodes.len() > 1024 {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            "/nodes",
+            "nodes must contain 1–1024 entries",
+            &["add nodes", "reduce node count"],
+        ));
+    }
+    for (path, digest) in [
+        (
+            "/run_input_schema_digest",
+            &definition.run_input_schema_digest,
+        ),
+        (
+            "/run_output_schema_digest",
+            &definition.run_output_schema_digest,
+        ),
+    ] {
+        if !valid_digest(&digest.0) {
+            errors.push(error(
+                ValidationErrorKind::InvalidField,
+                path,
+                "digest must be sha256: followed by 64 lowercase hex characters",
+                &["use a SHA-256 digest"],
+            ));
+        }
+    }
+}
+
+fn validate_node(
+    node: &NodeDefinition,
+    ids: &BTreeMap<Id, usize>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    let id = node_id(node);
+    if !valid_id(&id.0) {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            format!("/nodes/{}/id", id.0),
+            "node id must be 1–128 bytes and match the ID grammar",
+            &["use letters/digits followed by . _ : or -"],
+        ));
+    }
+    match node {
+        NodeDefinition::Action {
+            action,
+            bindings,
+            retry,
+            timeout,
+            declared_max_cost_units,
+            next,
+            ..
+        } => {
+            validate_action(
+                id,
+                action,
+                retry,
+                timeout,
+                *declared_max_cost_units,
+                next,
+                errors,
+            );
+            validate_binding_targets(id, bindings.iter().map(|binding| &binding.target), errors);
+            for binding in bindings {
+                validate_source(id, &binding.source, false, errors);
+            }
+        }
+        NodeDefinition::Map {
+            items,
+            max_items,
+            max_concurrency,
+            action,
+            bindings,
+            retry,
+            timeout,
+            declared_max_cost_units,
+            next,
+            ..
+        } => {
+            validate_source(id, items, false, errors);
+            if *max_items == 0
+                || *max_items > 10_000
+                || *max_concurrency == 0
+                || *max_concurrency > 1024
+                || max_concurrency > max_items
+            {
+                errors.push(error(ValidationErrorKind::MapBoundsInvalid, format!("/nodes/{}/max_concurrency", id.0), "Map requires 1 <= max_concurrency <= max_items <= 10000 and max_concurrency <= 1024", &["set positive bounded max_items and max_concurrency"]));
+            }
+            validate_action(
+                id,
+                action,
+                retry,
+                timeout,
+                *declared_max_cost_units,
+                next,
+                errors,
+            );
+            validate_binding_targets(id, bindings.iter().map(|binding| &binding.target), errors);
+            for binding in bindings {
+                validate_map_source(id, &binding.source, errors);
+            }
+        }
+        NodeDefinition::Choice {
+            input,
+            selector,
+            cases,
+            default,
+            ..
+        } => {
+            validate_source(id, input, false, errors);
+            if !valid_source_pointer(selector) {
+                errors.push(error(
+                    ValidationErrorKind::JsonPointerInvalid,
+                    format!("/nodes/{}/selector", id.0),
+                    "selector must be an RFC 6901 source pointer",
+                    &["use /property or empty pointer"],
+                ));
+            }
+            if cases.is_empty() || cases.len() > 100 {
+                errors.push(error(
+                    ValidationErrorKind::ChoiceCaseInvalid,
+                    format!("/nodes/{}/cases", id.0),
+                    "Choice requires 1–100 ordered cases",
+                    &["add a case"],
+                ));
+            }
+            if !ids.contains_key(default) {
+                errors.push(error(
+                    ValidationErrorKind::MissingNode,
+                    format!("/nodes/{}/default", id.0),
+                    "Choice default must target an existing node",
+                    &["use an existing node id"],
+                ));
+            }
+            let mut targets = BTreeSet::new();
+            targets.insert(default.clone());
+            let mut values = BTreeSet::new();
+            for case in cases {
+                if !targets.insert(case_target(case).clone()) {
+                    errors.push(error(
+                        ValidationErrorKind::ChoiceCaseInvalid,
+                        format!("/nodes/{}/cases", id.0),
+                        "Choice case and default targets must be unique",
+                        &["use distinct targets"],
+                    ));
+                }
+                let candidates: Vec<&Value> = match case {
+                    ChoiceCase::Equals { equals, .. } => vec![equals],
+                    ChoiceCase::In { r#in, .. } => r#in.iter().collect(),
+                };
+                if candidates.is_empty()
+                    || candidates.len() > 100
+                    || candidates.iter().any(|value| !is_scalar(value))
+                {
+                    errors.push(error(
+                        ValidationErrorKind::ChoiceCaseInvalid,
+                        format!("/nodes/{}/cases", id.0),
+                        "Choice values must be non-empty unique JSON scalars",
+                        &["use string, number, boolean, or null"],
+                    ));
+                }
+                for candidate in candidates {
+                    let encoded = serde_jcs::to_string(candidate).unwrap_or_default();
+                    if !values.insert(encoded) {
+                        errors.push(error(
+                            ValidationErrorKind::ChoiceCaseInvalid,
+                            format!("/nodes/{}/cases", id.0),
+                            "Choice case values must not overlap",
+                            &["remove duplicate scalar values"],
+                        ));
+                    }
+                }
+            }
+        }
+        NodeDefinition::Approval {
+            request,
+            gate,
+            next,
+            ..
+        } => {
+            validate_source(id, request, false, errors);
+            if gate.expires_after_ms == 0 || gate.expires_after_ms > 31_536_000_000 {
+                errors.push(error(
+                    ValidationErrorKind::InvalidField,
+                    format!("/nodes/{}/gate/expires_after_ms", id.0),
+                    "expires_after_ms must be 1..31536000000",
+                    &["use a bounded positive duration"],
+                ));
+            }
+            let principals_ok = gate
+                .authorization
+                .allowed_principal_ids
+                .iter()
+                .all(|value| !value.is_empty() && value.len() <= 256)
+                && unique(&gate.authorization.allowed_principal_ids);
+            let roles_ok = gate
+                .authorization
+                .allowed_role_ids
+                .iter()
+                .all(|value| !value.is_empty() && value.len() <= 256)
+                && unique(&gate.authorization.allowed_role_ids);
+            if (!principals_ok || !roles_ok)
+                || (gate.authorization.allowed_principal_ids.is_empty()
+                    && gate.authorization.allowed_role_ids.is_empty())
+                || gate.authorization.allowed_principal_ids.len() > 256
+                || gate.authorization.allowed_role_ids.len() > 256
+            {
+                errors.push(error(ValidationErrorKind::ApprovalAuthorizationInvalid, format!("/nodes/{}/gate/authorization", id.0), "approval authorization requires a non-empty unique principal or role allowlist", &["add allowed_principal_ids", "add allowed_role_ids"]));
+            }
+            validate_targets(id, next, errors);
+        }
+        NodeDefinition::Succeed { output, .. } => validate_source(id, output, false, errors),
+        NodeDefinition::Fail { code, message, .. } => {
+            if !valid_id(code) {
+                errors.push(error(
+                    ValidationErrorKind::InvalidField,
+                    format!("/nodes/{}/code", id.0),
+                    "Fail code must match the ID grammar",
+                    &["use a namespaced safe code"],
+                ));
+            }
+            if message.is_empty() || message.len() > 2000 {
+                errors.push(error(
+                    ValidationErrorKind::InvalidField,
+                    format!("/nodes/{}/message", id.0),
+                    "Fail message must be 1–2000 UTF-8 bytes",
+                    &["provide a bounded message"],
+                ));
+            }
+        }
+    }
+}
+
+fn validate_action(
+    id: &Id,
+    action: &ActionReference,
+    retry: &RetryPolicy,
+    timeout: &TimeoutPolicy,
+    _cost: CostUnits,
+    next: &[Id],
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    if action.name.is_empty()
+        || action.name.len() > 200
+        || action.contract_version.is_empty()
+        || action.contract_version.len() > 64
+        || [
+            &action.input_schema_digest,
+            &action.output_schema_digest,
+            &action.compatible_implementation_requirement,
+        ]
+        .iter()
+        .any(|digest| !valid_digest(&digest.0))
+    {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            format!("/nodes/{}/action", id.0),
+            "action pin requires bounded name/version and three SHA-256 digests",
+            &["supply all five action pin fields"],
+        ));
+    }
+    if retry.max_attempts == 0 || retry.max_attempts > 100 {
+        errors.push(error(
+            ValidationErrorKind::RetryPolicyInvalid,
+            format!("/nodes/{}/retry/max_attempts", id.0),
+            "max_attempts must be 1..100",
+            &["use a value between 1 and 100"],
+        ));
+    }
+    match retry.backoff {
+        BackoffPolicy::Fixed { delay_ms } if delay_ms <= 86_400_000 => {}
+        BackoffPolicy::Exponential {
+            initial_delay_ms,
+            multiplier,
+            max_delay_ms,
+        } if initial_delay_ms > 0
+            && initial_delay_ms <= 86_400_000
+            && (2..=16).contains(&multiplier)
+            && max_delay_ms >= initial_delay_ms
+            && max_delay_ms <= 86_400_000 => {}
+        _ => errors.push(error(
+            ValidationErrorKind::RetryPolicyInvalid,
+            format!("/nodes/{}/retry/backoff", id.0),
+            "backoff exceeds caps or exponential max_delay_ms is below initial_delay_ms",
+            &["use fixed 0..86400000", "use bounded exponential backoff"],
+        )),
+    }
+    if timeout.timeout_ms == 0 || timeout.timeout_ms > 86_400_000 {
+        errors.push(error(
+            ValidationErrorKind::TimeoutPolicyInvalid,
+            format!("/nodes/{}/timeout/timeout_ms", id.0),
+            "timeout_ms must be 1..86400000",
+            &["use a bounded positive timeout"],
+        ));
+    }
+    validate_targets(id, next, errors);
+}
+fn validate_targets(id: &Id, targets: &[Id], errors: &mut Vec<DefinitionValidationError>) {
+    if targets.is_empty() || targets.len() > 64 || !unique(targets) {
+        errors.push(error(
+            ValidationErrorKind::InvalidField,
+            format!("/nodes/{}/next", id.0),
+            "next must contain 1–64 unique targets",
+            &["use unique existing target IDs"],
+        ));
+    }
+}
+fn validate_binding_targets<'a>(
+    id: &Id,
+    targets: impl Iterator<Item = &'a String>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    let mut values: Vec<String> = targets.cloned().collect();
+    values.sort();
+    for target in &values {
+        if !valid_target_pointer(target) {
+            errors.push(error(
+                ValidationErrorKind::JsonPointerInvalid,
+                format!("/nodes/{}/bindings", id.0),
+                "binding target must be a non-empty RFC 6901 pointer",
+                &["use /field"],
+            ));
+        }
+    }
+    for pair in values.windows(2) {
+        if pair[0] == pair[1] || pair[1].starts_with(&(pair[0].clone() + "/")) {
+            errors.push(error(
+                ValidationErrorKind::BindingTargetInvalid,
+                format!("/nodes/{}/bindings", id.0),
+                "binding targets must be unique and must not overlap",
+                &["bind only one leaf per target"],
+            ));
+        }
+    }
+}
+fn validate_source(
+    id: &Id,
+    source: &BindingSource,
+    map_allowed: bool,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    match source { BindingSource::RunInput { pointer } => validate_pointer(id, pointer, errors), BindingSource::NodeOutput { pointer, .. } => validate_pointer(id, pointer, errors), BindingSource::ArtifactRef { source } => match source { ArtifactLocator::Literal { artifact_ref_id, digest, media_type } if valid_id(&artifact_ref_id.0) && valid_digest(&digest.0) && !media_type.is_empty() && media_type.len() <= 200 => {}, ArtifactLocator::RunInput { pointer } | ArtifactLocator::NodeOutput { pointer, .. } if valid_source_pointer(pointer) => {}, _ => errors.push(error(ValidationErrorKind::ArtifactLocatorInvalid, format!("/nodes/{}/source", id.0), "artifact locator requires an exact identity/digest/media tuple or valid source pointer", &["use a complete literal locator"])), }, BindingSource::Constant { .. } => {} }
+    let _ = map_allowed;
+}
+fn validate_map_source(
+    id: &Id,
+    source: &MapBindingSource,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    match source {
+        MapBindingSource::Constant { .. } | MapBindingSource::MapIndex => {}
+        MapBindingSource::RunInput { pointer }
+        | MapBindingSource::NodeOutput { pointer, .. }
+        | MapBindingSource::MapItem { pointer } => validate_pointer(id, pointer, errors),
+        MapBindingSource::ArtifactRef { source } => validate_source(
+            id,
+            &BindingSource::ArtifactRef {
+                source: source.clone(),
+            },
+            true,
+            errors,
+        ),
+    }
+}
+fn validate_pointer(id: &Id, pointer: &str, errors: &mut Vec<DefinitionValidationError>) {
+    if !valid_source_pointer(pointer) {
+        errors.push(error(
+            ValidationErrorKind::JsonPointerInvalid,
+            format!("/nodes/{}/source/pointer", id.0),
+            "source pointer must be RFC 6901",
+            &["use /property or empty pointer"],
+        ));
+    }
+}
+fn validate_bindings(
+    definition: &WorkflowDefinition,
+    edges: &BTreeMap<Id, Vec<(String, Id)>>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    for node in &definition.nodes {
+        let consumer = node_id(node);
+        let sources: Vec<Option<&Id>> = match node {
+            NodeDefinition::Action { bindings, .. } => bindings
+                .iter()
+                .map(|binding| source_node(&binding.source))
+                .collect(),
+            NodeDefinition::Map {
+                items, bindings, ..
+            } => std::iter::once(source_node(items))
+                .chain(
+                    bindings
+                        .iter()
+                        .map(|binding| map_source_node(&binding.source)),
+                )
+                .collect(),
+            NodeDefinition::Choice { input, .. }
+            | NodeDefinition::Approval { request: input, .. }
+            | NodeDefinition::Succeed { output: input, .. } => vec![source_node(input)],
+            NodeDefinition::Fail { .. } => vec![],
+        };
+        for source_id in sources.into_iter().flatten() {
+            let strict_ancestor =
+                source_id != consumer && graph_reaches(edges, source_id, consumer, None);
+            let choice_bypass = definition.nodes.iter().any(|candidate| {
+                matches!(candidate, NodeDefinition::Choice { .. })
+                    && graph_reaches(edges, node_id(candidate), source_id, None)
+                    && graph_reaches(edges, node_id(candidate), consumer, Some(source_id))
+            });
+            if !strict_ancestor || choice_bypass {
+                errors.push(error(ValidationErrorKind::BindingSourceInvalid, format!("/nodes/{}/bindings", consumer.0), format!("node_output `{}` must be a strict dominator of `{}`; branch outputs cannot cross Choice reconvergence", source_id.0, consumer.0), &["move the consumer onto that branch", "bind run_input", "bind a dominating node output"]));
+            }
+        }
+    }
+}
+fn map_source_node(source: &MapBindingSource) -> Option<&Id> {
+    match source {
+        MapBindingSource::NodeOutput { node_id, .. } => Some(node_id),
+        MapBindingSource::ArtifactRef {
+            source: ArtifactLocator::NodeOutput { node_id, .. },
+        } => Some(node_id),
+        _ => None,
+    }
+}
+fn source_node(source: &BindingSource) -> Option<&Id> {
+    match source {
+        BindingSource::NodeOutput { node_id, .. } => Some(node_id),
+        BindingSource::ArtifactRef {
+            source: ArtifactLocator::NodeOutput { node_id, .. },
+        } => Some(node_id),
+        _ => None,
+    }
+}
+fn ranks_from_edges(
+    definition: &WorkflowDefinition,
+    edges: &BTreeMap<Id, Vec<(String, Id)>>,
+) -> Result<BTreeMap<Id, TopologicalRank>, DefinitionValidationError> {
+    let mut indegree: BTreeMap<Id, u32> = definition
+        .nodes
+        .iter()
+        .map(|node| (node_id(node).clone(), 0))
+        .collect();
+    for targets in edges.values() {
+        for (_, target) in targets {
+            if let Some(value) = indegree.get_mut(target) {
+                *value += 1;
+            }
+        }
+    }
+    let mut ready: BTreeSet<Id> = indegree
+        .iter()
+        .filter(|(_, count)| **count == 0)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut ranks = BTreeMap::new();
+    while let Some(id) = ready.pop_first() {
+        let rank = ranks.len() as u32;
+        ranks.insert(id.clone(), TopologicalRank(rank));
+        let mut targets = edges.get(&id).cloned().unwrap_or_default();
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        for (_, target) in targets {
+            if let Some(count) = indegree.get_mut(&target) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(target);
+                }
+            }
+        }
+    }
+    if ranks.len() != definition.nodes.len() {
+        Err(error(
+            ValidationErrorKind::Cycle,
+            "/nodes",
+            "control graph must be acyclic",
+            &["remove the cycle", "use an explicit bounded Map"],
+        ))
+    } else {
+        Ok(ranks)
+    }
+}
+fn reachable(entry: &Id, edges: &BTreeMap<Id, Vec<(String, Id)>>) -> BTreeSet<Id> {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([entry.clone()]);
+    while let Some(id) = queue.pop_front() {
+        if seen.insert(id.clone()) {
+            if let Some(targets) = edges.get(&id) {
+                queue.extend(targets.iter().map(|(_, target)| target.clone()));
+            }
+        }
+    }
+    seen
+}
+fn graph_reaches(
+    edges: &BTreeMap<Id, Vec<(String, Id)>>,
+    start: &Id,
+    target: &Id,
+    blocked: Option<&Id>,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::from([start.clone()]);
+    while let Some(id) = queue.pop_front() {
+        if blocked == Some(&id) {
+            continue;
+        }
+        if id == *target {
+            return true;
+        }
+        if seen.insert(id.clone()) {
+            queue.extend(
+                edges
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .map(|(_, next)| next.clone()),
+            );
+        }
+    }
+    false
+}
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+fn valid_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn valid_source_pointer(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with('/') && value.split('/').skip(1).all(valid_pointer_token))
+}
+fn valid_target_pointer(value: &str) -> bool {
+    !value.is_empty() && value.starts_with('/') && value.split('/').skip(1).all(valid_pointer_token)
+}
+fn valid_pointer_token(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'~' {
+            if index + 1 >= bytes.len() || !matches!(bytes[index + 1], b'0' | b'1') {
+                return false;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+fn unique<T: Ord + Clone>(values: &[T]) -> bool {
+    let mut seen = BTreeSet::new();
+    values.iter().all(|value| seen.insert(value.clone()))
+}
+fn is_scalar(value: &Value) -> bool {
+    !matches!(value, Value::Array(_) | Value::Object(_))
+}
+
+struct NoDuplicateJson(Value);
+impl<'de> Deserialize<'de> for NoDuplicateJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct JsonVisitor;
+        impl<'de> Visitor<'de> for JsonVisitor {
+            type Value = Value;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON value without duplicate object keys")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+                Ok(Value::String(value))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = Vec::new();
+                while let Some(value) = values.next_element::<NoDuplicateJson>()? {
+                    result.push(value.0);
+                }
+                Ok(Value::Array(result))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = serde_json::Map::new();
+                while let Some(key) = values.next_key::<String>()? {
+                    let value = values.next_value::<NoDuplicateJson>()?.0;
+                    if result.insert(key.clone(), value).is_some() {
+                        return Err(de::Error::custom(format!("duplicate object key `{key}`")));
+                    }
+                }
+                Ok(Value::Object(result))
+            }
+        }
+        deserializer.deserialize_any(JsonVisitor).map(Self)
+    }
 }

@@ -2,7 +2,8 @@
 
 use crate::artifact::ArtifactKind;
 use crate::scope::ExecutionScope;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest as _, Sha256};
 
 macro_rules! string_newtype {
     ($name:ident, $doc:literal, $section:literal) => {
@@ -26,9 +27,35 @@ string_newtype!(
 pub struct Timestamp(pub i64);
 
 /// Opaque host-defined budget units. Contract section 1.1.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CostUnits(pub u64);
+
+impl Serialize for CostUnits {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CostUnits {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        if value == "0"
+            || (!value.starts_with('0') && value.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            value.parse().map(Self).map_err(serde::de::Error::custom)
+        } else {
+            Err(serde::de::Error::custom(
+                "cost units must be a canonical u64 decimal string",
+            ))
+        }
+    }
+}
 
 /// A mutable-row compare-and-swap counter. Contract section 1.1.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -69,12 +96,34 @@ pub fn edge_id(
     _edge_label: &str,
     _to_node_id: &Id,
 ) -> Id {
-    todo!()
+    let mut bytes = lp(b"dagger-edge-v1");
+    bytes.extend(lp(&digest_bytes(_revision_hash)));
+    bytes.extend(lp(_from_node_id.0.as_bytes()));
+    bytes.extend(lp(_edge_label.as_bytes()));
+    bytes.extend(lp(_to_node_id.0.as_bytes()));
+    Id(format!("edge_{}", hex(&Sha256::digest(bytes))))
 }
 
 /// Derives the typed content-use identifier. Contract section 1.10.
 pub fn artifact_ref_id(_identity: ArtifactRefIdentity<'_>) -> Id {
-    todo!()
+    let mut bytes = lp(b"dagger-artifact-ref-v1");
+    bytes.extend(lp(_identity.scope.tenant_id.as_str().as_bytes()));
+    bytes.extend(lp(_identity.scope.namespace.as_str().as_bytes()));
+    bytes.extend(lp(&digest_bytes(_identity.digest)));
+    bytes.extend(lp(artifact_kind_name(_identity.kind).as_bytes()));
+    bytes.extend(optional_lp(
+        _identity.producer_run_id.map(|value| value.0.as_bytes()),
+    ));
+    bytes.extend(optional_lp(
+        _identity.producer_node_id.map(|value| value.0.as_bytes()),
+    ));
+    bytes.extend(optional_lp(
+        _identity
+            .producer_attempt_id
+            .map(|value| value.0.as_bytes()),
+    ));
+    bytes.extend(lp(&_identity.ordinal.to_be_bytes()));
+    Id(format!("artifact_{}", hex(&Sha256::digest(bytes))))
 }
 
 /// Derives a static logical node's external idempotency key. Contract section 7.1.
@@ -83,7 +132,8 @@ pub fn idempotency_key(
     _run_id: &Id,
     _node_instance_id: &NodeInstanceId,
 ) -> String {
-    todo!()
+    let bytes = idem_prefix(_scope, _run_id, _node_instance_id);
+    format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
 }
 
 /// Derives a Map child's external idempotency key. Contract section 7.1.
@@ -95,7 +145,12 @@ pub fn map_child_idempotency_key(
     _map_item_index: u32,
     _map_item_digest: &Digest,
 ) -> String {
-    todo!()
+    let mut bytes = idem_prefix(_scope, _run_id, _child_node_instance_id);
+    bytes.extend(lp(b"map-child"));
+    bytes.extend(lp(_map_parent_node_instance_id.0.as_bytes()));
+    bytes.extend(lp(&_map_item_index.to_be_bytes()));
+    bytes.extend(lp(&digest_bytes(_map_item_digest)));
+    format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
 }
 
 /// Derives a synthetic Map child node identifier. Contract section 10.1.
@@ -105,12 +160,81 @@ pub fn map_child_id(
     _item_index: u32,
     _item_digest: &Digest,
 ) -> NodeInstanceId {
-    todo!()
+    let mut bytes = lp(b"dagger-map-child-v1");
+    bytes.extend(lp(_run_id.0.as_bytes()));
+    bytes.extend(lp(_map_node_instance_id.0.as_bytes()));
+    bytes.extend(lp(&_item_index.to_be_bytes()));
+    bytes.extend(lp(&digest_bytes(_item_digest)));
+    Id(format!("mapchild_{}", hex(&Sha256::digest(bytes))))
 }
 
 /// Derives the ordered Map expansion digest. Contract section 10.1.
 pub fn map_expansion_digest(_children: &[MapChildIdentity]) -> Digest {
-    todo!()
+    let mut bytes = lp(b"dagger-map-expansion-v1");
+    for child in _children {
+        bytes.extend(lp(&child.item_index.to_be_bytes()));
+        bytes.extend(lp(&digest_bytes(&child.item_digest)));
+        bytes.extend(lp(child.child_id.0.as_bytes()));
+    }
+    Digest(format!("sha256:{}", hex(&Sha256::digest(bytes))))
+}
+
+fn lp(value: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(8 + value.len());
+    encoded.extend((value.len() as u64).to_be_bytes());
+    encoded.extend(value);
+    encoded
+}
+
+fn optional_lp(value: Option<&[u8]>) -> Vec<u8> {
+    match value {
+        Some(value) => lp(value),
+        None => lp(b""),
+    }
+}
+
+fn idem_prefix(scope: &ExecutionScope, run_id: &Id, node_instance_id: &NodeInstanceId) -> Vec<u8> {
+    let mut bytes = lp(b"dagger-idem-v1");
+    bytes.extend(lp(scope.tenant_id.as_str().as_bytes()));
+    bytes.extend(lp(scope.namespace.as_str().as_bytes()));
+    bytes.extend(lp(run_id.0.as_bytes()));
+    bytes.extend(lp(node_instance_id.0.as_bytes()));
+    bytes
+}
+
+fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
+    match kind {
+        ArtifactKind::RunInput => "RunInput",
+        ArtifactKind::SchemaDocument => "SchemaDocument",
+        ArtifactKind::Definition => "Definition",
+        ArtifactKind::NodeOutput => "NodeOutput",
+        ArtifactKind::ActionInvocationInput => "ActionInvocationInput",
+        ArtifactKind::ActionArtifact => "ActionArtifact",
+        ArtifactKind::Diagnostics => "Diagnostics",
+        ArtifactKind::CompatibilityEvidence => "CompatibilityEvidence",
+        ArtifactKind::ChoiceInput => "ChoiceInput",
+        ArtifactKind::MapInput => "MapInput",
+        ArtifactKind::MapAggregate => "MapAggregate",
+        ArtifactKind::ApprovalRequest => "ApprovalRequest",
+        ArtifactKind::ApprovalDecisionPayload => "ApprovalDecisionPayload",
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn digest_bytes(digest: &Digest) -> [u8; 32] {
+    let hex = digest
+        .0
+        .strip_prefix("sha256:")
+        .expect("Digest must be sha256");
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .expect("Digest must be lowercase hex");
+    }
+    bytes
 }
 
 /// One ordered tuple included in the Map expansion digest. Contract section 10.1.

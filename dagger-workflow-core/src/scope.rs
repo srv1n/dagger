@@ -10,13 +10,29 @@ pub struct ScopeAtom(String);
 
 impl ScopeAtom {
     /// Validates and constructs a scope atom. Contract section 1.1.
-    pub fn new(_value: impl Into<String>) -> Result<Self, ScopeAtomError> {
-        todo!()
+    pub fn new(value: impl Into<String>) -> Result<Self, ScopeAtomError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ScopeAtomError::Empty);
+        }
+        if value.len() > 128 {
+            return Err(ScopeAtomError::TooLong);
+        }
+        let mut chars = value.bytes();
+        let first = chars.next().expect("checked non-empty");
+        if !first.is_ascii_alphanumeric()
+            || chars.any(|byte| {
+                !(byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+            })
+        {
+            return Err(ScopeAtomError::InvalidCharacters);
+        }
+        Ok(Self(value))
     }
 
     /// Returns the validated atom text. Contract section 1.1.
     pub fn as_str(&self) -> &str {
-        todo!()
+        &self.0
     }
 }
 
@@ -58,7 +74,11 @@ pub struct ScopedId<T> {
 
 impl<T> ScopedId<T> {
     /// Constructs an explicitly scoped identifier. Contract section 1.13.
-    pub fn new(_scope: ExecutionScope, _id: T) -> Self {
-        todo!()
+    pub fn new(scope: ExecutionScope, id: T) -> Self {
+        Self {
+            scope,
+            id,
+            marker: PhantomData,
+        }
     }
 }
