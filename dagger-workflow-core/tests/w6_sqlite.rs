@@ -48,10 +48,14 @@ async fn pool_injection_preserves_host_tables_and_applies_schema() {
         .await
         .unwrap();
 
-    let store =
-        SqliteWorkflowStore::from_pool(pool.clone(), Arc::new(TestClock::new(Timestamp(0))))
-            .await
-            .unwrap();
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::from_pool(
+        pool.clone(),
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
     let label: String = sqlx::query_scalar("SELECT label FROM host_jobs WHERE id = 1")
         .fetch_one(store.pool())
         .await
@@ -70,18 +74,21 @@ async fn pool_injection_preserves_host_tables_and_applies_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(table_count, 18);
+    assert_eq!(table_count, 34);
 }
 
 #[tokio::test]
 async fn standalone_open_reopens_a_converged_migration() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("workflow.sqlite");
-    let first = SqliteWorkflowStore::open(&path, Arc::new(TestClock::new(Timestamp(10))))
+    let first_clock = Arc::new(TestClock::new(Timestamp(10)));
+    let objects = Arc::new(InMemoryObjectStore::new(first_clock.clone()));
+    let first = SqliteWorkflowStore::open(&path, first_clock, objects.clone())
         .await
         .unwrap();
     first.pool().close().await;
-    let reopened = SqliteWorkflowStore::open(&path, Arc::new(TestClock::new(Timestamp(20))))
+    let reopened_clock = Arc::new(TestClock::new(Timestamp(20)));
+    let reopened = SqliteWorkflowStore::open(&path, reopened_clock, objects)
         .await
         .unwrap();
     let versions: Vec<i64> = sqlx::query_scalar(
@@ -130,9 +137,14 @@ async fn aborted_migration_transaction_reopens_and_converges() {
     }
     pool.close().await;
 
-    let reopened = SqliteWorkflowStore::open(&path, Arc::new(TestClock::new(Timestamp(0))))
-        .await
-        .unwrap();
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let reopened = SqliteWorkflowStore::open(
+        &path,
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
     let version: i64 =
         sqlx::query_scalar("SELECT MAX(version) FROM dagger_workflow_schema_migrations")
             .fetch_one(reopened.pool())
@@ -151,10 +163,14 @@ async fn aborted_migration_transaction_reopens_and_converges() {
 
 #[tokio::test]
 async fn interrupted_sql_transaction_leaves_no_partial_command_effect() {
-    let store =
-        SqliteWorkflowStore::open_url("sqlite::memory:", Arc::new(TestClock::new(Timestamp(0))))
-            .await
-            .unwrap();
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
     {
         let mut transaction = store.pool().begin().await.unwrap();
         sqlx::query(
@@ -193,10 +209,14 @@ async fn interrupted_sql_transaction_leaves_no_partial_command_effect() {
 
 #[tokio::test]
 async fn tenant_a_command_does_not_rewrite_tenant_b_rows() {
-    let store =
-        SqliteWorkflowStore::open_url("sqlite::memory:", Arc::new(TestClock::new(Timestamp(0))))
-            .await
-            .unwrap();
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
     let scope_a = scope("tenant-a");
     let scope_b = scope("tenant-b");
     let claim_a = store
@@ -209,8 +229,9 @@ async fn tenant_a_command_does_not_rewrite_tenant_b_rows() {
         .unwrap();
 
     let before: (String, i64) = sqlx::query_as(
-        "SELECT reducer_data, version FROM dagger_workflow_adapter_state
-         WHERE tenant_id = ? AND namespace = ?",
+        "SELECT row_data, version FROM dagger_workflow_engine_claim_rows
+         WHERE tenant_id = ? AND namespace = ?
+           AND entity_id = 'scheduler' AND sub_id = ''",
     )
     .bind(scope_b.tenant_id.as_str())
     .bind(scope_b.namespace.as_str())
@@ -233,8 +254,9 @@ async fn tenant_a_command_does_not_rewrite_tenant_b_rows() {
         .unwrap();
 
     let after: (String, i64) = sqlx::query_as(
-        "SELECT reducer_data, version FROM dagger_workflow_adapter_state
-         WHERE tenant_id = ? AND namespace = ?",
+        "SELECT row_data, version FROM dagger_workflow_engine_claim_rows
+         WHERE tenant_id = ? AND namespace = ?
+           AND entity_id = 'scheduler' AND sub_id = ''",
     )
     .bind(scope_b.tenant_id.as_str())
     .bind(scope_b.namespace.as_str())
@@ -254,13 +276,98 @@ async fn tenant_a_command_does_not_rewrite_tenant_b_rows() {
 }
 
 #[tokio::test]
+async fn command_reads_authority_rows_not_projection_rows() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
+    let workflow_scope = scope("authority-tenant");
+    let acquired = store
+        .acquire_engine_claim(&workflow_scope, Id::new("real-engine").unwrap())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE dagger_workflow_engine_claims SET instance_id = 'projection-poison'
+         WHERE tenant_id = ? AND namespace = ? AND control_plane_id = 'scheduler'",
+    )
+    .bind(workflow_scope.tenant_id.as_str())
+    .bind(workflow_scope.namespace.as_str())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let heartbeat = store
+        .heartbeat_engine_claim(&workflow_scope, &acquired.permit)
+        .await
+        .unwrap();
+    assert_eq!(heartbeat.instance_id.as_str(), "real-engine");
+}
+
+#[tokio::test]
+async fn authority_row_version_overflow_is_a_cas_conflict_and_rolls_back() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
+    let workflow_scope = scope("cas-tenant");
+    let acquired = store
+        .acquire_engine_claim(&workflow_scope, Id::new("cas-engine").unwrap())
+        .await
+        .unwrap();
+    let projection_before: (i64, i64) = sqlx::query_as(
+        "SELECT heartbeat_at_ms, version FROM dagger_workflow_engine_claims
+         WHERE tenant_id = ? AND namespace = ? AND control_plane_id = 'scheduler'",
+    )
+    .bind(workflow_scope.tenant_id.as_str())
+    .bind(workflow_scope.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE dagger_workflow_engine_claim_rows SET version = 9223372036854775807
+         WHERE tenant_id = ? AND namespace = ?
+           AND entity_id = 'scheduler' AND sub_id = ''",
+    )
+    .bind(workflow_scope.tenant_id.as_str())
+    .bind(workflow_scope.namespace.as_str())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    assert_eq!(
+        store
+            .heartbeat_engine_claim(&workflow_scope, &acquired.permit)
+            .await,
+        Err(dagger_workflow_core::store::StoreError::CasConflict)
+    );
+    let projection_after: (i64, i64) = sqlx::query_as(
+        "SELECT heartbeat_at_ms, version FROM dagger_workflow_engine_claims
+         WHERE tenant_id = ? AND namespace = ? AND control_plane_id = 'scheduler'",
+    )
+    .bind(workflow_scope.tenant_id.as_str())
+    .bind(workflow_scope.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(projection_after, projection_before);
+}
+
+#[tokio::test]
 async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("attempt-recovery.sqlite");
     let clock = Arc::new(TestClock::new(Timestamp(0)));
-    let objects = InMemoryObjectStore::new(clock.clone());
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
     let workflow_scope = scope("recovery-tenant");
-    let store = SqliteWorkflowStore::open(&path, clock.clone())
+    let store = SqliteWorkflowStore::open(&path, clock.clone(), objects.clone())
         .await
         .unwrap();
     let schema = objects
@@ -394,11 +501,12 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
         .await
         .unwrap();
     let durable_data: String = sqlx::query_scalar(
-        "SELECT reducer_data FROM dagger_workflow_adapter_state
-         WHERE tenant_id = ? AND namespace = ?",
+        "SELECT row_data FROM dagger_workflow_run_rows
+         WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
     )
     .bind(workflow_scope.tenant_id.as_str())
     .bind(workflow_scope.namespace.as_str())
+    .bind("recovery-run")
     .fetch_one(store.pool())
     .await
     .unwrap();
@@ -456,7 +564,7 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
     store.pool().close().await;
     drop(store);
 
-    let reopened = SqliteWorkflowStore::open(&path, Arc::new(TestClock::new(Timestamp(0))))
+    let reopened = SqliteWorkflowStore::open(&path, clock.clone(), objects.clone())
         .await
         .unwrap();
     let started = reopened
@@ -508,8 +616,8 @@ fn all_forty_conformance_fixtures_pass_unchanged() {
     struct Adapter {
         _directory: TempDir,
         clock: Arc<TestClock>,
-        store: SqliteWorkflowStore<TestClock>,
-        objects: InMemoryObjectStore<TestClock>,
+        store: SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+        objects: Arc<InMemoryObjectStore<TestClock>>,
     }
 
     impl Adapter {
@@ -519,16 +627,18 @@ fn all_forty_conformance_fixtures_pass_unchanged() {
                 runtime.block_on(async {
                     let directory = TempDir::new().unwrap();
                     let clock = Arc::new(TestClock::new(Timestamp(0)));
+                    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
                     let store = SqliteWorkflowStore::open(
                         directory.path().join("conformance.sqlite"),
                         clock.clone(),
+                        objects.clone(),
                     )
                     .await
                     .unwrap();
                     Self {
                         _directory: directory,
                         store,
-                        objects: InMemoryObjectStore::new(clock.clone()),
+                        objects,
                         clock,
                     }
                 })
@@ -539,7 +649,7 @@ fn all_forty_conformance_fixtures_pass_unchanged() {
     }
 
     impl dagger_workflow_core::conformance::ConformanceAdapter for Adapter {
-        type Store = SqliteWorkflowStore<TestClock>;
+        type Store = SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>;
         type Objects = InMemoryObjectStore<TestClock>;
 
         fn store(&self) -> &Self::Store {
@@ -547,7 +657,7 @@ fn all_forty_conformance_fixtures_pass_unchanged() {
         }
 
         fn objects(&self) -> &Self::Objects {
-            &self.objects
+            self.objects.as_ref()
         }
 
         fn advance_clock_ms(&self, milliseconds: i64) {
