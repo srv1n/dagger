@@ -192,6 +192,68 @@ async fn interrupted_sql_transaction_leaves_no_partial_command_effect() {
 }
 
 #[tokio::test]
+async fn tenant_a_command_does_not_rewrite_tenant_b_rows() {
+    let store =
+        SqliteWorkflowStore::open_url("sqlite::memory:", Arc::new(TestClock::new(Timestamp(0))))
+            .await
+            .unwrap();
+    let scope_a = scope("tenant-a");
+    let scope_b = scope("tenant-b");
+    let claim_a = store
+        .acquire_engine_claim(&scope_a, Id::new("engine-a").unwrap())
+        .await
+        .unwrap();
+    store
+        .acquire_engine_claim(&scope_b, Id::new("engine-b").unwrap())
+        .await
+        .unwrap();
+
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT reducer_data, version FROM dagger_workflow_adapter_state
+         WHERE tenant_id = ? AND namespace = ?",
+    )
+    .bind(scope_b.tenant_id.as_str())
+    .bind(scope_b.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let before_claim: (String, i64, i64) = sqlx::query_as(
+        "SELECT instance_id, generation, version FROM dagger_workflow_engine_claims
+         WHERE tenant_id = ? AND namespace = ? AND control_plane_id = 'scheduler'",
+    )
+    .bind(scope_b.tenant_id.as_str())
+    .bind(scope_b.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+
+    store
+        .heartbeat_engine_claim(&scope_a, &claim_a.permit)
+        .await
+        .unwrap();
+
+    let after: (String, i64) = sqlx::query_as(
+        "SELECT reducer_data, version FROM dagger_workflow_adapter_state
+         WHERE tenant_id = ? AND namespace = ?",
+    )
+    .bind(scope_b.tenant_id.as_str())
+    .bind(scope_b.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let after_claim: (String, i64, i64) = sqlx::query_as(
+        "SELECT instance_id, generation, version FROM dagger_workflow_engine_claims
+         WHERE tenant_id = ? AND namespace = ? AND control_plane_id = 'scheduler'",
+    )
+    .bind(scope_b.tenant_id.as_str())
+    .bind(scope_b.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!((after, after_claim), (before, before_claim));
+}
+
+#[tokio::test]
 async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("attempt-recovery.sqlite");
@@ -331,6 +393,19 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
         )
         .await
         .unwrap();
+    let durable_data: String = sqlx::query_scalar(
+        "SELECT reducer_data FROM dagger_workflow_adapter_state
+         WHERE tenant_id = ? AND namespace = ?",
+    )
+    .bind(workflow_scope.tenant_id.as_str())
+    .bind(workflow_scope.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    // The run input is a deliberately recognizable object payload. SQLite
+    // persists its digest/reference only; the bytes remain in ObjectStore.
+    assert!(!durable_data.contains(r#"{\"value\":1}"#));
+    assert!(!durable_data.contains("verified_object_bytes"));
     let acquired = store
         .acquire_engine_claim(&workflow_scope, Id::new("engine-before-crash").unwrap())
         .await

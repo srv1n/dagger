@@ -1,9 +1,8 @@
-//! SQL-authoritative SQLite workflow control plane.
+//! SQLite workflow control plane.
 //!
-//! Every command obtains a reserved writer with `BEGIN IMMEDIATE`, loads the
-//! committed reducer snapshot and database time from SQLite, applies the
-//! closed transition semantics to that transaction-local snapshot, and
-//! compare-and-swap persists the replacement before `COMMIT`.
+//! The database clock and every durable projection are scoped by tenant and
+//! namespace. Object contents are intentionally never persisted here: only
+//! verified object metadata and typed references belong to the control plane.
 
 mod codec;
 mod reducer;
@@ -22,10 +21,11 @@ use reducer::{ReducerState, ReducerStore};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqlitePool};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use schema::SCHEMA_VERSION;
 
@@ -41,6 +41,9 @@ impl Clock for DatabaseTimestamp {
 /// SQLite-backed workflow control plane with no process-local domain state.
 pub struct SqliteWorkflowStore<C> {
     pool: SqlitePool,
+    /// Process-local material from `VerifiedObjectRef`. This is deliberately
+    /// non-durable; bytes are owned by the object store, never SQLite.
+    verified_bytes: Arc<Mutex<BTreeMap<(ExecutionScope, Digest), Vec<u8>>>>,
     marker: PhantomData<fn() -> C>,
 }
 
@@ -50,6 +53,7 @@ impl<C> SqliteWorkflowStore<C> {
         schema::migrate(&pool).await?;
         Ok(Self {
             pool,
+            verified_bytes: Arc::new(Mutex::new(BTreeMap::new())),
             marker: PhantomData,
         })
     }
@@ -106,11 +110,39 @@ impl<C> SqliteWorkflowStore<C> {
 
     async fn load_state(
         connection: &mut PoolConnection<Sqlite>,
+        scope: &ExecutionScope,
     ) -> Result<(ReducerState, i64, Timestamp), StoreError> {
-        let (snapshot, state_version, now_ms): (String, i64, i64) = sqlx::query_as(
-            "SELECT state_json, state_version,
-                    CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                        + clock_offset_ms
+        let stored: Option<(String, i64)> = sqlx::query_as(
+            "SELECT reducer_data, version
+             FROM dagger_workflow_adapter_state
+             WHERE tenant_id = ? AND namespace = ?",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .fetch_optional(&mut **connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        let (mut state, version) = match stored {
+            Some((data, version)) => (
+                serde_json::from_str(&data).map_err(|_| StoreError::CorruptControlPlane)?,
+                version,
+            ),
+            None => (ReducerState::default(), 0),
+        };
+        // A scoped row can never hydrate another scope, even if a corrupt file
+        // was edited out of band.
+        if state
+            .definitions
+            .keys()
+            .any(|(row_scope, _)| row_scope != scope)
+            || state.runs.keys().any(|(row_scope, _)| row_scope != scope)
+        {
+            return Err(StoreError::CorruptControlPlane);
+        }
+        state.verified_object_bytes.clear();
+        let now_ms: i64 = sqlx::query_scalar(
+            "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+                    + clock_offset_ms
              FROM dagger_workflow_schema_migrations
              WHERE version = ?",
         )
@@ -118,24 +150,30 @@ impl<C> SqliteWorkflowStore<C> {
         .fetch_one(&mut **connection)
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
-        let state = serde_json::from_str(&snapshot).map_err(|_| StoreError::CorruptControlPlane)?;
-        Ok((state, state_version, Timestamp(now_ms)))
+        Ok((state, version, Timestamp(now_ms)))
     }
 
     async fn persist_state(
         connection: &mut PoolConnection<Sqlite>,
+        scope: &ExecutionScope,
         expected_state_version: i64,
         state: &ReducerState,
     ) -> Result<(), StoreError> {
-        let snapshot = serde_jcs::to_string(state).map_err(|_| StoreError::TransactionFailed)?;
+        let data = serde_jcs::to_string(state).map_err(|_| StoreError::TransactionFailed)?;
         let result = sqlx::query(
-            "UPDATE dagger_workflow_schema_migrations
-             SET state_json = ?, state_version = state_version + 1
-             WHERE version = ? AND state_version = ?
-               AND state_version < 9223372036854775807",
+            "INSERT INTO dagger_workflow_adapter_state
+                (tenant_id, namespace, reducer_data, version)
+             VALUES (?, ?, ?, 1)
+             ON CONFLICT(tenant_id, namespace) DO UPDATE
+             SET reducer_data = excluded.reducer_data, version = version + 1
+             WHERE tenant_id = ? AND namespace = ? AND version = ?
+               AND version < 9223372036854775807",
         )
-        .bind(snapshot)
-        .bind(SCHEMA_VERSION)
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(data)
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
         .bind(expected_state_version)
         .execute(&mut **connection)
         .await
@@ -152,6 +190,7 @@ impl<C> SqliteWorkflowStore<C> {
 
     async fn persist_projections(
         connection: &mut PoolConnection<Sqlite>,
+        scope: &ExecutionScope,
         state: &ReducerState,
     ) -> Result<(), StoreError> {
         const TABLES: &[&str] = &[
@@ -168,14 +207,15 @@ impl<C> SqliteWorkflowStore<C> {
             "dagger_workflow_run_limits",
             "dagger_workflow_runs",
             "dagger_workflow_engine_claims",
-            "dagger_workflow_action_pins",
             "dagger_workflow_revision_nodes",
             "dagger_workflow_revisions",
             "dagger_workflow_definitions",
         ];
         for table in TABLES {
-            let statement = format!("DELETE FROM {table}");
+            let statement = format!("DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?");
             sqlx::query(&statement)
+                .bind(scope.tenant_id.as_str())
+                .bind(scope.namespace.as_str())
                 .execute(&mut **connection)
                 .await
                 .map_err(|_| StoreError::TransactionFailed)?;
@@ -257,23 +297,6 @@ impl<C> SqliteWorkflowStore<C> {
                 .bind(node_id.as_str())
                 .bind(node_kind)
                 .bind(i64::from(rank.0))
-                .execute(&mut **connection)
-                .await
-                .map_err(|_| StoreError::TransactionFailed)?;
-            }
-            for pin in &revision.action_pins {
-                sqlx::query(
-                    "INSERT INTO dagger_workflow_action_pins
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                )
-                .bind(revision.scope.tenant_id.as_str())
-                .bind(revision.scope.namespace.as_str())
-                .bind(revision.definition_id.as_str())
-                .bind(revision.revision_hash.as_str())
-                .bind(&pin.reference_location)
-                .bind(pin.compatible_implementation_requirement.as_str())
-                .bind(pin.input_schema_digest.as_str())
-                .bind(pin.output_schema_digest.as_str())
                 .execute(&mut **connection)
                 .await
                 .map_err(|_| StoreError::TransactionFailed)?;
@@ -598,13 +621,36 @@ impl<C> SqliteWorkflowStore<C> {
         let _ = sqlx::query("ROLLBACK").execute(&mut **connection).await;
     }
 
-    async fn read_reducer(&self) -> Result<ReducerStore<DatabaseTimestamp>, StoreError> {
+    fn restore_verified_bytes(&self, state: &mut ReducerState, scope: &ExecutionScope) {
+        state.verified_object_bytes = self
+            .verified_bytes
+            .lock()
+            .expect("verified-byte cache lock poisoned")
+            .iter()
+            .filter(|((cached_scope, _), _)| cached_scope == scope)
+            .map(|(key, bytes)| (key.clone(), bytes.clone()))
+            .collect();
+    }
+
+    fn remember_verified_bytes(&self, state: &ReducerState) {
+        let mut cache = self
+            .verified_bytes
+            .lock()
+            .expect("verified-byte cache lock poisoned");
+        cache.extend(state.verified_object_bytes.clone());
+    }
+
+    async fn read_reducer(
+        &self,
+        scope: &ExecutionScope,
+    ) -> Result<ReducerStore<DatabaseTimestamp>, StoreError> {
         let mut connection = self
             .pool
             .acquire()
             .await
             .map_err(|_| StoreError::StorageUnavailable)?;
-        let (state, _, now) = Self::load_state(&mut connection).await?;
+        let (mut state, _, now) = Self::load_state(&mut connection, scope).await?;
+        self.restore_verified_bytes(&mut state, scope);
         Ok(ReducerStore::from_state(
             Arc::new(DatabaseTimestamp(now)),
             state,
@@ -616,7 +662,7 @@ impl<C> SqliteWorkflowStore<C> {
         &self,
         scope: &ExecutionScope,
     ) -> Result<Vec<ObjectRecord>, StoreError> {
-        Ok(self.read_reducer().await?.object_records(scope))
+        Ok(self.read_reducer(scope).await?.object_records(scope))
     }
 
     /// Advances the durable database-clock offset for deterministic conformance.
@@ -657,23 +703,25 @@ macro_rules! sql_command {
             $($arg: $arg_type),*
         ) -> Result<$output, StoreError> {
             let mut connection = self.begin_immediate().await?;
-            let (state, state_version, now) = match Self::load_state(&mut connection).await {
+            let (mut state, state_version, now) = match Self::load_state(&mut connection, scope).await {
                 Ok(value) => value,
                 Err(error) => {
                     Self::rollback(&mut connection).await;
                     return Err(error);
                 }
             };
+            self.restore_verified_bytes(&mut state, scope);
             let reducer = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state);
             match reducer.$name(scope, $($arg),*).await {
                 Ok(value) => {
                     let state = reducer.snapshot();
-                    if let Err(error) = Self::persist_projections(&mut connection, &state).await {
+                    self.remember_verified_bytes(&state);
+                    if let Err(error) = Self::persist_projections(&mut connection, scope, &state).await {
                         Self::rollback(&mut connection).await;
                         return Err(error);
                     }
                     if let Err(error) =
-                        Self::persist_state(&mut connection, state_version, &state).await
+                        Self::persist_state(&mut connection, scope, state_version, &state).await
                     {
                         Self::rollback(&mut connection).await;
                         return Err(error);
@@ -697,7 +745,7 @@ macro_rules! sql_read {
             scope: &ExecutionScope,
             $($arg: $arg_type),*
         ) -> Result<$output, StoreError> {
-            self.read_reducer().await?.$name(scope, $($arg),*).await
+            self.read_reducer(scope).await?.$name(scope, $($arg),*).await
         }
     };
 }
