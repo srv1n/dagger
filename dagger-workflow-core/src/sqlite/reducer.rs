@@ -67,7 +67,10 @@ pub(crate) struct ReducerState {
     pub(crate) object_store_nonce: Option<Vec<u8>>,
     #[serde(with = "map_as_sequence")]
     pub(crate) object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
-    #[serde(with = "map_as_sequence")]
+    /// Verified bytes belong to the object store. They may be cached while a
+    /// process is alive, but serializing them into SQLite would turn the
+    /// control-plane database into an object store.
+    #[serde(skip)]
     pub(crate) verified_object_bytes: BTreeMap<(ExecutionScope, Digest), Vec<u8>>,
     #[serde(with = "map_as_sequence")]
     pub(crate) artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,

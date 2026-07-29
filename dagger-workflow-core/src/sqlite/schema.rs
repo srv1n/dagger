@@ -5,7 +5,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use crate::store::StoreError;
 
 /// Current durable schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_1: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_definitions (
@@ -27,11 +27,13 @@ const MIGRATION_1: &[&str] = &[
         topological_rank INTEGER NOT NULL CHECK(topological_rank >= 0),
         PRIMARY KEY (tenant_id, namespace, definition_id, revision_hash, node_id)
     ) STRICT"#,
-    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_action_pins (
-        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, definition_id TEXT NOT NULL,
-        revision_hash TEXT NOT NULL, reference_location TEXT NOT NULL,
-        semantic_digest TEXT NOT NULL, input_schema_digest TEXT NOT NULL, output_schema_digest TEXT NOT NULL,
-        PRIMARY KEY (tenant_id, namespace, definition_id, revision_hash, reference_location)
+    // This is deliberately per scope.  It is a temporary semantic-oracle cache
+    // used while the row codecs are being split out; it never contains object
+    // bytes.  The authoritative projections remain the domain tables below.
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_adapter_state (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL,
+        reducer_data TEXT NOT NULL, version INTEGER NOT NULL CHECK(version >= 0),
+        PRIMARY KEY (tenant_id, namespace)
     ) STRICT"#,
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_engine_claims (
         tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, control_plane_id TEXT NOT NULL,
@@ -139,13 +141,14 @@ const MIGRATION_1: &[&str] = &[
         ON dagger_workflow_approval_gates(tenant_id, namespace, status, expires_at_ms, run_id, gate_id)"#,
 ];
 
-const MIGRATION_2: &[&str] = &[
-    r#"ALTER TABLE dagger_workflow_schema_migrations
-        ADD COLUMN state_json TEXT NOT NULL DEFAULT '{}'"#,
-    r#"ALTER TABLE dagger_workflow_schema_migrations
-        ADD COLUMN state_version INTEGER NOT NULL DEFAULT 0 CHECK(state_version >= 0)"#,
-    r#"ALTER TABLE dagger_workflow_schema_migrations
-        ADD COLUMN clock_offset_ms INTEGER NOT NULL DEFAULT 0"#,
+const MIGRATION_2: &[&str] = &[r#"ALTER TABLE dagger_workflow_schema_migrations
+        ADD COLUMN clock_offset_ms INTEGER NOT NULL DEFAULT 0"#];
+
+const MIGRATION_3: &[&str] = &[
+    // Version 3 is intentionally a no-op for fresh databases.  Keeping an
+    // explicit migration number makes the removal of the former global JSON
+    // state observable to hosts and tests.
+    "SELECT 1",
 ];
 
 /// Applies all pending migrations, committing each version independently.
@@ -169,6 +172,9 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     if applied.unwrap_or(0) < 2 {
         apply_version(pool, 2, MIGRATION_2).await?;
+    }
+    if applied.unwrap_or(0) < 3 {
+        apply_version(pool, 3, MIGRATION_3).await?;
     }
     Ok(())
 }

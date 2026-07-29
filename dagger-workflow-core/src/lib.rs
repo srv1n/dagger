@@ -14,6 +14,7 @@ pub mod conformance;
 pub mod definition;
 pub mod engine;
 pub mod event;
+pub mod fs_object_store;
 pub mod ids;
 pub mod memory;
 pub mod revision;
