@@ -7,6 +7,9 @@ use crate::artifact::{
 use crate::engine::Clock;
 use crate::ids::Digest;
 use crate::scope::ExecutionScope;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -193,17 +196,58 @@ impl<C: Clock> FsObjectStore<C> {
             return Err(ObjectStoreError::InvalidField);
         }
 
+        let canonical;
+        let bytes = if media_type == "application/json" {
+            canonical = canonical_json(bytes)?;
+            canonical.as_slice()
+        } else {
+            bytes
+        };
         let candidate_digest = digest(bytes);
+        let final_path = self.object_path(scope, &candidate_digest);
+        match fs::symlink_metadata(&final_path) {
+            Ok(_) => {
+                return self.verify_existing_candidate(scope, &candidate_digest, bytes, media_type);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return Err(ObjectStoreError::StorageUnavailable),
+        }
+
         let temporary = self.temporary_path()?;
         let media_temporary = self.media_temporary_path()?;
         write_and_sync(&temporary, bytes).map_err(storage_error)?;
         write_and_sync(&media_temporary, media_type.as_bytes()).map_err(storage_error)?;
-        let final_path = self.object_path(scope, &candidate_digest);
         let parent = final_path
             .parent()
             .expect("object paths always have a parent");
         fs::create_dir_all(parent).map_err(storage_error)?;
         sync_directory(parent).map_err(storage_error)?;
+
+        let media_path = self.media_path(scope, &candidate_digest);
+        let media_parent = media_path
+            .parent()
+            .expect("media paths always have a parent");
+        fs::create_dir_all(media_parent).map_err(storage_error)?;
+        sync_directory(media_parent).map_err(storage_error)?;
+
+        match fs::hard_link(&media_temporary, &media_path) {
+            Ok(()) => {
+                sync_directory(media_parent).map_err(storage_error)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(ObjectStoreError::StorageUnavailable),
+        }
+        let existing_media = read_media_type(&media_path).map_err(storage_error)?;
+        if existing_media != media_type {
+            remove_temp(&temporary);
+            remove_temp(&media_temporary);
+            return Err(ArtifactMetadataConflict {
+                digest: candidate_digest,
+                existing_size_bytes: bytes.len() as u64,
+                candidate_size_bytes: bytes.len() as u64,
+            }
+            .into());
+        }
 
         let created = match fs::hard_link(&temporary, &final_path) {
             Ok(()) => {
@@ -232,32 +276,35 @@ impl<C: Clock> FsObjectStore<C> {
                 .into())
             };
         }
+        remove_temp(&temporary);
+        remove_temp(&media_temporary);
+        Ok(self.verified_reference(scope, candidate_digest, verified.bytes, media_type))
+    }
 
-        let media_path = self.media_path(scope, &candidate_digest);
-        let media_parent = media_path
-            .parent()
-            .expect("media paths always have a parent");
-        fs::create_dir_all(media_parent).map_err(storage_error)?;
-        sync_directory(media_parent).map_err(storage_error)?;
-        match fs::hard_link(&media_temporary, &media_path) {
-            Ok(()) => sync_directory(media_parent).map_err(storage_error)?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) => return Err(ObjectStoreError::StorageUnavailable),
-        }
-        let existing_media = read_media_type(&media_path).map_err(storage_error)?;
-        if existing_media != media_type {
-            remove_temp(&temporary);
-            remove_temp(&media_temporary);
+    fn verify_existing_candidate(
+        &self,
+        scope: &ExecutionScope,
+        candidate_digest: &Digest,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        let final_path = self.object_path(scope, candidate_digest);
+        let verified = self.read_verified(&final_path).map_err(storage_error)?;
+        let existing_media =
+            read_media_type(&self.media_path(scope, candidate_digest)).map_err(storage_error)?;
+        if verified.digest != *candidate_digest
+            || verified.bytes.len() != bytes.len()
+            || verified.bytes != bytes
+            || existing_media != media_type
+        {
             return Err(ArtifactMetadataConflict {
-                digest: candidate_digest,
+                digest: candidate_digest.clone(),
                 existing_size_bytes: verified.bytes.len() as u64,
                 candidate_size_bytes: bytes.len() as u64,
             }
             .into());
         }
-        remove_temp(&temporary);
-        remove_temp(&media_temporary);
-        Ok(self.verified_reference(scope, candidate_digest, verified.bytes, media_type))
+        Ok(self.verified_reference(scope, candidate_digest.clone(), verified.bytes, media_type))
     }
 }
 
@@ -319,6 +366,88 @@ impl<C: Clock> ObjectStore for FsObjectStore<C> {
 struct ReadVerified {
     digest: Digest,
     bytes: Vec<u8>,
+}
+
+struct StrictJson(Value);
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictJsonVisitor;
+
+        impl<'de> Visitor<'de> for StrictJsonVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an I-JSON value without duplicate object keys")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+                if (value as f64) as i64 != value {
+                    return Err(E::custom("integer is not exactly representable as f64"));
+                }
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+                if (value as f64) as u64 != value {
+                    return Err(E::custom("integer is not exactly representable as f64"));
+                }
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+                Ok(Value::String(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = Vec::new();
+                while let Some(value) = values.next_element::<StrictJson>()? {
+                    result.push(value.0);
+                }
+                Ok(Value::Array(result))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = serde_json::Map::new();
+                while let Some(key) = values.next_key::<String>()? {
+                    let value = values.next_value::<StrictJson>()?.0;
+                    if result.insert(key, value).is_some() {
+                        return Err(de::Error::custom("duplicate object key"));
+                    }
+                }
+                Ok(Value::Object(result))
+            }
+        }
+
+        deserializer.deserialize_any(StrictJsonVisitor).map(Self)
+    }
+}
+
+fn canonical_json(bytes: &[u8]) -> Result<Vec<u8>, ObjectStoreError> {
+    let value: StrictJson =
+        serde_json::from_slice(bytes).map_err(|_| ObjectStoreError::InvalidField)?;
+    serde_jcs::to_vec(&value.0).map_err(|_| ObjectStoreError::InvalidField)
 }
 
 fn write_and_sync(path: &Path, bytes: &[u8]) -> io::Result<()> {

@@ -359,6 +359,346 @@ fn json_ref(
     )?))
 }
 
+fn revision_invalid(error: crate::definition::DefinitionValidationError) -> StoreError {
+    StoreError::RevisionInvalid {
+        code: error.kind,
+        path: error.path,
+        message: error.message,
+        valid_alternatives: error.valid_alternatives,
+    }
+}
+
+fn parse_canonical_revision(
+    bytes: &[u8],
+    supplied: &PublishableDefinition,
+) -> Result<PublishableDefinition, StoreError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| StoreError::RevisionInvalid {
+        code: crate::definition::ValidationErrorKind::InvalidField,
+        path: "$".to_owned(),
+        message: "canonical definition must be UTF-8 JSON".to_owned(),
+        valid_alternatives: vec!["publish RFC 8785 canonical JSON bytes".to_owned()],
+    })?;
+    let parsed = crate::definition::parse_json_definition(text).map_err(revision_invalid)?;
+    let canonical =
+        crate::definition::canonical_definition_json(&parsed).map_err(revision_invalid)?;
+    if canonical != bytes {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::InvalidField,
+            path: "$".to_owned(),
+            message: "definition object bytes are not RFC 8785 canonical JSON".to_owned(),
+            valid_alternatives: vec![
+                "publish the exact output of canonical_definition_json".to_owned()
+            ],
+        });
+    }
+    let supplied_canonical = crate::definition::canonical_definition_json(&supplied.definition)
+        .map_err(revision_invalid)?;
+    if supplied_canonical != canonical {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::InvalidField,
+            path: "$".to_owned(),
+            message: "supplied typed definition does not match canonical definition bytes"
+                .to_owned(),
+            valid_alternatives: vec![
+                "parse the canonical bytes and supply that exact typed definition".to_owned(),
+            ],
+        });
+    }
+    let topological_ranks =
+        crate::definition::canonical_topological_ranks(&parsed).map_err(revision_invalid)?;
+    if supplied.topological_ranks != topological_ranks {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::Cycle,
+            path: "/nodes".to_owned(),
+            message: "supplied topological ranks do not match canonical lexical Kahn ranks"
+                .to_owned(),
+            valid_alternatives: vec!["derive ranks from the canonical definition graph".to_owned()],
+        });
+    }
+    Ok(PublishableDefinition {
+        definition: parsed,
+        topological_ranks,
+    })
+}
+
+fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::SchemaSubsetUnsupported)?;
+    if serde_jcs::to_vec(&value).map_err(|_| StoreError::SchemaSubsetUnsupported)? != bytes {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let root = value
+        .as_object()
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    if let Some(schema_uri) = root.get("$schema") {
+        if schema_uri.as_str() != Some("https://json-schema.org/draft/2020-12/schema") {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    }
+    let definitions = match root.get("$defs") {
+        Some(value) => value
+            .as_object()
+            .cloned()
+            .ok_or(StoreError::SchemaSubsetUnsupported)?,
+        None => serde_json::Map::new(),
+    };
+    validate_schema_node(&value, true, 0, &definitions, &mut BTreeSet::new())?;
+    Ok(value)
+}
+
+fn validate_schema_node(
+    schema: &Value,
+    root: bool,
+    depth: usize,
+    definitions: &serde_json::Map<String, Value>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<(), StoreError> {
+    if depth > 64 {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let object = schema
+        .as_object()
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    const ALLOWED: &[&str] = &[
+        "$schema",
+        "$defs",
+        "$ref",
+        "type",
+        "const",
+        "enum",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minimum",
+        "maximum",
+    ];
+    if object
+        .keys()
+        .any(|keyword| !ALLOWED.contains(&keyword.as_str()))
+        || (!root && (object.contains_key("$schema") || object.contains_key("$defs")))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if let Some(reference) = object.get("$ref") {
+        if object.len() != 1 {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let encoded_name = reference
+            .as_str()
+            .and_then(|value| value.strip_prefix("#/$defs/"))
+            .filter(|value| !value.contains('/'))
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        let name = encoded_name.replace("~1", "/").replace("~0", "~");
+        let target = definitions
+            .get(&name)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        if !visiting.insert(name.clone()) {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let result = validate_schema_node(target, false, depth + 1, definitions, visiting);
+        visiting.remove(&name);
+        return result;
+    }
+    let schema_type = object
+        .get("type")
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    let mut types = BTreeSet::new();
+    match schema_type {
+        Value::String(name) if valid_schema_type(name) => {
+            types.insert(name.as_str());
+        }
+        Value::Array(names) if !names.is_empty() => {
+            for name in names {
+                let name = name.as_str().ok_or(StoreError::SchemaSubsetUnsupported)?;
+                if !valid_schema_type(name) || !types.insert(name) {
+                    return Err(StoreError::SchemaSubsetUnsupported);
+                }
+            }
+        }
+        _ => return Err(StoreError::SchemaSubsetUnsupported),
+    }
+    if let Some(defs) = object.get("$defs") {
+        for child in defs
+            .as_object()
+            .ok_or(StoreError::SchemaSubsetUnsupported)?
+            .values()
+        {
+            validate_schema_node(child, false, depth + 1, definitions, visiting)?;
+        }
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .filter(|values| values.len() <= 256)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        let mut canonical = BTreeSet::new();
+        for value in values {
+            if !canonical
+                .insert(serde_jcs::to_vec(value).map_err(|_| StoreError::SchemaSubsetUnsupported)?)
+            {
+                return Err(StoreError::SchemaSubsetUnsupported);
+            }
+        }
+    }
+    if types.contains("object") {
+        if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let empty_properties = serde_json::Map::new();
+        let properties = object
+            .get("properties")
+            .map(Value::as_object)
+            .unwrap_or(Some(&empty_properties))
+            .filter(|properties| properties.len() <= 1024)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        for child in properties.values() {
+            validate_schema_node(child, false, depth + 1, definitions, visiting)?;
+        }
+        if let Some(required) = object.get("required") {
+            let mut names = BTreeSet::new();
+            for name in required
+                .as_array()
+                .ok_or(StoreError::SchemaSubsetUnsupported)?
+            {
+                let name = name.as_str().ok_or(StoreError::SchemaSubsetUnsupported)?;
+                if !properties.contains_key(name) || !names.insert(name) {
+                    return Err(StoreError::SchemaSubsetUnsupported);
+                }
+            }
+        }
+    } else if object.contains_key("properties")
+        || object.contains_key("required")
+        || object.contains_key("additionalProperties")
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if types.contains("array") {
+        validate_schema_node(
+            object
+                .get("items")
+                .ok_or(StoreError::SchemaSubsetUnsupported)?,
+            false,
+            depth + 1,
+            definitions,
+            visiting,
+        )?;
+        let min = safe_schema_integer(object.get("minItems"))?;
+        let max = safe_schema_integer(object.get("maxItems"))?;
+        if min.zip(max).is_some_and(|(min, max)| min > max)
+            || object
+                .get("uniqueItems")
+                .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    } else if ["items", "minItems", "maxItems", "uniqueItems"]
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if safe_schema_integer(object.get("minLength"))?
+        .zip(safe_schema_integer(object.get("maxLength"))?)
+        .is_some_and(|(min, max)| min > max)
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if !types.contains("string")
+        && ["minLength", "maxLength", "pattern"]
+            .iter()
+            .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if let Some(pattern) = object.get("pattern") {
+        let pattern = pattern
+            .as_str()
+            .filter(|pattern| pattern.len() <= 1024)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        if pattern.contains("(?")
+            || pattern
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_digit())
+            || !pattern_is_syntactically_balanced(pattern)
+        {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    }
+    if !types.contains("number")
+        && !types.contains("integer")
+        && ["minimum", "maximum"]
+            .iter()
+            .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if finite_schema_number(object.get("minimum"))?
+        .zip(finite_schema_number(object.get("maximum"))?)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    Ok(())
+}
+
+fn pattern_is_syntactically_balanced(pattern: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '[' | '(' | '{' => stack.push(character),
+            ']' if stack.pop() != Some('[') => return false,
+            ')' if stack.pop() != Some('(') => return false,
+            '}' if stack.pop() != Some('{') => return false,
+            _ => {}
+        }
+    }
+    !escaped && stack.is_empty()
+}
+
+fn valid_schema_type(name: &str) -> bool {
+    matches!(
+        name,
+        "null" | "boolean" | "object" | "array" | "number" | "integer" | "string"
+    )
+}
+
+fn safe_schema_integer(value: Option<&Value>) -> Result<Option<u64>, StoreError> {
+    value
+        .map(|value| value.as_u64().ok_or(StoreError::SchemaSubsetUnsupported))
+        .transpose()
+}
+
+fn finite_schema_number(value: Option<&Value>) -> Result<Option<f64>, StoreError> {
+    value
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or(StoreError::SchemaSubsetUnsupported)
+        })
+        .transpose()
+}
+
 fn fingerprint<T: Serialize>(domain: &str, scope: &ExecutionScope, value: &T) -> Digest {
     let bytes = serde_jcs::to_vec(&(domain, scope, value)).expect("fingerprint input serializes");
     digest(&bytes)
@@ -2210,13 +2550,19 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             verified(&mut state, scope, &command.canonical_definition, now)?;
             verified(&mut state, scope, &command.run_input_schema, now)?;
             verified(&mut state, scope, &command.run_output_schema, now)?;
-            if command.parsed_revision.definition.definition_id != command.definition_id {
+            let canonical_revision = parse_canonical_revision(
+                command.canonical_definition.verified_bytes(),
+                &command.parsed_revision,
+            )?;
+            if canonical_revision.definition.definition_id != command.definition_id {
                 return Err(StoreError::RevisionDefinitionIdMismatch);
             }
+            validate_schema_document(command.run_input_schema.verified_bytes())?;
+            validate_schema_document(command.run_output_schema.verified_bytes())?;
             let revision_hash = command.canonical_definition.digest().clone();
-            if command.parsed_revision.definition.run_input_schema_digest
+            if canonical_revision.definition.run_input_schema_digest
                 != *command.run_input_schema.digest()
-                || command.parsed_revision.definition.run_output_schema_digest
+                || canonical_revision.definition.run_output_schema_digest
                     != *command.run_output_schema.digest()
             {
                 return Err(StoreError::DigestMismatch);
@@ -2271,8 +2617,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 1,
                 now,
             )?;
-            let extracted =
-                crate::definition::extract_action_pins(&command.parsed_revision.definition);
+            let extracted = crate::definition::extract_action_pins(&canonical_revision.definition);
             let mut pins = Vec::with_capacity(extracted.len());
             for pin in extracted {
                 let schemas = command
@@ -2284,6 +2629,8 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 {
                     return Err(StoreError::DigestMismatch);
                 }
+                validate_schema_document(schemas.input_schema.verified_bytes())?;
+                validate_schema_document(schemas.output_schema.verified_bytes())?;
                 pins.push(ActionPin {
                     reference_location: pin.reference_location,
                     name: pin.name,
@@ -2324,27 +2671,25 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 canonical_definition_ref,
                 run_input_schema_ref,
                 run_output_schema_ref,
-                run_input_schema_digest: command
-                    .parsed_revision
+                run_input_schema_digest: canonical_revision
                     .definition
                     .run_input_schema_digest
                     .clone(),
-                run_output_schema_digest: command
-                    .parsed_revision
+                run_output_schema_digest: canonical_revision
                     .definition
                     .run_output_schema_digest
                     .clone(),
-                entry_node_id: command.parsed_revision.definition.entry_node_id.clone(),
-                node_count: u32::try_from(command.parsed_revision.definition.nodes.len())
+                entry_node_id: canonical_revision.definition.entry_node_id.clone(),
+                node_count: u32::try_from(canonical_revision.definition.nodes.len())
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
-                node_topological_ranks: command.parsed_revision.topological_ranks.clone(),
+                node_topological_ranks: canonical_revision.topological_ranks.clone(),
                 action_pins: pins,
                 published_at: now,
                 published_by: command.principal.principal_id().to_owned(),
             };
             state
                 .parsed_revisions
-                .insert(revision_key.clone(), command.parsed_revision);
+                .insert(revision_key.clone(), canonical_revision);
             state.revisions.insert(revision_key, revision.clone());
             let definition = state
                 .definitions
@@ -2537,6 +2882,36 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 .get(&revision_key)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
+            let schema_bytes = state
+                .verified_object_bytes
+                .get(&(
+                    scope.clone(),
+                    revision.run_input_schema_ref.0.digest.clone(),
+                ))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let schema = validate_schema_document(schema_bytes)
+                .map_err(|_| StoreError::CorruptControlPlane)?;
+            let input: Value =
+                serde_json::from_slice(command.input.verified_bytes()).map_err(|_| {
+                    StoreError::ContractValidation {
+                        kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
+                        path: "/input".to_owned(),
+                        message:
+                            "run input must be canonical JSON accepted by the pinned root schema"
+                                .to_owned(),
+                        valid_alternatives: Vec::new(),
+                    }
+                })?;
+            if serde_jcs::to_vec(&input).ok().as_deref() != Some(command.input.verified_bytes())
+                || !schema_accepts(&schema, &schema, &input)
+            {
+                return Err(StoreError::ContractValidation {
+                    kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
+                    path: "/input".to_owned(),
+                    message: "run input does not match the pinned root input schema".to_owned(),
+                    valid_alternatives: Vec::new(),
+                });
+            }
             let static_node_count = u64::try_from(parsed.definition.nodes.len())
                 .map_err(|_| StoreError::ArithmeticOverflow)?;
             let creation_event_count = 1_u64

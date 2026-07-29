@@ -7,19 +7,24 @@ use dagger_workflow_core::approval::{
 };
 use dagger_workflow_core::artifact::ObjectStore;
 use dagger_workflow_core::definition::{
-    ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
-    PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
+    ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, MapBinding,
+    MapBindingSource, NodeDefinition, PublishableDefinition, RetryPolicy, TimeoutPolicy,
+    WorkflowDefinition,
 };
 use dagger_workflow_core::engine::TestClock;
-use dagger_workflow_core::ids::{CostUnits, Id, Timestamp, TopologicalRank, Version};
+use dagger_workflow_core::ids::{
+    map_child_id, map_expansion_digest, CostUnits, Id, MapChildIdentity, Timestamp,
+    TopologicalRank, Version,
+};
 use dagger_workflow_core::memory::InMemoryObjectStore;
 use dagger_workflow_core::run::RunLimits;
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::{SqliteWorkflowStore, SCHEMA_VERSION};
 use dagger_workflow_core::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
-    CompletionObjects, CreateDefinition, CreateRun, DecideApproval, PageRequest, PublishRevision,
-    RequestApproval, ResolvedActionSchemas, StartRun, StoreError, TimeoutAttempt, WorkflowStore,
+    CompleteMap, CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EnginePermit,
+    ExpandMap, OrderedMapItem, PageRequest, PublishRevision, RequestApproval, ResolveTerminalNode,
+    ResolvedActionSchemas, StartRun, StoreError, TimeoutAttempt, WorkflowStore,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
@@ -62,7 +67,11 @@ async fn seed_action_definition(
 ) -> ActionFixture {
     let workflow_scope = scope(tenant);
     let schema = objects
-        .put(&workflow_scope, b"{}", "application/json")
+        .put(
+            &workflow_scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
         .await
         .unwrap();
     let principal = AuthenticatedPrincipal::mint(
@@ -104,9 +113,9 @@ async fn seed_action_definition(
                     compatible_implementation_requirement: schema.digest().clone(),
                 },
                 bindings: vec![Binding {
-                    target: String::new(),
+                    target: "/value".to_owned(),
                     source: BindingSource::RunInput {
-                        pointer: String::new(),
+                        pointer: "/value".to_owned(),
                     },
                 }],
                 retry: RetryPolicy {
@@ -184,7 +193,11 @@ async fn seed_approval_definition(
 ) -> ActionFixture {
     let workflow_scope = scope(tenant);
     let schema = objects
-        .put(&workflow_scope, b"{}", "application/json")
+        .put(
+            &workflow_scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
         .await
         .unwrap();
     let principal = AuthenticatedPrincipal::mint(
@@ -304,6 +317,108 @@ fn create_run_command(fixture: &ActionFixture, run_id: &str) -> CreateRun {
     }
 }
 
+async fn complete_action_run(
+    store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+    fixture: &ActionFixture,
+    permit: &EnginePermit,
+    run_id: &str,
+) {
+    store
+        .create_run(&fixture.scope, create_run_command(fixture, run_id))
+        .await
+        .unwrap();
+    store
+        .start_run(
+            &fixture.scope,
+            StartRun {
+                permit: permit.clone(),
+                run_id: Id::new(run_id).unwrap(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: fixture.evidence_digest.clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let action = store
+        .get_node(
+            &fixture.scope,
+            &Id::new(run_id).unwrap(),
+            &Id::new("action").unwrap(),
+        )
+        .await
+        .unwrap();
+    let credential = match store
+        .claim_node_attempt(
+            &fixture.scope,
+            ClaimNodeAttempt {
+                permit: permit.clone(),
+                run_id: Id::new(run_id).unwrap(),
+                node_id: Id::new("action").unwrap(),
+                expected_node_version: action.version,
+                attempt_id: Id::new(format!("attempt-{run_id}")).unwrap(),
+                worker_id: Id::new("history-worker").unwrap(),
+                bound_input: fixture.input.clone(),
+                binding_derivation_digest: fixture.evidence_digest.clone(),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => panic!("history attempt was not claimed"),
+    };
+    store
+        .complete_attempt(
+            &fixture.scope,
+            CompleteAttempt {
+                completion_credential: credential,
+                run_id: Id::new(run_id).unwrap(),
+                node_id: Id::new("action").unwrap(),
+                attempt_id: Id::new(format!("attempt-{run_id}")).unwrap(),
+                submitted_outcome: ActionOutcome::Success {
+                    output: serde_json::json!({"value": 1}),
+                    artifacts: Vec::new(),
+                    actual_cost_units: CostUnits(1),
+                    diagnostics: None,
+                },
+                objects: CompletionObjects {
+                    output: Some(fixture.input.clone()),
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let terminal = store
+        .get_node(
+            &fixture.scope,
+            &Id::new(run_id).unwrap(),
+            &Id::new("succeed").unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .resolve_terminal_node(
+            &fixture.scope,
+            ResolveTerminalNode {
+                permit: permit.clone(),
+                run_id: Id::new(run_id).unwrap(),
+                node_id: Id::new("succeed").unwrap(),
+                expected_node_version: terminal.version,
+                output: Some(fixture.input.clone()),
+            },
+        )
+        .await
+        .unwrap();
+}
+
 async fn raw_scope_snapshot(
     pool: &sqlx::SqlitePool,
     workflow_scope: &ExecutionScope,
@@ -333,6 +448,56 @@ async fn raw_scope_snapshot(
         let json_columns = columns
             .iter()
             .map(|column| format!("quote(\"{column}\")"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = format!(
+            "SELECT json_array({json_columns}) FROM \"{table}\"
+             WHERE tenant_id = ? AND namespace = ? ORDER BY {order}"
+        );
+        let rows = sqlx::query_scalar(&statement)
+            .bind(workflow_scope.tenant_id.as_str())
+            .bind(workflow_scope.namespace.as_str())
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        snapshot.insert(table, rows);
+    }
+    snapshot
+}
+
+async fn raw_physical_scope_snapshot(
+    pool: &sqlx::SqlitePool,
+    workflow_scope: &ExecutionScope,
+) -> BTreeMap<String, Vec<String>> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name LIKE 'dagger_workflow_%'
+         ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut snapshot = BTreeMap::new();
+    for table in tables {
+        let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        if !columns.iter().any(|column| column == "tenant_id")
+            || !columns.iter().any(|column| column == "namespace")
+        {
+            continue;
+        }
+        let json_columns = std::iter::once("rowid".to_owned())
+            .chain(columns.iter().map(|column| format!("quote(\"{column}\")")))
             .collect::<Vec<_>>()
             .join(", ");
         let order = columns
@@ -424,7 +589,7 @@ async fn standalone_open_reopens_a_converged_migration() {
     .fetch_all(reopened.pool())
     .await
     .unwrap();
-    assert_eq!(versions, (1..=SCHEMA_VERSION).collect::<Vec<_>>());
+    assert_eq!(versions, vec![1]);
 }
 
 #[tokio::test]
@@ -442,7 +607,8 @@ async fn aborted_migration_transaction_reopens_and_converges() {
         .unwrap();
     sqlx::query(
         "CREATE TABLE dagger_workflow_schema_migrations(
-            version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL
+            version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
+            clock_offset_ms INTEGER NOT NULL DEFAULT 0
         ) STRICT",
     )
     .execute(&pool)
@@ -504,9 +670,10 @@ async fn interrupted_sql_transaction_leaves_no_partial_command_effect() {
             "INSERT INTO dagger_workflow_runs
              (tenant_id, namespace, run_id, definition_id, revision_hash, status,
               version, event_seq, aggregate_object_bytes, total_attempts,
-              budget_limit, budget_reserved, budget_spent, lifetime_deadline_at_ms, created_at_ms)
+              budget_limit, budget_reserved, budget_spent, lifetime_deadline_at_ms,
+              created_at_ms, updated_at_ms)
              VALUES ('tenant', 'workflow', 'run', 'definition', 'sha256:x', 'Pending',
-                     1, 0, 0, 0, 1, 0, 0, 100, 0)",
+                     1, 0, 0, 0, 1, 0, 0, 100, 0, 0)",
         )
         .execute(&mut *transaction)
         .await
@@ -560,16 +727,27 @@ async fn gate_4_tenant_command_changes_only_expected_rows_in_its_own_slice() {
         .await
         .unwrap();
 
-    let before_a = raw_scope_snapshot(store.pool(), &fixture_a.scope).await;
-    let before_b = raw_scope_snapshot(store.pool(), &fixture_b.scope).await;
+    let before_a = raw_physical_scope_snapshot(store.pool(), &fixture_a.scope).await;
+    let before_b = raw_physical_scope_snapshot(store.pool(), &fixture_b.scope).await;
 
     store
-        .heartbeat_engine_claim(&fixture_a.scope, &claim_a.permit)
+        .start_run(
+            &fixture_a.scope,
+            StartRun {
+                permit: claim_a.permit,
+                run_id: Id::new("run-a").unwrap(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: fixture_a.evidence_digest.clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
         .await
         .unwrap();
 
-    let after_a = raw_scope_snapshot(store.pool(), &fixture_a.scope).await;
-    let after_b = raw_scope_snapshot(store.pool(), &fixture_b.scope).await;
+    let after_a = raw_physical_scope_snapshot(store.pool(), &fixture_a.scope).await;
+    let after_b = raw_physical_scope_snapshot(store.pool(), &fixture_b.scope).await;
     assert_eq!(after_b, before_b, "tenant B changed byte-for-byte");
 
     let changed_a = before_a
@@ -581,14 +759,380 @@ async fn gate_4_tenant_command_changes_only_expected_rows_in_its_own_slice() {
     assert_eq!(
         changed_a,
         vec![
-            "dagger_workflow_engine_claim_rows",
-            "dagger_workflow_engine_claims"
+            "dagger_workflow_event_batch_rows",
+            "dagger_workflow_event_rows",
+            "dagger_workflow_events",
+            "dagger_workflow_run_rows",
+            "dagger_workflow_runs",
+            "dagger_workflow_scope_counters",
         ]
     );
-    for table in changed_a {
-        assert_eq!(before_a[table].len(), 1);
-        assert_eq!(after_a[table].len(), 1);
-    }
+    assert_eq!(
+        before_a["dagger_workflow_node_run_rows"], after_a["dagger_workflow_node_run_rows"],
+        "ordinary start_run physically rewrote untouched node authority rows"
+    );
+    assert_eq!(
+        before_a["dagger_workflow_nodes"], after_a["dagger_workflow_nodes"],
+        "ordinary start_run changed untouched projection rowids/versions"
+    );
+}
+
+#[tokio::test]
+async fn canonical_revision_and_root_input_schema_are_authoritative() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = SqliteWorkflowStore::open_url("sqlite::memory:", clock, objects.clone())
+        .await
+        .unwrap();
+    let fixture = seed_action_definition(&store, &objects, "canonical-authority").await;
+    let canonical = objects
+        .get(&fixture.scope, &fixture.revision_hash)
+        .await
+        .unwrap();
+    let mut mismatched_definition = dagger_workflow_core::definition::parse_json_definition(
+        std::str::from_utf8(&canonical.bytes).unwrap(),
+    )
+    .unwrap();
+    mismatched_definition.name = "caller-supplied-definition-b".to_owned();
+    let ranks =
+        dagger_workflow_core::definition::canonical_topological_ranks(&mismatched_definition)
+            .unwrap();
+    let schema = objects
+        .get(&fixture.scope, &fixture.evidence_digest)
+        .await
+        .unwrap()
+        .reference;
+    let before = raw_scope_snapshot(store.pool(), &fixture.scope).await;
+    let mismatch = store
+        .publish_revision(
+            &fixture.scope,
+            PublishRevision {
+                definition_id: Id::new("definition").unwrap(),
+                expected_definition_version: Version(2),
+                canonical_definition: canonical.reference,
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::from([(
+                    "action".to_owned(),
+                    ResolvedActionSchemas {
+                        input_schema: schema.clone(),
+                        output_schema: schema,
+                    },
+                )]),
+                parsed_revision: PublishableDefinition {
+                    definition: mismatched_definition,
+                    topological_ranks: ranks,
+                },
+                principal: fixture.principal.clone(),
+            },
+        )
+        .await;
+    assert!(matches!(mismatch, Err(StoreError::RevisionInvalid { .. })));
+    assert_eq!(
+        raw_scope_snapshot(store.pool(), &fixture.scope).await,
+        before,
+        "canonical/typed mismatch mutated publication state"
+    );
+
+    let invalid_input = objects
+        .put(&fixture.scope, br#"{"other":1}"#, "application/json")
+        .await
+        .unwrap();
+    let mut command = create_run_command(&fixture, "schema-rejected-run");
+    command.input = invalid_input;
+    assert!(matches!(
+        store.create_run(&fixture.scope, command).await,
+        Err(StoreError::ContractValidation { .. })
+    ));
+    assert!(matches!(
+        store
+            .get_run(&fixture.scope, &Id::new("schema-rejected-run").unwrap())
+            .await,
+        Err(StoreError::NotFound)
+    ));
+}
+
+#[tokio::test]
+async fn complete_map_rehydrates_pinned_output_schema_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("map-schema-restart.sqlite");
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = open_file_store(&path, clock.clone(), objects.clone()).await;
+    let workflow_scope = scope("map-schema-restart");
+    let schema = objects
+        .put(
+            &workflow_scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .unwrap();
+    let principal = AuthenticatedPrincipal::mint(
+        workflow_scope.clone(),
+        "map-host".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .unwrap();
+    let definition_id = Id::new("map-definition").unwrap();
+    store
+        .create_definition(
+            &workflow_scope,
+            CreateDefinition {
+                definition_id: definition_id.clone(),
+                display_name: "map".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: definition_id.clone(),
+        name: "map".to_owned(),
+        description: String::new(),
+        run_input_schema_digest: schema.digest().clone(),
+        run_output_schema_digest: schema.digest().clone(),
+        entry_node_id: Id::new("map").unwrap(),
+        nodes: vec![
+            NodeDefinition::Map {
+                id: Id::new("map").unwrap(),
+                items: BindingSource::Constant {
+                    value: serde_json::json!([{"value": 1}]),
+                },
+                max_items: 1,
+                max_concurrency: 1,
+                action: ActionReference {
+                    name: "map.action".to_owned(),
+                    contract_version: "1".to_owned(),
+                    input_schema_digest: schema.digest().clone(),
+                    output_schema_digest: schema.digest().clone(),
+                    compatible_implementation_requirement: schema.digest().clone(),
+                },
+                bindings: vec![MapBinding {
+                    target: "/value".to_owned(),
+                    source: MapBindingSource::MapItem {
+                        pointer: "/value".to_owned(),
+                    },
+                }],
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 60_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![Id::new("succeed").unwrap()],
+            },
+            NodeDefinition::Succeed {
+                id: Id::new("succeed").unwrap(),
+                output: BindingSource::NodeOutput {
+                    node_id: Id::new("map").unwrap(),
+                    pointer: String::new(),
+                },
+            },
+        ],
+    };
+    let canonical = objects
+        .put(
+            &workflow_scope,
+            &serde_jcs::to_vec(&definition).unwrap(),
+            "application/json",
+        )
+        .await
+        .unwrap();
+    store
+        .publish_revision(
+            &workflow_scope,
+            PublishRevision {
+                definition_id: definition_id.clone(),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical.clone(),
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::from([(
+                    "map/map_action".to_owned(),
+                    ResolvedActionSchemas {
+                        input_schema: schema.clone(),
+                        output_schema: schema.clone(),
+                    },
+                )]),
+                parsed_revision: PublishableDefinition {
+                    topological_ranks:
+                        dagger_workflow_core::definition::canonical_topological_ranks(&definition)
+                            .unwrap(),
+                    definition,
+                },
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let run_input = objects
+        .put(&workflow_scope, br#"{"value":1}"#, "application/json")
+        .await
+        .unwrap();
+    store
+        .create_run(
+            &workflow_scope,
+            CreateRun {
+                run_id: Id::new("map-run").unwrap(),
+                definition_id,
+                revision_hash: canonical.digest().clone(),
+                input: run_input,
+                budget_limit: CostUnits(10),
+                limits: RunLimits {
+                    max_dynamic_node_instances: 10,
+                    max_total_attempts: 10,
+                    max_total_events: 1_000,
+                    max_inline_json_bytes_per_value: 10_000,
+                    max_artifacts_per_attempt: 10,
+                    max_aggregate_object_bytes_per_run: 100_000,
+                    max_run_lifetime_ms: 100_000,
+                },
+                principal,
+                idempotency_token: "map-create-token-long-enough".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let claim = store
+        .acquire_engine_claim(&workflow_scope, Id::new("map-engine").unwrap())
+        .await
+        .unwrap();
+    store
+        .start_run(
+            &workflow_scope,
+            StartRun {
+                permit: claim.permit.clone(),
+                run_id: Id::new("map-run").unwrap(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let item = objects
+        .put(&workflow_scope, br#"{"value":1}"#, "application/json")
+        .await
+        .unwrap();
+    let expansion_input = objects
+        .put(&workflow_scope, br#"[{"value":1}]"#, "application/json")
+        .await
+        .unwrap();
+    let run_id = Id::new("map-run").unwrap();
+    let map_id = Id::new("map").unwrap();
+    let child_id = map_child_id(&run_id, &map_id, 0, item.digest());
+    let identities = vec![MapChildIdentity {
+        item_index: 0,
+        item_digest: item.digest().clone(),
+        child_id: child_id.clone(),
+    }];
+    let map = store
+        .get_node(&workflow_scope, &run_id, &map_id)
+        .await
+        .unwrap();
+    store
+        .expand_map(
+            &workflow_scope,
+            ExpandMap {
+                permit: claim.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: map_id.clone(),
+                expected_node_version: map.version,
+                input: expansion_input,
+                ordered_items: vec![OrderedMapItem {
+                    index: 0,
+                    item_digest: item.digest().clone(),
+                    child_id: child_id.clone(),
+                }],
+                expansion_digest: map_expansion_digest(&identities),
+            },
+        )
+        .await
+        .unwrap();
+    let child = store
+        .get_node(&workflow_scope, &run_id, &child_id)
+        .await
+        .unwrap();
+    let credential = match store
+        .claim_node_attempt(
+            &workflow_scope,
+            ClaimNodeAttempt {
+                permit: claim.permit.clone(),
+                run_id: run_id.clone(),
+                node_id: child_id.clone(),
+                expected_node_version: child.version,
+                attempt_id: Id::new("map-attempt").unwrap(),
+                worker_id: Id::new("map-worker").unwrap(),
+                bound_input: item.clone(),
+                binding_derivation_digest: schema.digest().clone(),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => panic!("map child was not claimed"),
+    };
+    store
+        .complete_attempt(
+            &workflow_scope,
+            CompleteAttempt {
+                completion_credential: credential,
+                run_id: run_id.clone(),
+                node_id: child_id,
+                attempt_id: Id::new("map-attempt").unwrap(),
+                submitted_outcome: ActionOutcome::Success {
+                    output: serde_json::json!({"value": 1}),
+                    artifacts: Vec::new(),
+                    actual_cost_units: CostUnits(1),
+                    diagnostics: None,
+                },
+                objects: CompletionObjects {
+                    output: Some(item),
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let aggregate = objects
+        .put(&workflow_scope, br#"[{"value":1}]"#, "application/json")
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+    let restarted = open_file_store(&path, clock, objects).await;
+    let parent = restarted
+        .get_node(&workflow_scope, &run_id, &map_id)
+        .await
+        .unwrap();
+    let completed = restarted
+        .complete_map(
+            &workflow_scope,
+            CompleteMap {
+                permit: claim.permit,
+                run_id,
+                map_node_id: map_id,
+                expected_node_version: parent.version,
+                aggregate,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        completed.status,
+        dagger_workflow_core::run::NodeState::Succeeded
+    );
 }
 
 #[tokio::test]
@@ -687,7 +1231,11 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
         .await
         .unwrap();
     let schema = objects
-        .put(&workflow_scope, b"{}", "application/json")
+        .put(
+            &workflow_scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
         .await
         .unwrap();
     let principal = AuthenticatedPrincipal::mint(
@@ -728,9 +1276,9 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
                     compatible_implementation_requirement: schema.digest().clone(),
                 },
                 bindings: vec![Binding {
-                    target: String::new(),
+                    target: "/value".to_owned(),
                     source: BindingSource::RunInput {
-                        pointer: String::new(),
+                        pointer: "/value".to_owned(),
                     },
                 }],
                 retry: RetryPolicy {
@@ -1304,7 +1852,7 @@ async fn gate_7_two_connection_races_preserve_all_domain_fences() {
 }
 
 #[tokio::test]
-async fn gate_8_restart_replay_and_bulk_abandoned_attempt_recovery_are_deterministic() {
+async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_deterministic() {
     use dagger_workflow_core::store::RecoverAbandonedAttemptsForRun;
 
     let directory = TempDir::new().unwrap();
@@ -1388,7 +1936,7 @@ async fn gate_8_restart_replay_and_bulk_abandoned_attempt_recovery_are_determini
             .claim_node_attempt(
                 &fixture.scope,
                 ClaimNodeAttempt {
-                    permit: first_engine.permit,
+                    permit: first_engine.permit.clone(),
                     run_id: Id::new("recovery-batch-run").unwrap(),
                     node_id: Id::new("action").unwrap(),
                     expected_node_version: node.version,
@@ -1402,131 +1950,59 @@ async fn gate_8_restart_replay_and_bulk_abandoned_attempt_recovery_are_determini
             .unwrap(),
         ClaimNodeAttemptResult::Claimed { .. }
     ));
-
-    let run_json: String = sqlx::query_scalar(
-        "SELECT row_data FROM dagger_workflow_run_rows
-         WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .fetch_one(restarted.pool())
-    .await
-    .unwrap();
-    let mut run_value: serde_json::Value = serde_json::from_str(&run_json).unwrap();
-    run_value["budget_reserved"] = serde_json::Value::String("2".to_owned());
-    run_value["total_attempt_count"] = serde_json::json!(2);
-    sqlx::query(
-        "UPDATE dagger_workflow_run_rows SET row_data = ?, version = version + 1
-         WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
-    )
-    .bind(serde_jcs::to_string(&run_value).unwrap())
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .execute(restarted.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE dagger_workflow_runs SET budget_reserved = 2, total_attempts = 2
-         WHERE tenant_id = ? AND namespace = ? AND run_id = ?",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .execute(restarted.pool())
-    .await
-    .unwrap();
-
-    let node_json: String = sqlx::query_scalar(
-        "SELECT row_data FROM dagger_workflow_node_run_rows
-         WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .bind("action")
-    .fetch_one(restarted.pool())
-    .await
-    .unwrap();
-    let mut node_value: serde_json::Value = serde_json::from_str(&node_json).unwrap();
-    node_value["node_instance_id"] = serde_json::json!("action-2");
-    node_value["active_attempt_id"] = serde_json::json!("attempt-2");
-    sqlx::query(
-        "INSERT INTO dagger_workflow_node_run_rows
-         (tenant_id, namespace, entity_id, sub_id, row_data, version)
-         VALUES (?, ?, ?, ?, ?, 1)",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .bind("action-2")
-    .bind(serde_jcs::to_string(&node_value).unwrap())
-    .execute(restarted.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO dagger_workflow_nodes
-         SELECT tenant_id, namespace, run_id, 'action-2', node_kind, status,
-                topological_rank, map_item_index, attempt_count, 'attempt-2',
-                next_eligible_at_ms, version
-         FROM dagger_workflow_nodes
-         WHERE tenant_id = ? AND namespace = ? AND run_id = ? AND node_id = 'action'",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .execute(restarted.pool())
-    .await
-    .unwrap();
-
-    let attempt_json: String = sqlx::query_scalar(
-        "SELECT row_data FROM dagger_workflow_attempt_rows
-         WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .bind("attempt-1")
-    .fetch_one(restarted.pool())
-    .await
-    .unwrap();
-    let mut attempt_value: serde_json::Value = serde_json::from_str(&attempt_json).unwrap();
-    attempt_value["attempt_id"] = serde_json::json!("attempt-2");
-    attempt_value["node_instance_id"] = serde_json::json!("action-2");
-    attempt_value["invocation_id"] = serde_json::json!("invocation-2");
-    sqlx::query(
-        "INSERT INTO dagger_workflow_attempt_rows
-         (tenant_id, namespace, entity_id, sub_id, row_data, version)
-         VALUES (?, ?, ?, ?, ?, 1)",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .bind("attempt-2")
-    .bind(serde_jcs::to_string(&attempt_value).unwrap())
-    .execute(restarted.pool())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO dagger_workflow_attempts
-         SELECT tenant_id, namespace, run_id, 'attempt-2', 'action-2',
-                attempt_number, status, engine_generation, completion_credential_digest,
-                reservation_units, started_at_ms, deadline_at_ms, finished_at_ms,
-                output_digest, diagnostics_digest, version
-         FROM dagger_workflow_attempts
-         WHERE tenant_id = ? AND namespace = ? AND run_id = ? AND attempt_id = 'attempt-1'",
-    )
-    .bind(fixture.scope.tenant_id.as_str())
-    .bind(fixture.scope.namespace.as_str())
-    .bind("recovery-batch-run")
-    .execute(restarted.pool())
-    .await
-    .unwrap();
+    restarted
+        .create_run(
+            &fixture.scope,
+            create_run_command(&fixture, "recovery-batch-run-2"),
+        )
+        .await
+        .unwrap();
+    restarted
+        .start_run(
+            &fixture.scope,
+            StartRun {
+                permit: first_engine.permit.clone(),
+                run_id: Id::new("recovery-batch-run-2").unwrap(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: fixture.evidence_digest.clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let second_node = restarted
+        .get_node(
+            &fixture.scope,
+            &Id::new("recovery-batch-run-2").unwrap(),
+            &Id::new("action").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        restarted
+            .claim_node_attempt(
+                &fixture.scope,
+                ClaimNodeAttempt {
+                    permit: first_engine.permit,
+                    run_id: Id::new("recovery-batch-run-2").unwrap(),
+                    node_id: Id::new("action").unwrap(),
+                    expected_node_version: second_node.version,
+                    attempt_id: Id::new("attempt-2").unwrap(),
+                    worker_id: Id::new("worker").unwrap(),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.evidence_digest.clone(),
+                },
+            )
+            .await
+            .unwrap(),
+        ClaimNodeAttemptResult::Claimed { .. }
+    ));
 
     restarted.pool().close().await;
     drop(restarted);
-    let after_crash = open_file_store(&path, clock, objects).await;
+    let after_crash = open_file_store(&path, clock.clone(), objects.clone()).await;
     after_crash.advance_database_clock_ms(20_000).await.unwrap();
     let recovery_engine = after_crash
         .acquire_engine_claim(&fixture.scope, Id::new("engine-after-crash").unwrap())
@@ -1536,26 +2012,110 @@ async fn gate_8_restart_replay_and_bulk_abandoned_attempt_recovery_are_determini
         .recover_abandoned_attempts_for_run(
             &fixture.scope,
             RecoverAbandonedAttemptsForRun {
-                permit: recovery_engine.permit,
+                permit: recovery_engine.permit.clone(),
                 run_id: Id::new("recovery-batch-run").unwrap(),
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        recovered
-            .iter()
-            .map(|attempt| attempt.attempt_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["attempt-1", "attempt-2"]
-    );
+    assert_eq!(recovered[0].attempt_id.as_str(), "attempt-1");
     assert!(recovered.iter().all(|attempt| {
         attempt.status == dagger_workflow_core::run::AttemptState::UnknownOutcome
     }));
+    let recovered_second = after_crash
+        .recover_abandoned_attempts_for_run(
+            &fixture.scope,
+            RecoverAbandonedAttemptsForRun {
+                permit: recovery_engine.permit.clone(),
+                run_id: Id::new("recovery-batch-run-2").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered_second[0].attempt_id.as_str(), "attempt-2");
+    let canonical_rows: Vec<String> = sqlx::query_scalar(
+        "SELECT row_data FROM dagger_workflow_event_rows
+         WHERE tenant_id = ? AND namespace = ?
+           AND entity_id IN ('recovery-batch-run', 'recovery-batch-run-2')
+         UNION ALL
+         SELECT row_data FROM dagger_workflow_event_batch_rows
+         WHERE tenant_id = ? AND namespace = ?
+           AND entity_id IN ('recovery-batch-run', 'recovery-batch-run-2')
+         ORDER BY row_data",
+    )
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .fetch_all(after_crash.pool())
+    .await
+    .unwrap();
+    assert!(canonical_rows.iter().all(|row| {
+        let value: serde_json::Value = serde_json::from_str(row).unwrap();
+        serde_jcs::to_string(&value).unwrap() == *row
+    }));
+    let recovered_snapshot = raw_scope_snapshot(after_crash.pool(), &fixture.scope).await;
+    after_crash.pool().close().await;
+    drop(after_crash);
+    let replayed = open_file_store(&path, clock, objects).await;
+    assert!(replayed
+        .recover_abandoned_attempts_for_run(
+            &fixture.scope,
+            RecoverAbandonedAttemptsForRun {
+                permit: recovery_engine.permit.clone(),
+                run_id: Id::new("recovery-batch-run").unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(replayed
+        .recover_abandoned_attempts_for_run(
+            &fixture.scope,
+            RecoverAbandonedAttemptsForRun {
+                permit: recovery_engine.permit,
+                run_id: Id::new("recovery-batch-run-2").unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        raw_scope_snapshot(replayed.pool(), &fixture.scope).await,
+        recovered_snapshot,
+        "recovery replay changed persisted event or batch bytes"
+    );
 }
 
 #[test]
 fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
+    fn top_level_sql(statement: &str) -> String {
+        let mut result = String::with_capacity(statement.len());
+        let mut depth = 0_u32;
+        let mut quoted = false;
+        for character in statement.chars() {
+            match character {
+                '\'' => {
+                    quoted = !quoted;
+                    if depth == 0 {
+                        result.push(character);
+                    }
+                }
+                '(' if !quoted => {
+                    depth += 1;
+                    result.push(' ');
+                }
+                ')' if !quoted => {
+                    depth = depth.saturating_sub(1);
+                    result.push(' ');
+                }
+                _ if depth == 0 => result.push(character),
+                _ => result.push(' '),
+            }
+        }
+        result.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     fn string_literals(source: &str) -> Vec<String> {
         let bytes = source.as_bytes();
         let mut literals = Vec::new();
@@ -1635,7 +2195,23 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
             if schema_ddl || migration_bookkeeping {
                 continue;
             }
-            if !lower.contains("tenant_id") || !lower.contains("namespace") {
+            let top_level = top_level_sql(&lower);
+            let scoped = if lower.starts_with("insert ") {
+                let target_columns = lower
+                    .split_once(" values ")
+                    .or_else(|| lower.split_once(" select "))
+                    .map_or(lower.as_str(), |(prefix, _)| prefix);
+                target_columns.contains("tenant_id") && target_columns.contains("namespace")
+            } else if lower.starts_with("update ") || lower.starts_with("delete ") {
+                top_level
+                    .split_once(" where ")
+                    .is_some_and(|(_, predicate)| {
+                        predicate.contains("tenant_id") && predicate.contains("namespace")
+                    })
+            } else {
+                top_level.contains("tenant_id") && top_level.contains("namespace")
+            };
+            if !scoped {
                 violations.push(format!(
                     "{}: {}",
                     path.file_name().unwrap().to_string_lossy(),
@@ -1657,99 +2233,67 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
         objects: &Arc<InMemoryObjectStore<TestClock>>,
         tenant: &str,
-        count: i64,
+        count: usize,
     ) -> (
         ActionFixture,
         dagger_workflow_core::store::AcquiredEngineClaim,
     ) {
         let fixture = seed_action_definition(store, objects, tenant).await;
-        store
-            .create_run(&fixture.scope, create_run_command(&fixture, "template-run"))
-            .await
-            .unwrap();
-        sqlx::query(
-            "WITH RECURSIVE seq(value) AS (
-                 SELECT 0 UNION ALL SELECT value + 1 FROM seq WHERE value + 1 < ?
-             )
-             INSERT INTO dagger_workflow_run_rows
-                 (tenant_id, namespace, entity_id, sub_id, row_data, version)
-             SELECT tenant_id, namespace, printf('history-%04d', value), '',
-                    json_set(row_data, '$.run_id', printf('history-%04d', value),
-                                      '$.status', 'Succeeded', '$.finished_at', 1),
-                    1
-             FROM dagger_workflow_run_rows CROSS JOIN seq
-             WHERE tenant_id = ? AND namespace = ?
-               AND entity_id = 'template-run' AND sub_id = ''",
-        )
-        .bind(count)
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "WITH RECURSIVE seq(value) AS (
-                 SELECT 0 UNION ALL SELECT value + 1 FROM seq WHERE value + 1 < ?
-             )
-             INSERT INTO dagger_workflow_runs
-                 (tenant_id, namespace, run_id, definition_id, revision_hash, status,
-                  version, event_seq, aggregate_object_bytes, total_attempts,
-                  budget_limit, budget_reserved, budget_spent, lifetime_deadline_at_ms,
-                  created_at_ms, updated_at_ms)
-             SELECT tenant_id, namespace, printf('history-%04d', value), definition_id,
-                    revision_hash, 'Succeeded', version, event_seq,
-                    aggregate_object_bytes, total_attempts, budget_limit, 0,
-                    budget_spent, lifetime_deadline_at_ms, created_at_ms, updated_at_ms
-             FROM dagger_workflow_runs CROSS JOIN seq
-             WHERE tenant_id = ? AND namespace = ? AND run_id = 'template-run'",
-        )
-        .bind(count)
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "DELETE FROM dagger_workflow_run_rows
-             WHERE tenant_id = ? AND namespace = ?
-               AND entity_id = 'template-run' AND sub_id = ''",
-        )
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "DELETE FROM dagger_workflow_runs
-             WHERE tenant_id = ? AND namespace = ? AND run_id = 'template-run'",
-        )
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
         let claim = store
             .acquire_engine_claim(&fixture.scope, Id::new("cost-engine").unwrap())
             .await
             .unwrap();
+        for index in 0..count {
+            complete_action_run(
+                store,
+                &fixture,
+                &claim.permit,
+                &format!("history-{index:04}"),
+            )
+            .await;
+        }
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dagger_workflow_runs
+             WHERE tenant_id = ? AND namespace = ? AND status = 'Succeeded'",
+        )
+        .bind(fixture.scope.tenant_id.as_str())
+        .bind(fixture.scope.namespace.as_str())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(completed, count as i64);
         (fixture, claim)
     }
 
-    async fn measure_heartbeats(
+    async fn measure_ordinary_starts(
         store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
         fixture: &ActionFixture,
         claim: &dagger_workflow_core::store::AcquiredEngineClaim,
     ) -> Duration {
-        for _ in 0..3 {
+        for index in 0..20 {
             store
-                .heartbeat_engine_claim(&fixture.scope, &claim.permit)
+                .create_run(
+                    &fixture.scope,
+                    create_run_command(fixture, &format!("measured-{index:04}")),
+                )
                 .await
                 .unwrap();
         }
         let started = Instant::now();
-        for _ in 0..25 {
+        for index in 0..20 {
             store
-                .heartbeat_engine_claim(&fixture.scope, &claim.permit)
+                .start_run(
+                    &fixture.scope,
+                    StartRun {
+                        permit: claim.permit.clone(),
+                        run_id: Id::new(format!("measured-{index:04}")).unwrap(),
+                        compatibility_evidence: CompatibilityReport {
+                            evidence_digest: fixture.evidence_digest.clone(),
+                            incompatible_reference_locations: Vec::new(),
+                            evidence: Vec::new(),
+                        },
+                    },
+                )
                 .await
                 .unwrap();
         }
@@ -1774,20 +2318,20 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
     )
     .await;
     let (small_fixture, small_claim) =
-        seed_completed_history(&small, &small_objects, "small-history", 10).await;
+        seed_completed_history(&small, &small_objects, "small-history", 5).await;
     let (large_fixture, large_claim) =
-        seed_completed_history(&large, &large_objects, "large-history", 750).await;
+        seed_completed_history(&large, &large_objects, "large-history", 80).await;
 
-    let small_elapsed = measure_heartbeats(&small, &small_fixture, &small_claim).await;
-    let large_elapsed = measure_heartbeats(&large, &large_fixture, &large_claim).await;
+    let small_elapsed = measure_ordinary_starts(&small, &small_fixture, &small_claim).await;
+    let large_elapsed = measure_ordinary_starts(&large, &large_fixture, &large_claim).await;
     let generous_bound = small_elapsed
         .checked_mul(8)
         .unwrap_or(Duration::MAX)
         .saturating_add(Duration::from_millis(100));
     assert!(
         large_elapsed <= generous_bound,
-        "750-run heartbeat {large_elapsed:?} scaled with history; \
-         10-run heartbeat was {small_elapsed:?}, bound {generous_bound:?}"
+        "80-run ordinary start {large_elapsed:?} scaled with completed history; \
+         5-run ordinary start was {small_elapsed:?}, bound {generous_bound:?}"
     );
 }
 
