@@ -27,13 +27,110 @@ const MIGRATION_1: &[&str] = &[
         topological_rank INTEGER NOT NULL CHECK(topological_rank >= 0),
         PRIMARY KEY (tenant_id, namespace, definition_id, revision_hash, node_id)
     ) STRICT"#,
-    // This is deliberately per scope.  It is a temporary semantic-oracle cache
-    // used while the row codecs are being split out; it never contains object
-    // bytes.  The authoritative projections remain the domain tables below.
-    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_adapter_state (
-        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL,
-        reducer_data TEXT NOT NULL, version INTEGER NOT NULL CHECK(version >= 0),
-        PRIMARY KEY (tenant_id, namespace)
+    // Each authority table stores one independently CAS-protected domain row.
+    // The payload is the control-plane entity codec, never object bytes.  The
+    // canonical revision row is also the durable home of its parsed revision.
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_definition_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_revision_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_engine_claim_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_run_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_node_run_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_edge_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_attempt_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_approval_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_invocation_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_idempotency_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_artifact_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_object_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_event_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_event_batch_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_budget_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_stale_observation_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_scope_counters (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
     ) STRICT"#,
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_engine_claims (
         tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, control_plane_id TEXT NOT NULL,
@@ -73,6 +170,7 @@ const MIGRATION_1: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_edges (
         tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, run_id TEXT NOT NULL, edge_id TEXT NOT NULL,
         from_node_id TEXT NOT NULL, to_node_id TEXT NOT NULL, status TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
         PRIMARY KEY (tenant_id, namespace, run_id, edge_id)
     ) STRICT"#,
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_attempts (
@@ -81,6 +179,7 @@ const MIGRATION_1: &[&str] = &[
         engine_generation INTEGER NOT NULL, completion_credential_digest TEXT NOT NULL,
         reservation_units INTEGER NOT NULL, started_at_ms INTEGER NOT NULL, deadline_at_ms INTEGER NOT NULL,
         finished_at_ms INTEGER, output_digest TEXT, diagnostics_digest TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
         PRIMARY KEY (tenant_id, namespace, run_id, attempt_id),
         UNIQUE (tenant_id, namespace, run_id, node_id, attempt_number)
     ) STRICT"#,
