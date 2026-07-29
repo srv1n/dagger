@@ -5,7 +5,11 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use crate::store::StoreError;
 
 /// Current durable schema version.
-pub const SCHEMA_VERSION: i64 = 4;
+///
+/// This pre-release adapter has one coherent baseline. Earlier local W6
+/// migration numbers never represented independently usable schemas and were
+/// deliberately collapsed rather than retained as fictional compatibility.
+pub const SCHEMA_VERSION: i64 = 1;
 
 const MIGRATION_1: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_definitions (
@@ -150,6 +154,7 @@ const MIGRATION_1: &[&str] = &[
         budget_reserved INTEGER NOT NULL CHECK(budget_reserved >= 0),
         budget_spent INTEGER NOT NULL CHECK(budget_spent >= 0),
         lifetime_deadline_at_ms INTEGER NOT NULL, created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, namespace, run_id)
     ) STRICT"#,
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_run_limits (
@@ -165,6 +170,7 @@ const MIGRATION_1: &[&str] = &[
         node_kind TEXT NOT NULL, status TEXT NOT NULL, topological_rank INTEGER NOT NULL,
         map_item_index INTEGER, attempt_count INTEGER NOT NULL CHECK(attempt_count >= 0),
         active_attempt_id TEXT, next_eligible_at_ms INTEGER, version INTEGER NOT NULL CHECK(version > 0),
+        updated_at_ms INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, namespace, run_id, node_id)
     ) STRICT"#,
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_edges (
@@ -232,41 +238,20 @@ const MIGRATION_1: &[&str] = &[
         created_at_ms INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, namespace, artifact_ref_id)
     ) STRICT"#,
-    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_nodes_ready_scan
-        ON dagger_workflow_nodes(tenant_id, namespace, status, topological_rank, run_id, node_id)"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_nodes_scheduler_scan
+        ON dagger_workflow_nodes(
+            tenant_id, namespace, status, run_id, node_id, updated_at_ms, next_eligible_at_ms
+        )"#,
     r#"CREATE INDEX IF NOT EXISTS dagger_workflow_attempts_deadline_scan
-        ON dagger_workflow_attempts(tenant_id, namespace, status, deadline_at_ms, run_id, node_id)"#,
-    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_gates_expiry_scan
-        ON dagger_workflow_approval_gates(tenant_id, namespace, status, expires_at_ms, run_id, gate_id)"#,
-];
-
-const MIGRATION_2: &[&str] = &[r#"ALTER TABLE dagger_workflow_schema_migrations
-        ADD COLUMN clock_offset_ms INTEGER NOT NULL DEFAULT 0"#];
-
-const MIGRATION_3: &[&str] = &[
-    // Version 3 is intentionally a no-op for fresh databases.  Keeping an
-    // explicit migration number makes the removal of the former global JSON
-    // state observable to hosts and tests.
-    "SELECT 1",
-];
-
-const MIGRATION_4: &[&str] = &[
-    r#"ALTER TABLE dagger_workflow_runs
-        ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0"#,
-    r#"UPDATE dagger_workflow_runs AS runs
-        SET updated_at_ms = COALESCE(
-            (SELECT json_extract(rows.row_data, '$.updated_at')
-             FROM dagger_workflow_run_rows AS rows
-             WHERE rows.tenant_id = runs.tenant_id
-               AND rows.namespace = runs.namespace
-               AND rows.entity_id = runs.run_id
-               AND rows.sub_id = ''),
-            runs.created_at_ms
+        ON dagger_workflow_attempts(
+            tenant_id, namespace, status, deadline_at_ms, run_id, node_id, attempt_id, started_at_ms
         )"#,
     r#"CREATE INDEX IF NOT EXISTS dagger_workflow_attempts_recovery_scan
         ON dagger_workflow_attempts(
             tenant_id, namespace, status, engine_generation, started_at_ms, run_id, attempt_id
         )"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_gates_expiry_scan
+        ON dagger_workflow_approval_gates(tenant_id, namespace, status, expires_at_ms, run_id, gate_id)"#,
     r#"CREATE INDEX IF NOT EXISTS dagger_workflow_runs_compatibility_scan
         ON dagger_workflow_runs(
             tenant_id, namespace, status, updated_at_ms, run_id
@@ -281,7 +266,8 @@ const MIGRATION_4: &[&str] = &[
 pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(
         r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
-            version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL
+            version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
+            clock_offset_ms INTEGER NOT NULL DEFAULT 0
         ) STRICT"#,
     )
     .execute(pool)
@@ -293,17 +279,50 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
             .fetch_one(pool)
             .await
             .map_err(|_| StoreError::StorageUnavailable)?;
+    if applied.is_some_and(|version| version > SCHEMA_VERSION) {
+        return Err(StoreError::TransactionFailed);
+    }
     if applied.unwrap_or(0) < 1 {
         apply_version(pool, 1, MIGRATION_1).await?;
     }
-    if applied.unwrap_or(0) < 2 {
-        apply_version(pool, 2, MIGRATION_2).await?;
-    }
-    if applied.unwrap_or(0) < 3 {
-        apply_version(pool, 3, MIGRATION_3).await?;
-    }
-    if applied.unwrap_or(0) < 4 {
-        apply_version(pool, 4, MIGRATION_4).await?;
+    validate_coherent_v1(pool).await?;
+    Ok(())
+}
+
+async fn validate_coherent_v1(pool: &SqlitePool) -> Result<(), StoreError> {
+    for (table, required_columns) in [
+        (
+            "dagger_workflow_schema_migrations",
+            &["clock_offset_ms"][..],
+        ),
+        (
+            "dagger_workflow_run_rows",
+            &["tenant_id", "namespace", "row_data", "version"][..],
+        ),
+        (
+            "dagger_workflow_runs",
+            &["tenant_id", "namespace", "updated_at_ms"][..],
+        ),
+        (
+            "dagger_workflow_nodes",
+            &["tenant_id", "namespace", "updated_at_ms"][..],
+        ),
+    ] {
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info(?)
+             WHERE name IN ('tenant_id', 'namespace', 'row_data', 'version',
+                            'clock_offset_ms', 'updated_at_ms')",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        if required_columns
+            .iter()
+            .any(|required| !present.iter().any(|column| column == required))
+        {
+            return Err(StoreError::TransactionFailed);
+        }
     }
     Ok(())
 }

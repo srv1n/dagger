@@ -32,6 +32,12 @@ fn object_file(root: &Path) -> PathBuf {
     files.pop().unwrap()
 }
 
+fn media_file(root: &Path, object: &Path) -> PathBuf {
+    root.join("meta")
+        .join("object-media")
+        .join(object.strip_prefix(root.join("objects")).unwrap())
+}
+
 fn collect_files(path: &Path, files: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(path).unwrap() {
         let path = entry.unwrap().path();
@@ -77,6 +83,54 @@ impl Drop for TestRoot {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).unwrap();
     }
+}
+
+#[tokio::test]
+async fn application_json_is_canonicalized_before_digest_and_storage() {
+    let root = TestRoot::new("canonical-json");
+    let store = open_store(root.path());
+    let scope = scope();
+    let unordered = store
+        .put(&scope, br#"{ "b": 1, "a": [3, 2, 1] }"#, "application/json")
+        .await
+        .unwrap();
+    let ordered = store
+        .publish_if_absent(&scope, br#"{"a":[3,2,1],"b":1}"#, "application/json")
+        .await
+        .unwrap();
+
+    assert_eq!(unordered.digest(), ordered.digest());
+    assert_eq!(
+        fs::read(object_file(root.path())).unwrap(),
+        br#"{"a":[3,2,1],"b":1}"#
+    );
+    assert_eq!(
+        store.get(&scope, unordered.digest()).await.unwrap().bytes,
+        br#"{"a":[3,2,1],"b":1}"#
+    );
+}
+
+#[tokio::test]
+async fn application_json_rejects_invalid_and_non_i_json_without_publication() {
+    let root = TestRoot::new("invalid-json");
+    let store = open_store(root.path());
+    let scope = scope();
+
+    for bytes in [
+        br#"{"unterminated":"#.as_slice(),
+        br#"{"duplicate":1,"duplicate":2}"#.as_slice(),
+        br#"{"unsafe_integer":9007199254740993}"#.as_slice(),
+        b"{\"invalid_utf8\":\"\xff\"}".as_slice(),
+    ] {
+        assert!(matches!(
+            store.put(&scope, bytes, "application/json").await,
+            Err(ObjectStoreError::InvalidField)
+        ));
+    }
+
+    let mut objects = Vec::new();
+    collect_files(&root.path().join("objects"), &mut objects);
+    assert!(objects.is_empty());
 }
 
 #[tokio::test]
@@ -154,20 +208,24 @@ async fn existing_tampered_path_returns_conflict_and_preserves_original_bytes() 
 }
 
 #[tokio::test]
-async fn orphan_temp_before_rename_is_invisible_after_reopen() {
+async fn crash_before_sidecar_link_leaves_no_visible_object() {
     let root = TestRoot::new("orphan-temp");
     let scope = scope();
     let store = open_store(root.path());
-    let orphan = root.path().join("tmp").join("killed-before-rename");
-    fs::write(&orphan, b"orphan").unwrap();
-    fs::File::open(&orphan).unwrap().sync_all().unwrap();
+    let orphan_data = root.path().join("tmp").join("killed-before-sidecar-data");
+    let orphan_media = root.path().join("tmp").join("killed-before-sidecar-media");
+    fs::write(&orphan_data, b"orphan").unwrap();
+    fs::write(&orphan_media, b"text/plain").unwrap();
+    fs::File::open(&orphan_data).unwrap().sync_all().unwrap();
+    fs::File::open(&orphan_media).unwrap().sync_all().unwrap();
     drop(store);
 
     let reopened = open_store(root.path());
     let unknown = Digest::new(format!("sha256:{}", "0".repeat(64))).unwrap();
     let error = reopened.get(&scope, &unknown).await.unwrap_err();
     assert_eq!(error.proof.error_class(), FailedReadClass::Missing);
-    assert!(orphan.exists());
+    assert!(orphan_data.exists());
+    assert!(orphan_media.exists());
     assert!(root
         .path()
         .join("objects")
@@ -178,7 +236,98 @@ async fn orphan_temp_before_rename_is_invisible_after_reopen() {
 }
 
 #[tokio::test]
-async fn published_object_survives_crash_before_caller_acknowledgment() {
+async fn crash_after_sidecar_before_data_keeps_object_invisible_and_type_locked() {
+    let root = TestRoot::new("after-sidecar");
+    let scope = scope();
+    let store = open_store(root.path());
+    let digest = store
+        .put(&scope, b"sidecar first", "text/plain")
+        .await
+        .unwrap()
+        .digest()
+        .clone();
+    let object = object_file(root.path());
+    let media = media_file(root.path(), &object);
+    fs::remove_file(&object).unwrap();
+    drop(store);
+
+    let reopened = open_store(root.path());
+    let error = reopened.get(&scope, &digest).await.unwrap_err();
+    assert_eq!(error.proof.error_class(), FailedReadClass::Missing);
+    assert!(matches!(
+        reopened
+            .put(&scope, b"sidecar first", "application/octet-stream")
+            .await,
+        Err(ObjectStoreError::ArtifactMetadataConflict(_))
+    ));
+    assert!(!object.exists());
+    assert_eq!(fs::read(&media).unwrap(), b"text/plain");
+
+    reopened
+        .put(&scope, b"sidecar first", "text/plain")
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.get(&scope, &digest).await.unwrap().bytes,
+        b"sidecar first"
+    );
+}
+
+#[tokio::test]
+async fn data_with_missing_or_invalid_sidecar_is_never_repaired() {
+    let root = TestRoot::new("data-without-sidecar");
+    let scope = scope();
+    let store = open_store(root.path());
+    let digest = store
+        .put(&scope, b"must stay incomplete", "text/plain")
+        .await
+        .unwrap()
+        .digest()
+        .clone();
+    let object = object_file(root.path());
+    let media = media_file(root.path(), &object);
+    fs::remove_file(&media).unwrap();
+    drop(store);
+
+    let reopened = open_store(root.path());
+    for media_type in ["text/plain", "application/octet-stream"] {
+        assert!(matches!(
+            reopened
+                .put(&scope, b"must stay incomplete", media_type)
+                .await,
+            Err(ObjectStoreError::StorageUnavailable)
+        ));
+        assert!(
+            !media.exists(),
+            "a retry must not recreate missing metadata"
+        );
+        assert_eq!(fs::read(&object).unwrap(), b"must stay incomplete");
+    }
+
+    fs::write(&media, []).unwrap();
+    for media_type in ["text/plain", "application/octet-stream"] {
+        assert!(matches!(
+            reopened
+                .put(&scope, b"must stay incomplete", media_type)
+                .await,
+            Err(ObjectStoreError::StorageUnavailable)
+        ));
+        assert_eq!(fs::read(&media).unwrap(), b"");
+        assert_eq!(fs::read(&object).unwrap(), b"must stay incomplete");
+    }
+
+    let mut temporary = Vec::new();
+    collect_files(&root.path().join("tmp"), &mut temporary);
+    assert!(
+        temporary.is_empty(),
+        "existing incomplete objects must fail before creating candidates"
+    );
+    let error = reopened.get(&scope, &digest).await.unwrap_err();
+    assert_eq!(error.proof.error_class(), FailedReadClass::Missing);
+}
+
+#[tokio::test]
+async fn crash_after_data_link_has_a_complete_readable_object() {
     let root = TestRoot::new("after-rename");
     let scope = scope();
     let store = open_store(root.path());

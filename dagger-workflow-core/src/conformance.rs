@@ -246,7 +246,11 @@ async fn run_original_case<A: ConformanceAdapter>(
 
     let schema = adapter
         .objects()
-        .put(scope_a, b"{}", "application/json")
+        .put(
+            scope_a,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
         .await
         .map_err(|_| failure(17, "schema publication failed"))?;
     let principal = AuthenticatedPrincipal::mint(
@@ -291,9 +295,9 @@ async fn run_original_case<A: ConformanceAdapter>(
                     compatible_implementation_requirement: schema.digest().clone(),
                 },
                 bindings: vec![Binding {
-                    target: String::new(),
+                    target: "/value".to_owned(),
                     source: BindingSource::RunInput {
-                        pointer: String::new(),
+                        pointer: "/value".to_owned(),
                     },
                 }],
                 retry: RetryPolicy {
@@ -867,7 +871,11 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
 ) -> Result<(), ConformanceFailure> {
     let schema = adapter
         .objects()
-        .put(scope, b"{}", "application/json")
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"request":{"type":"boolean"}},"required":["request"],"type":"object"}"#,
+            "application/json",
+        )
         .await
         .map_err(|_| failure(37, "schema publication failed"))?;
     let creator = AuthenticatedPrincipal::mint(
@@ -924,9 +932,9 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                     compatible_implementation_requirement: schema.digest().clone(),
                 },
                 bindings: vec![Binding {
-                    target: String::new(),
+                    target: "/request".to_owned(),
                     source: BindingSource::RunInput {
-                        pointer: String::new(),
+                        pointer: "/request".to_owned(),
                     },
                 }],
                 retry: RetryPolicy {
@@ -1144,7 +1152,11 @@ async fn prepare_map_conformance<A: ConformanceAdapter>(
 ) -> Result<MapConformanceFixture, ConformanceFailure> {
     let schema = adapter
         .objects()
-        .put(scope, b"{}", "application/json")
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"item":{"type":"integer"}},"type":"object"}"#,
+            "application/json",
+        )
         .await
         .map_err(|_| failure(case, "Map schema publication failed"))?;
     let principal = AuthenticatedPrincipal::mint(
@@ -1194,7 +1206,7 @@ async fn prepare_map_conformance<A: ConformanceAdapter>(
                     compatible_implementation_requirement: schema.digest().clone(),
                 },
                 bindings: vec![crate::definition::MapBinding {
-                    target: String::new(),
+                    target: "/item".to_owned(),
                     source: crate::definition::MapBindingSource::MapItem {
                         pointer: String::new(),
                     },

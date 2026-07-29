@@ -28,7 +28,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqlitePool};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::Path;
 use std::str::FromStr;
@@ -529,7 +529,7 @@ pub struct SqliteWorkflowStore<C, O> {
     pool: SqlitePool,
     /// The scoped durable object plane. SQLite retains only metadata and
     /// references. Proof validation is nonce-based, matching memory.
-    _objects: Arc<O>,
+    objects: Arc<O>,
     /// Ephemeral reducer input only. It is neither serialized nor read after
     /// restart; object verification belongs exclusively to the engine.
     verified_bytes: Arc<Mutex<BTreeMap<(ExecutionScope, Digest), Vec<u8>>>>,
@@ -551,7 +551,7 @@ where
         schema::migrate(&pool).await?;
         Ok(Self {
             pool,
-            _objects: objects,
+            objects,
             verified_bytes: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "conformance")]
             commit_fault: Arc::new(Mutex::new(None)),
@@ -624,6 +624,19 @@ where
             .await
             .map_err(|_| StoreError::StorageUnavailable)?;
         sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
+        Ok(connection)
+    }
+
+    async fn begin_read(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        sqlx::query("BEGIN")
             .execute(&mut *connection)
             .await
             .map_err(|_| StoreError::TransactionFailed)?;
@@ -829,64 +842,113 @@ where
     async fn persist_projections(
         connection: &mut PoolConnection<Sqlite>,
         scope: &ExecutionScope,
-        run_filter: Option<&Id>,
+        before: &LoadedAuthority,
         state: &ReducerState,
     ) -> Result<(), StoreError> {
-        const GLOBAL_TABLES: &[&str] = &[
-            "dagger_workflow_artifact_refs",
-            "dagger_workflow_objects",
-            "dagger_workflow_command_receipts",
-            "dagger_workflow_engine_claims",
-            "dagger_workflow_revision_nodes",
-            "dagger_workflow_revisions",
-            "dagger_workflow_definitions",
-        ];
-        const RUN_TABLES: &[&str] = &[
-            "dagger_workflow_events",
-            "dagger_workflow_budget_ledger",
-            "dagger_workflow_approval_gates",
-            "dagger_workflow_action_invocations",
-            "dagger_workflow_attempts",
-            "dagger_workflow_edges",
-            "dagger_workflow_nodes",
-            "dagger_workflow_run_limits",
-            "dagger_workflow_runs",
-        ];
-        for table in GLOBAL_TABLES {
-            let statement = format!("DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?");
-            sqlx::query(&statement)
+        let after = encode_authority_rows(state, scope)?;
+        let changed = before
+            .rows
+            .keys()
+            .chain(after.keys())
+            .filter(|key| before.rows.get(*key).map(|(data, _)| data) != after.get(*key))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let touched = |table: &'static str, entity_id: &str, sub_id: &str| {
+            changed.contains(&AuthorityKey::new(
+                table,
+                entity_id.to_owned(),
+                sub_id.to_owned(),
+            ))
+        };
+        for key in &changed {
+            let (table, entity_column, sub_column) = match key.table {
+                DEFINITION_ROWS => ("dagger_workflow_definitions", "definition_id", None),
+                REVISION_ROWS => {
+                    for table in [
+                        "dagger_workflow_revision_nodes",
+                        "dagger_workflow_revisions",
+                    ] {
+                        let statement = format!(
+                            "DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?
+                             AND definition_id = ? AND revision_hash = ?"
+                        );
+                        sqlx::query(&statement)
+                            .bind(scope.tenant_id.as_str())
+                            .bind(scope.namespace.as_str())
+                            .bind(&key.entity_id)
+                            .bind(&key.sub_id)
+                            .execute(&mut **connection)
+                            .await
+                            .map_err(|_| StoreError::TransactionFailed)?;
+                    }
+                    continue;
+                }
+                ENGINE_CLAIM_ROWS => ("dagger_workflow_engine_claims", "control_plane_id", None),
+                RUN_ROWS => ("dagger_workflow_runs", "run_id", None),
+                NODE_ROWS => ("dagger_workflow_nodes", "run_id", Some("node_id")),
+                EDGE_ROWS => ("dagger_workflow_edges", "run_id", Some("edge_id")),
+                ATTEMPT_ROWS => ("dagger_workflow_attempts", "run_id", Some("attempt_id")),
+                APPROVAL_ROWS => ("dagger_workflow_approval_gates", "run_id", Some("gate_id")),
+                INVOCATION_ROWS => (
+                    "dagger_workflow_action_invocations",
+                    "run_id",
+                    Some("invocation_id"),
+                ),
+                IDEMPOTENCY_ROWS => (
+                    "dagger_workflow_command_receipts",
+                    "command_kind",
+                    Some("idempotency_token"),
+                ),
+                ARTIFACT_ROWS => ("dagger_workflow_artifact_refs", "artifact_ref_id", None),
+                OBJECT_ROWS => ("dagger_workflow_objects", "digest", None),
+                EVENT_ROWS => ("dagger_workflow_events", "run_id", Some("event_seq")),
+                BUDGET_ROWS => (
+                    "dagger_workflow_budget_ledger",
+                    "run_id",
+                    Some("ledger_seq"),
+                ),
+                _ => continue,
+            };
+            let statement = if let Some(sub_column) = sub_column {
+                format!(
+                    "DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?
+                     AND {entity_column} = ? AND {sub_column} = ?"
+                )
+            } else {
+                format!(
+                    "DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?
+                     AND {entity_column} = ?"
+                )
+            };
+            let mut query = sqlx::query(&statement)
                 .bind(scope.tenant_id.as_str())
                 .bind(scope.namespace.as_str())
+                .bind(match key.table {
+                    IDEMPOTENCY_ROWS if key.entity_id == "create-run" => "CreateRun",
+                    IDEMPOTENCY_ROWS if key.entity_id == "cancel-run" => "CancelRun",
+                    _ => key.entity_id.as_str(),
+                });
+            if sub_column.is_some() {
+                if matches!(key.table, EVENT_ROWS | BUDGET_ROWS) {
+                    query = query.bind(
+                        key.sub_id
+                            .parse::<i64>()
+                            .map_err(|_| StoreError::CorruptControlPlane)?,
+                    );
+                } else {
+                    query = query.bind(&key.sub_id);
+                }
+            }
+            query
                 .execute(&mut **connection)
                 .await
                 .map_err(|_| StoreError::TransactionFailed)?;
         }
-        for table in RUN_TABLES {
-            if let Some(run_id) = run_filter {
-                let statement = format!(
-                    "DELETE FROM {table}
-                     WHERE tenant_id = ? AND namespace = ? AND run_id = ?"
-                );
-                sqlx::query(&statement)
-                    .bind(scope.tenant_id.as_str())
-                    .bind(scope.namespace.as_str())
-                    .bind(run_id.as_str())
-                    .execute(&mut **connection)
-                    .await
-                    .map_err(|_| StoreError::TransactionFailed)?;
-            } else {
-                let statement =
-                    format!("DELETE FROM {table} WHERE tenant_id = ? AND namespace = ?");
-                sqlx::query(&statement)
-                    .bind(scope.tenant_id.as_str())
-                    .bind(scope.namespace.as_str())
-                    .execute(&mut **connection)
-                    .await
-                    .map_err(|_| StoreError::TransactionFailed)?;
-            }
-        }
 
         for definition in state.definitions.values() {
+            if !touched(DEFINITION_ROWS, definition.definition_id.as_str(), "") {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_definitions
                  (tenant_id, namespace, definition_id, display_name, description,
@@ -907,6 +969,13 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for revision in state.revisions.values() {
+            if !touched(
+                REVISION_ROWS,
+                revision.definition_id.as_str(),
+                revision.revision_hash.as_str(),
+            ) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_revisions
                  (tenant_id, namespace, definition_id, revision_hash,
@@ -976,6 +1045,9 @@ where
         }
         for stored in state.claims.values() {
             let claim = &stored.claim;
+            if !touched(ENGINE_CLAIM_ROWS, "scheduler", "") {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_engine_claims
                  (tenant_id, namespace, control_plane_id, instance_id, generation,
@@ -999,6 +1071,9 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for run in state.runs.values() {
+            if !touched(RUN_ROWS, run.run_id.as_str(), "") {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_runs
                  (tenant_id, namespace, run_id, definition_id, revision_hash, status,
@@ -1026,39 +1101,50 @@ where
             .execute(&mut **connection)
             .await
             .map_err(|_| StoreError::TransactionFailed)?;
-            sqlx::query(
-                "INSERT INTO dagger_workflow_run_limits
+            let run_key =
+                AuthorityKey::new(RUN_ROWS, run.run_id.as_str().to_owned(), String::new());
+            if !before.rows.contains_key(&run_key) {
+                sqlx::query(
+                    "INSERT INTO dagger_workflow_run_limits
                  (tenant_id, namespace, run_id, max_dynamic_node_instances,
                   max_total_attempts, max_total_events, max_inline_json_bytes_per_value,
                   max_artifacts_per_attempt, max_aggregate_object_bytes_per_run,
                   max_run_lifetime_ms)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(run.scope.tenant_id.as_str())
-            .bind(run.scope.namespace.as_str())
-            .bind(run.run_id.as_str())
-            .bind(Self::sql_integer(run.limits.max_dynamic_node_instances)?)
-            .bind(Self::sql_integer(run.limits.max_total_attempts)?)
-            .bind(Self::sql_integer(run.limits.max_total_events)?)
-            .bind(Self::sql_integer(
-                run.limits.max_inline_json_bytes_per_value,
-            )?)
-            .bind(Self::sql_integer(run.limits.max_artifacts_per_attempt)?)
-            .bind(Self::sql_integer(
-                run.limits.max_aggregate_object_bytes_per_run,
-            )?)
-            .bind(Self::sql_integer(run.limits.max_run_lifetime_ms)?)
-            .execute(&mut **connection)
-            .await
-            .map_err(|_| StoreError::TransactionFailed)?;
+                )
+                .bind(run.scope.tenant_id.as_str())
+                .bind(run.scope.namespace.as_str())
+                .bind(run.run_id.as_str())
+                .bind(Self::sql_integer(run.limits.max_dynamic_node_instances)?)
+                .bind(Self::sql_integer(run.limits.max_total_attempts)?)
+                .bind(Self::sql_integer(run.limits.max_total_events)?)
+                .bind(Self::sql_integer(
+                    run.limits.max_inline_json_bytes_per_value,
+                )?)
+                .bind(Self::sql_integer(run.limits.max_artifacts_per_attempt)?)
+                .bind(Self::sql_integer(
+                    run.limits.max_aggregate_object_bytes_per_run,
+                )?)
+                .bind(Self::sql_integer(run.limits.max_run_lifetime_ms)?)
+                .execute(&mut **connection)
+                .await
+                .map_err(|_| StoreError::TransactionFailed)?;
+            }
         }
         for node in state.nodes.values() {
+            if !touched(
+                NODE_ROWS,
+                node.run_id.as_str(),
+                node.node_instance_id.as_str(),
+            ) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_nodes
                  (tenant_id, namespace, run_id, node_id, node_kind, status,
                   topological_rank, map_item_index, attempt_count, active_attempt_id,
-                  next_eligible_at_ms, version)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  next_eligible_at_ms, version, updated_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(node.scope.tenant_id.as_str())
             .bind(node.scope.namespace.as_str())
@@ -1072,11 +1158,15 @@ where
             .bind(node.active_attempt_id.as_ref().map(Id::as_str))
             .bind(node.next_eligible_at.map(|time| time.0))
             .bind(Self::sql_integer(node.version.0)?)
+            .bind(node.updated_at.0)
             .execute(&mut **connection)
             .await
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for edge in state.edges.values() {
+            if !touched(EDGE_ROWS, edge.run_id.as_str(), edge.edge_id.as_str()) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_edges
                  (tenant_id, namespace, run_id, edge_id, from_node_id, to_node_id,
@@ -1096,6 +1186,13 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for attempt in state.attempts.values() {
+            if !touched(
+                ATTEMPT_ROWS,
+                attempt.run_id.as_str(),
+                attempt.attempt_id.as_str(),
+            ) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_attempts
                  (tenant_id, namespace, run_id, attempt_id, node_id, attempt_number,
@@ -1134,6 +1231,13 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for invocation in state.invocations.values() {
+            if !touched(
+                INVOCATION_ROWS,
+                invocation.run_id.as_str(),
+                invocation.invocation_id.as_str(),
+            ) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_action_invocations
                  (tenant_id, namespace, run_id, invocation_id, attempt_id, node_id,
@@ -1164,6 +1268,9 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for gate in state.gates.values() {
+            if !touched(APPROVAL_ROWS, gate.run_id.as_str(), gate.gate_id.as_str()) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_approval_gates
                  (tenant_id, namespace, run_id, gate_id, node_id, status,
@@ -1202,6 +1309,13 @@ where
         }
         for entries in state.ledger.values() {
             for entry in entries {
+                if !touched(
+                    BUDGET_ROWS,
+                    entry.run_id.as_str(),
+                    &format!("{:020}", entry.ledger_seq),
+                ) {
+                    continue;
+                }
                 let reserved_delta = i64::try_from(entry.reserved_delta)
                     .map_err(|_| StoreError::ArithmeticOverflow)?;
                 sqlx::query(
@@ -1230,6 +1344,13 @@ where
         }
         for events in state.events.values() {
             for event in events {
+                if !touched(
+                    EVENT_ROWS,
+                    event.run_id.as_str(),
+                    &format!("{:020}", event.event_seq),
+                ) {
+                    continue;
+                }
                 sqlx::query(
                     "INSERT INTO dagger_workflow_events
                      (tenant_id, namespace, run_id, event_seq, batch_id, batch_index,
@@ -1258,6 +1379,13 @@ where
             }
         }
         for receipt in state.receipts.values() {
+            let command_kind = match receipt.command_kind {
+                CommandKind::CreateRun => "create-run",
+                CommandKind::CancelRun => "cancel-run",
+            };
+            if !touched(IDEMPOTENCY_ROWS, command_kind, &receipt.idempotency_token) {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_command_receipts
                  (tenant_id, namespace, command_kind, idempotency_token,
@@ -1281,6 +1409,9 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for record in state.object_records.values() {
+            if !touched(OBJECT_ROWS, record.digest.as_str(), "") {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_objects
                  (tenant_id, namespace, digest, size_bytes, object_key, created_at_ms)
@@ -1297,6 +1428,9 @@ where
             .map_err(|_| StoreError::TransactionFailed)?;
         }
         for reference in state.artifact_refs.values() {
+            if !touched(ARTIFACT_ROWS, reference.artifact_ref_id.as_str(), "") {
+                continue;
+            }
             sqlx::query(
                 "INSERT INTO dagger_workflow_artifact_refs
                  (tenant_id, namespace, artifact_ref_id, digest, size_bytes,
@@ -1381,6 +1515,80 @@ where
         let _ = sqlx::query("ROLLBACK").execute(&mut **connection).await;
     }
 
+    async fn hydrate_revision_schemas(
+        &self,
+        scope: &ExecutionScope,
+        definition_id: &Id,
+        revision_hash: &Digest,
+        include_action_schemas: bool,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.begin_read().await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT row_data FROM dagger_workflow_revision_rows
+             WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(definition_id.as_str())
+        .bind(revision_hash.as_str())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let (data,) = row.ok_or(StoreError::NotFound)?;
+        let authority: RevisionAuthority = decode_row(&data)?;
+        let mut digests = vec![authority.revision.run_input_schema_ref.0.digest];
+        if include_action_schemas {
+            digests.extend(authority.revision.action_pins.into_iter().flat_map(|pin| {
+                [
+                    pin.input_schema_ref.0.digest,
+                    pin.output_schema_ref.0.digest,
+                ]
+            }));
+        }
+        digests.sort();
+        digests.dedup();
+        for digest in digests {
+            let object = self
+                .objects
+                .get(scope, &digest)
+                .await
+                // The frozen StoreError taxonomy cannot transport FailedReadProof.
+                // CorruptControlPlane is the closest no-write command failure; the
+                // engine can repeat ObjectStore::get to receive the minted proof
+                // and submit mark_corrupt_storage.
+                .map_err(|_| StoreError::CorruptControlPlane)?;
+            self.verified_bytes
+                .lock()
+                .expect("verified-byte cache lock poisoned")
+                .insert((scope.clone(), digest), object.bytes);
+        }
+        Ok(())
+    }
+
+    async fn hydrate_run_action_schemas(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.begin_read().await?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT row_data FROM dagger_workflow_run_rows
+             WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(run_id.as_str())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let (data,) = row.ok_or(StoreError::NotFound)?;
+        let run: WorkflowRun = decode_row(&data)?;
+        self.hydrate_revision_schemas(scope, &run.definition_id, &run.revision_hash, true)
+            .await
+    }
+
     fn restore_verified_bytes(&self, state: &mut ReducerState, scope: &ExecutionScope) {
         state.verified_object_bytes = self
             .verified_bytes
@@ -1404,14 +1612,11 @@ where
         &self,
         scope: &ExecutionScope,
     ) -> Result<ReducerStore<DatabaseTimestamp>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
         let mut state = Self::load_state(&mut connection, scope, None).await?.state;
         self.restore_verified_bytes(&mut state, scope);
+        Self::commit(connection).await?;
         Ok(ReducerStore::from_state(
             Arc::new(DatabaseTimestamp(now)),
             state,
@@ -1423,16 +1628,157 @@ where
         Ok((encoded ^ (1_u64 << 63)) as i64)
     }
 
+    async fn scan_nodes_sql(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+        query: &'static str,
+        status: &'static str,
+        due_retry: bool,
+    ) -> Result<Page<NodeRun>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
+        let (last_run_id, last_node_id) = if last.is_empty() {
+            ("", "")
+        } else if last.len() == 2 {
+            (last[0].as_str(), last[1].as_str())
+        } else {
+            return Err(StoreError::InvalidField);
+        };
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT nr.row_data
+             FROM dagger_workflow_nodes AS n
+             JOIN dagger_workflow_runs AS r
+               ON r.tenant_id = n.tenant_id AND r.namespace = n.namespace
+              AND r.run_id = n.run_id
+             JOIN dagger_workflow_node_run_rows AS nr
+               ON nr.tenant_id = n.tenant_id AND nr.namespace = n.namespace
+              AND nr.entity_id = n.run_id AND nr.sub_id = n.node_id
+             WHERE n.tenant_id = ? AND n.namespace = ?
+               AND r.tenant_id = ? AND r.namespace = ?
+               AND nr.tenant_id = ? AND nr.namespace = ?
+               AND r.status = 'Running' AND n.status = ?
+               AND n.updated_at_ms <= ?
+               AND (? = 0 OR n.next_eligible_at_ms <= ?)
+               AND (n.run_id > ? OR (n.run_id = ? AND n.node_id > ?))
+             ORDER BY n.run_id, n.node_id
+             LIMIT ?",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(status)
+        .bind(cutoff.0)
+        .bind(i64::from(due_retry))
+        .bind(cutoff.0)
+        .bind(last_run_id)
+        .bind(last_run_id)
+        .bind(last_node_id)
+        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (data,) in rows {
+            let node: NodeRun = decode_row(&data)?;
+            scoped(scope, &node.scope, ())?;
+            items.push(node);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, |node| {
+            vec![
+                node.run_id.as_str().to_owned(),
+                node.node_instance_id.as_str().to_owned(),
+            ]
+        })
+    }
+
+    async fn scan_due_deadlines_sql(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<NodeAttempt>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let query = "due_deadlines";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
+        let (last_deadline, last_run_id, last_node_id, last_attempt_id) = if last.is_empty() {
+            (i64::MIN, "", "", "")
+        } else if last.len() == 4 {
+            (
+                Self::timestamp_from_cursor(&last[0])?,
+                last[1].as_str(),
+                last[2].as_str(),
+                last[3].as_str(),
+            )
+        } else {
+            return Err(StoreError::InvalidField);
+        };
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT ar.row_data
+             FROM dagger_workflow_attempts AS a
+             JOIN dagger_workflow_attempt_rows AS ar
+               ON ar.tenant_id = a.tenant_id AND ar.namespace = a.namespace
+              AND ar.entity_id = a.run_id AND ar.sub_id = a.attempt_id
+             WHERE a.tenant_id = ? AND a.namespace = ?
+               AND ar.tenant_id = ? AND ar.namespace = ?
+               AND a.status = 'Started' AND a.started_at_ms <= ?
+               AND a.deadline_at_ms <= ?
+               AND (a.deadline_at_ms > ?
+                 OR (a.deadline_at_ms = ? AND a.run_id > ?)
+                 OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id > ?)
+                 OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id = ?
+                     AND a.attempt_id > ?))
+             ORDER BY a.deadline_at_ms, a.run_id, a.node_id, a.attempt_id
+             LIMIT ?",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(cutoff.0)
+        .bind(cutoff.0)
+        .bind(last_deadline)
+        .bind(last_deadline)
+        .bind(last_run_id)
+        .bind(last_deadline)
+        .bind(last_run_id)
+        .bind(last_node_id)
+        .bind(last_deadline)
+        .bind(last_run_id)
+        .bind(last_node_id)
+        .bind(last_attempt_id)
+        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (data,) in rows {
+            let attempt: NodeAttempt = decode_row(&data)?;
+            scoped(scope, &attempt.scope, ())?;
+            items.push(attempt);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, |attempt| {
+            vec![
+                timestamp_cursor_key(attempt.deadline_at),
+                attempt.run_id.as_str().to_owned(),
+                attempt.node_instance_id.as_str().to_owned(),
+                attempt.attempt_id.as_str().to_owned(),
+            ]
+        })
+    }
+
     async fn scan_recovery_runs_sql(
         &self,
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
         let query = "recovery_runs";
         let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
@@ -1474,6 +1820,7 @@ where
         .fetch_all(&mut *connection)
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (_, data) in rows {
             let run: WorkflowRun = decode_row(&data)?;
@@ -1490,11 +1837,7 @@ where
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
         let query = "compatibility_rechecks";
         let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
@@ -1531,6 +1874,7 @@ where
         .fetch_all(&mut *connection)
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
             let run: WorkflowRun = decode_row(&data)?;
@@ -1550,11 +1894,7 @@ where
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<ApprovalGate>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
         let query = "due_gates";
         let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
@@ -1599,6 +1939,7 @@ where
         .fetch_all(&mut *connection)
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
             let gate: ApprovalGate = decode_row(&data)?;
@@ -1619,11 +1960,7 @@ where
         scope: &ExecutionScope,
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
         let query = "due_run_lifetimes";
         let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
@@ -1661,6 +1998,7 @@ where
         .fetch_all(&mut *connection)
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
             let run: WorkflowRun = decode_row(&data)?;
@@ -1714,12 +2052,17 @@ where
 }
 
 macro_rules! sql_command {
-    ($name:ident ( $($arg:ident : $arg_type:ty),* $(,)? ) -> $output:ty; $run_filter:expr) => {
+    ($name:ident ( $($arg:ident : $arg_type:ty),* $(,)? ) -> $output:ty; $run_filter:expr $(; |$store:ident, $workflow_scope:ident| $hydrate:expr)?) => {
         async fn $name(
             &self,
             scope: &ExecutionScope,
             $($arg: $arg_type),*
         ) -> Result<$output, StoreError> {
+            $(
+                let $store = self;
+                let $workflow_scope = scope;
+                $hydrate;
+            )?
             let mut connection = self.begin_immediate().await?;
             let now = match Self::database_now(&mut connection).await {
                 Ok(value) => value,
@@ -1747,7 +2090,7 @@ macro_rules! sql_command {
                         Self::persist_projections(
                             &mut connection,
                             scope,
-                            run_filter.as_ref(),
+                            &loaded,
                             &state,
                         )
                         .await
@@ -1859,19 +2202,25 @@ macro_rules! sql_read {
             scope: &ExecutionScope,
             $($arg: $arg_type),*
         ) -> Result<$output, StoreError> {
-            let mut connection = self
-                .pool
-                .acquire()
-                .await
-                .map_err(|_| StoreError::StorageUnavailable)?;
+            let mut connection = self.begin_read().await?;
             let now = Self::database_now(&mut connection).await?;
             let run_filter: Option<Id> = $run_filter;
             let mut state =
                 Self::load_state(&mut connection, scope, run_filter.as_ref()).await?.state;
             self.restore_verified_bytes(&mut state, scope);
-            ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
+            let result = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
                 .$name(scope, $($arg),*)
-                .await
+                .await;
+            match result {
+                Ok(value) => {
+                    Self::commit(connection).await?;
+                    Ok(value)
+                }
+                Err(error) => {
+                    Self::rollback(&mut connection).await;
+                    Err(error)
+                }
+            }
         }
     };
 }
@@ -1886,7 +2235,16 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     sql_engine_command!(acquire_engine_claim(instance_id: Id) -> AcquiredEngineClaim);
     sql_engine_command!(heartbeat_engine_claim(permit: &EnginePermit) -> EngineClaim);
     sql_engine_command!(release_engine_claim(permit: &EnginePermit) -> ());
-    sql_command!(create_run(command: CreateRun) -> CommandReceipt; Some(command.run_id.clone()));
+    sql_command!(
+        create_run(command: CreateRun) -> CommandReceipt;
+        Some(command.run_id.clone());
+        |store, workflow_scope| store.hydrate_revision_schemas(
+            workflow_scope,
+            &command.definition_id,
+            &command.revision_hash,
+            false,
+        ).await?
+    );
     sql_command!(start_run(command: StartRun) -> WorkflowRun; Some(command.run_id.clone()));
     sql_command!(
         suspend_incompatible(command: SuspendIncompatible) -> WorkflowRun;
@@ -1924,7 +2282,11 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     );
     sql_command!(
         complete_map(command: CompleteMap) -> NodeRun;
-        Some(command.run_id.clone())
+        Some(command.run_id.clone());
+        |store, workflow_scope| store.hydrate_run_action_schemas(
+            workflow_scope,
+            &command.run_id,
+        ).await?
     );
     sql_command!(
         request_approval(command: RequestApproval) -> ApprovalGate;
@@ -1974,10 +2336,40 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         list_events_after(run_id: &Id, page: EventPageRequest) -> Vec<WorkflowEvent>;
         Some((*run_id).clone())
     );
-    sql_read!(scan_ready_nodes(page: PageRequest) -> Page<NodeRun>; None);
-    sql_read!(scan_budget_waiters(page: PageRequest) -> Page<NodeRun>; None);
-    sql_read!(scan_due_deadlines(page: PageRequest) -> Page<NodeAttempt>; None);
-    sql_read!(scan_due_retries(page: PageRequest) -> Page<NodeRun>; None);
+    async fn scan_ready_nodes(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<NodeRun>, StoreError> {
+        self.scan_nodes_sql(scope, page, "ready", "Ready", false)
+            .await
+    }
+
+    async fn scan_budget_waiters(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<NodeRun>, StoreError> {
+        self.scan_nodes_sql(scope, page, "budget_waiters", "BudgetWaiting", false)
+            .await
+    }
+
+    async fn scan_due_deadlines(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<NodeAttempt>, StoreError> {
+        self.scan_due_deadlines_sql(scope, page).await
+    }
+
+    async fn scan_due_retries(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<NodeRun>, StoreError> {
+        self.scan_nodes_sql(scope, page, "due_retries", "RetryWaiting", true)
+            .await
+    }
     async fn scan_recovery_runs(
         &self,
         scope: &ExecutionScope,
