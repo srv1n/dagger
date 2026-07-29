@@ -207,6 +207,120 @@ async fn prepare_definition(
         .unwrap();
 }
 
+#[test]
+fn memory_create_run_rejects_input_outside_pinned_root_schema_without_a_run() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(500)));
+        let store = InMemoryStore::new(clock.clone());
+        let objects = InMemoryObjectStore::new(clock);
+        let schema = objects
+            .put(
+                &execution_scope,
+                br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("schema-definition"),
+            name: "schema fixture".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: schema.digest().clone(),
+            run_output_schema_digest: schema.digest().clone(),
+            entry_node_id: id("succeed"),
+            nodes: vec![NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::RunInput {
+                    pointer: String::new(),
+                },
+            }],
+        };
+        let canonical = objects
+            .put(
+                &execution_scope,
+                &serde_jcs::to_vec(&definition).unwrap(),
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let principal = AuthenticatedPrincipal::mint(
+            execution_scope.clone(),
+            "schema-tester".to_owned(),
+            Vec::new(),
+            hash(b"schema-auth"),
+        )
+        .unwrap();
+        store
+            .create_definition(
+                &execution_scope,
+                CreateDefinition {
+                    definition_id: definition.definition_id.clone(),
+                    display_name: definition.name.clone(),
+                    description: String::new(),
+                    principal: principal.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .publish_revision(
+                &execution_scope,
+                PublishRevision {
+                    definition_id: definition.definition_id.clone(),
+                    expected_definition_version: dagger_workflow_core::ids::Version(1),
+                    canonical_definition: canonical.clone(),
+                    run_input_schema: schema.clone(),
+                    run_output_schema: schema,
+                    resolved_action_schema_objects: BTreeMap::new(),
+                    parsed_revision: PublishableDefinition {
+                        definition,
+                        topological_ranks: BTreeMap::from([(id("succeed"), TopologicalRank(0))]),
+                    },
+                    principal: principal.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let invalid_input = objects
+            .put(&execution_scope, br#"{"other":1}"#, "application/json")
+            .await
+            .unwrap();
+        let run_id = id("schema-rejected-run");
+        assert!(matches!(
+            store
+                .create_run(
+                    &execution_scope,
+                    CreateRun {
+                        run_id: run_id.clone(),
+                        definition_id: id("schema-definition"),
+                        revision_hash: canonical.digest().clone(),
+                        input: invalid_input,
+                        budget_limit: CostUnits(10),
+                        limits: RunLimits {
+                            max_dynamic_node_instances: 10,
+                            max_total_attempts: 10,
+                            max_total_events: 1_000,
+                            max_inline_json_bytes_per_value: 10_000,
+                            max_artifacts_per_attempt: 10,
+                            max_aggregate_object_bytes_per_run: 100_000,
+                            max_run_lifetime_ms: 100_000,
+                        },
+                        principal,
+                        idempotency_token: "schema-rejected-create-token".to_owned(),
+                    },
+                )
+                .await,
+            Err(StoreError::ContractValidation { .. })
+        ));
+        assert!(matches!(
+            store.get_run(&execution_scope, &run_id).await,
+            Err(StoreError::NotFound)
+        ));
+    });
+}
+
 struct RetryOnce {
     descriptor: ActionDescriptor,
     fail: AtomicBool,

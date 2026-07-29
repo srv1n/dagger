@@ -49,19 +49,78 @@ fn object_store_is_content_addressed_and_scope_confined() {
         let store = InMemoryObjectStore::new(clock);
         let a = scope("tenant-a");
         let b = scope("tenant-b");
-        let first = store.put(&a, b"same", "application/json").await.unwrap();
-        let replay = store
-            .publish_if_absent(&a, b"same", "application/json")
+        let first = store
+            .put(&a, br#""same""#, "application/json")
             .await
             .unwrap();
-        let other_scope = store.put(&b, b"same", "application/json").await.unwrap();
+        let replay = store
+            .publish_if_absent(&a, br#""same""#, "application/json")
+            .await
+            .unwrap();
+        let other_scope = store
+            .put(&b, br#""same""#, "application/json")
+            .await
+            .unwrap();
         assert_eq!(first, replay);
         assert_eq!(first.digest(), other_scope.digest());
         assert_ne!(first.scope(), other_scope.scope());
-        assert_eq!(store.get(&a, first.digest()).await.unwrap().bytes, b"same");
+        assert_eq!(
+            store.get(&a, first.digest()).await.unwrap().bytes,
+            br#""same""#
+        );
         let foreign = InMemoryObjectStore::new(Arc::new(TestClock::new(Timestamp(100))));
-        let foreign_ref = foreign.put(&a, b"same", "application/json").await.unwrap();
+        let foreign_ref = foreign
+            .put(&a, br#""same""#, "application/json")
+            .await
+            .unwrap();
         assert_ne!(first, foreign_ref);
+    });
+}
+
+#[test]
+fn object_store_canonicalizes_and_strictly_validates_json() {
+    block_on(async {
+        let store = InMemoryObjectStore::new(Arc::new(TestClock::new(Timestamp(150))));
+        let execution_scope = scope("tenant-a");
+        let spaced = store
+            .put(
+                &execution_scope,
+                br#"{ "b": 1, "a": [3, 2, 1] }"#,
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let canonical = store
+            .publish_if_absent(
+                &execution_scope,
+                br#"{"a":[3,2,1],"b":1}"#,
+                "application/json",
+            )
+            .await
+            .unwrap();
+        assert_eq!(spaced.digest(), canonical.digest());
+        assert_eq!(
+            store
+                .get(&execution_scope, spaced.digest())
+                .await
+                .unwrap()
+                .bytes,
+            br#"{"a":[3,2,1],"b":1}"#
+        );
+
+        for invalid in [
+            br#"{"a":1,"a":2}"#.as_slice(),
+            br#"{"value":9007199254740993}"#.as_slice(),
+            br#"{"unterminated":"#.as_slice(),
+            b"{\"invalid_utf8\":\"\xff\"}".as_slice(),
+        ] {
+            assert!(matches!(
+                store
+                    .put(&execution_scope, invalid, "application/json")
+                    .await,
+                Err(dagger_workflow_core::artifact::ObjectStoreError::InvalidField)
+            ));
+        }
     });
 }
 

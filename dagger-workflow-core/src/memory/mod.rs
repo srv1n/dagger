@@ -26,6 +26,7 @@ use crate::run::{
 };
 use crate::scope::ExecutionScope;
 use crate::store::*;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -181,6 +182,13 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
         if media_type.is_empty() || media_type.len() > 255 {
             return Err(ObjectStoreError::InvalidField);
         }
+        let canonical;
+        let bytes = if media_type == "application/json" {
+            canonical = canonical_json(bytes)?;
+            canonical.as_slice()
+        } else {
+            bytes
+        };
         let object_digest = digest(bytes);
         let key = (scope.clone(), object_digest.clone());
         let mut objects = self.objects.lock().expect("object lock poisoned");
@@ -227,6 +235,88 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
             bytes.to_vec(),
         ))
     }
+}
+
+struct StrictJson(Value);
+
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StrictJsonVisitor;
+
+        impl<'de> Visitor<'de> for StrictJsonVisitor {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an I-JSON value without duplicate object keys")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+
+            fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+                if (value as f64) as i64 != value {
+                    return Err(E::custom("integer is not exactly representable as f64"));
+                }
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+                if (value as f64) as u64 != value {
+                    return Err(E::custom("integer is not exactly representable as f64"));
+                }
+                Ok(Value::Number(value.into()))
+            }
+
+            fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| E::custom("non-finite JSON number"))
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+                Ok(Value::String(value))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = Vec::new();
+                while let Some(value) = values.next_element::<StrictJson>()? {
+                    result.push(value.0);
+                }
+                Ok(Value::Array(result))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut values: A) -> Result<Value, A::Error> {
+                let mut result = serde_json::Map::new();
+                while let Some(key) = values.next_key::<String>()? {
+                    let value = values.next_value::<StrictJson>()?.0;
+                    if result.insert(key, value).is_some() {
+                        return Err(de::Error::custom("duplicate object key"));
+                    }
+                }
+                Ok(Value::Object(result))
+            }
+        }
+
+        deserializer.deserialize_any(StrictJsonVisitor).map(Self)
+    }
+}
+
+fn canonical_json(bytes: &[u8]) -> Result<Vec<u8>, ObjectStoreError> {
+    let value: StrictJson =
+        serde_json::from_slice(bytes).map_err(|_| ObjectStoreError::InvalidField)?;
+    serde_jcs::to_vec(&value.0).map_err(|_| ObjectStoreError::InvalidField)
 }
 
 #[derive(Clone, Default)]
@@ -2685,6 +2775,41 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .get(&revision_key)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
+            let schema_bytes = state
+                .verified_object_bytes
+                .get(&(
+                    scope.clone(),
+                    revision.run_input_schema_ref.0.digest.clone(),
+                ))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let schema: Value = serde_json::from_slice(schema_bytes)
+                .map_err(|_| StoreError::CorruptControlPlane)?;
+            if !schema.is_object()
+                || serde_jcs::to_vec(&schema).ok().as_deref() != Some(schema_bytes.as_slice())
+            {
+                return Err(StoreError::CorruptControlPlane);
+            }
+            let input: Value =
+                serde_json::from_slice(command.input.verified_bytes()).map_err(|_| {
+                    StoreError::ContractValidation {
+                        kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
+                        path: "/input".to_owned(),
+                        message:
+                            "run input must be canonical JSON accepted by the pinned root schema"
+                                .to_owned(),
+                        valid_alternatives: Vec::new(),
+                    }
+                })?;
+            if serde_jcs::to_vec(&input).ok().as_deref() != Some(command.input.verified_bytes())
+                || !schema_accepts(&schema, &schema, &input)
+            {
+                return Err(StoreError::ContractValidation {
+                    kind: crate::definition::ValidationErrorKind::SchemaSubsetUnsupported,
+                    path: "/input".to_owned(),
+                    message: "run input does not match the pinned root input schema".to_owned(),
+                    valid_alternatives: Vec::new(),
+                });
+            }
             let static_node_count = u64::try_from(parsed.definition.nodes.len())
                 .map_err(|_| StoreError::ArithmeticOverflow)?;
             let creation_event_count = 1_u64
