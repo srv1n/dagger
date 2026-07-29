@@ -5,7 +5,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 use crate::store::StoreError;
 
 /// Current durable schema version.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_1: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_definitions (
@@ -250,6 +250,33 @@ const MIGRATION_3: &[&str] = &[
     "SELECT 1",
 ];
 
+const MIGRATION_4: &[&str] = &[
+    r#"ALTER TABLE dagger_workflow_runs
+        ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0"#,
+    r#"UPDATE dagger_workflow_runs AS runs
+        SET updated_at_ms = COALESCE(
+            (SELECT json_extract(rows.row_data, '$.updated_at')
+             FROM dagger_workflow_run_rows AS rows
+             WHERE rows.tenant_id = runs.tenant_id
+               AND rows.namespace = runs.namespace
+               AND rows.entity_id = runs.run_id
+               AND rows.sub_id = ''),
+            runs.created_at_ms
+        )"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_attempts_recovery_scan
+        ON dagger_workflow_attempts(
+            tenant_id, namespace, status, engine_generation, started_at_ms, run_id, attempt_id
+        )"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_runs_compatibility_scan
+        ON dagger_workflow_runs(
+            tenant_id, namespace, status, updated_at_ms, run_id
+        )"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_runs_lifetime_scan
+        ON dagger_workflow_runs(
+            tenant_id, namespace, status, lifetime_deadline_at_ms, run_id
+        )"#,
+];
+
 /// Applies all pending migrations, committing each version independently.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(
@@ -274,6 +301,9 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     if applied.unwrap_or(0) < 3 {
         apply_version(pool, 3, MIGRATION_3).await?;
+    }
+    if applied.unwrap_or(0) < 4 {
+        apply_version(pool, 4, MIGRATION_4).await?;
     }
     Ok(())
 }

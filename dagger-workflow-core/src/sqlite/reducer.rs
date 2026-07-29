@@ -2079,7 +2079,7 @@ struct MemoryCursor {
     last: Vec<String>,
 }
 
-fn scan_page_context(
+pub(crate) fn scan_page_context(
     page: &PageRequest,
     scope: &ExecutionScope,
     query: &str,
@@ -2117,7 +2117,7 @@ fn next_scan_cursor(
     .map_err(|_| StoreError::TransactionFailed)
 }
 
-fn finish_scan_page<T>(
+pub(crate) fn finish_scan_page<T>(
     mut items: Vec<T>,
     limit: usize,
     scope: &ExecutionScope,
@@ -2138,7 +2138,7 @@ fn finish_scan_page<T>(
     Ok(Page { items, next_cursor })
 }
 
-fn timestamp_cursor_key(timestamp: Timestamp) -> String {
+pub(crate) fn timestamp_cursor_key(timestamp: Timestamp) -> String {
     format!("{:016x}", (timestamp.0 as u64) ^ (1_u64 << 63))
 }
 
