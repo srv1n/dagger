@@ -10,7 +10,7 @@ mod schema;
 
 use crate::action::ActionInvocation;
 use crate::approval::ApprovalGate;
-use crate::artifact::{ArtifactRef, ObjectRecord, ObjectStore};
+use crate::artifact::{ArtifactRef, ObjectRecord, ObjectStore, VerifiedObjectRef};
 use crate::budget::BudgetLedgerEntry;
 use crate::definition::PublishableDefinition;
 use crate::engine::Clock;
@@ -105,6 +105,42 @@ const RUN_SCOPED_AUTHORITY_TABLES: &[&str] = &[
     BUDGET_ROWS,
     STALE_ROWS,
 ];
+
+#[derive(Default)]
+struct AuthorityLoad {
+    run_id: Option<Id>,
+    revision: Option<(Id, Digest)>,
+    receipt: Option<(CommandKindKey, String)>,
+    object_digests: Vec<Digest>,
+}
+
+impl AuthorityLoad {
+    fn unfiltered() -> Self {
+        Self::default()
+    }
+
+    fn run(run_id: &Id) -> Self {
+        Self {
+            run_id: Some(run_id.clone()),
+            ..Self::default()
+        }
+    }
+
+    fn revision(mut self, definition_id: &Id, revision_hash: &Digest) -> Self {
+        self.revision = Some((definition_id.clone(), revision_hash.clone()));
+        self
+    }
+
+    fn receipt(mut self, kind: CommandKindKey, token: &str) -> Self {
+        self.receipt = Some((kind, token.to_owned()));
+        self
+    }
+
+    fn objects<'a>(mut self, digests: impl IntoIterator<Item = &'a Digest>) -> Self {
+        self.object_digests.extend(digests.into_iter().cloned());
+        self
+    }
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct AuthorityKey {
@@ -697,19 +733,115 @@ where
     async fn load_state(
         connection: &mut PoolConnection<Sqlite>,
         scope: &ExecutionScope,
-        run_filter: Option<&Id>,
+        request: &AuthorityLoad,
     ) -> Result<LoadedAuthority, StoreError> {
         let mut loaded = LoadedAuthority {
             state: ReducerState::default(),
             rows: BTreeMap::new(),
         };
-        for table in AUTHORITY_TABLES {
-            for (entity_id, sub_id, row_data, version) in
-                Self::load_authority_table(connection, scope, table, run_filter).await?
-            {
-                let key = AuthorityKey::new(table, entity_id, sub_id);
+
+        if let Some(run_id) = request.run_id.as_ref() {
+            for table in RUN_SCOPED_AUTHORITY_TABLES {
+                for (entity_id, sub_id, row_data, version) in
+                    Self::load_authority_table(connection, scope, table, Some(run_id)).await?
+                {
+                    let key = AuthorityKey::new(table, entity_id, sub_id);
+                    decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
+                    loaded.rows.insert(key, (row_data, version));
+                }
+            }
+            for table in [ENGINE_CLAIM_ROWS, COUNTER_ROWS] {
+                for (entity_id, sub_id, row_data, version) in
+                    Self::load_authority_table(connection, scope, table, None).await?
+                {
+                    let key = AuthorityKey::new(table, entity_id, sub_id);
+                    decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
+                    loaded.rows.insert(key, (row_data, version));
+                }
+            }
+
+            let revision = request.revision.clone().or_else(|| {
+                loaded
+                    .state
+                    .runs
+                    .get(&(scope.clone(), run_id.clone()))
+                    .map(|run| (run.definition_id.clone(), run.revision_hash.clone()))
+            });
+            if let Some((definition_id, revision_hash)) = revision {
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    REVISION_ROWS,
+                    definition_id.as_str(),
+                    revision_hash.as_str(),
+                )
+                .await?;
+            }
+            if let Some((kind, token)) = request.receipt.as_ref() {
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    IDEMPOTENCY_ROWS,
+                    match kind {
+                        CommandKindKey::Create => "create-run",
+                        CommandKindKey::Cancel => "cancel-run",
+                    },
+                    token,
+                )
+                .await?;
+            }
+
+            let artifact_rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+                "SELECT ar.entity_id, ar.sub_id, ar.row_data, ar.version
+                 FROM dagger_workflow_artifact_refs AS a
+                 JOIN dagger_workflow_artifact_rows AS ar
+                   ON ar.tenant_id = a.tenant_id AND ar.namespace = a.namespace
+                  AND ar.entity_id = a.artifact_ref_id AND ar.sub_id = ''
+                 WHERE a.tenant_id = ? AND a.namespace = ? AND a.producer_run_id = ?",
+            )
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(run_id.as_str())
+            .fetch_all(&mut **connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+            for (entity_id, sub_id, row_data, version) in artifact_rows {
+                let key = AuthorityKey::new(ARTIFACT_ROWS, entity_id, sub_id);
                 decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
                 loaded.rows.insert(key, (row_data, version));
+            }
+            let mut object_digests = request.object_digests.clone();
+            object_digests.extend(
+                loaded
+                    .state
+                    .artifact_refs
+                    .values()
+                    .map(|reference| reference.digest.clone()),
+            );
+            object_digests.sort();
+            object_digests.dedup();
+            for digest in object_digests {
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    OBJECT_ROWS,
+                    digest.as_str(),
+                    "",
+                )
+                .await?;
+            }
+        } else {
+            for table in AUTHORITY_TABLES {
+                for (entity_id, sub_id, row_data, version) in
+                    Self::load_authority_table(connection, scope, table, None).await?
+                {
+                    let key = AuthorityKey::new(table, entity_id, sub_id);
+                    decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
+                    loaded.rows.insert(key, (row_data, version));
+                }
             }
         }
         for events in loaded.state.events.values_mut() {
@@ -734,6 +866,34 @@ where
                 .insert((run_scope.clone(), run_id.clone()), parsed.clone());
         }
         Ok(loaded)
+    }
+
+    async fn load_authority_point(
+        connection: &mut PoolConnection<Sqlite>,
+        scope: &ExecutionScope,
+        loaded: &mut LoadedAuthority,
+        table: &'static str,
+        entity_id: &str,
+        sub_id: &str,
+    ) -> Result<(), StoreError> {
+        let statement = format!(
+            "SELECT row_data, version FROM {table}
+             WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?"
+        );
+        let row: Option<(String, i64)> = sqlx::query_as(&statement)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(entity_id)
+            .bind(sub_id)
+            .fetch_optional(&mut **connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        if let Some((row_data, version)) = row {
+            let key = AuthorityKey::new(table, entity_id.to_owned(), sub_id.to_owned());
+            decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
+            loaded.rows.insert(key, (row_data, version));
+        }
+        Ok(())
     }
 
     async fn load_engine_claim_state(
@@ -1548,6 +1708,7 @@ where
         }
         digests.sort();
         digests.dedup();
+        let mut staged = BTreeMap::new();
         for digest in digests {
             let object = self
                 .objects
@@ -1558,11 +1719,12 @@ where
                 // engine can repeat ObjectStore::get to receive the minted proof
                 // and submit mark_corrupt_storage.
                 .map_err(|_| StoreError::CorruptControlPlane)?;
-            self.verified_bytes
-                .lock()
-                .expect("verified-byte cache lock poisoned")
-                .insert((scope.clone(), digest), object.bytes);
+            staged.insert((scope.clone(), digest), object.bytes);
         }
+        self.verified_bytes
+            .lock()
+            .expect("verified-byte cache lock poisoned")
+            .extend(staged);
         Ok(())
     }
 
@@ -1614,7 +1776,9 @@ where
     ) -> Result<ReducerStore<DatabaseTimestamp>, StoreError> {
         let mut connection = self.begin_read().await?;
         let now = Self::database_now(&mut connection).await?;
-        let mut state = Self::load_state(&mut connection, scope, None).await?.state;
+        let mut state = Self::load_state(&mut connection, scope, &AuthorityLoad::unfiltered())
+            .await?
+            .state;
         self.restore_verified_bytes(&mut state, scope);
         Self::commit(connection).await?;
         Ok(ReducerStore::from_state(
@@ -1848,19 +2012,41 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT rr.row_data
-             FROM dagger_workflow_runs AS r
-             JOIN dagger_workflow_run_rows AS rr
-               ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-              AND rr.entity_id = r.run_id AND rr.sub_id = ''
-             WHERE r.tenant_id = ? AND r.namespace = ?
-               AND rr.tenant_id = ? AND rr.namespace = ?
-               AND r.status IN ('Pending', 'Running', 'BlockedIncompatible')
-               AND r.updated_at_ms <= ?
-               AND (r.updated_at_ms > ? OR (r.updated_at_ms = ? AND r.run_id > ?))
-             ORDER BY r.updated_at_ms, r.run_id
-             LIMIT ?",
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT rr.row_data, r.updated_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'Pending' AND r.updated_at_ms <= ?5
+                 AND (r.updated_at_ms > ?6
+                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+               UNION ALL
+               SELECT rr.row_data, r.updated_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'Running' AND r.updated_at_ms <= ?5
+                 AND (r.updated_at_ms > ?6
+                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+               UNION ALL
+               SELECT rr.row_data, r.updated_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'BlockedIncompatible' AND r.updated_at_ms <= ?5
+                 AND (r.updated_at_ms > ?6
+                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+             ORDER BY updated_at_ms, run_id
+             LIMIT ?9",
         )
         .bind(scope.tenant_id.as_str())
         .bind(scope.namespace.as_str())
@@ -1876,7 +2062,7 @@ where
         .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
-        for (data,) in rows {
+        for (data, _, _) in rows {
             let run: WorkflowRun = decode_row(&data)?;
             scoped(scope, &run.scope, ())?;
             items.push(run);
@@ -1971,20 +2157,42 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT rr.row_data
-             FROM dagger_workflow_runs AS r
-             JOIN dagger_workflow_run_rows AS rr
-               ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-              AND rr.entity_id = r.run_id AND rr.sub_id = ''
-             WHERE r.tenant_id = ? AND r.namespace = ?
-               AND rr.tenant_id = ? AND rr.namespace = ?
-               AND r.status NOT IN ('Succeeded', 'Failed', 'Cancelled', 'CorruptStorage')
-               AND r.lifetime_deadline_at_ms <= ?
-               AND (r.lifetime_deadline_at_ms > ?
-                 OR (r.lifetime_deadline_at_ms = ? AND r.run_id > ?))
-             ORDER BY r.lifetime_deadline_at_ms, r.run_id
-             LIMIT ?",
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'Pending' AND r.lifetime_deadline_at_ms <= ?5
+                 AND (r.lifetime_deadline_at_ms > ?6
+                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+               UNION ALL
+               SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'Running' AND r.lifetime_deadline_at_ms <= ?5
+                 AND (r.lifetime_deadline_at_ms > ?6
+                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+               UNION ALL
+               SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                AND rr.entity_id = r.run_id AND rr.sub_id = ''
+               WHERE r.tenant_id = ?1 AND r.namespace = ?2
+                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
+                 AND r.status = 'BlockedIncompatible'
+                 AND r.lifetime_deadline_at_ms <= ?5
+                 AND (r.lifetime_deadline_at_ms > ?6
+                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+             ORDER BY lifetime_deadline_at_ms, run_id
+             LIMIT ?9",
         )
         .bind(scope.tenant_id.as_str())
         .bind(scope.namespace.as_str())
@@ -2000,7 +2208,7 @@ where
         .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
-        for (data,) in rows {
+        for (data, _, _) in rows {
             let run: WorkflowRun = decode_row(&data)?;
             scoped(scope, &run.scope, ())?;
             items.push(run);
@@ -2052,7 +2260,7 @@ where
 }
 
 macro_rules! sql_command {
-    ($name:ident ( $($arg:ident : $arg_type:ty),* $(,)? ) -> $output:ty; $run_filter:expr $(; |$store:ident, $workflow_scope:ident| $hydrate:expr)?) => {
+    ($name:ident ( $($arg:ident : $arg_type:ty),* $(,)? ) -> $output:ty; $authority_load:expr $(; |$store:ident, $workflow_scope:ident| $hydrate:expr)?) => {
         async fn $name(
             &self,
             scope: &ExecutionScope,
@@ -2071,8 +2279,8 @@ macro_rules! sql_command {
                     return Err(error);
                 }
             };
-            let run_filter: Option<Id> = $run_filter;
-            let loaded = match Self::load_state(&mut connection, scope, run_filter.as_ref()).await {
+            let authority_load: AuthorityLoad = $authority_load;
+            let loaded = match Self::load_state(&mut connection, scope, &authority_load).await {
                 Ok(value) => value,
                 Err(error) => {
                     Self::rollback(&mut connection).await;
@@ -2205,8 +2413,11 @@ macro_rules! sql_read {
             let mut connection = self.begin_read().await?;
             let now = Self::database_now(&mut connection).await?;
             let run_filter: Option<Id> = $run_filter;
+            let authority_load = run_filter
+                .as_ref()
+                .map_or_else(AuthorityLoad::unfiltered, AuthorityLoad::run);
             let mut state =
-                Self::load_state(&mut connection, scope, run_filter.as_ref()).await?.state;
+                Self::load_state(&mut connection, scope, &authority_load).await?.state;
             self.restore_verified_bytes(&mut state, scope);
             let result = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
                 .$name(scope, $($arg),*)
@@ -2226,18 +2437,21 @@ macro_rules! sql_read {
 }
 
 impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O> {
-    sql_command!(create_definition(command: CreateDefinition) -> DefinitionRecord; None);
+    sql_command!(create_definition(command: CreateDefinition) -> DefinitionRecord; AuthorityLoad::unfiltered());
     sql_command!(
         update_definition_metadata(command: UpdateDefinitionMetadata) -> DefinitionRecord;
-        None
+        AuthorityLoad::unfiltered()
     );
-    sql_command!(publish_revision(command: PublishRevision) -> WorkflowRevision; None);
+    sql_command!(publish_revision(command: PublishRevision) -> WorkflowRevision; AuthorityLoad::unfiltered());
     sql_engine_command!(acquire_engine_claim(instance_id: Id) -> AcquiredEngineClaim);
     sql_engine_command!(heartbeat_engine_claim(permit: &EnginePermit) -> EngineClaim);
     sql_engine_command!(release_engine_claim(permit: &EnginePermit) -> ());
     sql_command!(
         create_run(command: CreateRun) -> CommandReceipt;
-        Some(command.run_id.clone());
+        AuthorityLoad::run(&command.run_id)
+            .revision(&command.definition_id, &command.revision_hash)
+            .receipt(CommandKindKey::Create, &command.idempotency_token)
+            .objects([command.input.digest()]);
         |store, workflow_scope| store.hydrate_revision_schemas(
             workflow_scope,
             &command.definition_id,
@@ -2245,44 +2459,48 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             false,
         ).await?
     );
-    sql_command!(start_run(command: StartRun) -> WorkflowRun; Some(command.run_id.clone()));
+    sql_command!(start_run(command: StartRun) -> WorkflowRun; AuthorityLoad::run(&command.run_id));
     sql_command!(
         suspend_incompatible(command: SuspendIncompatible) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects([command.incompatibilities.digest()])
     );
     sql_command!(
         resume_compatible(command: ResumeCompatible) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
     );
     sql_command!(
         claim_node_attempt(command: ClaimNodeAttempt) -> ClaimNodeAttemptResult;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects([command.bound_input.digest()])
     );
     sql_command!(
         complete_attempt(command: CompleteAttempt) -> CompleteAttemptResult;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects(
+            command.objects.output.iter().map(VerifiedObjectRef::digest)
+                .chain(command.objects.artifacts.iter().map(VerifiedObjectRef::digest))
+                .chain(command.objects.diagnostics.iter().map(VerifiedObjectRef::digest))
+        )
     );
-    sql_command!(timeout_attempt(command: TimeoutAttempt) -> NodeAttempt; Some(command.run_id.clone()));
+    sql_command!(timeout_attempt(command: TimeoutAttempt) -> NodeAttempt; AuthorityLoad::run(&command.run_id));
     sql_command!(
         recover_abandoned_attempts_for_run(command: RecoverAbandonedAttemptsForRun)
             -> Vec<NodeAttempt>;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
     );
     sql_command!(
         release_retry(command: ReleaseRetry) -> NodeRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
     );
     sql_command!(
         record_choice(command: RecordChoice) -> NodeRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects([command.input.digest()])
     );
     sql_command!(
         expand_map(command: ExpandMap) -> NodeRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects([command.input.digest()])
     );
     sql_command!(
         complete_map(command: CompleteMap) -> NodeRun;
-        Some(command.run_id.clone());
+        AuthorityLoad::run(&command.run_id).objects([command.aggregate.digest()]);
         |store, workflow_scope| store.hydrate_run_action_schemas(
             workflow_scope,
             &command.run_id,
@@ -2290,35 +2508,42 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     );
     sql_command!(
         request_approval(command: RequestApproval) -> ApprovalGate;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects([command.request.digest()])
     );
     sql_command!(
         decide_approval(command: DecideApproval) -> ApprovalGate;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id).objects(
+            command.decision_payload.iter().map(VerifiedObjectRef::digest)
+                .chain(command.approval_output.iter().map(VerifiedObjectRef::digest))
+        )
     );
     sql_command!(
         expire_approval(command: ExpireApproval) -> ApprovalGate;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
+            .objects(command.approval_output.iter().map(VerifiedObjectRef::digest))
     );
     sql_command!(
         resolve_terminal_node(command: ResolveTerminalNode) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
+            .objects(command.output.iter().map(VerifiedObjectRef::digest))
     );
     sql_command!(
         fail_contract(command: FailContract) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
+            .objects(command.diagnostics.iter().map(VerifiedObjectRef::digest))
     );
     sql_command!(
         cancel_run(command: CancelRun) -> CommandReceipt;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
+            .receipt(CommandKindKey::Cancel, &command.idempotency_token)
     );
     sql_command!(
         expire_run_lifetime(command: ExpireRunLifetime) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
     );
     sql_command!(
         mark_corrupt_storage(command: MarkCorruptStorage) -> WorkflowRun;
-        Some(command.run_id.clone())
+        AuthorityLoad::run(&command.run_id)
     );
 
     sql_read!(get_definition(definition_id: &Id) -> DefinitionRecord; None);

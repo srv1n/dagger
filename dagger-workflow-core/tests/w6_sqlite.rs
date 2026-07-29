@@ -22,16 +22,16 @@ use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::{SqliteWorkflowStore, SCHEMA_VERSION};
 use dagger_workflow_core::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
-    CompleteMap, CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EnginePermit,
-    ExpandMap, OrderedMapItem, PageRequest, PublishRevision, RequestApproval, ResolveTerminalNode,
-    ResolvedActionSchemas, StartRun, StoreError, TimeoutAttempt, WorkflowStore,
+    CompleteMap, CompletionObjects, CreateDefinition, CreateRun, DecideApproval, ExpandMap,
+    OrderedMapItem, PageRequest, PublishRevision, RequestApproval, ResolvedActionSchemas, StartRun,
+    StoreError, TimeoutAttempt, WorkflowStore,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn scope(tenant: &str) -> ExecutionScope {
@@ -317,108 +317,6 @@ fn create_run_command(fixture: &ActionFixture, run_id: &str) -> CreateRun {
     }
 }
 
-async fn complete_action_run(
-    store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
-    fixture: &ActionFixture,
-    permit: &EnginePermit,
-    run_id: &str,
-) {
-    store
-        .create_run(&fixture.scope, create_run_command(fixture, run_id))
-        .await
-        .unwrap();
-    store
-        .start_run(
-            &fixture.scope,
-            StartRun {
-                permit: permit.clone(),
-                run_id: Id::new(run_id).unwrap(),
-                compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
-                    incompatible_reference_locations: Vec::new(),
-                    evidence: Vec::new(),
-                },
-            },
-        )
-        .await
-        .unwrap();
-    let action = store
-        .get_node(
-            &fixture.scope,
-            &Id::new(run_id).unwrap(),
-            &Id::new("action").unwrap(),
-        )
-        .await
-        .unwrap();
-    let credential = match store
-        .claim_node_attempt(
-            &fixture.scope,
-            ClaimNodeAttempt {
-                permit: permit.clone(),
-                run_id: Id::new(run_id).unwrap(),
-                node_id: Id::new("action").unwrap(),
-                expected_node_version: action.version,
-                attempt_id: Id::new(format!("attempt-{run_id}")).unwrap(),
-                worker_id: Id::new("history-worker").unwrap(),
-                bound_input: fixture.input.clone(),
-                binding_derivation_digest: fixture.evidence_digest.clone(),
-            },
-        )
-        .await
-        .unwrap()
-    {
-        ClaimNodeAttemptResult::Claimed {
-            completion_credential,
-            ..
-        } => completion_credential,
-        _ => panic!("history attempt was not claimed"),
-    };
-    store
-        .complete_attempt(
-            &fixture.scope,
-            CompleteAttempt {
-                completion_credential: credential,
-                run_id: Id::new(run_id).unwrap(),
-                node_id: Id::new("action").unwrap(),
-                attempt_id: Id::new(format!("attempt-{run_id}")).unwrap(),
-                submitted_outcome: ActionOutcome::Success {
-                    output: serde_json::json!({"value": 1}),
-                    artifacts: Vec::new(),
-                    actual_cost_units: CostUnits(1),
-                    diagnostics: None,
-                },
-                objects: CompletionObjects {
-                    output: Some(fixture.input.clone()),
-                    artifacts: Vec::new(),
-                    diagnostics: None,
-                },
-            },
-        )
-        .await
-        .unwrap();
-    let terminal = store
-        .get_node(
-            &fixture.scope,
-            &Id::new(run_id).unwrap(),
-            &Id::new("succeed").unwrap(),
-        )
-        .await
-        .unwrap();
-    store
-        .resolve_terminal_node(
-            &fixture.scope,
-            ResolveTerminalNode {
-                permit: permit.clone(),
-                run_id: Id::new(run_id).unwrap(),
-                node_id: Id::new("succeed").unwrap(),
-                expected_node_version: terminal.version,
-                output: Some(fixture.input.clone()),
-            },
-        )
-        .await
-        .unwrap();
-}
-
 async fn raw_scope_snapshot(
     pool: &sqlx::SqlitePool,
     workflow_scope: &ExecutionScope,
@@ -590,6 +488,37 @@ async fn standalone_open_reopens_a_converged_migration() {
     .await
     .unwrap();
     assert_eq!(versions, vec![1]);
+}
+
+#[tokio::test]
+async fn version_one_rejects_any_missing_table_or_index() {
+    for missing_object in [
+        "DROP TABLE dagger_workflow_invocation_rows",
+        "DROP INDEX dagger_workflow_runs_lifetime_scan",
+    ] {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let clock = Arc::new(TestClock::new(Timestamp(0)));
+        let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+        let store = SqliteWorkflowStore::from_pool(pool.clone(), clock.clone(), objects.clone())
+            .await
+            .unwrap();
+        sqlx::query(missing_object)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            SqliteWorkflowStore::from_pool(pool, clock, objects).await,
+            Err(StoreError::TransactionFailed)
+        ));
+    }
 }
 
 #[tokio::test]
@@ -1522,6 +1451,79 @@ async fn phase_b_scheduler_keyset_pagination_is_deterministic_and_complete() {
     assert_eq!(first.len(), 37);
 }
 
+#[tokio::test]
+async fn scheduler_multi_status_scans_are_index_ordered_without_temp_sorts() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
+    for (name, ordered_column, expected_index) in [
+        (
+            "compatibility",
+            "updated_at_ms",
+            "dagger_workflow_runs_compatibility_scan",
+        ),
+        (
+            "lifetime",
+            "lifetime_deadline_at_ms",
+            "dagger_workflow_runs_lifetime_scan",
+        ),
+    ] {
+        let branches = ["Pending", "Running", "BlockedIncompatible"]
+            .into_iter()
+            .map(|status| {
+                format!(
+                    "SELECT rr.row_data, r.{ordered_column}, r.run_id
+                     FROM dagger_workflow_runs AS r
+                     JOIN dagger_workflow_run_rows AS rr
+                       ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+                      AND rr.entity_id = r.run_id AND rr.sub_id = ''
+                     WHERE r.tenant_id = 'tenant' AND r.namespace = 'workflow'
+                       AND rr.tenant_id = 'tenant' AND rr.namespace = 'workflow'
+                       AND r.status = '{status}' AND r.{ordered_column} <= 100
+                       AND (r.{ordered_column} > -100
+                         OR (r.{ordered_column} = -100 AND r.run_id > ''))"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let statement = format!(
+            "EXPLAIN QUERY PLAN {branches}
+             ORDER BY {ordered_column}, run_id LIMIT 11"
+        );
+        let details: Vec<String> = sqlx::query(&statement)
+            .fetch_all(store.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get("detail"))
+            .collect();
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+            "{name} scheduler scan uses a temporary ORDER BY sort:\n{}",
+            details.join("\n")
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("MERGE (UNION ALL)"))
+                && details
+                    .iter()
+                    .filter(|detail| detail.contains(expected_index))
+                    .count()
+                    == 3,
+            "{name} scheduler scan did not merge three index-ordered status ranges:\n{}",
+            details.join("\n")
+        );
+    }
+}
+
 #[cfg(feature = "conformance")]
 #[tokio::test]
 async fn gate_6_real_command_fault_windows_are_atomic_and_replay_safe() {
@@ -2229,6 +2231,25 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
 
 #[tokio::test]
 async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
+    async fn open_cost_store(
+        path: &Path,
+        clock: Arc<TestClock>,
+        objects: Arc<InMemoryObjectStore<TestClock>>,
+    ) -> SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        SqliteWorkflowStore::from_pool(pool, clock, objects)
+            .await
+            .unwrap()
+    }
+
     async fn seed_completed_history(
         store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
         objects: &Arc<InMemoryObjectStore<TestClock>>,
@@ -2239,19 +2260,56 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         dagger_workflow_core::store::AcquiredEngineClaim,
     ) {
         let fixture = seed_action_definition(store, objects, tenant).await;
+        sqlx::query(
+            "WITH RECURSIVE history(index_value) AS (
+                 SELECT 0 UNION ALL
+                 SELECT index_value + 1 FROM history WHERE index_value + 1 < ?
+             )
+             INSERT INTO dagger_workflow_runs(
+                 tenant_id, namespace, run_id, definition_id, revision_hash, status,
+                 version, event_seq, aggregate_object_bytes, total_attempts,
+                 budget_limit, budget_reserved, budget_spent, lifetime_deadline_at_ms,
+                 created_at_ms, updated_at_ms
+             )
+             SELECT ?, ?, printf('history-%04d', index_value), 'historical-definition',
+                    'sha256:historical', 'Succeeded', 1, 1, 0, 0, 0, 0, 0, 0, 0, 0
+             FROM history",
+        )
+        .bind(count as i64)
+        .bind(fixture.scope.tenant_id.as_str())
+        .bind(fixture.scope.namespace.as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "WITH RECURSIVE history(index_value) AS (
+                 SELECT 0 UNION ALL
+                 SELECT index_value + 1 FROM history WHERE index_value + 1 < ?
+             ), template(row_data) AS (
+                 SELECT row_data FROM dagger_workflow_object_rows
+                 WHERE tenant_id = ? AND namespace = ? LIMIT 1
+             )
+             INSERT INTO dagger_workflow_object_rows(
+                 tenant_id, namespace, entity_id, sub_id, row_data, version
+             )
+             SELECT ?, ?, printf('sha256:%064x', index_value + 1000000), '',
+                    json_set(template.row_data, '$.digest',
+                             printf('sha256:%064x', index_value + 1000000)),
+                    1
+             FROM history CROSS JOIN template",
+        )
+        .bind(count as i64)
+        .bind(fixture.scope.tenant_id.as_str())
+        .bind(fixture.scope.namespace.as_str())
+        .bind(fixture.scope.tenant_id.as_str())
+        .bind(fixture.scope.namespace.as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
         let claim = store
             .acquire_engine_claim(&fixture.scope, Id::new("cost-engine").unwrap())
             .await
             .unwrap();
-        for index in 0..count {
-            complete_action_run(
-                store,
-                &fixture,
-                &claim.permit,
-                &format!("history-{index:04}"),
-            )
-            .await;
-        }
         let completed: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dagger_workflow_runs
              WHERE tenant_id = ? AND namespace = ? AND status = 'Succeeded'",
@@ -2265,39 +2323,45 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         (fixture, claim)
     }
 
-    async fn measure_ordinary_starts(
+    async fn measure_ordinary_start_vm_steps(
         store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
         fixture: &ActionFixture,
         claim: &dagger_workflow_core::store::AcquiredEngineClaim,
-    ) -> Duration {
-        for index in 0..20 {
-            store
-                .create_run(
-                    &fixture.scope,
-                    create_run_command(fixture, &format!("measured-{index:04}")),
-                )
-                .await
-                .unwrap();
-        }
-        let started = Instant::now();
-        for index in 0..20 {
-            store
-                .start_run(
-                    &fixture.scope,
-                    StartRun {
-                        permit: claim.permit.clone(),
-                        run_id: Id::new(format!("measured-{index:04}")).unwrap(),
-                        compatibility_evidence: CompatibilityReport {
-                            evidence_digest: fixture.evidence_digest.clone(),
-                            incompatible_reference_locations: Vec::new(),
-                            evidence: Vec::new(),
-                        },
+    ) -> u64 {
+        store
+            .create_run(&fixture.scope, create_run_command(fixture, "measured-run"))
+            .await
+            .unwrap();
+        let steps = Arc::new(AtomicU64::new(0));
+        let mut connection = store.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, {
+                let steps = steps.clone();
+                move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            });
+        drop(connection);
+        store
+            .start_run(
+                &fixture.scope,
+                StartRun {
+                    permit: claim.permit.clone(),
+                    run_id: Id::new("measured-run").unwrap(),
+                    compatibility_evidence: CompatibilityReport {
+                        evidence_digest: fixture.evidence_digest.clone(),
+                        incompatible_reference_locations: Vec::new(),
+                        evidence: Vec::new(),
                     },
-                )
-                .await
-                .unwrap();
-        }
-        started.elapsed()
+                },
+            )
+            .await
+            .unwrap();
+        steps.load(Ordering::Relaxed)
     }
 
     let small_directory = TempDir::new().unwrap();
@@ -2305,33 +2369,30 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
     let clock = Arc::new(TestClock::new(Timestamp(0)));
     let small_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
     let large_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
-    let small = open_file_store(
+    let small = open_cost_store(
         &small_directory.path().join("small.sqlite"),
         clock.clone(),
         small_objects.clone(),
     )
     .await;
-    let large = open_file_store(
+    let large = open_cost_store(
         &large_directory.path().join("large.sqlite"),
         clock,
         large_objects.clone(),
     )
     .await;
     let (small_fixture, small_claim) =
-        seed_completed_history(&small, &small_objects, "small-history", 5).await;
+        seed_completed_history(&small, &small_objects, "small-history", 100).await;
     let (large_fixture, large_claim) =
-        seed_completed_history(&large, &large_objects, "large-history", 80).await;
+        seed_completed_history(&large, &large_objects, "large-history", 2_000).await;
 
-    let small_elapsed = measure_ordinary_starts(&small, &small_fixture, &small_claim).await;
-    let large_elapsed = measure_ordinary_starts(&large, &large_fixture, &large_claim).await;
-    let generous_bound = small_elapsed
-        .checked_mul(8)
-        .unwrap_or(Duration::MAX)
-        .saturating_add(Duration::from_millis(100));
+    let small_steps = measure_ordinary_start_vm_steps(&small, &small_fixture, &small_claim).await;
+    let large_steps = measure_ordinary_start_vm_steps(&large, &large_fixture, &large_claim).await;
+    let bound = small_steps.saturating_mul(2).saturating_add(2_000);
     assert!(
-        large_elapsed <= generous_bound,
-        "80-run ordinary start {large_elapsed:?} scaled with completed history; \
-         5-run ordinary start was {small_elapsed:?}, bound {generous_bound:?}"
+        large_steps <= bound,
+        "2,000-run ordinary start used {large_steps} SQLite VM steps and scaled with \
+         completed history; 100-run ordinary start used {small_steps}, bound {bound}"
     );
 }
 

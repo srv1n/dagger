@@ -11,6 +11,11 @@ use crate::store::StoreError;
 /// deliberately collapsed rather than retained as fictional compatibility.
 pub const SCHEMA_VERSION: i64 = 1;
 
+const MIGRATIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
+    version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
+    clock_offset_ms INTEGER NOT NULL DEFAULT 0
+) STRICT"#;
+
 const MIGRATION_1: &[&str] = &[
     r#"CREATE TABLE IF NOT EXISTS dagger_workflow_definitions (
         tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, definition_id TEXT NOT NULL,
@@ -238,6 +243,10 @@ const MIGRATION_1: &[&str] = &[
         created_at_ms INTEGER NOT NULL,
         PRIMARY KEY (tenant_id, namespace, artifact_ref_id)
     ) STRICT"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_artifacts_run_scan
+        ON dagger_workflow_artifact_refs(
+            tenant_id, namespace, producer_run_id, artifact_ref_id
+        )"#,
     r#"CREATE INDEX IF NOT EXISTS dagger_workflow_nodes_scheduler_scan
         ON dagger_workflow_nodes(
             tenant_id, namespace, status, run_id, node_id, updated_at_ms, next_eligible_at_ms
@@ -264,15 +273,10 @@ const MIGRATION_1: &[&str] = &[
 
 /// Applies all pending migrations, committing each version independently.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
-    sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
-            version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
-            clock_offset_ms INTEGER NOT NULL DEFAULT 0
-        ) STRICT"#,
-    )
-    .execute(pool)
-    .await
-    .map_err(|_| StoreError::StorageUnavailable)?;
+    sqlx::query(MIGRATIONS_TABLE_DDL)
+        .execute(pool)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
 
     let applied: Option<i64> =
         sqlx::query_scalar("SELECT MAX(version) FROM dagger_workflow_schema_migrations")
@@ -290,41 +294,82 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
 }
 
 async fn validate_coherent_v1(pool: &SqlitePool) -> Result<(), StoreError> {
-    for (table, required_columns) in [
-        (
-            "dagger_workflow_schema_migrations",
-            &["clock_offset_ms"][..],
-        ),
-        (
-            "dagger_workflow_run_rows",
-            &["tenant_id", "namespace", "row_data", "version"][..],
-        ),
-        (
-            "dagger_workflow_runs",
-            &["tenant_id", "namespace", "updated_at_ms"][..],
-        ),
-        (
-            "dagger_workflow_nodes",
-            &["tenant_id", "namespace", "updated_at_ms"][..],
-        ),
-    ] {
-        let present: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM pragma_table_info(?)
-             WHERE name IN ('tenant_id', 'namespace', 'row_data', 'version',
-                            'clock_offset_ms', 'updated_at_ms')",
-        )
-        .bind(table)
-        .fetch_all(pool)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
-        if required_columns
-            .iter()
-            .any(|required| !present.iter().any(|column| column == required))
-        {
+    for statement in std::iter::once(MIGRATIONS_TABLE_DDL).chain(MIGRATION_1.iter().copied()) {
+        if statement.starts_with("CREATE TABLE") {
+            let (table, expected_columns) =
+                table_inventory(statement).ok_or(StoreError::TransactionFailed)?;
+            let present: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+                .bind(table)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::StorageUnavailable)?;
+            if present != expected_columns {
+                return Err(StoreError::TransactionFailed);
+            }
+        } else if statement.starts_with("CREATE INDEX") {
+            let (index, expected_columns) =
+                index_inventory(statement).ok_or(StoreError::TransactionFailed)?;
+            let present: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_info(?)")
+                .bind(index)
+                .fetch_all(pool)
+                .await
+                .map_err(|_| StoreError::StorageUnavailable)?;
+            if present != expected_columns {
+                return Err(StoreError::TransactionFailed);
+            }
+        } else {
             return Err(StoreError::TransactionFailed);
         }
     }
     Ok(())
+}
+
+fn table_inventory(statement: &str) -> Option<(&str, Vec<String>)> {
+    let name = statement.split_whitespace().nth(5)?;
+    let body = statement.split_once('(')?.1.rsplit_once(')')?.0;
+    let columns = top_level_items(body)
+        .into_iter()
+        .filter_map(|item| {
+            let first = item.split_whitespace().next()?;
+            (!matches!(
+                first.to_ascii_uppercase().as_str(),
+                "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "CONSTRAINT"
+            ))
+            .then(|| first.trim_matches('"').to_owned())
+        })
+        .collect();
+    Some((name, columns))
+}
+
+fn index_inventory(statement: &str) -> Option<(&str, Vec<String>)> {
+    let index = statement.split_whitespace().nth(5)?;
+    let body = statement.split_once('(')?.1.rsplit_once(')')?.0;
+    Some((
+        index,
+        top_level_items(body)
+            .into_iter()
+            .map(|item| item.trim().trim_matches('"').to_owned())
+            .collect(),
+    ))
+}
+
+fn top_level_items(body: &str) -> Vec<&str> {
+    let mut depth = 0_u32;
+    let mut start = 0;
+    let mut items = Vec::new();
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                items.push(body[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(body[start..].trim());
+    items
 }
 
 async fn apply_version(
