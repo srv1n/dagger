@@ -18,7 +18,8 @@ use crate::ids::{
     TopologicalRank, Version,
 };
 use crate::run::{
-    AttemptState, NodeFailureKind, NodeRun, NodeState, RunLimits, RunState, WorkflowRun,
+    AttemptState, GateState, NodeFailureKind, NodeRun, NodeState, RunFailureKind, RunLimits,
+    RunState, WorkflowRun,
 };
 use crate::scope::ExecutionScope;
 use crate::store::{
@@ -32,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 53;
+pub const CASE_COUNT: usize = 57;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -89,6 +90,10 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "map_aggregate_inline_limit_boundary_accepted",
     "map_aggregate_object_limit_enforced",
     "map_aggregate_object_limit_boundary_accepted",
+    "expand_map_input_invalid_applied",
+    "expand_map_dynamic_node_limit_applied",
+    "claim_inline_json_limit_applied",
+    "decide_approval_payload_invalid_applied",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -3107,6 +3112,622 @@ async fn map_aggregate_object_limit_boundary_accepted<A: ConformanceAdapter>(
     Ok(())
 }
 
+/// Durable watermark taken immediately before an applied-failure command.
+///
+/// Section 5.5's `ContractValidationApplied` and `RunLimitApplied` claim the
+/// transition is already durable, so proving them needs a before/after comparison
+/// on committed rows rather than on the returned value. Versions alone are not
+/// enough either: a store that silently bumped a version while discarding the
+/// transition would pass a version-only check, so every assertion below pairs the
+/// watermark with the exact closed status and failure kind.
+struct AppliedFailureWatermark {
+    node_version: Version,
+    run_version: Version,
+    last_event_seq: u64,
+    aggregate_object_bytes: u64,
+    dynamic_node_count: u64,
+    total_attempt_count: u64,
+}
+
+async fn applied_failure_watermark<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    run_id: &Id,
+    node_id: &Id,
+) -> Result<AppliedFailureWatermark, ConformanceFailure> {
+    let node = adapter
+        .store()
+        .get_node(scope, run_id, node_id)
+        .await
+        .map_err(|_| failure(case, "watermark node read failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, run_id)
+        .await
+        .map_err(|_| failure(case, "watermark run read failed"))?
+        .run;
+    Ok(AppliedFailureWatermark {
+        node_version: node.version,
+        run_version: run.version,
+        last_event_seq: run.last_event_seq,
+        aggregate_object_bytes: run.aggregate_object_bytes,
+        dynamic_node_count: run.dynamic_node_count,
+        total_attempt_count: run.total_attempt_count,
+    })
+}
+
+/// Asserts the node/run halves of an applied N46/N64/N67 plus R08.
+async fn assert_applied_contract_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    run_id: &Id,
+    node_id: &Id,
+    node_kind: NodeFailureKind,
+    run_kind: RunFailureKind,
+    before: &AppliedFailureWatermark,
+) -> Result<(NodeRun, WorkflowRun), ConformanceFailure> {
+    let node = adapter
+        .store()
+        .get_node(scope, run_id, node_id)
+        .await
+        .map_err(|_| failure(case, "applied-failure node read failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, run_id)
+        .await
+        .map_err(|_| failure(case, "applied-failure run read failed"))?
+        .run;
+    if node.status != NodeState::ContractFailed {
+        return Err(failure(case, "node did not durably reach ContractFailed"));
+    }
+    if node.failure_kind != Some(node_kind) {
+        return Err(failure(case, "node failure kind was not the closed kind"));
+    }
+    if run.status != RunState::ContractFailed {
+        return Err(failure(case, "run did not durably reach ContractFailed"));
+    }
+    if run.failure_kind != Some(run_kind) {
+        return Err(failure(case, "run failure kind was not the closed kind"));
+    }
+    if node.version <= before.node_version || run.version <= before.run_version {
+        return Err(failure(
+            case,
+            "applied failure did not advance row versions",
+        ));
+    }
+    if run.last_event_seq <= before.last_event_seq {
+        return Err(failure(case, "applied failure appended no event batch"));
+    }
+    if run.finished_at.is_none() {
+        return Err(failure(case, "terminalized run kept a null finish time"));
+    }
+    Ok((node, run))
+}
+
+/// Section 5.3 `expand_map`: a Map input that is not a canonical JSON array applies
+/// N46/R08 with `MapInputInvalid` and reports it as `ContractValidationApplied`.
+async fn expand_map_input_invalid_applied<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 54;
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        case,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    let before = applied_failure_watermark(adapter, scope, case, &run_id, &id("map")).await?;
+    let object_input = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(case, "non-array Map input publication failed"))?;
+    match adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: before.node_version,
+                input: object_input,
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest.clone(),
+            },
+        )
+        .await
+    {
+        Err(StoreError::ContractValidationApplied { code }) if code == "MapInputInvalid" => {}
+        _ => return Err(failure(case, "non-array Map input was not rejected")),
+    }
+    let (node, run) = assert_applied_contract_failure(
+        adapter,
+        scope,
+        case,
+        &run_id,
+        &id("map"),
+        NodeFailureKind::MapInputInvalid,
+        RunFailureKind::MapInputInvalid,
+        &before,
+    )
+    .await?;
+    if node.map_input_ref.is_some()
+        || node.map_expansion_digest.is_some()
+        || node.map_child_count.is_some()
+    {
+        return Err(failure(case, "rejected expansion left Map state behind"));
+    }
+    if run.aggregate_object_bytes != before.aggregate_object_bytes
+        || run.dynamic_node_count != before.dynamic_node_count
+    {
+        return Err(failure(case, "rejected expansion charged run counters"));
+    }
+    Ok(())
+}
+
+/// Section 5.3 `expand_map`: exceeding `max_dynamic_node_instances` applies N46/R08
+/// and reports `RunLimitApplied`, registering no child and no Map input ref.
+async fn expand_map_dynamic_node_limit_applied<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 55;
+    let fixture = prepare_map_conformance_with_limits(
+        adapter,
+        scope,
+        case,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+        RunLimits {
+            max_dynamic_node_instances: 1,
+            max_total_attempts: 200,
+            max_total_events: 2_000,
+            max_inline_json_bytes_per_value: 10_000,
+            max_artifacts_per_attempt: 10,
+            max_aggregate_object_bytes_per_run: 1_000_000,
+            max_run_lifetime_ms: 31_536_000_000,
+        },
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    let before = applied_failure_watermark(adapter, scope, case, &run_id, &id("map")).await?;
+    match adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: before.node_version,
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest.clone(),
+            },
+        )
+        .await
+    {
+        Err(StoreError::RunLimitApplied { code }) if code == "RunDynamicNodeLimitExceeded" => {}
+        _ => return Err(failure(case, "dynamic-node limit was not enforced")),
+    }
+    let (node, run) = assert_applied_contract_failure(
+        adapter,
+        scope,
+        case,
+        &run_id,
+        &id("map"),
+        NodeFailureKind::RunDynamicNodeLimitExceeded,
+        RunFailureKind::RunDynamicNodeLimitExceeded,
+        &before,
+    )
+    .await?;
+    if node.map_expansion_digest.is_some() || run.dynamic_node_count != before.dynamic_node_count {
+        return Err(failure(case, "over-limit expansion partially applied"));
+    }
+    for item in &fixture.ordered_items {
+        if adapter
+            .store()
+            .get_node(scope, &run_id, &item.child_id)
+            .await
+            .is_ok()
+        {
+            return Err(failure(case, "over-limit expansion created a child"));
+        }
+    }
+    Ok(())
+}
+
+/// Section 5.3 `claim_node_attempt`: a bound input over
+/// `max_inline_json_bytes_per_value` commits the terminal batch and creates no
+/// attempt, reporting the `RunLimitApplied` result rather than an error.
+async fn claim_inline_json_limit_applied<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 56;
+    let fixture = prepare_map_conformance_with_limits(
+        adapter,
+        scope,
+        case,
+        1,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+        RunLimits {
+            max_dynamic_node_instances: 100,
+            max_total_attempts: 200,
+            max_total_events: 2_000,
+            max_inline_json_bytes_per_value: 256,
+            max_artifacts_per_attempt: 10,
+            max_aggregate_object_bytes_per_run: 1_000_000,
+            max_run_lifetime_ms: 31_536_000_000,
+        },
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map expansion failed"))?;
+    let child_id = fixture.ordered_items[0].child_id.clone();
+    let before = applied_failure_watermark(adapter, scope, case, &run_id, &child_id).await?;
+    let oversized = serde_jcs::to_vec(&json!({ "item": "x".repeat(512) }))
+        .map_err(|_| failure(case, "oversized bound input encoding failed"))?;
+    let bound_input = adapter
+        .objects()
+        .put(scope, &oversized, "application/json")
+        .await
+        .map_err(|_| failure(case, "oversized bound input publication failed"))?;
+    match adapter
+        .store()
+        .claim_node_attempt(
+            scope,
+            ClaimNodeAttempt {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                node_id: child_id.clone(),
+                expected_node_version: before.node_version,
+                attempt_id: id("oversized-attempt"),
+                worker_id: id("worker"),
+                bound_input,
+                binding_derivation_digest: fixture.expansion_digest.clone(),
+            },
+        )
+        .await
+    {
+        Ok(ClaimNodeAttemptResult::RunLimitApplied(_)) => {}
+        _ => return Err(failure(case, "inline JSON limit was not applied")),
+    }
+    let (node, run) = assert_applied_contract_failure(
+        adapter,
+        scope,
+        case,
+        &run_id,
+        &child_id,
+        NodeFailureKind::InlineJsonLimitExceeded,
+        RunFailureKind::InlineJsonLimitExceeded,
+        &before,
+    )
+    .await?;
+    // N46's postcondition is "no attempt/reservation".
+    if node.active_attempt_id.is_some() || node.attempt_count != 0 {
+        return Err(failure(case, "rejected claim left an attempt on the node"));
+    }
+    if run.total_attempt_count != before.total_attempt_count || run.budget_reserved != CostUnits(0)
+    {
+        return Err(failure(case, "rejected claim charged the run"));
+    }
+    if adapter
+        .store()
+        .get_attempt(scope, &run_id, &id("oversized-attempt"))
+        .await
+        .is_ok()
+    {
+        return Err(failure(case, "rejected claim persisted an attempt row"));
+    }
+    Ok(())
+}
+
+/// Section 5.3 `decide_approval` and N67: an approval output that is not the exact
+/// canonical `ApprovalResult` applies N67/G06/R08 with `ApprovalPayloadInvalid`,
+/// registering no decision-payload ref.
+async fn decide_approval_payload_invalid_applied<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 57;
+    let fixture = prepare_approval_conformance(adapter, scope, case).await?;
+    let run_id = id(&format!("approval-run-{case}"));
+    let before = applied_failure_watermark(adapter, scope, case, &run_id, &id("approval")).await?;
+    // Well-formed JSON, but not the engine-constructed canonical envelope.
+    let forged = adapter
+        .objects()
+        .put(scope, br#"{"decision":"approve"}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "forged approval output publication failed"))?;
+    match adapter
+        .store()
+        .decide_approval(
+            scope,
+            DecideApproval {
+                run_id: run_id.clone(),
+                gate_id: id("approval-gate"),
+                expected_run_version: before.run_version,
+                expected_gate_version: fixture.gate_version,
+                decision: ApprovalDecision::Approve,
+                decision_payload: None,
+                approval_output: Some(forged),
+                principal: fixture.approver.clone(),
+            },
+        )
+        .await
+    {
+        Err(StoreError::ContractValidationApplied { code }) if code == "ApprovalPayloadInvalid" => {
+        }
+        _ => return Err(failure(case, "forged approval envelope was accepted")),
+    }
+    let (node, _run) = assert_applied_contract_failure(
+        adapter,
+        scope,
+        case,
+        &run_id,
+        &id("approval"),
+        NodeFailureKind::ApprovalPayloadInvalid,
+        RunFailureKind::ApprovalPayloadInvalid,
+        &before,
+    )
+    .await?;
+    if node.result_ref.is_some() {
+        return Err(failure(case, "rejected approval stored a node output"));
+    }
+    // N67 requires the still-Pending gate cancelled by G06 in the same transaction.
+    let gate = adapter
+        .store()
+        .get_gate(scope, &run_id, &id("approval-gate"))
+        .await
+        .map_err(|_| failure(case, "gate read failed"))?;
+    if gate.status != GateState::Cancelled {
+        return Err(failure(case, "G06 did not cancel the Pending gate"));
+    }
+    if gate.decision_payload_ref.is_some() || gate.deciding_principal.is_some() {
+        return Err(failure(case, "rejected approval recorded a decision"));
+    }
+    if gate.version <= fixture.gate_version {
+        return Err(failure(
+            case,
+            "gate cancellation did not advance its version",
+        ));
+    }
+    Ok(())
+}
+
+struct ApprovalConformanceFixture {
+    approver: AuthenticatedPrincipal,
+    gate_version: Version,
+}
+
+/// Publishes a one-Approval definition, starts its run, and opens a Pending gate.
+async fn prepare_approval_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<ApprovalConformanceFixture, ConformanceFailure> {
+    let schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"request":{"type":"boolean"}},"required":["request"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "approval schema publication failed"))?;
+    let creator = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        format!("approval-creator-{case}"),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "approval creator capability failed"))?;
+    let definition_id = id(&format!("approval-definition-{case}"));
+    let run_id = id(&format!("approval-run-{case}"));
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: definition_id.clone(),
+                display_name: format!("approval-{case}"),
+                description: String::new(),
+                principal: creator.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "approval definition creation failed"))?;
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: definition_id.clone(),
+        name: format!("approval-{case}"),
+        description: String::new(),
+        run_input_schema_digest: schema.digest().clone(),
+        run_output_schema_digest: schema.digest().clone(),
+        entry_node_id: id("approval"),
+        nodes: vec![
+            NodeDefinition::Approval {
+                id: id("approval"),
+                request: BindingSource::RunInput {
+                    pointer: String::new(),
+                },
+                gate: ApprovalGateConfig {
+                    expires_after_ms: 10_000,
+                    on_expiry: ApprovalExpiryPolicy::Reject,
+                    authorization: DecisionAuthorizationPolicy {
+                        allowed_principal_ids: vec![format!("approval-approver-{case}")],
+                        allowed_role_ids: Vec::new(),
+                    },
+                },
+                next: vec![id("succeed")],
+            },
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::Constant { value: Value::Null },
+            },
+        ],
+    };
+    let canonical = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&definition)
+                .map_err(|_| failure(case, "approval definition encoding failed"))?,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "approval definition publication failed"))?;
+    adapter
+        .store()
+        .publish_revision(
+            scope,
+            PublishRevision {
+                definition_id: definition_id.clone(),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical.clone(),
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::new(),
+                parsed_revision: PublishableDefinition {
+                    definition,
+                    topological_ranks: BTreeMap::from([
+                        (id("approval"), TopologicalRank(0)),
+                        (id("succeed"), TopologicalRank(1)),
+                    ]),
+                },
+                principal: creator.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "approval revision publication failed"))?;
+    let input = adapter
+        .objects()
+        .put(scope, br#"{"request":true}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "approval run input publication failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: run_id.clone(),
+                definition_id,
+                revision_hash: canonical.digest().clone(),
+                input,
+                budget_limit: CostUnits(10),
+                limits: RunLimits {
+                    max_dynamic_node_instances: 10,
+                    max_total_attempts: 10,
+                    max_total_events: 500,
+                    max_inline_json_bytes_per_value: 10_000,
+                    max_artifacts_per_attempt: 10,
+                    max_aggregate_object_bytes_per_run: 1_000_000,
+                    max_run_lifetime_ms: 100_000,
+                },
+                principal: creator,
+                idempotency_token: format!("approval-create-{case}"),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "approval run creation failed"))?;
+    let claim = adapter
+        .store()
+        .acquire_engine_claim(scope, id(&format!("approval-engine-{case}")))
+        .await
+        .map_err(|_| failure(case, "approval engine claim failed"))?;
+    adapter
+        .store()
+        .start_run(
+            scope,
+            StartRun {
+                permit: claim.permit.clone(),
+                run_id: run_id.clone(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "approval run start failed"))?;
+    let node = adapter
+        .store()
+        .get_node(scope, &run_id, &id("approval"))
+        .await
+        .map_err(|_| failure(case, "approval node read failed"))?;
+    let request = adapter
+        .objects()
+        .put(scope, br#"{"request":true}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "approval request publication failed"))?;
+    let gate = adapter
+        .store()
+        .request_approval(
+            scope,
+            RequestApproval {
+                permit: claim.permit,
+                run_id,
+                node_id: id("approval"),
+                expected_node_version: node.version,
+                gate_id: id("approval-gate"),
+                request,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "approval request failed"))?;
+    let approver = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        format!("approval-approver-{case}"),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "approver capability failed"))?;
+    Ok(ApprovalConformanceFixture {
+        approver,
+        gate_version: gate.version,
+    })
+}
+
 /// One independently executed conformance result.
 #[derive(Debug)]
 pub struct ConformanceCaseResult {
@@ -3240,6 +3861,22 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         "map_aggregate_object_limit_boundary_accepted",
         map_aggregate_object_limit_boundary_accepted
     );
+    run_fixture!(
+        "expand_map_input_invalid_applied",
+        expand_map_input_invalid_applied
+    );
+    run_fixture!(
+        "expand_map_dynamic_node_limit_applied",
+        expand_map_dynamic_node_limit_applied
+    );
+    run_fixture!(
+        "claim_inline_json_limit_applied",
+        claim_inline_json_limit_applied
+    );
+    run_fixture!(
+        "decide_approval_payload_invalid_applied",
+        decide_approval_payload_invalid_applied
+    );
     results
 }
 
@@ -3254,4 +3891,100 @@ fn failure(case: usize, detail: &'static str) -> ConformanceFailure {
 #[allow(dead_code)]
 fn _closed_object_error(error: ObjectStoreError) -> ObjectStoreError {
     error
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::TestClock;
+    use crate::memory::{InMemoryObjectStore, InMemoryStore};
+    use crate::scope::ScopeAtom;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWake(std::thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on<T>(future: impl Future<Output = T>) -> T {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut context = Context::from_waker(&waker);
+        let mut future = Box::pin(future);
+        loop {
+            match Pin::new(&mut future).poll(&mut context) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    struct Adapter {
+        clock: Arc<TestClock>,
+        store: InMemoryStore<TestClock>,
+        objects: InMemoryObjectStore<TestClock>,
+    }
+
+    impl ConformanceAdapter for Adapter {
+        type Store = InMemoryStore<TestClock>;
+        type Objects = InMemoryObjectStore<TestClock>;
+
+        fn store(&self) -> &Self::Store {
+            &self.store
+        }
+
+        fn objects(&self) -> &Self::Objects {
+            &self.objects
+        }
+
+        fn advance_clock_ms(&self, milliseconds: i64) {
+            self.clock.advance_ms(milliseconds).expect("clock advances");
+        }
+
+        fn object_records(&self, scope: &ExecutionScope) -> Vec<ObjectRecord> {
+            self.store.object_records(scope)
+        }
+
+        fn fresh(&self) -> Self {
+            let clock = Arc::new(TestClock::new(Timestamp(0)));
+            Self {
+                store: InMemoryStore::new(clock.clone()),
+                objects: InMemoryObjectStore::new(clock.clone()),
+                clock,
+            }
+        }
+    }
+
+    fn scope(tenant: &str) -> ExecutionScope {
+        ExecutionScope {
+            tenant_id: ScopeAtom::new(tenant).expect("scope atom"),
+            namespace: ScopeAtom::new("workflow").expect("scope atom"),
+        }
+    }
+
+    /// Keeps the in-crate suite runnable without the adapter-specific test targets,
+    /// so section 5.5's applied-failure fixtures stay checkable under `--lib`.
+    #[test]
+    fn conformance_suite_passes_against_the_volatile_store() {
+        block_on(async {
+            let clock = Arc::new(TestClock::new(Timestamp(0)));
+            let adapter = Adapter {
+                store: InMemoryStore::new(clock.clone()),
+                objects: InMemoryObjectStore::new(clock.clone()),
+                clock,
+            };
+            let results = run_conformance(&adapter, &scope("tenant-a"), &scope("tenant-b")).await;
+            assert_eq!(results.len(), CASE_COUNT);
+            let failed = results
+                .iter()
+                .filter(|result| !result.passed())
+                .collect::<Vec<_>>();
+            assert!(failed.is_empty(), "{failed:?}");
+        });
+    }
 }

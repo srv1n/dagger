@@ -439,6 +439,23 @@ impl<C: Clock> InMemoryStore<C> {
                         if code == "RunEventLimitExceeded"
                 );
                 if !event_capacity {
+                    // Section 5.5 defines `ContractValidationApplied` and `RunLimitApplied`
+                    // as applied outcomes: the transaction commits the contract transition
+                    // (N46/N64/N67 with R08, plus G06 when a gate is involved) and reports
+                    // the closed code. Every site returning one of them installs that
+                    // transition into `staged` first, so discarding `staged` here would
+                    // leave the node in its prior state, the gate Pending, and the run
+                    // Running -- precisely the state the closed code claims was applied.
+                    // The single exception is handled below: `RunEventLimitExceeded` is
+                    // section 5.3's `event_capacity_guard`, whose defining property is that
+                    // the originating command does not apply.
+                    if matches!(
+                        error,
+                        StoreError::ContractValidationApplied { .. }
+                            | StoreError::RunLimitApplied { .. }
+                    ) {
+                        *committed = staged;
+                    }
                     return Err(error);
                 }
                 let affected = staged.runs.iter().find_map(|(key, run)| {
@@ -2655,33 +2672,45 @@ fn apply_map_contract_failure(
     Ok(node)
 }
 
-/// N46 (`Ready` -> `ContractFailed`, `NodeContractFailed`) paired with R08
-/// (`Running` -> `ContractFailed`, `RunContractFailed`) for a terminal Succeed
-/// node whose output fails a section 1.4 ceiling or the section 5.3 pinned root
-/// output schema. N46's postcondition is "no attempt/reservation", so callers
-/// must reach here before registering any artifact ref, before marking the node
-/// `Succeeded`, and before charging aggregate bytes.
-fn apply_terminal_contract_failure(
+/// A section 3.3 node contract failure paired with R08 (`Running` ->
+/// `ContractFailed`, `RunContractFailed`). The caller names the transition because
+/// the source state selects it: `Ready` is N46, `BudgetWaiting` is N64, and
+/// `WaitingApproval` is N67. `terminalize_run`'s cascade cancels every still-Pending
+/// gate by G06, which is exactly N67's "cancel Pending gate" side effect and is a
+/// no-op for the other two sources.
+///
+/// Every one of those transitions has the postcondition "no attempt, reservation, or
+/// registered ref", so callers must reach here before staging an attempt, a budget
+/// reservation, an artifact ref, or an aggregate-byte charge. Section 5.5's applied
+/// error variants promise this transition is durable, so the caller must not
+/// unwind: it either returns `Ok` or returns the applied error, which `transaction`
+/// commits.
+fn apply_node_contract_failure(
     state: &mut MemoryState,
     scope: &ExecutionScope,
     run_id: &Id,
     node_id: &NodeInstanceId,
+    transition: &str,
     failure_kind: NodeFailureKind,
     now: Timestamp,
+    actor_kind: EventActorKind,
     actor_id: String,
 ) -> Result<WorkflowRun, StoreError> {
     let key = (scope.clone(), run_id.clone(), node_id.clone());
     let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+    let gate_id = node.approval_gate_id.clone();
     node.status = NodeState::ContractFailed;
     node.failure_kind = Some(failure_kind);
+    // N64's side effect is "clear wait amount"; no other source carries one.
+    node.budget_wait_amount = None;
     set_node_mutated(&mut node, now)?;
     state.nodes.insert(key, node);
     let run_kind = run_failure(failure_kind);
     let mut specs = vec![event_spec(
-        "N46",
+        transition,
         Some(node_id),
         None,
-        None,
+        gate_id.as_ref(),
         event_payload::node_contract_failed(
             &(Option::<&Id>::None),
             &(failure_kind),
@@ -2705,20 +2734,36 @@ fn apply_terminal_contract_failure(
         None,
         event_payload::run_contract_failed(&(run_kind), &(Option::<&Digest>::None)),
     ));
-    append_batch(
-        state,
-        scope,
-        run_id,
-        now,
-        EventActorKind::Engine,
-        actor_id,
-        specs,
-    )?;
+    append_batch(state, scope, run_id, now, actor_kind, actor_id, specs)?;
     Ok(state
         .runs
         .get(&(scope.clone(), run_id.clone()))
         .cloned()
         .unwrap_or(run))
+}
+
+/// N46/R08 for a terminal Succeed node whose output fails a section 1.4 ceiling or
+/// the section 5.3 pinned root output schema.
+fn apply_terminal_contract_failure(
+    state: &mut MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    node_id: &NodeInstanceId,
+    failure_kind: NodeFailureKind,
+    now: Timestamp,
+    actor_id: String,
+) -> Result<WorkflowRun, StoreError> {
+    apply_node_contract_failure(
+        state,
+        scope,
+        run_id,
+        node_id,
+        "N46",
+        failure_kind,
+        now,
+        EventActorKind::Engine,
+        actor_id,
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -3753,22 +3798,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             if run_snapshot.status != RunState::Running {
                 return Err(StoreError::IllegalTransition);
             }
-            if command.bound_input.size_bytes()
-                > run_snapshot.limits.max_inline_json_bytes_per_value
-            {
-                return Err(StoreError::RunLimitApplied {
-                    code: "InlineJsonLimitExceeded".to_owned(),
-                });
-            }
-            let aggregate_after_input = run_snapshot
-                .aggregate_object_bytes
-                .checked_add(command.bound_input.size_bytes())
-                .ok_or(StoreError::ArithmeticOverflow)?;
-            if aggregate_after_input > run_snapshot.limits.max_aggregate_object_bytes_per_run {
-                return Err(StoreError::RunLimitApplied {
-                    code: "AggregateObjectLimitExceeded".to_owned(),
-                });
-            }
             let node_key = (
                 scope.clone(),
                 command.run_id.clone(),
@@ -3789,18 +3818,84 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             if node.kind != NodeKind::Action {
                 return Err(StoreError::IllegalTransition);
             }
+            // Section 3.3: the ContractFailed source transition is fixed by the node's
+            // current state, N46 from `Ready` and N64 from `BudgetWaiting`. Every applied
+            // failure below shares it.
+            let contract_transition = if source_status == NodeState::BudgetWaiting {
+                "N64"
+            } else {
+                "N46"
+            };
+            let actor_id = command.permit.instance_id().as_str().to_owned();
+            // Section 5.3: a permanent limit failure commits the terminal batch and creates
+            // no attempt, and section 1.4 enforces both ceilings "before binding". The node
+            // CAS above is N46/N64's precondition, so these follow it.
+            if command.bound_input.size_bytes()
+                > run_snapshot.limits.max_inline_json_bytes_per_value
+            {
+                let run = apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.node_id,
+                    contract_transition,
+                    NodeFailureKind::InlineJsonLimitExceeded,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
+                return Ok(ClaimNodeAttemptResult::RunLimitApplied(run));
+            }
+            let aggregate_after_input = run_snapshot
+                .aggregate_object_bytes
+                .checked_add(command.bound_input.size_bytes())
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if aggregate_after_input > run_snapshot.limits.max_aggregate_object_bytes_per_run {
+                let run = apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.node_id,
+                    contract_transition,
+                    NodeFailureKind::AggregateObjectLimitExceeded,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
+                return Ok(ClaimNodeAttemptResult::RunLimitApplied(run));
+            }
             let definition = state
                 .run_definitions
                 .get(&run_key)
                 .cloned()
                 .ok_or(StoreError::CorruptControlPlane)?;
-            validate_bound_artifact_refs(
+            // Section 8.4 makes every binding failure an applied N46/R08 with
+            // `BindingTypeMismatch`, not a rejection: the run is dead, not retryable.
+            // `ContractValidationApplied` reports it after `transaction` commits the
+            // transition installed here.
+            if let Err(error) = validate_bound_artifact_refs(
                 &state,
                 scope,
                 &definition,
                 &node,
                 command.bound_input.verified_bytes(),
-            )?;
+            ) {
+                let StoreError::ContractValidationApplied { .. } = &error else {
+                    return Err(error);
+                };
+                apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.node_id,
+                    contract_transition,
+                    NodeFailureKind::BindingTypeMismatch,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
+                return Err(error);
+            }
             let (action, retry, timeout_ms, declared_max) =
                 action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
             if node.attempt_count >= retry.max_attempts {
@@ -4131,9 +4226,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .checked_add(command.bound_input.size_bytes())
                 .ok_or(StoreError::ArithmeticOverflow)?;
             if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
-                return Err(StoreError::RunLimitApplied {
-                    code: "AggregateObjectLimitExceeded".to_owned(),
-                });
+                // Unreachable: the same sum is checked against the same ceiling before the
+                // node CAS, where it can still apply N46/N64 with no attempt. Reaching it here
+                // would mean the attempt, invocation, and reservation are already staged, so
+                // there is no applied outcome left to report; fail closed rather than let
+                // `transaction`'s applied-error path commit a half-written claim.
+                return Err(StoreError::TransactionFailed);
             }
             set_run_mutated(run, now)?;
             let ledger_key = (scope.clone(), command.run_id.clone());
@@ -4364,6 +4462,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     });
                 }
             }
+            // Section 1.4 enforces both ceilings "before accepted action completion", and
+            // N21/A05 is the transition for an accepted completion that breaches an output
+            // or artifact limit: settle, contract-fail the attempt and node, R08. The kind
+            // is recorded here and applied with the cost-protocol branch below, after the
+            // section 3.4 deadline check, because a due completion is A06/A14 regardless.
+            let mut limit_failure = None;
             if let ActionOutcome::Success { artifacts, .. } = &command.submitted_outcome {
                 let output = command
                     .objects
@@ -4384,14 +4488,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .runs
                     .get(&(scope.clone(), command.run_id.clone()))
                     .expect("run");
-                if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
-                    > run.limits.max_artifacts_per_attempt
-                {
-                    state.attempts.insert(attempt_key, attempt);
-                    return Err(StoreError::RunLimitApplied {
-                        code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
-                    });
-                }
                 let artifact_bytes =
                     command
                         .objects
@@ -4406,16 +4502,17 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .size_bytes()
                     .checked_add(artifact_bytes)
                     .ok_or(StoreError::ArithmeticOverflow)?;
-                if run
+                if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
+                    > run.limits.max_artifacts_per_attempt
+                {
+                    limit_failure = Some(NodeFailureKind::ArtifactsPerAttemptLimitExceeded);
+                } else if run
                     .aggregate_object_bytes
                     .checked_add(charged_bytes)
                     .ok_or(StoreError::ArithmeticOverflow)?
                     > run.limits.max_aggregate_object_bytes_per_run
                 {
-                    state.attempts.insert(attempt_key, attempt);
-                    return Err(StoreError::RunLimitApplied {
-                        code: "AggregateObjectLimitExceeded".to_owned(),
-                    });
+                    limit_failure = Some(NodeFailureKind::AggregateObjectLimitExceeded);
                 }
             }
             if now >= attempt.deadline_at {
@@ -4508,13 +4605,22 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 now,
             )?;
             let mut specs = Vec::new();
-            if contract_cost_failure {
+            // A05/N21 covers every accepted-completion contract breach. The cost protocol
+            // wins when both hold, because it is what fixed `charged` to the full
+            // reservation just above.
+            let contract_kind = if contract_cost_failure {
+                Some(NodeFailureKind::ActionCostProtocolViolation)
+            } else {
+                limit_failure
+            };
+            if let Some(contract_kind) = contract_kind {
+                let run_kind = run_failure(contract_kind);
                 attempt.status = AttemptState::ContractFailed;
                 attempt.error_class = Some(AttemptErrorClass::Contract);
                 attempt.finished_at = Some(now);
                 node.status = NodeState::ContractFailed;
                 node.active_attempt_id = None;
-                node.failure_kind = Some(NodeFailureKind::ActionCostProtocolViolation);
+                node.failure_kind = Some(contract_kind);
                 set_node_mutated(&mut node, now)?;
                 specs.push(event_spec(
                     "A05",
@@ -4523,7 +4629,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     event_payload::attempt_contract_failed(
                         &(charged),
-                        &(NodeFailureKind::ActionCostProtocolViolation),
+                        &(contract_kind),
                         &(Option::<&Digest>::None),
                     ),
                 ));
@@ -4534,7 +4640,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     event_payload::node_contract_failed(
                         &(Some(&command.attempt_id)),
-                        &(NodeFailureKind::ActionCostProtocolViolation),
+                        &(contract_kind),
                         &(Option::<&Digest>::None),
                     ),
                 ));
@@ -4551,8 +4657,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     scope,
                     &command.run_id,
                     RunState::ContractFailed,
-                    Some(RunFailureKind::ActionCostProtocolViolation),
-                    "ActionCostProtocolViolation",
+                    Some(run_kind),
+                    if contract_cost_failure {
+                        "ActionCostProtocolViolation"
+                    } else {
+                        "ContractFailed"
+                    },
                     now,
                     &mut specs,
                 )?;
@@ -4561,10 +4671,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     None,
                     None,
                     None,
-                    event_payload::run_contract_failed(
-                        &(RunFailureKind::ActionCostProtocolViolation),
-                        &(Option::<&Digest>::None),
-                    ),
+                    event_payload::run_contract_failed(&(run_kind), &(Option::<&Digest>::None)),
                 ));
                 append_batch(
                     &mut state,
@@ -4595,9 +4702,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     if u64::try_from(artifacts.len()).map_err(|_| StoreError::ArithmeticOverflow)?
                         > run_snapshot.limits.max_artifacts_per_attempt
                     {
-                        return Err(StoreError::RunLimitApplied {
-                            code: "ArtifactsPerAttemptLimitExceeded".to_owned(),
-                        });
+                        // Unreachable: the same limit is checked before the deadline branch,
+                        // where it records `limit_failure` and applies A05/N21/R08. Reaching
+                        // it here would mean output and artifact refs are already staged, so
+                        // fail closed rather than let `transaction`'s applied-error path
+                        // commit them without the transition.
+                        return Err(StoreError::TransactionFailed);
                     }
                     let output_ref = json_ref(
                         &mut state,
@@ -4642,9 +4752,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         .checked_add(bytes)
                         .ok_or(StoreError::ArithmeticOverflow)?;
                     if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
-                        return Err(StoreError::RunLimitApplied {
-                            code: "AggregateObjectLimitExceeded".to_owned(),
-                        });
+                        // Unreachable: the same limit is checked before the deadline branch,
+                        // where it records `limit_failure` and applies A05/N21/R08. Reaching
+                        // it here would mean output and artifact refs are already staged, so
+                        // fail closed rather than let `transaction`'s applied-error path
+                        // commit them without the transition.
+                        return Err(StoreError::TransactionFailed);
                     }
                     set_run_mutated(run, now)?;
                     attempt.status = AttemptState::Succeeded;
@@ -5513,59 +5626,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         self.transaction(|mut state, now| {
             running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
             verified(&mut state, scope, &command.input, now)?;
-            if command.input.media_type() != "application/json" {
-                return Err(StoreError::ContractValidationApplied {
-                    code: "MapInputInvalid".to_owned(),
-                });
-            }
-            let input_value: Value = serde_json::from_slice(command.input.verified_bytes())
-                .map_err(|_| StoreError::ContractValidationApplied {
-                    code: "MapInputInvalid".to_owned(),
-                })?;
-            let input_items =
-                input_value
-                    .as_array()
-                    .ok_or_else(|| StoreError::ContractValidationApplied {
-                        code: "MapInputInvalid".to_owned(),
-                    })?;
-            if serde_jcs::to_vec(&input_value).map_err(|_| {
-                StoreError::ContractValidationApplied {
-                    code: "MapInputInvalid".to_owned(),
-                }
-            })? != command.input.verified_bytes()
-            {
-                return Err(StoreError::ContractValidationApplied {
-                    code: "MapInputInvalid".to_owned(),
-                });
-            }
-            let mut recomputed_items = Vec::with_capacity(input_items.len());
-            let mut recomputed_identities = Vec::with_capacity(input_items.len());
-            for (index, item) in input_items.iter().enumerate() {
-                let index = u32::try_from(index).map_err(|_| StoreError::ArithmeticOverflow)?;
-                let item_digest = digest(&serde_jcs::to_vec(item).map_err(|_| {
-                    StoreError::ContractValidationApplied {
-                        code: "MapInputInvalid".to_owned(),
-                    }
-                })?);
-                let child_id =
-                    map_child_id(&command.run_id, &command.map_node_id, index, &item_digest);
-                recomputed_identities.push(MapChildIdentity {
-                    item_index: index,
-                    item_digest: item_digest.clone(),
-                    child_id: child_id.clone(),
-                });
-                recomputed_items.push(OrderedMapItem {
-                    index,
-                    item_digest,
-                    child_id,
-                });
-            }
-            let recomputed_expansion_digest = map_expansion_digest(&recomputed_identities);
-            if command.ordered_items != recomputed_items
-                || command.expansion_digest != recomputed_expansion_digest
-            {
-                return Err(StoreError::IdempotencyConflict);
-            }
+            // N46's precondition is the node CAS, so the row is loaded and CASed before any
+            // applied failure below can name it. Replay detection stays ahead of the CAS
+            // because section 5.3 makes a matching expansion idempotent.
             let key = (
                 scope.clone(),
                 command.run_id.clone(),
@@ -5585,6 +5648,65 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             {
                 return Err(StoreError::CasConflict);
             }
+            let actor_id = command.permit.instance_id().as_str().to_owned();
+            // Every way the untrusted Map input can be malformed is the same closed
+            // section 1.4 kind, `MapInputInvalid`, and section 5.3 applies it as N46/R08
+            // rather than rejecting it. They are computed together so exactly one applied
+            // transition is written, before any row is mutated.
+            let recomputed = (|| -> Option<(Vec<OrderedMapItem>, Vec<MapChildIdentity>)> {
+                if command.input.media_type() != "application/json" {
+                    return None;
+                }
+                let input_value: Value =
+                    serde_json::from_slice(command.input.verified_bytes()).ok()?;
+                let input_items = input_value.as_array()?;
+                if serde_jcs::to_vec(&input_value).ok()? != command.input.verified_bytes() {
+                    return None;
+                }
+                let mut items = Vec::with_capacity(input_items.len());
+                let mut identities = Vec::with_capacity(input_items.len());
+                for (index, item) in input_items.iter().enumerate() {
+                    // An index past u32 is unreachable under `max_items`, and it is still a
+                    // property of the supplied array, so it stays a Map input failure.
+                    let index = u32::try_from(index).ok()?;
+                    let item_digest = digest(&serde_jcs::to_vec(item).ok()?);
+                    let child_id =
+                        map_child_id(&command.run_id, &command.map_node_id, index, &item_digest);
+                    identities.push(MapChildIdentity {
+                        item_index: index,
+                        item_digest: item_digest.clone(),
+                        child_id: child_id.clone(),
+                    });
+                    items.push(OrderedMapItem {
+                        index,
+                        item_digest,
+                        child_id,
+                    });
+                }
+                Some((items, identities))
+            })();
+            let Some((recomputed_items, recomputed_identities)) = recomputed else {
+                apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    "N46",
+                    NodeFailureKind::MapInputInvalid,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
+                return Err(StoreError::ContractValidationApplied {
+                    code: "MapInputInvalid".to_owned(),
+                });
+            };
+            let recomputed_expansion_digest = map_expansion_digest(&recomputed_identities);
+            if command.ordered_items != recomputed_items
+                || command.expansion_digest != recomputed_expansion_digest
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
             let run_key = (scope.clone(), command.run_id.clone());
             let mut run = state
                 .runs
@@ -5598,6 +5720,17 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .checked_add(added_nodes)
                 .ok_or(StoreError::ArithmeticOverflow)?;
             if dynamic_after > run.limits.max_dynamic_node_instances {
+                apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    "N46",
+                    NodeFailureKind::RunDynamicNodeLimitExceeded,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
                 return Err(StoreError::RunLimitApplied {
                     code: "RunDynamicNodeLimitExceeded".to_owned(),
                 });
@@ -5618,8 +5751,48 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 })
                 .ok_or(StoreError::CorruptControlPlane)?;
             if command.ordered_items.len() > max_items as usize {
+                apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    "N46",
+                    NodeFailureKind::MapBoundExceeded,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
                 return Err(StoreError::ContractValidationApplied {
                     code: "MapBoundExceeded".to_owned(),
+                });
+            }
+            // Section 1.4 charges the Map input, plus the zero-item aggregate, against the
+            // run ceiling. The check is hoisted ahead of every mutation so the applied
+            // N46/R08 leaves no Map input ref, no children, and no charged counter.
+            let zero_aggregate_bytes = if command.ordered_items.is_empty() {
+                command.input.size_bytes()
+            } else {
+                0
+            };
+            let aggregate_after = run
+                .aggregate_object_bytes
+                .checked_add(command.input.size_bytes())
+                .and_then(|bytes| bytes.checked_add(zero_aggregate_bytes))
+                .ok_or(StoreError::ArithmeticOverflow)?;
+            if aggregate_after > run.limits.max_aggregate_object_bytes_per_run {
+                apply_node_contract_failure(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    &command.map_node_id,
+                    "N46",
+                    NodeFailureKind::AggregateObjectLimitExceeded,
+                    now,
+                    EventActorKind::Engine,
+                    actor_id,
+                )?;
+                return Err(StoreError::RunLimitApplied {
+                    code: "AggregateObjectLimitExceeded".to_owned(),
                 });
             }
             node.map_input_ref = Some(json_ref(
@@ -5639,11 +5812,6 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
             );
             let mut specs = Vec::new();
-            let zero_aggregate_bytes = if command.ordered_items.is_empty() {
-                command.input.size_bytes()
-            } else {
-                0
-            };
             if command.ordered_items.is_empty() {
                 node.status = NodeState::Succeeded;
                 node.result_ref = Some(json_ref(
@@ -5749,16 +5917,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 bump_frontier_epoch(&mut state, scope, &command.run_id)?;
             }
             run.dynamic_node_count = dynamic_after;
-            run.aggregate_object_bytes = run
-                .aggregate_object_bytes
-                .checked_add(command.input.size_bytes())
-                .and_then(|bytes| bytes.checked_add(zero_aggregate_bytes))
-                .ok_or(StoreError::ArithmeticOverflow)?;
-            if run.aggregate_object_bytes > run.limits.max_aggregate_object_bytes_per_run {
-                return Err(StoreError::RunLimitApplied {
-                    code: "AggregateObjectLimitExceeded".to_owned(),
-                });
-            }
+            run.aggregate_object_bytes = aggregate_after;
             set_run_mutated(&mut run, now)?;
             state.runs.insert(run_key, run);
             append_batch(
@@ -6190,6 +6349,58 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             );
             let mut node = state.nodes.get(&node_key).cloned().expect("gate node");
             let mut specs = Vec::new();
+            // N67 says an invalid approval envelope must contract-fail "without registering
+            // refs", so the decision-payload ArtifactRef is only inserted once the envelope
+            // validates. Its ID is a pure function of scope/digest/kind/producer/ordinal, so
+            // the canonical ApprovalResult that embeds it can be built before registration.
+            let payload_value = command.decision_payload.as_ref().map(|payload| {
+                crate::artifact::ArtifactRefValue {
+                    artifact_ref_id: artifact_ref_id(ArtifactRefIdentity {
+                        scope,
+                        digest: payload.digest(),
+                        kind: ArtifactKind::ApprovalDecisionPayload,
+                        producer_run_id: Some(&command.run_id),
+                        producer_node_id: Some(&node.node_instance_id),
+                        producer_attempt_id: None,
+                        ordinal: 0,
+                    }),
+                    digest: payload.digest().clone(),
+                    size_bytes: payload.size_bytes().to_string(),
+                    media_type: payload.media_type().to_owned(),
+                }
+            });
+            if command.decision == ApprovalDecision::Approve {
+                let output = command
+                    .approval_output
+                    .as_ref()
+                    .ok_or(StoreError::ObjectNotVerified)?;
+                let expected = crate::approval::canonical_human_approval_result(
+                    payload_value,
+                    &command.principal,
+                );
+                if output.media_type() != "application/json"
+                    || output.digest() != &digest(&expected)
+                    || output.size_bytes() != expected.len() as u64
+                {
+                    // N67: `WaitingApproval` -> `ContractFailed` with
+                    // `ApprovalPayloadInvalid`, the Pending gate cancelled by G06 inside the
+                    // R08 cascade. Section 5.5 reports it as an applied error.
+                    apply_node_contract_failure(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        &node.node_instance_id,
+                        "N67",
+                        NodeFailureKind::ApprovalPayloadInvalid,
+                        now,
+                        EventActorKind::Host,
+                        command.principal.principal_id().to_owned(),
+                    )?;
+                    return Err(StoreError::ContractValidationApplied {
+                        code: "ApprovalPayloadInvalid".to_owned(),
+                    });
+                }
+            }
             let payload_reference = command
                 .decision_payload
                 .as_ref()
@@ -6207,33 +6418,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     )
                 })
                 .transpose()?;
-            let payload_value =
-                payload_reference
-                    .as_ref()
-                    .map(|reference| crate::artifact::ArtifactRefValue {
-                        artifact_ref_id: reference.artifact_ref_id.clone(),
-                        digest: reference.digest.clone(),
-                        size_bytes: reference.size_bytes.to_string(),
-                        media_type: reference.media_type.clone(),
-                    });
             match command.decision {
                 ApprovalDecision::Approve => {
                     let output = command
                         .approval_output
                         .as_ref()
                         .ok_or(StoreError::ObjectNotVerified)?;
-                    let expected = crate::approval::canonical_human_approval_result(
-                        payload_value,
-                        &command.principal,
-                    );
-                    if output.media_type() != "application/json"
-                        || output.digest() != &digest(&expected)
-                        || output.size_bytes() != expected.len() as u64
-                    {
-                        return Err(StoreError::ContractValidationApplied {
-                            code: "ApprovalPayloadInvalid".to_owned(),
-                        });
-                    }
                     gate.status = crate::run::GateState::Approved;
                     node.status = NodeState::Succeeded;
                     node.result_ref = Some(json_ref(
@@ -6423,6 +6613,21 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         || output.digest() != &digest(&expected)
                         || output.size_bytes() != expected.len() as u64
                     {
+                        // N67: `WaitingApproval` -> `ContractFailed` with
+                        // `ApprovalPayloadInvalid`, the Pending gate cancelled by G06 inside
+                        // the R08 cascade. Section 5.5 reports it as an applied error, and
+                        // nothing above this point registered a ref.
+                        apply_node_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &node.node_instance_id,
+                            "N67",
+                            NodeFailureKind::ApprovalPayloadInvalid,
+                            now,
+                            EventActorKind::Engine,
+                            command.permit.instance_id().as_str().to_owned(),
+                        )?;
                         return Err(StoreError::ContractValidationApplied {
                             code: "ApprovalPayloadInvalid".to_owned(),
                         });

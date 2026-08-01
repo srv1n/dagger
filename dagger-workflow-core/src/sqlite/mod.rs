@@ -2482,6 +2482,37 @@ macro_rules! sql_command {
                     }
                     Ok(value)
                 }
+                // Section 5.5 defines `ContractValidationApplied` and `RunLimitApplied`
+                // as APPLIED outcomes, and the reducer guard commits its staged state
+                // for both before returning them. Rolling the SQL transaction back here
+                // would discard exactly the transition the closed code claims was
+                // applied, leaving the durable row set disagreeing with the in-memory
+                // oracle. The reducer owns the decision about what is staged; this arm
+                // only has to persist whatever it committed.
+                Err(error)
+                    if matches!(
+                        error,
+                        StoreError::ContractValidationApplied { .. }
+                            | StoreError::RunLimitApplied { .. }
+                    ) =>
+                {
+                    let state = reducer.snapshot();
+                    self.remember_verified_bytes(&state);
+                    if let Err(persist_error) =
+                        Self::persist_projections(&mut connection, scope, &loaded, &state).await
+                    {
+                        Self::rollback(&mut connection).await;
+                        return Err(persist_error);
+                    }
+                    if let Err(persist_error) =
+                        Self::persist_authority(&mut connection, scope, &loaded, &state).await
+                    {
+                        Self::rollback(&mut connection).await;
+                        return Err(persist_error);
+                    }
+                    Self::commit(connection).await?;
+                    Err(error)
+                }
                 Err(error) => {
                     Self::rollback(&mut connection).await;
                     Err(error)
