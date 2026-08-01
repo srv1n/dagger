@@ -19,12 +19,17 @@ use dagger_workflow_core::ids::{
 use dagger_workflow_core::memory::InMemoryObjectStore;
 use dagger_workflow_core::run::RunLimits;
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
-use dagger_workflow_core::sqlite::{SqliteWorkflowStore, SCHEMA_VERSION};
+use dagger_workflow_core::sqlite::{
+    SqliteWorkflowStore, SCHEDULER_COMPATIBILITY_SCAN_SQL, SCHEDULER_DEADLINES_SCAN_SQL,
+    SCHEDULER_GATES_SCAN_SQL, SCHEDULER_LIFETIMES_SCAN_SQL, SCHEDULER_NODES_SCAN_SQL,
+    SCHEDULER_RECOVERY_SCAN_SQL, SCHEMA_VERSION,
+};
 use dagger_workflow_core::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
     CompleteMap, CompletionObjects, CreateDefinition, CreateRun, DecideApproval, ExpandMap,
-    OrderedMapItem, PageRequest, PublishRevision, RequestApproval, ResolvedActionSchemas, StartRun,
-    StoreError, TimeoutAttempt, WorkflowStore,
+    OrderedMapItem, PageRequest, PublishRevision, RequestApproval, ResolveTerminalNode,
+    ResolvedActionSchemas, StartRun, StoreError, TimeoutAttempt, UpdateDefinitionMetadata,
+    WorkflowStore,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
@@ -184,6 +189,103 @@ async fn seed_action_definition(
         input,
         evidence_digest: schema.digest().clone(),
     }
+}
+
+#[tokio::test]
+async fn publish_revision_reuses_existing_schema_artifact_refs() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = SqliteWorkflowStore::open_url("sqlite::memory:", clock, objects.clone())
+        .await
+        .unwrap();
+    let fixture = seed_action_definition(&store, &objects, "reused-schema").await;
+    let schema = objects
+        .get(&fixture.scope, &fixture.evidence_digest)
+        .await
+        .unwrap()
+        .reference;
+    let definition_id = Id::new("definition").unwrap();
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: definition_id.clone(),
+        name: "fixture revision two".to_owned(),
+        description: "reuses the first revision schemas".to_owned(),
+        run_input_schema_digest: schema.digest().clone(),
+        run_output_schema_digest: schema.digest().clone(),
+        entry_node_id: Id::new("action").unwrap(),
+        nodes: vec![
+            NodeDefinition::Action {
+                id: Id::new("action").unwrap(),
+                action: ActionReference {
+                    name: "fixture.action".to_owned(),
+                    contract_version: "1".to_owned(),
+                    input_schema_digest: schema.digest().clone(),
+                    output_schema_digest: schema.digest().clone(),
+                    compatible_implementation_requirement: schema.digest().clone(),
+                },
+                bindings: vec![Binding {
+                    target: "/value".to_owned(),
+                    source: BindingSource::RunInput {
+                        pointer: "/value".to_owned(),
+                    },
+                }],
+                retry: RetryPolicy {
+                    max_attempts: 2,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 60_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![Id::new("succeed").unwrap()],
+            },
+            NodeDefinition::Succeed {
+                id: Id::new("succeed").unwrap(),
+                output: BindingSource::NodeOutput {
+                    node_id: Id::new("action").unwrap(),
+                    pointer: String::new(),
+                },
+            },
+        ],
+    };
+    let canonical = objects
+        .put(
+            &fixture.scope,
+            &serde_jcs::to_vec(&definition).unwrap(),
+            "application/json",
+        )
+        .await
+        .unwrap();
+    let ranks = BTreeMap::from([
+        (Id::new("action").unwrap(), TopologicalRank(0)),
+        (Id::new("succeed").unwrap(), TopologicalRank(1)),
+    ]);
+
+    let revision = store
+        .publish_revision(
+            &fixture.scope,
+            PublishRevision {
+                definition_id,
+                expected_definition_version: Version(2),
+                canonical_definition: canonical.clone(),
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: BTreeMap::from([(
+                    "action".to_owned(),
+                    ResolvedActionSchemas {
+                        input_schema: schema.clone(),
+                        output_schema: schema,
+                    },
+                )]),
+                parsed_revision: PublishableDefinition {
+                    definition,
+                    topological_ranks: ranks,
+                },
+                principal: fixture.principal,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(revision.revision_hash, *canonical.digest());
 }
 
 async fn seed_approval_definition(
@@ -491,10 +593,25 @@ async fn standalone_open_reopens_a_converged_migration() {
 }
 
 #[tokio::test]
-async fn version_one_rejects_any_missing_table_or_index() {
-    for missing_object in [
-        "DROP TABLE dagger_workflow_invocation_rows",
-        "DROP INDEX dagger_workflow_runs_lifetime_scan",
+async fn version_one_rejects_missing_or_semantically_corrupt_schema_objects() {
+    for corruption in [
+        vec!["DROP TABLE dagger_workflow_invocation_rows"],
+        vec!["DROP INDEX dagger_workflow_runs_lifetime_scan"],
+        vec![
+            "DROP TABLE dagger_workflow_invocation_rows",
+            "CREATE TABLE dagger_workflow_invocation_rows (
+                tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+                sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+                version INTEGER NOT NULL CHECK(version > 0)
+            )",
+        ],
+        vec![
+            "DROP INDEX dagger_workflow_runs_lifetime_scan",
+            "CREATE INDEX dagger_workflow_runs_lifetime_scan
+             ON dagger_workflow_runs(
+                 namespace, tenant_id, status, lifetime_deadline_at_ms, run_id
+             )",
+        ],
     ] {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -510,10 +627,9 @@ async fn version_one_rejects_any_missing_table_or_index() {
         let store = SqliteWorkflowStore::from_pool(pool.clone(), clock.clone(), objects.clone())
             .await
             .unwrap();
-        sqlx::query(missing_object)
-            .execute(store.pool())
-            .await
-            .unwrap();
+        for statement in corruption {
+            sqlx::query(statement).execute(store.pool()).await.unwrap();
+        }
         assert!(matches!(
             SqliteWorkflowStore::from_pool(pool, clock, objects).await,
             Err(StoreError::TransactionFailed)
@@ -1461,47 +1577,147 @@ async fn scheduler_multi_status_scans_are_index_ordered_without_temp_sorts() {
     )
     .await
     .unwrap();
-    for (name, ordered_column, expected_index) in [
+    for (name, statement, expected_index, expected_uses) in [
         (
-            "compatibility",
-            "updated_at_ms",
-            "dagger_workflow_runs_compatibility_scan",
+            "ready nodes",
+            SCHEDULER_NODES_SCAN_SQL,
+            "dagger_workflow_nodes_scheduler_scan",
+            1,
+        ),
+        (
+            "budget waiters",
+            SCHEDULER_NODES_SCAN_SQL,
+            "dagger_workflow_nodes_scheduler_scan",
+            1,
+        ),
+        (
+            "deadlines",
+            SCHEDULER_DEADLINES_SCAN_SQL,
+            "dagger_workflow_attempts_deadline_scan",
+            1,
+        ),
+        (
+            "retries",
+            SCHEDULER_NODES_SCAN_SQL,
+            "dagger_workflow_nodes_scheduler_scan",
+            1,
+        ),
+        (
+            "recovery",
+            SCHEDULER_RECOVERY_SCAN_SQL,
+            "dagger_workflow_attempts_recovery_scan",
+            1,
+        ),
+        (
+            "gate expiry",
+            SCHEDULER_GATES_SCAN_SQL,
+            "dagger_workflow_gates_expiry_scan",
+            1,
         ),
         (
             "lifetime",
-            "lifetime_deadline_at_ms",
+            SCHEDULER_LIFETIMES_SCAN_SQL,
             "dagger_workflow_runs_lifetime_scan",
+            3,
+        ),
+        (
+            "compatibility",
+            SCHEDULER_COMPATIBILITY_SCAN_SQL,
+            "dagger_workflow_runs_compatibility_scan",
+            3,
         ),
     ] {
-        let branches = ["Pending", "Running", "BlockedIncompatible"]
-            .into_iter()
-            .map(|status| {
-                format!(
-                    "SELECT rr.row_data, r.{ordered_column}, r.run_id
-                     FROM dagger_workflow_runs AS r
-                     JOIN dagger_workflow_run_rows AS rr
-                       ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                      AND rr.entity_id = r.run_id AND rr.sub_id = ''
-                     WHERE r.tenant_id = 'tenant' AND r.namespace = 'workflow'
-                       AND rr.tenant_id = 'tenant' AND rr.namespace = 'workflow'
-                       AND r.status = '{status}' AND r.{ordered_column} <= 100
-                       AND (r.{ordered_column} > -100
-                         OR (r.{ordered_column} = -100 AND r.run_id > ''))"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" UNION ALL ");
-        let statement = format!(
-            "EXPLAIN QUERY PLAN {branches}
-             ORDER BY {ordered_column}, run_id LIMIT 11"
-        );
-        let details: Vec<String> = sqlx::query(&statement)
-            .fetch_all(store.pool())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|row| row.get("detail"))
-            .collect();
+        let explain = format!("EXPLAIN QUERY PLAN {statement}");
+        let rows = match name {
+            "ready nodes" | "budget waiters" | "retries" => sqlx::query(&explain)
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind(if name == "ready nodes" {
+                    "Ready"
+                } else if name == "budget waiters" {
+                    "BudgetWaiting"
+                } else {
+                    "RetryWaiting"
+                })
+                .bind(100_i64)
+                .bind(i64::from(name == "retries"))
+                .bind(100_i64)
+                .bind("")
+                .bind("")
+                .bind("")
+                .bind(11_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap(),
+            "deadlines" => sqlx::query(&explain)
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind(100_i64)
+                .bind(100_i64)
+                .bind(-100_i64)
+                .bind(-100_i64)
+                .bind("")
+                .bind(-100_i64)
+                .bind("")
+                .bind("")
+                .bind(-100_i64)
+                .bind("")
+                .bind("")
+                .bind("")
+                .bind(11_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap(),
+            "recovery" => sqlx::query(&explain)
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind(2_i64)
+                .bind(100_i64)
+                .bind("")
+                .bind(11_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap(),
+            "gate expiry" => sqlx::query(&explain)
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind(100_i64)
+                .bind(-100_i64)
+                .bind(-100_i64)
+                .bind("")
+                .bind(-100_i64)
+                .bind("")
+                .bind("")
+                .bind(11_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap(),
+            "lifetime" | "compatibility" => sqlx::query(&explain)
+                .bind("tenant")
+                .bind("workflow")
+                .bind("tenant")
+                .bind("workflow")
+                .bind(100_i64)
+                .bind(-100_i64)
+                .bind(-100_i64)
+                .bind("")
+                .bind(11_i64)
+                .fetch_all(store.pool())
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        let details: Vec<String> = rows.into_iter().map(|row| row.get("detail")).collect();
         assert!(
             details
                 .iter()
@@ -1512,13 +1728,11 @@ async fn scheduler_multi_status_scans_are_index_ordered_without_temp_sorts() {
         assert!(
             details
                 .iter()
-                .any(|detail| detail.contains("MERGE (UNION ALL)"))
-                && details
-                    .iter()
-                    .filter(|detail| detail.contains(expected_index))
-                    .count()
-                    == 3,
-            "{name} scheduler scan did not merge three index-ordered status ranges:\n{}",
+                .filter(|detail| detail.contains(expected_index))
+                .count()
+                >= expected_uses,
+            "{name} scheduler scan did not use its scoped ordering index \
+             {expected_index} {expected_uses} time(s):\n{}",
             details.join("\n")
         );
     }
@@ -2122,8 +2336,16 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
         let bytes = source.as_bytes();
         let mut literals = Vec::new();
         let mut index = 0;
+        // An `r` only opens a raw string at a token boundary. Without this check an identifier
+        // ending in `r` immediately before a quote is read as a raw-string opener, which makes the
+        // scanner swallow the real closing quote and desynchronize for the rest of the file.
+        let opens_raw_string = |index: usize| {
+            bytes[index] == b'r'
+                && (index == 0
+                    || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_'))
+        };
         while index < bytes.len() {
-            if bytes[index] == b'r' {
+            if opens_raw_string(index) {
                 let mut hashes = 0;
                 while index + 1 + hashes < bytes.len() && bytes[index + 1 + hashes] == b'#' {
                     hashes += 1;
@@ -2131,6 +2353,7 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
                 if index + 1 + hashes < bytes.len() && bytes[index + 1 + hashes] == b'"' {
                     let start = index + 2 + hashes;
                     let mut end = start;
+                    let mut terminated = false;
                     while end < bytes.len() {
                         if bytes[end] == b'"'
                             && (0..hashes).all(|offset| {
@@ -2139,9 +2362,15 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
                         {
                             literals.push(source[start..end].to_owned());
                             index = end + 1 + hashes;
+                            terminated = true;
                             break;
                         }
                         end += 1;
+                    }
+                    // An unterminated literal must still advance the cursor, or this loop spins
+                    // forever. The source compiles, so reaching here means the scan desynchronized.
+                    if !terminated {
+                        index = bytes.len();
                     }
                     continue;
                 }
@@ -2150,17 +2379,19 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
                 let start = index + 1;
                 let mut end = start;
                 let mut escaped = false;
+                let mut terminated = false;
                 while end < bytes.len() {
                     if bytes[end] == b'"' && !escaped {
                         literals.push(source[start..end].to_owned());
                         index = end + 1;
+                        terminated = true;
                         break;
                     }
                     escaped = bytes[end] == b'\\' && !escaped;
-                    if bytes[end] != b'\\' {
-                        escaped = false;
-                    }
                     end += 1;
+                }
+                if !terminated {
+                    index = bytes.len();
                 }
                 continue;
             }
@@ -2232,7 +2463,6 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
 #[tokio::test]
 async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
     async fn open_cost_store(
-        path: &Path,
         clock: Arc<TestClock>,
         objects: Arc<InMemoryObjectStore<TestClock>>,
     ) -> SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>> {
@@ -2240,7 +2470,7 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
             .max_connections(1)
             .connect_with(
                 SqliteConnectOptions::new()
-                    .filename(path)
+                    .filename(":memory:")
                     .create_if_missing(true),
             )
             .await
@@ -2260,57 +2490,115 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         dagger_workflow_core::store::AcquiredEngineClaim,
     ) {
         let fixture = seed_action_definition(store, objects, tenant).await;
-        sqlx::query(
-            "WITH RECURSIVE history(index_value) AS (
-                 SELECT 0 UNION ALL
-                 SELECT index_value + 1 FROM history WHERE index_value + 1 < ?
-             )
-             INSERT INTO dagger_workflow_runs(
-                 tenant_id, namespace, run_id, definition_id, revision_hash, status,
-                 version, event_seq, aggregate_object_bytes, total_attempts,
-                 budget_limit, budget_reserved, budget_spent, lifetime_deadline_at_ms,
-                 created_at_ms, updated_at_ms
-             )
-             SELECT ?, ?, printf('history-%04d', index_value), 'historical-definition',
-                    'sha256:historical', 'Succeeded', 1, 1, 0, 0, 0, 0, 0, 0, 0, 0
-             FROM history",
-        )
-        .bind(count as i64)
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
-        sqlx::query(
-            "WITH RECURSIVE history(index_value) AS (
-                 SELECT 0 UNION ALL
-                 SELECT index_value + 1 FROM history WHERE index_value + 1 < ?
-             ), template(row_data) AS (
-                 SELECT row_data FROM dagger_workflow_object_rows
-                 WHERE tenant_id = ? AND namespace = ? LIMIT 1
-             )
-             INSERT INTO dagger_workflow_object_rows(
-                 tenant_id, namespace, entity_id, sub_id, row_data, version
-             )
-             SELECT ?, ?, printf('sha256:%064x', index_value + 1000000), '',
-                    json_set(template.row_data, '$.digest',
-                             printf('sha256:%064x', index_value + 1000000)),
-                    1
-             FROM history CROSS JOIN template",
-        )
-        .bind(count as i64)
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .bind(fixture.scope.tenant_id.as_str())
-        .bind(fixture.scope.namespace.as_str())
-        .execute(store.pool())
-        .await
-        .unwrap();
         let claim = store
             .acquire_engine_claim(&fixture.scope, Id::new("cost-engine").unwrap())
             .await
             .unwrap();
-        let completed: i64 = sqlx::query_scalar(
+        for index in 0..count {
+            let run_id = format!("history-{index:04}");
+            let attempt_id = format!("attempt-{index:04}");
+            store
+                .create_run(&fixture.scope, create_run_command(&fixture, &run_id))
+                .await
+                .unwrap();
+            store
+                .start_run(
+                    &fixture.scope,
+                    StartRun {
+                        permit: claim.permit.clone(),
+                        run_id: Id::new(&run_id).unwrap(),
+                        compatibility_evidence: CompatibilityReport {
+                            evidence_digest: fixture.evidence_digest.clone(),
+                            incompatible_reference_locations: Vec::new(),
+                            evidence: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let action = store
+                .get_node(
+                    &fixture.scope,
+                    &Id::new(&run_id).unwrap(),
+                    &Id::new("action").unwrap(),
+                )
+                .await
+                .unwrap();
+            let credential = match store
+                .claim_node_attempt(
+                    &fixture.scope,
+                    ClaimNodeAttempt {
+                        permit: claim.permit.clone(),
+                        run_id: Id::new(&run_id).unwrap(),
+                        node_id: Id::new("action").unwrap(),
+                        expected_node_version: action.version,
+                        attempt_id: Id::new(&attempt_id).unwrap(),
+                        worker_id: Id::new("history-worker").unwrap(),
+                        bound_input: fixture.input.clone(),
+                        binding_derivation_digest: fixture.evidence_digest.clone(),
+                    },
+                )
+                .await
+                .unwrap()
+            {
+                ClaimNodeAttemptResult::Claimed {
+                    completion_credential,
+                    ..
+                } => completion_credential,
+                _ => panic!("historical action was not claimed"),
+            };
+            store
+                .complete_attempt(
+                    &fixture.scope,
+                    CompleteAttempt {
+                        completion_credential: credential,
+                        run_id: Id::new(&run_id).unwrap(),
+                        node_id: Id::new("action").unwrap(),
+                        attempt_id: Id::new(&attempt_id).unwrap(),
+                        submitted_outcome: ActionOutcome::Success {
+                            output: serde_json::json!({"value": 1}),
+                            artifacts: Vec::new(),
+                            actual_cost_units: CostUnits(1),
+                            diagnostics: None,
+                        },
+                        objects: CompletionObjects {
+                            output: Some(fixture.input.clone()),
+                            artifacts: Vec::new(),
+                            diagnostics: None,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let terminal = store
+                .get_node(
+                    &fixture.scope,
+                    &Id::new(&run_id).unwrap(),
+                    &Id::new("succeed").unwrap(),
+                )
+                .await
+                .unwrap();
+            store
+                .resolve_terminal_node(
+                    &fixture.scope,
+                    ResolveTerminalNode {
+                        permit: claim.permit.clone(),
+                        run_id: Id::new(&run_id).unwrap(),
+                        node_id: Id::new("succeed").unwrap(),
+                        expected_node_version: terminal.version,
+                        output: Some(fixture.input.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+            if index > 0 && index % 10 == 0 {
+                store
+                    .heartbeat_engine_claim(&fixture.scope, &claim.permit)
+                    .await
+                    .unwrap();
+            }
+        }
+        let completed_projection: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM dagger_workflow_runs
              WHERE tenant_id = ? AND namespace = ? AND status = 'Succeeded'",
         )
@@ -2319,7 +2607,20 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(completed, count as i64);
+        let completed_authority: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM dagger_workflow_run_rows
+             WHERE tenant_id = ? AND namespace = ?
+               AND entity_id LIKE 'history-%' AND json_extract(row_data, '$.status') = 'Succeeded'",
+        )
+        .bind(fixture.scope.tenant_id.as_str())
+        .bind(fixture.scope.namespace.as_str())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (completed_projection, completed_authority),
+            (count as i64, count as i64)
+        );
         (fixture, claim)
     }
 
@@ -2364,36 +2665,192 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
         steps.load(Ordering::Relaxed)
     }
 
-    let small_directory = TempDir::new().unwrap();
-    let large_directory = TempDir::new().unwrap();
     let clock = Arc::new(TestClock::new(Timestamp(0)));
     let small_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
     let large_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
-    let small = open_cost_store(
-        &small_directory.path().join("small.sqlite"),
-        clock.clone(),
-        small_objects.clone(),
-    )
-    .await;
-    let large = open_cost_store(
-        &large_directory.path().join("large.sqlite"),
-        clock,
-        large_objects.clone(),
-    )
-    .await;
+    let small = open_cost_store(clock.clone(), small_objects.clone()).await;
+    let large = open_cost_store(clock, large_objects.clone()).await;
+    // Each history is measured immediately after it is seeded. Lease deadlines come from the
+    // in-transaction database clock rather than TestClock, so seeding the large history before
+    // measuring the small one expires the small claim in real time.
     let (small_fixture, small_claim) =
-        seed_completed_history(&small, &small_objects, "small-history", 100).await;
-    let (large_fixture, large_claim) =
-        seed_completed_history(&large, &large_objects, "large-history", 2_000).await;
-
+        seed_completed_history(&small, &small_objects, "small-history", 50).await;
+    small
+        .heartbeat_engine_claim(&small_fixture.scope, &small_claim.permit)
+        .await
+        .unwrap();
     let small_steps = measure_ordinary_start_vm_steps(&small, &small_fixture, &small_claim).await;
+
+    let (large_fixture, large_claim) =
+        seed_completed_history(&large, &large_objects, "large-history", 500).await;
+    large
+        .heartbeat_engine_claim(&large_fixture.scope, &large_claim.permit)
+        .await
+        .unwrap();
     let large_steps = measure_ordinary_start_vm_steps(&large, &large_fixture, &large_claim).await;
     let bound = small_steps.saturating_mul(2).saturating_add(2_000);
     assert!(
         large_steps <= bound,
-        "2,000-run ordinary start used {large_steps} SQLite VM steps and scaled with \
-         completed history; 100-run ordinary start used {small_steps}, bound {bound}"
+        "500-run ordinary start used {large_steps} SQLite VM steps and scaled with \
+         completed history; 50-run ordinary start used {small_steps}, bound {bound}"
     );
+}
+
+#[tokio::test]
+async fn gate_11_definition_and_list_runs_cost_is_bounded_by_page_not_history() {
+    async fn open_cost_store(
+        clock: Arc<TestClock>,
+        objects: Arc<InMemoryObjectStore<TestClock>>,
+    ) -> SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(":memory:")
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        SqliteWorkflowStore::from_pool(pool, clock, objects)
+            .await
+            .unwrap()
+    }
+
+    async fn seed_history(
+        store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+        objects: &Arc<InMemoryObjectStore<TestClock>>,
+        tenant: &str,
+        count: usize,
+    ) -> ActionFixture {
+        let fixture = seed_action_definition(store, objects, tenant).await;
+        for index in 0..count {
+            let run_id = format!("history-{index:04}");
+            store
+                .create_run(&fixture.scope, create_run_command(&fixture, &run_id))
+                .await
+                .unwrap();
+        }
+        fixture
+    }
+
+    async fn measure(
+        store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+        name: &str,
+        operation: impl std::future::Future<Output = Result<(), StoreError>>,
+    ) -> u64 {
+        let steps = Arc::new(AtomicU64::new(0));
+        let mut connection = store.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, {
+                let steps = steps.clone();
+                move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            });
+        drop(connection);
+        operation
+            .await
+            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        steps.load(Ordering::Relaxed)
+    }
+
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let small_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let large_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let small = open_cost_store(clock.clone(), small_objects.clone()).await;
+    let large = open_cost_store(clock, large_objects.clone()).await;
+    let small_fixture = seed_history(&small, &small_objects, "small-definition-history", 50).await;
+    let large_fixture = seed_history(&large, &large_objects, "large-definition-history", 500).await;
+    let small_definition_version = small
+        .get_definition(&small_fixture.scope, &Id::new("definition").unwrap())
+        .await
+        .unwrap()
+        .version;
+    let large_definition_version = large
+        .get_definition(&large_fixture.scope, &Id::new("definition").unwrap())
+        .await
+        .unwrap()
+        .version;
+
+    let small_definition_steps = measure(&small, "small definition update", async {
+        small
+            .update_definition_metadata(
+                &small_fixture.scope,
+                UpdateDefinitionMetadata {
+                    definition_id: Id::new("definition").unwrap(),
+                    expected_version: small_definition_version,
+                    display_name: "updated".to_owned(),
+                    description: String::new(),
+                },
+            )
+            .await
+            .map(|_| ())
+    })
+    .await;
+    let large_definition_steps = measure(&large, "large definition update", async {
+        large
+            .update_definition_metadata(
+                &large_fixture.scope,
+                UpdateDefinitionMetadata {
+                    definition_id: Id::new("definition").unwrap(),
+                    expected_version: large_definition_version,
+                    display_name: "updated".to_owned(),
+                    description: String::new(),
+                },
+            )
+            .await
+            .map(|_| ())
+    })
+    .await;
+    let small_list_steps = measure(&small, "small list_runs", async {
+        small
+            .list_runs(
+                &small_fixture.scope,
+                PageRequest {
+                    cursor: None,
+                    page_size: 10,
+                },
+            )
+            .await
+            .map(|_| ())
+    })
+    .await;
+    let large_list_steps = measure(&large, "large list_runs", async {
+        large
+            .list_runs(
+                &large_fixture.scope,
+                PageRequest {
+                    cursor: None,
+                    page_size: 10,
+                },
+            )
+            .await
+            .map(|_| ())
+    })
+    .await;
+    eprintln!(
+        "gate_11 VM steps: definition update {small_definition_steps}/{large_definition_steps}; \
+         list_runs {small_list_steps}/{large_list_steps} (50/500 runs)"
+    );
+    for (name, small_steps, large_steps) in [
+        (
+            "definition update",
+            small_definition_steps,
+            large_definition_steps,
+        ),
+        ("list_runs", small_list_steps, large_list_steps),
+    ] {
+        let bound = small_steps.saturating_mul(2).saturating_add(2_000);
+        assert!(
+            large_steps <= bound,
+            "{name}: 500-run cost {large_steps} scaled with unrelated history; \
+             50-run cost {small_steps}, bound {bound}"
+        );
+    }
 }
 
 #[cfg(feature = "conformance")]

@@ -10,12 +10,14 @@ mod schema;
 
 use crate::action::ActionInvocation;
 use crate::approval::ApprovalGate;
-use crate::artifact::{ArtifactRef, ObjectRecord, ObjectStore, VerifiedObjectRef};
+use crate::artifact::{
+    ArtifactKind, ArtifactRef, ObjectReadError, ObjectRecord, ObjectStore, VerifiedObjectRef,
+};
 use crate::budget::BudgetLedgerEntry;
 use crate::definition::PublishableDefinition;
 use crate::engine::Clock;
 use crate::event::WorkflowEvent;
-use crate::ids::{Digest, Id, NodeInstanceId, Timestamp};
+use crate::ids::{artifact_ref_id, ArtifactRefIdentity, Digest, Id, NodeInstanceId, Timestamp};
 use crate::revision::WorkflowRevision;
 use crate::run::{EdgeFact, NodeAttempt, NodeRun, WorkflowRun, WorkflowRunView};
 use crate::scope::ExecutionScope;
@@ -35,6 +37,156 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 pub use schema::SCHEMA_VERSION;
+
+#[doc(hidden)]
+pub const SCHEDULER_NODES_SCAN_SQL: &str = "SELECT nr.row_data
+     FROM dagger_workflow_nodes AS n
+     JOIN dagger_workflow_runs AS r
+       ON r.tenant_id = n.tenant_id AND r.namespace = n.namespace
+      AND r.run_id = n.run_id
+     JOIN dagger_workflow_node_run_rows AS nr
+       ON nr.tenant_id = n.tenant_id AND nr.namespace = n.namespace
+      AND nr.entity_id = n.run_id AND nr.sub_id = n.node_id
+     WHERE n.tenant_id = ? AND n.namespace = ?
+       AND r.tenant_id = ? AND r.namespace = ?
+       AND nr.tenant_id = ? AND nr.namespace = ?
+       AND r.status = 'Running' AND n.status = ?
+       AND n.updated_at_ms <= ?
+       AND (? = 0 OR n.next_eligible_at_ms <= ?)
+       AND (n.run_id > ? OR (n.run_id = ? AND n.node_id > ?))
+     ORDER BY n.run_id, n.node_id
+     LIMIT ?";
+
+#[doc(hidden)]
+pub const SCHEDULER_DEADLINES_SCAN_SQL: &str = "SELECT ar.row_data
+     FROM dagger_workflow_attempts AS a
+     JOIN dagger_workflow_attempt_rows AS ar
+       ON ar.tenant_id = a.tenant_id AND ar.namespace = a.namespace
+      AND ar.entity_id = a.run_id AND ar.sub_id = a.attempt_id
+     WHERE a.tenant_id = ? AND a.namespace = ?
+       AND ar.tenant_id = ? AND ar.namespace = ?
+       AND a.status = 'Started' AND a.started_at_ms <= ?
+       AND a.deadline_at_ms <= ?
+       AND (a.deadline_at_ms > ?
+         OR (a.deadline_at_ms = ? AND a.run_id > ?)
+         OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id > ?)
+         OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id = ?
+             AND a.attempt_id > ?))
+     ORDER BY a.deadline_at_ms, a.run_id, a.node_id, a.attempt_id
+     LIMIT ?";
+
+#[doc(hidden)]
+pub const SCHEDULER_RECOVERY_SCAN_SQL: &str = "SELECT DISTINCT rr.entity_id, rr.row_data
+     FROM dagger_workflow_attempts AS a
+     JOIN dagger_workflow_run_rows AS rr
+       ON rr.tenant_id = a.tenant_id AND rr.namespace = a.namespace
+      AND rr.entity_id = a.run_id AND rr.sub_id = ''
+     WHERE a.tenant_id = ? AND a.namespace = ?
+       AND rr.tenant_id = ? AND rr.namespace = ?
+       AND a.status = 'Started' AND a.engine_generation < ?
+       AND a.started_at_ms <= ? AND rr.entity_id > ?
+     ORDER BY rr.entity_id
+     LIMIT ?";
+
+#[doc(hidden)]
+pub const SCHEDULER_COMPATIBILITY_SCAN_SQL: &str = "SELECT rr.row_data, r.updated_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'Pending' AND r.updated_at_ms <= ?5
+         AND (r.updated_at_ms > ?6
+           OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+       UNION ALL
+       SELECT rr.row_data, r.updated_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'Running' AND r.updated_at_ms <= ?5
+         AND (r.updated_at_ms > ?6
+           OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+       UNION ALL
+       SELECT rr.row_data, r.updated_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'BlockedIncompatible' AND r.updated_at_ms <= ?5
+         AND (r.updated_at_ms > ?6
+           OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
+     ORDER BY updated_at_ms, run_id
+     LIMIT ?9";
+
+#[doc(hidden)]
+pub const SCHEDULER_GATES_SCAN_SQL: &str = "SELECT ar.row_data
+     FROM dagger_workflow_approval_gates AS g
+     JOIN dagger_workflow_approval_rows AS ar
+       ON ar.tenant_id = g.tenant_id AND ar.namespace = g.namespace
+      AND ar.entity_id = g.run_id AND ar.sub_id = g.gate_id
+     WHERE g.tenant_id = ? AND g.namespace = ?
+       AND ar.tenant_id = ? AND ar.namespace = ?
+       AND g.status = 'Pending' AND g.expires_at_ms <= ?
+       AND (g.expires_at_ms > ?
+         OR (g.expires_at_ms = ? AND g.run_id > ?)
+         OR (g.expires_at_ms = ? AND g.run_id = ? AND g.gate_id > ?))
+     ORDER BY g.expires_at_ms, g.run_id, g.gate_id
+     LIMIT ?";
+
+#[doc(hidden)]
+pub const SCHEDULER_LIFETIMES_SCAN_SQL: &str =
+    "SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'Pending' AND r.lifetime_deadline_at_ms <= ?5
+         AND (r.lifetime_deadline_at_ms > ?6
+           OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+       UNION ALL
+       SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'Running' AND r.lifetime_deadline_at_ms <= ?5
+         AND (r.lifetime_deadline_at_ms > ?6
+           OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+       UNION ALL
+       SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
+       FROM dagger_workflow_runs AS r
+       JOIN dagger_workflow_run_rows AS rr
+         ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+        AND rr.entity_id = r.run_id AND rr.sub_id = ''
+       WHERE r.tenant_id = ?1 AND r.namespace = ?2
+         AND rr.tenant_id = ?3 AND rr.namespace = ?4
+         AND r.status = 'BlockedIncompatible'
+         AND r.lifetime_deadline_at_ms <= ?5
+         AND (r.lifetime_deadline_at_ms > ?6
+           OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
+     ORDER BY lifetime_deadline_at_ms, run_id
+     LIMIT ?9";
+
+const LIST_RUNS_SQL: &str = "SELECT rr.row_data
+     FROM dagger_workflow_runs AS r
+     JOIN dagger_workflow_run_rows AS rr
+       ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+      AND rr.entity_id = r.run_id AND rr.sub_id = ''
+     WHERE r.tenant_id = ? AND r.namespace = ?
+       AND rr.tenant_id = ? AND rr.namespace = ?
+       AND r.created_at_ms <= ? AND r.run_id > ?
+     ORDER BY r.run_id
+     LIMIT ?";
 
 /// One-shot crash-window injection for the SQLite proof suite.
 #[cfg(feature = "conformance")]
@@ -109,9 +261,12 @@ const RUN_SCOPED_AUTHORITY_TABLES: &[&str] = &[
 #[derive(Default)]
 struct AuthorityLoad {
     run_id: Option<Id>,
+    definition_id: Option<Id>,
+    scope_counter: bool,
     revision: Option<(Id, Digest)>,
     receipt: Option<(CommandKindKey, String)>,
     object_digests: Vec<Digest>,
+    artifact_ref_ids: Vec<Id>,
 }
 
 impl AuthorityLoad {
@@ -124,6 +279,16 @@ impl AuthorityLoad {
             run_id: Some(run_id.clone()),
             ..Self::default()
         }
+    }
+
+    fn definition(mut self, definition_id: &Id) -> Self {
+        self.definition_id = Some(definition_id.clone());
+        self
+    }
+
+    fn scope_counter(mut self) -> Self {
+        self.scope_counter = true;
+        self
     }
 
     fn revision(mut self, definition_id: &Id, revision_hash: &Digest) -> Self {
@@ -140,6 +305,57 @@ impl AuthorityLoad {
         self.object_digests.extend(digests.into_iter().cloned());
         self
     }
+
+    fn artifacts(mut self, ids: impl IntoIterator<Item = Id>) -> Self {
+        self.artifact_ref_ids.extend(ids);
+        self
+    }
+}
+
+/// Deterministic artifact ref IDs `publish_revision` can touch, so the bounded
+/// load sees refs an earlier revision already registered for the same schemas.
+/// Mirrors the `json_ref` calls in `reducer::publish_revision` and reuses
+/// [`artifact_ref_id`] so the derivations cannot drift apart. Ordinals 0 and 1
+/// are both loaded for every schema object: a superset of what the reducer
+/// touches, still bounded by the command.
+fn publish_revision_artifact_ids(scope: &ExecutionScope, command: &PublishRevision) -> Vec<Id> {
+    let identity = |digest: &Digest, kind: ArtifactKind, ordinal: u32| {
+        artifact_ref_id(ArtifactRefIdentity {
+            scope,
+            digest,
+            kind,
+            producer_run_id: None,
+            producer_node_id: None,
+            producer_attempt_id: None,
+            ordinal,
+        })
+    };
+    let schema_digests = [
+        command.run_input_schema.digest(),
+        command.run_output_schema.digest(),
+    ]
+    .into_iter()
+    .chain(
+        command
+            .resolved_action_schema_objects
+            .values()
+            .flat_map(|schemas| {
+                [
+                    schemas.input_schema.digest(),
+                    schemas.output_schema.digest(),
+                ]
+            }),
+    );
+    let mut ids = vec![identity(
+        command.canonical_definition.digest(),
+        ArtifactKind::Definition,
+        0,
+    )];
+    for digest in schema_digests {
+        ids.push(identity(digest, ArtifactKind::SchemaDocument, 0));
+        ids.push(identity(digest, ArtifactKind::SchemaDocument, 1));
+    }
+    ids
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -739,6 +955,8 @@ where
             state: ReducerState::default(),
             rows: BTreeMap::new(),
         };
+        let mut revision = request.revision.clone();
+        let mut object_digests = request.object_digests.clone();
 
         if let Some(run_id) = request.run_id.as_ref() {
             for table in RUN_SCOPED_AUTHORITY_TABLES {
@@ -760,38 +978,13 @@ where
                 }
             }
 
-            let revision = request.revision.clone().or_else(|| {
+            revision = revision.or_else(|| {
                 loaded
                     .state
                     .runs
                     .get(&(scope.clone(), run_id.clone()))
                     .map(|run| (run.definition_id.clone(), run.revision_hash.clone()))
             });
-            if let Some((definition_id, revision_hash)) = revision {
-                Self::load_authority_point(
-                    connection,
-                    scope,
-                    &mut loaded,
-                    REVISION_ROWS,
-                    definition_id.as_str(),
-                    revision_hash.as_str(),
-                )
-                .await?;
-            }
-            if let Some((kind, token)) = request.receipt.as_ref() {
-                Self::load_authority_point(
-                    connection,
-                    scope,
-                    &mut loaded,
-                    IDEMPOTENCY_ROWS,
-                    match kind {
-                        CommandKindKey::Create => "create-run",
-                        CommandKindKey::Cancel => "cancel-run",
-                    },
-                    token,
-                )
-                .await?;
-            }
 
             let artifact_rows: Vec<(String, String, String, i64)> = sqlx::query_as(
                 "SELECT ar.entity_id, ar.sub_id, ar.row_data, ar.version
@@ -812,7 +1005,6 @@ where
                 decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
                 loaded.rows.insert(key, (row_data, version));
             }
-            let mut object_digests = request.object_digests.clone();
             object_digests.extend(
                 loaded
                     .state
@@ -820,20 +1012,87 @@ where
                     .values()
                     .map(|reference| reference.digest.clone()),
             );
-            object_digests.sort();
-            object_digests.dedup();
-            for digest in object_digests {
-                Self::load_authority_point(
-                    connection,
-                    scope,
-                    &mut loaded,
-                    OBJECT_ROWS,
-                    digest.as_str(),
-                    "",
-                )
-                .await?;
-            }
-        } else {
+        }
+        if let Some(definition_id) = request.definition_id.as_ref() {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                DEFINITION_ROWS,
+                definition_id.as_str(),
+                "",
+            )
+            .await?;
+        }
+        if request.scope_counter {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                COUNTER_ROWS,
+                "event-batch",
+                "",
+            )
+            .await?;
+        }
+        if let Some((definition_id, revision_hash)) = revision.as_ref() {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                REVISION_ROWS,
+                definition_id.as_str(),
+                revision_hash.as_str(),
+            )
+            .await?;
+        }
+        for artifact_ref_id in &request.artifact_ref_ids {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                ARTIFACT_ROWS,
+                artifact_ref_id.as_str(),
+                "",
+            )
+            .await?;
+        }
+        if let Some((kind, token)) = request.receipt.as_ref() {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                IDEMPOTENCY_ROWS,
+                match kind {
+                    CommandKindKey::Create => "create-run",
+                    CommandKindKey::Cancel => "cancel-run",
+                },
+                token,
+            )
+            .await?;
+        }
+        object_digests.sort();
+        object_digests.dedup();
+        for digest in object_digests {
+            Self::load_authority_point(
+                connection,
+                scope,
+                &mut loaded,
+                OBJECT_ROWS,
+                digest.as_str(),
+                "",
+            )
+            .await?;
+        }
+        if request.run_id.is_none()
+            && request.definition_id.is_none()
+            && !request.scope_counter
+            && request.revision.is_none()
+            && request.receipt.is_none()
+            && request.object_digests.is_empty()
+            && request.artifact_ref_ids.is_empty()
+        {
+            // Only object_records uses this diagnostic, tenant-wide snapshot.
             for table in AUTHORITY_TABLES {
                 for (entity_id, sub_id, row_data, version) in
                     Self::load_authority_table(connection, scope, table, None).await?
@@ -1714,11 +1973,16 @@ where
                 .objects
                 .get(scope, &digest)
                 .await
-                // The frozen StoreError taxonomy cannot transport FailedReadProof.
-                // CorruptControlPlane is the closest no-write command failure; the
-                // engine can repeat ObjectStore::get to receive the minted proof
-                // and submit mark_corrupt_storage.
-                .map_err(|_| StoreError::CorruptControlPlane)?;
+                .map_err(|error| match error {
+                    // Availability is not corruption: hydration is retryable and
+                    // must not label the control plane corrupt.
+                    ObjectReadError::StorageUnavailable => StoreError::StorageUnavailable,
+                    // The frozen StoreError taxonomy cannot transport FailedReadProof.
+                    // CorruptControlPlane is the closest no-write command failure; the
+                    // engine can repeat ObjectStore::get to receive the minted proof
+                    // and submit mark_corrupt_storage.
+                    ObjectReadError::Corrupt(_) => StoreError::CorruptControlPlane,
+                })?;
             staged.insert((scope.clone(), digest), object.bytes);
         }
         self.verified_bytes
@@ -1810,42 +2074,24 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT nr.row_data
-             FROM dagger_workflow_nodes AS n
-             JOIN dagger_workflow_runs AS r
-               ON r.tenant_id = n.tenant_id AND r.namespace = n.namespace
-              AND r.run_id = n.run_id
-             JOIN dagger_workflow_node_run_rows AS nr
-               ON nr.tenant_id = n.tenant_id AND nr.namespace = n.namespace
-              AND nr.entity_id = n.run_id AND nr.sub_id = n.node_id
-             WHERE n.tenant_id = ? AND n.namespace = ?
-               AND r.tenant_id = ? AND r.namespace = ?
-               AND nr.tenant_id = ? AND nr.namespace = ?
-               AND r.status = 'Running' AND n.status = ?
-               AND n.updated_at_ms <= ?
-               AND (? = 0 OR n.next_eligible_at_ms <= ?)
-               AND (n.run_id > ? OR (n.run_id = ? AND n.node_id > ?))
-             ORDER BY n.run_id, n.node_id
-             LIMIT ?",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(status)
-        .bind(cutoff.0)
-        .bind(i64::from(due_retry))
-        .bind(cutoff.0)
-        .bind(last_run_id)
-        .bind(last_run_id)
-        .bind(last_node_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String,)> = sqlx::query_as(SCHEDULER_NODES_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(status)
+            .bind(cutoff.0)
+            .bind(i64::from(due_retry))
+            .bind(cutoff.0)
+            .bind(last_run_id)
+            .bind(last_run_id)
+            .bind(last_node_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
@@ -1882,44 +2128,27 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT ar.row_data
-             FROM dagger_workflow_attempts AS a
-             JOIN dagger_workflow_attempt_rows AS ar
-               ON ar.tenant_id = a.tenant_id AND ar.namespace = a.namespace
-              AND ar.entity_id = a.run_id AND ar.sub_id = a.attempt_id
-             WHERE a.tenant_id = ? AND a.namespace = ?
-               AND ar.tenant_id = ? AND ar.namespace = ?
-               AND a.status = 'Started' AND a.started_at_ms <= ?
-               AND a.deadline_at_ms <= ?
-               AND (a.deadline_at_ms > ?
-                 OR (a.deadline_at_ms = ? AND a.run_id > ?)
-                 OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id > ?)
-                 OR (a.deadline_at_ms = ? AND a.run_id = ? AND a.node_id = ?
-                     AND a.attempt_id > ?))
-             ORDER BY a.deadline_at_ms, a.run_id, a.node_id, a.attempt_id
-             LIMIT ?",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(cutoff.0)
-        .bind(cutoff.0)
-        .bind(last_deadline)
-        .bind(last_deadline)
-        .bind(last_run_id)
-        .bind(last_deadline)
-        .bind(last_run_id)
-        .bind(last_node_id)
-        .bind(last_deadline)
-        .bind(last_run_id)
-        .bind(last_node_id)
-        .bind(last_attempt_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String,)> = sqlx::query_as(SCHEDULER_DEADLINES_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(cutoff.0)
+            .bind(cutoff.0)
+            .bind(last_deadline)
+            .bind(last_deadline)
+            .bind(last_run_id)
+            .bind(last_deadline)
+            .bind(last_run_id)
+            .bind(last_node_id)
+            .bind(last_deadline)
+            .bind(last_run_id)
+            .bind(last_node_id)
+            .bind(last_attempt_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
@@ -1960,30 +2189,18 @@ where
         .transpose()?
         .unwrap_or(0);
         let last_run_id = last.first().map_or("", String::as_str);
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT DISTINCT rr.entity_id, rr.row_data
-             FROM dagger_workflow_attempts AS a
-             JOIN dagger_workflow_run_rows AS rr
-               ON rr.tenant_id = a.tenant_id AND rr.namespace = a.namespace
-              AND rr.entity_id = a.run_id AND rr.sub_id = ''
-             WHERE a.tenant_id = ? AND a.namespace = ?
-               AND rr.tenant_id = ? AND rr.namespace = ?
-               AND a.status = 'Started' AND a.engine_generation < ?
-               AND a.started_at_ms <= ? AND rr.entity_id > ?
-             ORDER BY rr.entity_id
-             LIMIT ?",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(Self::sql_integer(generation)?)
-        .bind(cutoff.0)
-        .bind(last_run_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String, String)> = sqlx::query_as(SCHEDULER_RECOVERY_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(Self::sql_integer(generation)?)
+            .bind(cutoff.0)
+            .bind(last_run_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (_, data) in rows {
@@ -2012,54 +2229,19 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT rr.row_data, r.updated_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'Pending' AND r.updated_at_ms <= ?5
-                 AND (r.updated_at_ms > ?6
-                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
-               UNION ALL
-               SELECT rr.row_data, r.updated_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'Running' AND r.updated_at_ms <= ?5
-                 AND (r.updated_at_ms > ?6
-                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
-               UNION ALL
-               SELECT rr.row_data, r.updated_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'BlockedIncompatible' AND r.updated_at_ms <= ?5
-                 AND (r.updated_at_ms > ?6
-                   OR (r.updated_at_ms = ?7 AND r.run_id > ?8))
-             ORDER BY updated_at_ms, run_id
-             LIMIT ?9",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(cutoff.0)
-        .bind(last_updated)
-        .bind(last_updated)
-        .bind(last_run_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(SCHEDULER_COMPATIBILITY_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(cutoff.0)
+            .bind(last_updated)
+            .bind(last_updated)
+            .bind(last_run_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data, _, _) in rows {
@@ -2095,36 +2277,22 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT ar.row_data
-             FROM dagger_workflow_approval_gates AS g
-             JOIN dagger_workflow_approval_rows AS ar
-               ON ar.tenant_id = g.tenant_id AND ar.namespace = g.namespace
-              AND ar.entity_id = g.run_id AND ar.sub_id = g.gate_id
-             WHERE g.tenant_id = ? AND g.namespace = ?
-               AND ar.tenant_id = ? AND ar.namespace = ?
-               AND g.status = 'Pending' AND g.expires_at_ms <= ?
-               AND (g.expires_at_ms > ?
-                 OR (g.expires_at_ms = ? AND g.run_id > ?)
-                 OR (g.expires_at_ms = ? AND g.run_id = ? AND g.gate_id > ?))
-             ORDER BY g.expires_at_ms, g.run_id, g.gate_id
-             LIMIT ?",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(cutoff.0)
-        .bind(last_expiry)
-        .bind(last_expiry)
-        .bind(last_run_id)
-        .bind(last_expiry)
-        .bind(last_run_id)
-        .bind(last_gate_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String,)> = sqlx::query_as(SCHEDULER_GATES_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(cutoff.0)
+            .bind(last_expiry)
+            .bind(last_expiry)
+            .bind(last_run_id)
+            .bind(last_expiry)
+            .bind(last_run_id)
+            .bind(last_gate_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data,) in rows {
@@ -2157,55 +2325,19 @@ where
         } else {
             return Err(StoreError::InvalidField);
         };
-        let rows: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'Pending' AND r.lifetime_deadline_at_ms <= ?5
-                 AND (r.lifetime_deadline_at_ms > ?6
-                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
-               UNION ALL
-               SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'Running' AND r.lifetime_deadline_at_ms <= ?5
-                 AND (r.lifetime_deadline_at_ms > ?6
-                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
-               UNION ALL
-               SELECT rr.row_data, r.lifetime_deadline_at_ms, r.run_id
-               FROM dagger_workflow_runs AS r
-               JOIN dagger_workflow_run_rows AS rr
-                 ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
-                AND rr.entity_id = r.run_id AND rr.sub_id = ''
-               WHERE r.tenant_id = ?1 AND r.namespace = ?2
-                 AND rr.tenant_id = ?3 AND rr.namespace = ?4
-                 AND r.status = 'BlockedIncompatible'
-                 AND r.lifetime_deadline_at_ms <= ?5
-                 AND (r.lifetime_deadline_at_ms > ?6
-                   OR (r.lifetime_deadline_at_ms = ?7 AND r.run_id > ?8))
-             ORDER BY lifetime_deadline_at_ms, run_id
-             LIMIT ?9",
-        )
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(scope.tenant_id.as_str())
-        .bind(scope.namespace.as_str())
-        .bind(cutoff.0)
-        .bind(last_deadline)
-        .bind(last_deadline)
-        .bind(last_run_id)
-        .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| StoreError::StorageUnavailable)?;
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(SCHEDULER_LIFETIMES_SCAN_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(cutoff.0)
+            .bind(last_deadline)
+            .bind(last_deadline)
+            .bind(last_run_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
         Self::commit(connection).await?;
         let mut items = Vec::with_capacity(rows.len());
         for (data, _, _) in rows {
@@ -2437,12 +2569,40 @@ macro_rules! sql_read {
 }
 
 impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O> {
-    sql_command!(create_definition(command: CreateDefinition) -> DefinitionRecord; AuthorityLoad::unfiltered());
+    sql_command!(
+        create_definition(command: CreateDefinition) -> DefinitionRecord;
+        AuthorityLoad::default()
+            .definition(&command.definition_id)
+            .scope_counter()
+    );
     sql_command!(
         update_definition_metadata(command: UpdateDefinitionMetadata) -> DefinitionRecord;
-        AuthorityLoad::unfiltered()
+        AuthorityLoad::default()
+            .definition(&command.definition_id)
+            .scope_counter()
     );
-    sql_command!(publish_revision(command: PublishRevision) -> WorkflowRevision; AuthorityLoad::unfiltered());
+    sql_command!(
+        publish_revision(command: PublishRevision) -> WorkflowRevision;
+        AuthorityLoad::default()
+            .definition(&command.definition_id)
+            .revision(&command.definition_id, command.canonical_definition.digest())
+            .scope_counter()
+            .objects(
+                std::iter::once(command.canonical_definition.digest())
+                    .chain(std::iter::once(command.run_input_schema.digest()))
+                    .chain(std::iter::once(command.run_output_schema.digest()))
+                    .chain(command.resolved_action_schema_objects.values().flat_map(|schemas| [
+                        schemas.input_schema.digest(),
+                        schemas.output_schema.digest(),
+                    ]))
+            )
+            // The macro's `scope` binding is not hygienically reachable here.
+            // The reducer rejects `principal.scope() != scope` with InvalidField
+            // before touching state, and every load statement still binds the
+            // request scope's tenant and namespace, so a mismatch can only make
+            // these point loads miss.
+            .artifacts(publish_revision_artifact_ids(command.principal.scope(), &command))
+    );
     sql_engine_command!(acquire_engine_claim(instance_id: Id) -> AcquiredEngineClaim);
     sql_engine_command!(heartbeat_engine_claim(permit: &EnginePermit) -> EngineClaim);
     sql_engine_command!(release_engine_claim(permit: &EnginePermit) -> ());
@@ -2546,16 +2706,108 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         AuthorityLoad::run(&command.run_id)
     );
 
-    sql_read!(get_definition(definition_id: &Id) -> DefinitionRecord; None);
-    sql_read!(
-        get_revision(definition_id: &Id, revision_hash: &Digest) -> WorkflowRevision;
-        None
-    );
+    async fn get_definition(
+        &self,
+        scope: &ExecutionScope,
+        definition_id: &Id,
+    ) -> Result<DefinitionRecord, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let mut state = Self::load_state(
+            &mut connection,
+            scope,
+            &AuthorityLoad::default().definition(definition_id),
+        )
+        .await?
+        .state;
+        self.restore_verified_bytes(&mut state, scope);
+        let result = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
+            .get_definition(scope, definition_id)
+            .await;
+        match result {
+            Ok(value) => {
+                Self::commit(connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                Self::rollback(&mut connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn get_revision(
+        &self,
+        scope: &ExecutionScope,
+        definition_id: &Id,
+        revision_hash: &Digest,
+    ) -> Result<WorkflowRevision, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let mut state = Self::load_state(
+            &mut connection,
+            scope,
+            &AuthorityLoad::default().revision(definition_id, revision_hash),
+        )
+        .await?
+        .state;
+        self.restore_verified_bytes(&mut state, scope);
+        let result = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
+            .get_revision(scope, definition_id, revision_hash)
+            .await;
+        match result {
+            Ok(value) => {
+                Self::commit(connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                Self::rollback(&mut connection).await;
+                Err(error)
+            }
+        }
+    }
     sql_read!(get_run(run_id: &Id) -> WorkflowRunView; Some((*run_id).clone()));
     sql_read!(get_node(run_id: &Id, node_id: &NodeInstanceId) -> NodeRun; Some((*run_id).clone()));
     sql_read!(get_attempt(run_id: &Id, attempt_id: &Id) -> NodeAttempt; Some((*run_id).clone()));
     sql_read!(get_gate(run_id: &Id, gate_id: &Id) -> ApprovalGate; Some((*run_id).clone()));
-    sql_read!(list_runs(page: PageRequest) -> Page<WorkflowRun>; None);
+    async fn list_runs(
+        &self,
+        scope: &ExecutionScope,
+        page: PageRequest,
+    ) -> Result<Page<WorkflowRun>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let query = "list_runs";
+        let (limit, cutoff, last) = scan_page_context(&page, scope, query, now)?;
+        let last_run_id = if last.is_empty() {
+            ""
+        } else if last.len() == 1 {
+            last[0].as_str()
+        } else {
+            return Err(StoreError::InvalidField);
+        };
+        let rows: Vec<(String,)> = sqlx::query_as(LIST_RUNS_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(cutoff.0)
+            .bind(last_run_id)
+            .bind(i64::try_from(limit + 1).map_err(|_| StoreError::ArithmeticOverflow)?)
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let mut items = Vec::with_capacity(rows.len());
+        for (data,) in rows {
+            let run: WorkflowRun = decode_row(&data)?;
+            scoped(scope, &run.scope, ())?;
+            items.push(run);
+        }
+        finish_scan_page(items, limit, scope, query, cutoff, |run| {
+            vec![run.run_id.as_str().to_owned()]
+        })
+    }
     sql_read!(list_nodes(run_id: &Id, page: PageRequest) -> Page<NodeRun>; Some((*run_id).clone()));
     sql_read!(
         list_events_after(run_id: &Id, page: EventPageRequest) -> Vec<WorkflowEvent>;

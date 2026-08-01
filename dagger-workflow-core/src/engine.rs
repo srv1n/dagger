@@ -3,7 +3,9 @@
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
 };
-use crate::artifact::{ArtifactRefValue, ObjectStore};
+use crate::artifact::{
+    ArtifactRef, ArtifactRefValue, ObjectReadError, ObjectStore, VerifiedObject,
+};
 use crate::definition::{
     ArtifactLocator, Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource,
     NodeDefinition, WorkflowDefinition,
@@ -535,6 +537,64 @@ where
         Ok(changed)
     }
 
+    /// Reads one committed object, separating integrity failure from unavailability.
+    ///
+    /// `Corrupt` carries the only capability that authorizes `mark_corrupt_storage`,
+    /// so the command is submitted here with the exact committed ref before the
+    /// integrity failure is returned. `StorageUnavailable` mints no proof and
+    /// authorizes nothing: it is propagated unchanged, without any durable command,
+    /// so the caller aborts before its next state-changing command and a later
+    /// operational retry can repeat the read. Contract sections 5.4 and 12.3.
+    async fn read_committed(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        committed: &ArtifactRef,
+        owner_node_id: Option<&Id>,
+    ) -> Result<VerifiedObject, EngineError> {
+        match self.object_store.get(scope, &committed.digest).await {
+            Ok(object) => Ok(object),
+            Err(ObjectReadError::StorageUnavailable) => Err(EngineError::StorageUnavailable),
+            Err(ObjectReadError::Corrupt(proof)) => {
+                self.store
+                    .mark_corrupt_storage(
+                        scope,
+                        MarkCorruptStorage {
+                            run_id: run_id.clone(),
+                            bad_ref: committed.clone(),
+                            proof,
+                            // The reducer accepts only the node that produced the bad ref
+                            // (or the waiting Map parent, passed explicitly by aggregation).
+                            owner_node_id: owner_node_id
+                                .cloned()
+                                .or_else(|| committed.producer_node_id.clone()),
+                        },
+                    )
+                    .await?;
+                Err(EngineError::ObjectRead)
+            }
+        }
+    }
+
+    /// Reads an object addressed by digest alone, with no committed ref to mark.
+    ///
+    /// Artifact locators carry a digest, not an `ArtifactRef`, so no valid
+    /// `mark_corrupt_storage` command can be formed for them; corruption surfaces
+    /// as an integrity error only. The availability split is still preserved.
+    // ponytail: no artifact-ref lookup exists on WorkflowStore. If one is added,
+    // route these two reads through read_committed as well.
+    async fn read_by_digest(
+        &self,
+        scope: &ExecutionScope,
+        digest: &Digest,
+    ) -> Result<VerifiedObject, EngineError> {
+        match self.object_store.get(scope, digest).await {
+            Ok(object) => Ok(object),
+            Err(ObjectReadError::StorageUnavailable) => Err(EngineError::StorageUnavailable),
+            Err(ObjectReadError::Corrupt(_)) => Err(EngineError::ObjectRead),
+        }
+    }
+
     async fn definition_for(
         &self,
         scope: &ExecutionScope,
@@ -546,10 +606,8 @@ where
             .get_revision(scope, &run.definition_id, &run.revision_hash)
             .await?;
         let object = self
-            .object_store
-            .get(scope, &revision.canonical_definition_ref.0.digest)
-            .await
-            .map_err(|_| EngineError::ObjectRead)?;
+            .read_committed(scope, run_id, &revision.canonical_definition_ref.0, None)
+            .await?;
         let definition = crate::definition::parse_json_definition(
             std::str::from_utf8(&object.bytes).map_err(|_| EngineError::DefinitionDecode)?,
         )
@@ -674,10 +732,8 @@ where
         let parent = self.store.get_node(scope, &run.run_id, parent_id).await?;
         let map_input = parent.map_input_ref.ok_or(EngineError::Binding)?;
         let input = self
-            .object_store
-            .get(scope, &map_input.0.digest)
-            .await
-            .map_err(|_| EngineError::ObjectRead)?;
+            .read_committed(scope, &run.run_id, &map_input.0, None)
+            .await?;
         let items: Value =
             serde_json::from_slice(&input.bytes).map_err(|_| EngineError::Binding)?;
         let index = child.map_item_index.ok_or(EngineError::Binding)?;
@@ -738,20 +794,16 @@ where
             BindingSource::Constant { value } => Ok(value.clone()),
             BindingSource::RunInput { pointer } => {
                 let object = self
-                    .object_store
-                    .get(scope, &run.input_ref.0.digest)
-                    .await
-                    .map_err(|_| EngineError::ObjectRead)?;
+                    .read_committed(scope, &run.run_id, &run.input_ref.0, None)
+                    .await?;
                 select_json(&object.bytes, pointer)
             }
             BindingSource::NodeOutput { node_id, pointer } => {
                 let node = self.store.get_node(scope, &run.run_id, node_id).await?;
                 let output = node.result_ref.ok_or(EngineError::Binding)?;
                 let object = self
-                    .object_store
-                    .get(scope, &output.0.digest)
-                    .await
-                    .map_err(|_| EngineError::ObjectRead)?;
+                    .read_committed(scope, &run.run_id, &output.0, None)
+                    .await?;
                 select_json(&object.bytes, pointer)
             }
             BindingSource::ArtifactRef { source } => {
@@ -772,11 +824,7 @@ where
                 digest,
                 media_type,
             } => {
-                let object = self
-                    .object_store
-                    .get(scope, digest)
-                    .await
-                    .map_err(|_| EngineError::ObjectRead)?;
+                let object = self.read_by_digest(scope, digest).await?;
                 if object.reference.media_type() != media_type {
                     return Err(EngineError::Binding);
                 }
@@ -789,10 +837,8 @@ where
             }
             ArtifactLocator::RunInput { pointer } => {
                 let object = self
-                    .object_store
-                    .get(scope, &run.input_ref.0.digest)
-                    .await
-                    .map_err(|_| EngineError::ObjectRead)?;
+                    .read_committed(scope, &run.run_id, &run.input_ref.0, None)
+                    .await?;
                 serde_json::from_value(select_json(&object.bytes, pointer)?)
                     .map_err(|_| EngineError::Binding)?
             }
@@ -800,19 +846,13 @@ where
                 let node = self.store.get_node(scope, &run.run_id, node_id).await?;
                 let output = node.result_ref.ok_or(EngineError::Binding)?;
                 let object = self
-                    .object_store
-                    .get(scope, &output.0.digest)
-                    .await
-                    .map_err(|_| EngineError::ObjectRead)?;
+                    .read_committed(scope, &run.run_id, &output.0, None)
+                    .await?;
                 serde_json::from_value(select_json(&object.bytes, pointer)?)
                     .map_err(|_| EngineError::Binding)?
             }
         };
-        let object = self
-            .object_store
-            .get(scope, &value.digest)
-            .await
-            .map_err(|_| EngineError::ObjectRead)?;
+        let object = self.read_by_digest(scope, &value.digest).await?;
         if object.reference.size_bytes().to_string() != value.size_bytes
             || object.reference.media_type() != value.media_type
         {
@@ -1061,23 +1101,24 @@ where
                 let mut values: Vec<Value> = Vec::with_capacity(children.len());
                 for child in &children {
                     let output = child.result_ref.clone().ok_or(EngineError::Binding)?;
-                    let object = match self.object_store.get(scope, &output.0.digest).await {
+                    let object = match self
+                        .read_committed(
+                            scope,
+                            &run.run_id,
+                            &output.0,
+                            Some(&parent.node_instance_id),
+                        )
+                        .await
+                    {
                         Ok(object) => object,
-                        Err(error) => {
-                            self.store
-                                .mark_corrupt_storage(
-                                    scope,
-                                    MarkCorruptStorage {
-                                        run_id: run.run_id.clone(),
-                                        bad_ref: output.0,
-                                        proof: error.proof,
-                                        owner_node_id: Some(parent.node_instance_id.clone()),
-                                    },
-                                )
-                                .await?;
+                        // The helper already committed mark_corrupt_storage for the
+                        // waiting Map parent; stop aggregating this run's map.
+                        Err(EngineError::ObjectRead) => {
                             changed += 1;
                             break;
                         }
+                        // Unavailability commits nothing and aborts the pass.
+                        Err(error) => return Err(error),
                     };
                     values.push(
                         serde_json::from_slice(&object.bytes).map_err(|_| EngineError::Binding)?,
@@ -1226,9 +1267,12 @@ pub enum EngineError {
     /// The scope has no acquired local scheduler permit.
     #[error("engine scope is not acquired")]
     ScopeNotAcquired,
-    /// A committed object could not be verified.
+    /// A committed object failed verification. Proof-backed integrity failure.
     #[error("committed object read failed")]
     ObjectRead,
+    /// The object store could not complete a read. No proof, no state change.
+    #[error("object storage unavailable")]
+    StorageUnavailable,
     /// An object could not be published.
     #[error("object publication failed")]
     ObjectWrite,

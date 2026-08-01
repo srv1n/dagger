@@ -295,81 +295,57 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
 
 async fn validate_coherent_v1(pool: &SqlitePool) -> Result<(), StoreError> {
     for statement in std::iter::once(MIGRATIONS_TABLE_DDL).chain(MIGRATION_1.iter().copied()) {
-        if statement.starts_with("CREATE TABLE") {
-            let (table, expected_columns) =
-                table_inventory(statement).ok_or(StoreError::TransactionFailed)?;
-            let present: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
-                .bind(table)
-                .fetch_all(pool)
+        let mut words = statement.split_whitespace();
+        let object_type = match (words.next(), words.next()) {
+            (Some("CREATE"), Some("TABLE")) => "table",
+            (Some("CREATE"), Some("INDEX")) => "index",
+            _ => return Err(StoreError::TransactionFailed),
+        };
+        let object_name = words
+            .nth(3)
+            .ok_or(StoreError::TransactionFailed)?
+            .trim_matches('"');
+        let present: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?")
+                .bind(object_type)
+                .bind(object_name)
+                .fetch_optional(pool)
                 .await
                 .map_err(|_| StoreError::StorageUnavailable)?;
-            if present != expected_columns {
-                return Err(StoreError::TransactionFailed);
-            }
-        } else if statement.starts_with("CREATE INDEX") {
-            let (index, expected_columns) =
-                index_inventory(statement).ok_or(StoreError::TransactionFailed)?;
-            let present: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_index_info(?)")
-                .bind(index)
-                .fetch_all(pool)
-                .await
-                .map_err(|_| StoreError::StorageUnavailable)?;
-            if present != expected_columns {
-                return Err(StoreError::TransactionFailed);
-            }
-        } else {
+        let expected = statement.replacen(" IF NOT EXISTS", "", 1);
+        if present.as_deref().map(normalize_schema_sql).as_deref()
+            != Some(normalize_schema_sql(&expected).as_str())
+        {
             return Err(StoreError::TransactionFailed);
         }
     }
     Ok(())
 }
 
-fn table_inventory(statement: &str) -> Option<(&str, Vec<String>)> {
-    let name = statement.split_whitespace().nth(5)?;
-    let body = statement.split_once('(')?.1.rsplit_once(')')?.0;
-    let columns = top_level_items(body)
-        .into_iter()
-        .filter_map(|item| {
-            let first = item.split_whitespace().next()?;
-            (!matches!(
-                first.to_ascii_uppercase().as_str(),
-                "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "CONSTRAINT"
-            ))
-            .then(|| first.trim_matches('"').to_owned())
-        })
-        .collect();
-    Some((name, columns))
-}
-
-fn index_inventory(statement: &str) -> Option<(&str, Vec<String>)> {
-    let index = statement.split_whitespace().nth(5)?;
-    let body = statement.split_once('(')?.1.rsplit_once(')')?.0;
-    Some((
-        index,
-        top_level_items(body)
-            .into_iter()
-            .map(|item| item.trim().trim_matches('"').to_owned())
-            .collect(),
-    ))
-}
-
-fn top_level_items(body: &str) -> Vec<&str> {
-    let mut depth = 0_u32;
-    let mut start = 0;
-    let mut items = Vec::new();
-    for (index, byte) in body.bytes().enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 => {
-                items.push(body[start..index].trim());
-                start = index + 1;
-            }
-            _ => {}
+/// Normalizes DDL text for structural comparison against `sqlite_master`.
+///
+/// SQLite stores the original `CREATE` statement verbatim, so a byte comparison would reject a
+/// database whose schema is identical but whose text was formatted differently - including one
+/// written by an earlier release of this crate, or by this crate after its DDL constants are
+/// reformatted. Punctuation is therefore spaced out before whitespace is collapsed, so
+/// `name (col)` and `name(col)` agree while column names, types, ordering, and constraints stay
+/// strictly compared.
+fn normalize_schema_sql(statement: &str) -> String {
+    let mut spaced = String::with_capacity(statement.len() * 2);
+    for character in statement.chars() {
+        if matches!(character, '(' | ')' | ',') {
+            spaced.push(' ');
+            spaced.push(character);
+            spaced.push(' ');
+        } else {
+            spaced.push(character);
         }
     }
-    items.push(body[start..].trim());
-    items
+    spaced
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 async fn apply_version(

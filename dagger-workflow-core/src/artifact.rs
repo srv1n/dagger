@@ -254,12 +254,25 @@ pub struct VerifiedObject {
     pub bytes: Vec<u8>,
 }
 
-/// A verified read failure carrying the only valid corruption proof. Contract section 12.3.
+/// A failed read of a committed object. Contract section 12.3.
+///
+/// The two variants are not interchangeable. `Corrupt` asserts an integrity
+/// failure and carries the only capability that may invoke
+/// `mark_corrupt_storage`; it is reserved for authoritative absence of a
+/// committed component and for a completed read whose digest does not match.
+/// `StorageUnavailable` asserts nothing about the object: the store could not
+/// complete a verification, so no proof is minted and no workflow transition is
+/// authorized. Every transport, permission, descriptor, and interruption
+/// failure belongs here, which is what allows a networked object store to
+/// implement this trait without corrupting runs on routine operational errors.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-#[error("verified object read failed")]
-pub struct ObjectReadError {
-    /// Opaque proof minted for this failed read. Contract section 12.3.
-    pub proof: FailedReadProof,
+pub enum ObjectReadError {
+    /// Verified integrity failure carrying the only valid corruption proof. Contract section 12.3.
+    #[error("committed object failed verification")]
+    Corrupt(FailedReadProof),
+    /// The store could not complete a verification. Mints no proof. Contract section 5.5.
+    #[error("object storage unavailable")]
+    StorageUnavailable,
 }
 
 /// A conflicting same-digest publication. Contract section 12.1.
