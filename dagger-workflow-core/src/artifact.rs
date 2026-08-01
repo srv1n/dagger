@@ -96,7 +96,11 @@ pub struct ArtifactRefValue {
 pub struct JsonRef(pub ArtifactRef);
 
 /// Opaque proof that an object was durably published and verified. Contract section 5.1.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Debug` is implemented by hand and redacts the store-instance nonce and the
+/// verified bytes. Both are capability material, and this type rides inside
+/// errors and values that are routinely logged.
+#[derive(Clone, Eq, PartialEq)]
 pub struct VerifiedObjectRef {
     scope: ExecutionScope,
     digest: Digest,
@@ -162,6 +166,21 @@ impl VerifiedObjectRef {
     }
 }
 
+impl std::fmt::Debug for VerifiedObjectRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VerifiedObjectRef")
+            .field("scope", &self.scope)
+            .field("digest", &self.digest)
+            .field("size_bytes", &self.size_bytes)
+            .field("media_type", &self.media_type)
+            .field("object_key", &self.object_key)
+            .field("store_instance_nonce", &"<redacted>")
+            .field("verified_bytes", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Closed failed-read classes. Contract section 1.1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FailedReadClass {
@@ -172,7 +191,12 @@ pub enum FailedReadClass {
 }
 
 /// Opaque object-store proof for a failed committed read. Contract section 12.3.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `Debug` is implemented by hand and redacts both nonces. This proof is the
+/// only capability that authorizes `mark_corrupt_storage`, and it now travels
+/// inside `StoreError::CommittedObjectCorrupt`, which lands in log lines and
+/// panic messages.
+#[derive(Clone, Eq, PartialEq)]
 pub struct FailedReadProof {
     scope: ExecutionScope,
     requested_digest: Digest,
@@ -242,6 +266,21 @@ impl FailedReadProof {
         bytes.extend(&self.proof_nonce);
         bytes.extend(self.checked_at.0.to_be_bytes());
         bytes
+    }
+}
+
+impl std::fmt::Debug for FailedReadProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FailedReadProof")
+            .field("scope", &self.scope)
+            .field("requested_digest", &self.requested_digest)
+            .field("error_class", &self.error_class)
+            .field("observed_digest", &self.observed_digest)
+            .field("store_instance_nonce", &"<redacted>")
+            .field("proof_nonce", &"<redacted>")
+            .field("checked_at", &self.checked_at)
+            .finish()
     }
 }
 

@@ -4,8 +4,9 @@ use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
 };
 use crate::artifact::{
-    ArtifactRef, ArtifactRefValue, ObjectReadError, ObjectStore, VerifiedObject,
+    ArtifactRef, ArtifactRefValue, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject,
 };
+use crate::committed_read::{CommittedObjectReader, CommittedReadOutcome};
 use crate::definition::{
     ArtifactLocator, Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource,
     NodeDefinition, WorkflowDefinition,
@@ -111,9 +112,14 @@ pub enum EngineBuildError {
 
 /// Durable workflow scheduler shell implemented by W3. Contract section 5.
 #[allow(dead_code)]
-pub struct WorkflowEngine<S, O, R> {
+pub struct WorkflowEngine<S, O, R>
+where
+    S: WorkflowStore,
+    O: ObjectStore,
+{
     store: Arc<S>,
     object_store: Arc<O>,
+    reader: CommittedObjectReader<S, O>,
     registry: Arc<R>,
     config: EngineConfig,
     permits: Mutex<BTreeMap<ExecutionScope, crate::store::EnginePermit>>,
@@ -138,6 +144,7 @@ where
             return Err(EngineBuildError::InvalidConcurrency);
         }
         Ok(Self {
+            reader: CommittedObjectReader::new(store.clone(), object_store.clone()),
             store,
             object_store,
             registry,
@@ -193,7 +200,8 @@ where
             .get_revision(scope, &view.run.definition_id, &view.run.revision_hash)
             .await?;
         let evidence = self.registry.check_pins(&revision.action_pins);
-        self.store
+        match self
+            .store
             .start_run(
                 scope,
                 StartRun {
@@ -202,8 +210,16 @@ where
                     compatibility_evidence: evidence,
                 },
             )
-            .await?;
-        Ok(())
+            .await
+        {
+            Ok(_) => Ok(()),
+            // The run already exists, so hydration corruption is marked before
+            // the integrity failure is surfaced. Contract sections 5.5 and 12.3.
+            Err(StoreError::CommittedObjectCorrupt { bad_ref, proof }) => Err(self
+                .apply_committed_corruption(scope, run_id, bad_ref, proof, None)
+                .await),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Executes one deterministic scheduler pass and returns committed work count.
@@ -537,14 +553,13 @@ where
         Ok(changed)
     }
 
-    /// Reads one committed object, separating integrity failure from unavailability.
+    /// Reads one committed object through the crate-owned committed reader.
     ///
-    /// `Corrupt` carries the only capability that authorizes `mark_corrupt_storage`,
-    /// so the command is submitted here with the exact committed ref before the
-    /// integrity failure is returned. `StorageUnavailable` mints no proof and
-    /// authorizes nothing: it is propagated unchanged, without any durable command,
-    /// so the caller aborts before its next state-changing command and a later
-    /// operational retry can repeat the read. Contract sections 5.4 and 12.3.
+    /// The ordering rules live in `CommittedObjectReader`; this is only the
+    /// engine's mapping of its four outcomes onto `EngineError`. A failed
+    /// `mark_corrupt_storage` surfaces as the store failure, never as the
+    /// integrity failure, because the run has not been invalidated in that
+    /// case. Contract sections 5.5 and 12.3.
     async fn read_committed(
         &self,
         scope: &ExecutionScope,
@@ -552,27 +567,53 @@ where
         committed: &ArtifactRef,
         owner_node_id: Option<&Id>,
     ) -> Result<VerifiedObject, EngineError> {
-        match self.object_store.get(scope, &committed.digest).await {
-            Ok(object) => Ok(object),
-            Err(ObjectReadError::StorageUnavailable) => Err(EngineError::StorageUnavailable),
-            Err(ObjectReadError::Corrupt(proof)) => {
-                self.store
-                    .mark_corrupt_storage(
-                        scope,
-                        MarkCorruptStorage {
-                            run_id: run_id.clone(),
-                            bad_ref: committed.clone(),
-                            proof,
-                            // The reducer accepts only the node that produced the bad ref
-                            // (or the waiting Map parent, passed explicitly by aggregation).
-                            owner_node_id: owner_node_id
-                                .cloned()
-                                .or_else(|| committed.producer_node_id.clone()),
-                        },
-                    )
-                    .await?;
-                Err(EngineError::ObjectRead)
-            }
+        // The reducer accepts only the node that produced the bad ref (or the
+        // waiting Map parent, passed explicitly by aggregation).
+        match self
+            .reader
+            .read(scope, run_id, committed, owner_node_id)
+            .await
+        {
+            CommittedReadOutcome::Verified(object) => Ok(object),
+            CommittedReadOutcome::StorageUnavailable => Err(EngineError::StorageUnavailable),
+            CommittedReadOutcome::CorruptionApplied { .. } => Err(EngineError::ObjectRead),
+            CommittedReadOutcome::CorruptionMarkFailed { error, .. } => Err(error.into()),
+        }
+    }
+
+    /// Applies a store-reported committed-object corruption to an existing run.
+    ///
+    /// A store command may reject with `CommittedObjectCorrupt` after hydrating
+    /// a committed prerequisite. The proof it carries is the same capability a
+    /// direct read would have minted, so the run is marked here before the
+    /// integrity failure is surfaced. A failed mark surfaces as the store
+    /// failure. Contract sections 5.5 and 12.3.
+    async fn apply_committed_corruption(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        bad_ref: ArtifactRef,
+        proof: FailedReadProof,
+        owner_node_id: Option<&Id>,
+    ) -> EngineError {
+        let owner_node_id = owner_node_id
+            .cloned()
+            .or_else(|| bad_ref.producer_node_id.clone());
+        match self
+            .store
+            .mark_corrupt_storage(
+                scope,
+                MarkCorruptStorage {
+                    run_id: run_id.clone(),
+                    bad_ref,
+                    proof,
+                    owner_node_id,
+                },
+            )
+            .await
+        {
+            Ok(_) => EngineError::ObjectRead,
+            Err(error) => error.into(),
         }
     }
 
@@ -1156,6 +1197,20 @@ where
                 {
                     Ok(_) => changed += 1,
                     Err(StoreError::CasConflict | StoreError::ChildrenIncomplete) => {}
+                    // The store hydrated a committed child object and found it
+                    // corrupt. The run exists, so it is marked before the
+                    // integrity failure is surfaced. Contract sections 5.5 and 12.3.
+                    Err(StoreError::CommittedObjectCorrupt { bad_ref, proof }) => {
+                        return Err(self
+                            .apply_committed_corruption(
+                                scope,
+                                &run.run_id,
+                                bad_ref,
+                                proof,
+                                Some(&parent.node_instance_id),
+                            )
+                            .await)
+                    }
                     Err(error) => return Err(error.into()),
                 }
             }
@@ -1262,6 +1317,12 @@ struct ClaimedAction {
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     /// A durable store command failed.
+    ///
+    /// A pre-run `StoreError::CommittedObjectCorrupt` propagates through here
+    /// unchanged. `create_run` is a no-write pre-run failure: no run exists, so
+    /// no `mark_corrupt_storage` is attempted, no run and no control-plane state
+    /// are created, and the carried proof stays available for diagnostics.
+    /// Contract sections 5.5 and 12.3.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The scope has no acquired local scheduler permit.

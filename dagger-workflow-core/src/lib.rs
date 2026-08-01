@@ -9,6 +9,7 @@ pub mod action;
 pub mod approval;
 pub mod artifact;
 pub mod budget;
+pub mod committed_read;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod definition;

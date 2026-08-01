@@ -7,7 +7,10 @@ be patched locally, and the options with a recommendation.
 
 ## E1. A transient object-read failure has no legal representation and is laundered into permanent corruption
 
-**Status:** open, needs a ruling before alpha sign-off.
+**Status:** ruled and implemented. The type split landed in commit 5653849. The
+three residuals it left open were ruled on 2026-08-01 and adopted as contract
+erratum 0.1.1 (`docs/WORKFLOW_CORE_CONTRACT_ERRATUM_0_1_1.md`); see "Residual
+rulings" at the end of this document.
 **Found by:** external review of W6/W7, confirmed by direct source inspection.
 **Severity:** high. A recoverable operational condition permanently destroys a
 run's usable output.
@@ -131,7 +134,13 @@ harness exists today, which is why this defect survived three review rounds.
 
 ## E2. fsync ordering in the object store is argued, not proven
 
-**Status:** open, lower priority than E1. Recommend folding into W11 acceptance.
+**Status:** ruled 2026-08-01. Folded into W11 as gates W11-D (stateful crash
+model, mandatory, with negative controls) and W11-E (real abrupt-crash
+qualification on a block device). The ruling confirms this document's claim: a
+userspace model alone proves the protocol against its model and cannot support a
+crash-durability claim on a named filesystem. Process SIGKILL is explicitly not a
+crash-consistency test. Remains open as engineering work; no longer open as a
+question.
 
 The W7 put protocol now fsyncs every directory level it creates beneath an
 already-durable base (`src/fs_object_store.rs:462`), and fsyncs the containing
@@ -154,7 +163,12 @@ test-proven. It is code-reviewed, which is a weaker and honest claim.
 
 ## E3. Server embedding is a first-class target, and parts of the design currently assume a single local process
 
-**Status:** open. Owner directive, 2026-08-01: "this needs to work with server
+**Status:** ruled 2026-08-01. A storage support matrix is now normative (erratum
+0.1.1 section C.3): FsObjectStore is local-filesystem only, NFS/EFS are
+unsupported for the durability tier unless independently qualified, and remote
+object stores get a distinct profile. Consequence 4 below is therefore settled.
+Server-shaped acceptance became W11-B, W11-F, W11-G, and W11-H. Remains open as
+engineering work. Owner directive, 2026-08-01: "this needs to work with server
 implementations."
 **Severity:** high for scope. It does not invalidate the frozen model, but it
 changes what "done" means for W11 acceptance and it raises the priority of E1.
@@ -264,3 +278,135 @@ E1 implementation should be written and reviewed with a remote store as the
 motivating case, since that is what makes the transient branch load-bearing.
 Then extend the W11 acceptance matrix with the four items above, and record the
 supported topology in the plan.
+
+---
+
+# Residual rulings adopted 2026-08-01
+
+External architect ruling on the E1 residuals, E2, and E3. Verdict: alpha
+sign-off blocked, no fundamental redesign required. Every finding below was
+independently confirmed against source before adoption. Normative text lives in
+`docs/WORKFLOW_CORE_CONTRACT_ERRATUM_0_1_1.md`; this section records provenance
+and the defects the review surfaced.
+
+## Ruled
+
+- **Q1, proof transport.** Option A: add
+  `StoreError::CommittedObjectCorrupt { bad_ref, proof }`. Do not re-read to
+  reconstruct the signal, and do not classify object corruption as
+  `CorruptControlPlane`. Widening an exhaustively matched enum is desirable here:
+  it forces every command caller to decide whether it has a run to transition.
+- **Q2, host boundary.** The embedder owns the host response boundary, but the
+  crate must own the safety mechanism. A crate-owned composite reader performs
+  the read and, on corruption, commits `mark_corrupt_storage` before returning
+  the integrity result. An embedder-implemented trait was rejected: a server can
+  implement it correctly and still bypass it in an endpoint.
+- **Q3, durability evidence.** A stateful crash model is mandatory and is
+  sufficient to prove the publication algorithm against that model. It is not
+  sufficient to claim crash durability on a named filesystem, which additionally
+  requires abrupt VM or block-device qualification. `FsObjectStore` is a
+  local-filesystem profile only; NFS/EFS are unsupported unless independently
+  qualified; remote object stores need a distinct conditional-publication and
+  authoritative-read profile.
+
+## Defects the review surfaced, all confirmed against source
+
+1. **Hydration laundered the proof.** `sqlite/mod.rs` mapped
+   `ObjectReadError::Corrupt(_)` onto `CorruptControlPlane` and discarded the
+   proof, having already deduplicated schema refs to bare digests so the exact
+   `ArtifactRef` was unrecoverable. `CorruptControlPlane` is reserved for an
+   impossible durable control-plane projection, so this was also the wrong
+   semantic category.
+2. **`get` minted a committable capability with no durability barrier.**
+   Publication links the final data entry before `finalize_candidate` syncs the
+   containing directory, and `get` performed no barrier at all. A second process
+   knowing the digest could obtain a committable `VerifiedObjectRef` for an entry
+   that was not yet durable. A process-local lock cannot fix this, because the
+   target deployment is multi-process.
+3. **Unrelated-run poisoning.** `mark_corrupt_storage` validated scope, digest,
+   store-instance nonce, and ref registration, then loaded the run
+   independently. With `owner_node_id = None`, nothing established that the ref
+   was reachable from the named run, so a valid proof for any same-scope
+   artifact could drive any run in scope to `CorruptStorage`.
+
+## Correction adopted into the durability claim
+
+The property "no visible-before-durable window" was wrong as written and must
+not be claimed. Namespace visibility before the barrier is normal and
+unavoidable for a link-and-fsync protocol. The binding property is a capability
+property: no successful publication response and no committable
+`VerifiedObjectRef` may escape before all required durability barriers and
+post-publication verification have completed.
+
+## Not independently verified by the reviewer
+
+The review environment had no Cargo binary, so the ruling rests on the clean
+bundle's source, contract, escalation record, and test contents rather than a
+fresh test execution. Test-suite state is ours to establish.
+
+## E4. Two obligations from erratum 0.1.1 that the crate cannot enforce
+
+**Status:** open. Raised by the implementation wave of 2026-08-01, after the
+architect ruling was adopted. Neither blocks the wave; both block an honest
+alpha claim.
+
+### E4.1 The `create_run` no-write rule has no enforcement point
+
+Erratum section A.4 requires that proof-bearing prerequisite corruption at
+`create_run` be a no-write pre-run failure: no run created, no corruption command
+attempted, proof retained for diagnostics.
+
+The engine has no `create_run` call site. `create_run` exists only on the
+`WorkflowStore` trait, so hosts call it directly. The rule is therefore a host
+obligation, and the crate can document it but cannot enforce it. It is currently
+recorded as a doc comment on `EngineError::Store`, which is a comment, not a
+guarantee.
+
+This is the same shape as the host-read obligation the ruling already assigned to
+the embedder, so it likely wants the same treatment: name the responsible party
+in the contract and cover it with a server-shaped W11-B fixture. Confirming that
+is an architect call, not an implementer's.
+
+### E4.2 The read-path barrier is a cost the ruling's own alternative removes
+
+Closing the premature-capability window (ruling Q3) was implemented by having
+`get` establish the publication barrier before minting a committable ref. That is
+correct and it is the smallest change, but it puts two directory fsyncs on every
+successful read. On local SSD that is tens of microseconds once warm; on
+network-attached storage it is milliseconds, and it does not batch because each
+`get` syncs its own directory handles. For a read-heavy workload over a hot
+object the barriers dominate, since the bytes themselves come from page cache.
+
+The architect's first alternative removes the cost structurally: if `get`
+returned a read-only capability that cannot be committed as a durable reference,
+the read path needs no barrier and only the put path pays. That is a change to
+the `artifact` contract types and their consumers in both object stores and the
+engine, so it is a deliberate wave rather than an improvisation inside this one.
+
+Recommendation: take the type split before alpha, and treat the current barrier
+as the correct conservative default until then. Do not benchmark-tune around it;
+the fix is structural.
+
+## E5. Suspected create_run parity divergence between the oracle and the SQLite adapter
+
+**Status:** open, unverified. Observed 2026-08-01 while adding corruption
+reachability fixtures.
+
+The in-memory store is the semantic oracle for the SQLite adapter, and the
+conformance suite exists to hold them identical. While writing a new fixture, the
+same `create_run` call was observed to succeed against the memory store and fail
+against SQLite with `SchemaSubsetUnsupported`, suggesting SQLite validates run
+input against the pinned root schema at creation and memory does not.
+
+The fixture was made schema-valid to isolate the change under test, so nothing in
+the suite currently exercises the divergence. That is exactly why it needs
+recording: a parity gap that no fixture covers is invisible to the mechanism
+built to catch parity gaps.
+
+If real, the oracle is weaker than the implementation, which is the dangerous
+direction. Every parity claim rests on the oracle being at least as strict as
+what it certifies.
+
+Next step is not a ruling. It is a fixture: submit a run input that violates the
+pinned root schema and assert both stacks reject it identically. Whichever stack
+is wrong then gets fixed against the contract, not against the other stack.
