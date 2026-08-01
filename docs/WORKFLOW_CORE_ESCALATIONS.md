@@ -487,3 +487,59 @@ raising marginally more `NotFound` (52/51) and `InvalidField` (20/17) -- the saf
 direction, with the `InvalidField` surplus confined to memory's snapshot serde
 code, which SQLite has no counterpart for. Those three were not chased
 exhaustively.
+
+## E7. An action's output commit escapes the per-value inline ceiling
+
+**Status:** open, confirmed by demonstration 2026-08-01. Not yet fixed.
+
+Contract section 1.4 applies `max_inline_json_bytes_per_value` "before binding,
+invocation, event-inline value, or **output commit**". The enforcement sites are
+`create_run`, `claim_node_attempt` (bound input), `complete_map` (aggregate), and
+now `resolve_terminal_node` (Succeed output). `complete_attempt` has none, so an
+Action node's own output commit is unchecked.
+
+Demonstrated by `examples/guardrails.rs` guardrail 4: under a 2048-byte
+`max_inline_json_bytes_per_value`, the `work` node commits a 4130-byte result and
+only the downstream Succeed node refuses. The oversized value is still charged
+against `max_aggregate_object_bytes_per_run`, so nothing is unbounded -- but a
+ceiling named "per value" does not hold for every value.
+
+This wants a deliberate ruling rather than a reflex fix. Either the ceiling
+applies to every committed value, in which case `complete_attempt` needs the
+check and the aggregate ceiling is the second line of defence; or intermediate
+node outputs are deliberately governed only by the aggregate ceiling, in which
+case section 1.4's wording is wrong and the erratum should say so. Adding the
+check without settling that would leave the contract and the code disagreeing in
+a new place.
+
+Note also that the aggregate ceiling is what currently bounds this, and until
+2026-08-01 the `complete_map` aggregate check was covered by no fixture at all
+(see the conformance cases added that day). A single unproven ceiling should not
+be the only bound on a value the contract says has two.
+
+## E8. Ergonomics: every host will rewrite the same publication plumbing
+
+**Status:** open, recorded 2026-08-01 from four independent example authors.
+
+Four examples (`durable_demo`, `yaml_pipeline`, `guardrails`, `multi_tenant`)
+each independently wrote the same two blocks:
+
+1. a repin pass over `NodeDefinition::{Action, Map}` rewriting placeholder action
+   pins from the registry, because a YAML author cannot write content addresses
+   that are derived from registered implementations (~40 lines each);
+2. a publish sequence: put every schema document, build
+   `resolved_action_schema_objects` keyed by reference location (`<node>` and
+   `<node>/map_action`), `create_definition`, `publish_revision` (~70 lines each).
+
+Both are correct-by-construction plumbing with a sharp failure mode: getting the
+reference-location key wrong surfaces much later as a hydration or pin error. A
+`repin_from_registry(&mut WorkflowDefinition, &registry)` and a
+`publish_definition(...)` convenience would delete this from every consumer and
+remove a class of integration bug from hosts the crate will never see.
+
+Related smaller items from the same authors: no `list_attempts` on
+`WorkflowStore` (a node's attempt history is reconstructable only from the event
+stream, which any run-detail UI needs immediately); `ArtifactRefValue` identity
+derivation is not public, so a caller cannot construct a valid registered ref;
+and `SchemaSubsetUnsupported` carries no path or keyword, unlike
+`DefinitionValidationError` which is exemplary.

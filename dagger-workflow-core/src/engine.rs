@@ -12,11 +12,11 @@ use crate::definition::{
     NodeDefinition, WorkflowDefinition,
 };
 use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChildIdentity};
-use crate::run::{NodeFailureKind, NodeKind, NodeRun};
+use crate::run::{NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime, FailContract,
+    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
     MarkCorruptStorage, OrderedMapItem, PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun,
     ReleaseRetry, RequestApproval, ResolveTerminalNode, ResumeCompatible, StartRun, StoreError,
     SuspendIncompatible, TimeoutAttempt, WorkflowStore,
@@ -1028,24 +1028,16 @@ where
             .await
         {
             Ok(_) => {}
-            // Map cardinality is a runtime contract failure, not a scheduler error. The
-            // expansion command validates the untrusted ordered child set; the engine owns
-            // the N46/R08 transition for the still-Ready Map node.
-            Err(StoreError::ContractValidationApplied { code }) if code == "MapBoundExceeded" => {
-                self.store
-                    .fail_contract(
-                        scope,
-                        FailContract {
-                            permit: permit.clone(),
-                            run_id: node.run_id,
-                            node_id: node.node_instance_id,
-                            expected_node_version: node.version,
-                            closed_failure_kind: NodeFailureKind::MapBoundExceeded,
-                            diagnostics: None,
-                        },
-                    )
-                    .await?;
-            }
+            // Section 5.5: both variants are applied outcomes. `expand_map` already
+            // committed N46/R08 for the still-Ready Map node and terminalized the run in
+            // the same transaction, so there is nothing left for the scheduler to do and
+            // nothing to report as a scheduler error. Section 5.3 lists exactly these two
+            // as the command's runtime failure outcomes (`MapInputInvalid`,
+            // `MapBoundExceeded`, `RunDynamicNodeLimitExceeded`,
+            // `AggregateObjectLimitExceeded`).
+            Err(
+                StoreError::ContractValidationApplied { .. } | StoreError::RunLimitApplied { .. },
+            ) => {}
             Err(error) => return Err(error.into()),
         }
         Ok(())

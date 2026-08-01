@@ -5,6 +5,58 @@ Status: W0 complete and frozen by the final document-only pass
 are integrated and their definition/action/store-boundary outputs are
 reconciled against the frozen contract.
 
+## Status as of 2026-08-01
+
+The workstream numbering below describes intended scope, not completion. This
+block is the current ground truth; where the two disagree, this block wins.
+
+| Workstream | State | Evidence |
+|---|---|---|
+| W0 contract | frozen, plus binding erratum 0.1.1 | `WORKFLOW_CORE_CONTRACT.md`, `..._ERRATUM_0_1_1.md` |
+| W1 definition, IDs | built | `tests/w1_definition.rs`, `tests/w1_ids.rs` |
+| W2 action contract | built | `tests/w2_action_contract.rs` |
+| W3 engine, memory store | built | `tests/w3_engine.rs`, `tests/w3_memory.rs` |
+| W4 Map | built | `tests/w4_map.rs` |
+| W5 reference workflow A | built | `tests/w5_legal_research.rs` |
+| W6 SQLite adapter | built, 11 gates | `tests/w6_sqlite.rs` |
+| W7 filesystem object store | built | `tests/w7_fs_object_store.rs` |
+| W8 crash recovery | 6 of 8 plan bullets proven | `tests/w8_recovery.rs` |
+| W9 approvals | commands exist; proof pending | `request/decide/expire_approval` in both stores |
+| W10 budgets, events | implemented; 17 fixtures | `tests/w10_budgets.rs` |
+| W11-A/B/C integrity | built | `tests/w11_integrity.rs` |
+| W11-D local protocol model | **not built — blocking for alpha** | see W11 below |
+| W11-E/F/G/H | not built | remote, deployment, topology |
+| W12 | out of v0.1 by decision | |
+
+**The gap to alpha is evidence, not features.** W9 and W10 were both listed as
+unbuilt while being substantially implemented; the missing artefact in each case
+was proof, not code. Do not read an unbuilt marker as an empty module without
+checking the source first.
+
+**W11-D is the one true blocker.** Every fsync in `fs_object_store.rs` is
+code-reviewed, not test-proven, and fsync is not observable through `std::fs`.
+Until the stateful crash model and its negative controls exist, the supportable
+claim is "protocol-model unverified", not "crash-durable".
+
+### What proof is worth here
+
+Four defects were found on 2026-08-01, and none was findable by running the
+suite:
+
+- **E5** — invisible because no fixture exercised `publish_revision` on the
+  in-memory oracle.
+- **The Succeed-output hole** — `resolve_terminal_node` validated nothing.
+  Invisible because BOTH stores were wrong identically, so conformance parity
+  held. Parity is evidence about agreement, never about correctness.
+- **The `complete_map` aggregate ceiling** — proven uncovered only when the
+  check was disabled by accident and the entire suite stayed green.
+- **The Map-to-Action binding bug** — found by an example author hitting a wall,
+  not by a test.
+
+The working standard is therefore: a fixture that has not been watched to fail
+is not evidence. New fixtures name the source mutation that breaks them, and
+where practical that mutation is applied, observed red, and reverted.
+
 ## Product framing
 
 Two automation modes exist in the host product (RZN):

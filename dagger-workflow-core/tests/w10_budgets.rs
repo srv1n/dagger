@@ -31,7 +31,7 @@ use dagger_workflow_core::ids::{
     Timestamp, Version,
 };
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
-use dagger_workflow_core::run::{NodeState, RunLimits, RunState};
+use dagger_workflow_core::run::{AttemptState, NodeFailureKind, NodeState, RunLimits, RunState};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::SqliteWorkflowStore;
 use dagger_workflow_core::store::{
@@ -740,6 +740,11 @@ async fn max_total_attempts_ceiling_is_exact_at_claim() {
 /// Section 1.4 enforces this "before binding, invocation, ...". The bound input
 /// is deliberately larger than the run input so the run-creation copy of this
 /// check cannot be what fires; the boundary is the bound value's exact size.
+///
+/// The refusal is N46 (from `Ready`) with R08, not a bare error: section 5.3
+/// requires the terminal batch to commit and no attempt to be minted, so the
+/// fixture asserts the durable node, run, and attempt state as well as the
+/// boundary.
 #[tokio::test]
 async fn max_inline_json_bytes_per_value_ceiling_is_exact_at_claim() {
     async fn body<S: WorkflowStore>(
@@ -786,12 +791,31 @@ async fn max_inline_json_bytes_per_value_ceiling_is_exact_at_claim() {
                     "{tenant}: a value exactly at the ceiling is admitted"
                 );
             } else {
+                let Ok(ClaimNodeAttemptResult::RunLimitApplied(run)) = outcome else {
+                    panic!("{tenant}: a value one byte over the ceiling must apply a run limit");
+                };
+                assert_eq!(run.status, RunState::ContractFailed, "{tenant}: R08");
+                let node = store
+                    .get_node(&fixture.scope, &id(run_id), &id("action"))
+                    .await
+                    .unwrap();
+                assert_eq!(node.status, NodeState::ContractFailed, "{tenant}: N46");
                 assert_eq!(
-                    outcome.err(),
-                    Some(StoreError::RunLimitApplied {
-                        code: "InlineJsonLimitExceeded".to_owned()
-                    }),
-                    "{tenant}"
+                    node.failure_kind,
+                    Some(NodeFailureKind::InlineJsonLimitExceeded),
+                    "{tenant}: the applied failure must name the ceiling that fired"
+                );
+                assert_eq!(
+                    store
+                        .get_attempt(
+                            &fixture.scope,
+                            &id(run_id),
+                            &id(&format!("{run_id}-attempt"))
+                        )
+                        .await
+                        .err(),
+                    Some(StoreError::NotFound),
+                    "{tenant}: the refused claim must not mint an attempt"
                 );
             }
         }
@@ -803,6 +827,11 @@ async fn max_inline_json_bytes_per_value_ceiling_is_exact_at_claim() {
 ///
 /// Section 1.4 enforces this "before accepted action completion", so the
 /// ceiling is per attempt and counted against the submitted artifact list.
+///
+/// A breach here is an accepted completion, not a rejected command: transitions
+/// A05 and N21 make it a contract failure that is applied, with R08 ending the
+/// run. The refused side therefore asserts that terminal state rather than
+/// asserting the node stayed put, which would be the pre-repair defect.
 #[tokio::test]
 async fn max_artifacts_per_attempt_ceiling_is_exact_at_complete_attempt() {
     async fn body<S: WorkflowStore>(
@@ -880,21 +909,36 @@ async fn max_artifacts_per_attempt_ceiling_is_exact_at_complete_attempt() {
                     "{tenant}: one artifact fits a ceiling of one"
                 );
             } else {
+                let Ok(CompleteAttemptResult::TerminalRun(run)) = outcome else {
+                    panic!("{tenant}: one artifact over the ceiling must terminalize the run");
+                };
+                assert_eq!(run.status, RunState::ContractFailed, "{tenant}: R08");
+                let node = store
+                    .get_node(&fixture.scope, &id(run_id), &id("action"))
+                    .await
+                    .unwrap();
+                assert_eq!(node.status, NodeState::ContractFailed, "{tenant}: N21");
                 assert_eq!(
-                    outcome.err(),
-                    Some(StoreError::RunLimitApplied {
-                        code: "ArtifactsPerAttemptLimitExceeded".to_owned()
-                    }),
-                    "{tenant}"
+                    node.failure_kind,
+                    Some(NodeFailureKind::ArtifactsPerAttemptLimitExceeded),
+                    "{tenant}: the applied failure must name the ceiling that fired"
+                );
+                assert_eq!(
+                    node.active_attempt_id, None,
+                    "{tenant}: N21 clears the active attempt"
                 );
                 assert_eq!(
                     store
-                        .get_node(&fixture.scope, &id(run_id), &id("action"))
+                        .get_attempt(
+                            &fixture.scope,
+                            &id(run_id),
+                            &id(&format!("{run_id}-attempt"))
+                        )
                         .await
                         .unwrap()
                         .status,
-                    NodeState::Running,
-                    "{tenant}: a refused completion must not move the node"
+                    AttemptState::ContractFailed,
+                    "{tenant}: A05"
                 );
             }
         }
@@ -978,12 +1022,42 @@ async fn max_aggregate_object_bytes_per_run_ceiling_is_exact_at_claim() {
                     "{tenant}"
                 );
             } else {
+                let Ok(ClaimNodeAttemptResult::RunLimitApplied(run)) = outcome else {
+                    panic!(
+                        "{tenant}: the invocation input must be charged on top of the run input \
+                         and applied as a contract failure"
+                    );
+                };
+                assert_eq!(run.status, RunState::ContractFailed, "{tenant}: R08");
+                // The refusal is a rejection of the charge, so the running total
+                // must still read the creation-time watermark: a ceiling that
+                // fired after charging would leave the ledger overstated.
                 assert_eq!(
-                    outcome.err(),
-                    Some(StoreError::RunLimitApplied {
-                        code: "AggregateObjectLimitExceeded".to_owned()
-                    }),
-                    "{tenant}: the invocation input must be charged on top of the run input"
+                    run.aggregate_object_bytes,
+                    fixture.input.size_bytes(),
+                    "{tenant}: the refused invocation input must not be charged"
+                );
+                let node = store
+                    .get_node(&fixture.scope, &id(run_id), &id("action"))
+                    .await
+                    .unwrap();
+                assert_eq!(node.status, NodeState::ContractFailed, "{tenant}: N46");
+                assert_eq!(
+                    node.failure_kind,
+                    Some(NodeFailureKind::AggregateObjectLimitExceeded),
+                    "{tenant}: the applied failure must name the ceiling that fired"
+                );
+                assert_eq!(
+                    store
+                        .get_attempt(
+                            &fixture.scope,
+                            &id(run_id),
+                            &id(&format!("{run_id}-attempt"))
+                        )
+                        .await
+                        .err(),
+                    Some(StoreError::NotFound),
+                    "{tenant}: the refused claim must not mint an attempt"
                 );
             }
         }
