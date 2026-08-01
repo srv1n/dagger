@@ -631,6 +631,81 @@ fn json_ref(
     )?))
 }
 
+fn revision_invalid(error: crate::definition::DefinitionValidationError) -> StoreError {
+    StoreError::RevisionInvalid {
+        code: error.kind,
+        path: error.path,
+        message: error.message,
+        valid_alternatives: error.valid_alternatives,
+    }
+}
+
+/// Re-derives the publishable revision from the canonical object bytes.
+///
+/// Section 5.2 requires the canonical document itself to be the authority: its
+/// `definition_id` must equal the publication target, its digests must recompute,
+/// and it must pass definition/semantic rules and canonical Kahn ranking. Trusting
+/// the caller's typed struct instead would let a host store node ranks, an entry
+/// node, and a node set that disagree with the canonical bytes the `revision_hash`
+/// is derived from. Section 1.5 makes the persisted rank the recovery-order key
+/// used by sections 3.4 and 4, so an unverified rank corrupts deterministic bulk
+/// recovery. The oracle must be at least as strict as the adapter it certifies, so
+/// this duplicates `sqlite::reducer::parse_canonical_revision` rather than sharing
+/// it -- the same deliberate duplication as `schema_accepts` and the schema subset
+/// validator.
+fn parse_canonical_revision(
+    bytes: &[u8],
+    supplied: &PublishableDefinition,
+) -> Result<PublishableDefinition, StoreError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| StoreError::RevisionInvalid {
+        code: crate::definition::ValidationErrorKind::InvalidField,
+        path: "$".to_owned(),
+        message: "canonical definition must be UTF-8 JSON".to_owned(),
+        valid_alternatives: vec!["publish RFC 8785 canonical JSON bytes".to_owned()],
+    })?;
+    let parsed = crate::definition::parse_json_definition(text).map_err(revision_invalid)?;
+    let canonical =
+        crate::definition::canonical_definition_json(&parsed).map_err(revision_invalid)?;
+    if canonical != bytes {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::InvalidField,
+            path: "$".to_owned(),
+            message: "definition object bytes are not RFC 8785 canonical JSON".to_owned(),
+            valid_alternatives: vec![
+                "publish the exact output of canonical_definition_json".to_owned()
+            ],
+        });
+    }
+    let supplied_canonical = crate::definition::canonical_definition_json(&supplied.definition)
+        .map_err(revision_invalid)?;
+    if supplied_canonical != canonical {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::InvalidField,
+            path: "$".to_owned(),
+            message: "supplied typed definition does not match canonical definition bytes"
+                .to_owned(),
+            valid_alternatives: vec![
+                "parse the canonical bytes and supply that exact typed definition".to_owned(),
+            ],
+        });
+    }
+    let topological_ranks =
+        crate::definition::canonical_topological_ranks(&parsed).map_err(revision_invalid)?;
+    if supplied.topological_ranks != topological_ranks {
+        return Err(StoreError::RevisionInvalid {
+            code: crate::definition::ValidationErrorKind::Cycle,
+            path: "/nodes".to_owned(),
+            message: "supplied topological ranks do not match canonical lexical Kahn ranks"
+                .to_owned(),
+            valid_alternatives: vec!["derive ranks from the canonical definition graph".to_owned()],
+        });
+    }
+    Ok(PublishableDefinition {
+        definition: parsed,
+        topological_ranks,
+    })
+}
+
 fn fingerprint<T: Serialize>(domain: &str, scope: &ExecutionScope, value: &T) -> Digest {
     let bytes = serde_jcs::to_vec(&(domain, scope, value)).expect("fingerprint input serializes");
     digest(&bytes)
@@ -2905,7 +2980,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             verified(&mut state, scope, &command.canonical_definition, now)?;
             verified(&mut state, scope, &command.run_input_schema, now)?;
             verified(&mut state, scope, &command.run_output_schema, now)?;
-            if command.parsed_revision.definition.definition_id != command.definition_id {
+            let canonical_revision = parse_canonical_revision(
+                command.canonical_definition.verified_bytes(),
+                &command.parsed_revision,
+            )?;
+            if canonical_revision.definition.definition_id != command.definition_id {
                 return Err(StoreError::RevisionDefinitionIdMismatch);
             }
             // Section 5.2 requires every root and action schema ref to match both
@@ -2915,9 +2994,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             validate_schema_document(command.run_input_schema.verified_bytes())?;
             validate_schema_document(command.run_output_schema.verified_bytes())?;
             let revision_hash = command.canonical_definition.digest().clone();
-            if command.parsed_revision.definition.run_input_schema_digest
+            if canonical_revision.definition.run_input_schema_digest
                 != *command.run_input_schema.digest()
-                || command.parsed_revision.definition.run_output_schema_digest
+                || canonical_revision.definition.run_output_schema_digest
                     != *command.run_output_schema.digest()
             {
                 return Err(StoreError::DigestMismatch);
@@ -2972,8 +3051,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 1,
                 now,
             )?;
-            let extracted =
-                crate::definition::extract_action_pins(&command.parsed_revision.definition);
+            let extracted = crate::definition::extract_action_pins(&canonical_revision.definition);
             let mut pins = Vec::with_capacity(extracted.len());
             for pin in extracted {
                 let schemas = command
@@ -3027,27 +3105,25 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 canonical_definition_ref,
                 run_input_schema_ref,
                 run_output_schema_ref,
-                run_input_schema_digest: command
-                    .parsed_revision
+                run_input_schema_digest: canonical_revision
                     .definition
                     .run_input_schema_digest
                     .clone(),
-                run_output_schema_digest: command
-                    .parsed_revision
+                run_output_schema_digest: canonical_revision
                     .definition
                     .run_output_schema_digest
                     .clone(),
-                entry_node_id: command.parsed_revision.definition.entry_node_id.clone(),
-                node_count: u32::try_from(command.parsed_revision.definition.nodes.len())
+                entry_node_id: canonical_revision.definition.entry_node_id.clone(),
+                node_count: u32::try_from(canonical_revision.definition.nodes.len())
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
-                node_topological_ranks: command.parsed_revision.topological_ranks.clone(),
+                node_topological_ranks: canonical_revision.topological_ranks.clone(),
                 action_pins: pins,
                 published_at: now,
                 published_by: command.principal.principal_id().to_owned(),
             };
             state
                 .parsed_revisions
-                .insert(revision_key.clone(), command.parsed_revision);
+                .insert(revision_key.clone(), canonical_revision);
             state.revisions.insert(revision_key, revision.clone());
             let definition = state
                 .definitions

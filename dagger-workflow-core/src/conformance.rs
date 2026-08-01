@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 57;
+pub const CASE_COUNT: usize = 61;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -94,6 +94,10 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "expand_map_dynamic_node_limit_applied",
     "claim_inline_json_limit_applied",
     "decide_approval_payload_invalid_applied",
+    "revision_non_canonical_bytes_rejected",
+    "revision_typed_definition_mismatch_rejected",
+    "revision_definition_id_mismatch_rejected",
+    "revision_topological_ranks_mismatch_rejected",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -2026,16 +2030,15 @@ async fn corrupt_pinned_revision_ref_accepted<A: ConformanceAdapter>(
 ///
 /// Both stacks must reach the schema decision, so everything else the command
 /// validates first is held identical to the passing fixtures above.
-async fn publish_with_root_input_schema<A: ConformanceAdapter>(
-    adapter: &A,
-    scope: &ExecutionScope,
-    principal: &AuthenticatedPrincipal,
+/// Builds the two-node publication fixture shared by the section 5.2 cases.
+fn publishable_definition(
+    definition_id: Id,
     action_schema: &VerifiedObjectRef,
     root_input_schema: &VerifiedObjectRef,
-) -> Result<(VerifiedObjectRef, Result<(), StoreError>), ConformanceFailure> {
-    let definition = WorkflowDefinition {
+) -> WorkflowDefinition {
+    WorkflowDefinition {
         definition_format_version: "0.1".to_owned(),
-        definition_id: id("conformance-definition"),
+        definition_id,
         name: "conformance".to_owned(),
         description: String::new(),
         run_input_schema_digest: root_input_schema.digest().clone(),
@@ -2073,7 +2076,21 @@ async fn publish_with_root_input_schema<A: ConformanceAdapter>(
                 },
             },
         ],
-    };
+    }
+}
+
+async fn publish_with_root_input_schema<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    principal: &AuthenticatedPrincipal,
+    action_schema: &VerifiedObjectRef,
+    root_input_schema: &VerifiedObjectRef,
+) -> Result<(VerifiedObjectRef, Result<(), StoreError>), ConformanceFailure> {
+    let definition = publishable_definition(
+        id("conformance-definition"),
+        action_schema,
+        root_input_schema,
+    );
     let canonical = adapter
         .objects()
         .put(
@@ -2225,6 +2242,283 @@ async fn pinned_root_schema_subset_enforced<A: ConformanceAdapter>(
         Err(StoreError::NotFound)
     ) {
         return Err(failure(44, "rejected run creation left a run row"));
+    }
+    Ok(())
+}
+
+/// Publishes one hand-built canonical-bytes / typed-definition pair.
+///
+/// Section 5.2 makes the canonical document the publication authority, so the two
+/// halves are supplied independently here: every canonical-authority case differs
+/// only in how it makes them disagree.
+async fn publish_canonical_pair<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    principal: &AuthenticatedPrincipal,
+    case: usize,
+    canonical_bytes: Vec<u8>,
+    parsed_revision: PublishableDefinition,
+    schema: &VerifiedObjectRef,
+) -> Result<Result<(), StoreError>, ConformanceFailure> {
+    let canonical = adapter
+        .objects()
+        .put(scope, &canonical_bytes, "application/json")
+        .await
+        .map_err(|_| failure(case, "definition object publication failed"))?;
+    // The object store JCS-normalises `application/json`, which silently repairs
+    // some malformed inputs. A case whose bytes were repaired on the way in would
+    // pass while proving nothing, so refuse to continue on a rewritten object.
+    if canonical.verified_bytes() != canonical_bytes.as_slice() {
+        return Err(failure(case, "object store rewrote the fixture bytes"));
+    }
+    let mut schemas = BTreeMap::new();
+    schemas.insert(
+        "action".to_owned(),
+        ResolvedActionSchemas {
+            input_schema: schema.clone(),
+            output_schema: schema.clone(),
+        },
+    );
+    Ok(adapter
+        .store()
+        .publish_revision(
+            scope,
+            PublishRevision {
+                definition_id: id("conformance-definition"),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical,
+                run_input_schema: schema.clone(),
+                run_output_schema: schema.clone(),
+                resolved_action_schema_objects: schemas,
+                parsed_revision,
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map(|_| ()))
+}
+
+/// Prepares the schema object, principal, and empty definition row for a
+/// canonical-authority case.
+async fn prepare_canonical_authority<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<(VerifiedObjectRef, AuthenticatedPrincipal), ConformanceFailure> {
+    let schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "conformance".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "principal construction failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("conformance-definition"),
+                display_name: "conformance".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "definition creation failed"))?;
+    Ok((schema, principal))
+}
+
+/// Both stacks reject definition bytes that are not RFC 8785 canonical.
+///
+/// Section 5.2 derives `revision_hash` from the canonical document, and section
+/// 13.1 fixes canonical form. Accepting a differently serialised encoding of the
+/// same document would give one definition two revision hashes, so the byte
+/// comparison against `canonical_definition_json` is the publication gate.
+async fn revision_non_canonical_bytes_rejected<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (schema, principal) = prepare_canonical_authority(adapter, scope, 58).await?;
+    let definition = publishable_definition(id("conformance-definition"), &schema, &schema);
+    let canonical = crate::definition::canonical_definition_json(&definition)
+        .map_err(|_| failure(58, "canonical encoding failed"))?;
+    // Section 14.2 expands schema defaults, so a document that merely omits a
+    // defaulted member parses to the same definition but is not its canonical
+    // form. Whitespace and key order cannot be used here: the object store
+    // already JCS-normalises `application/json` on put, and dropping the root
+    // `description` is the omission that survives that pass.
+    let mut object = match serde_json::from_slice::<Value>(&canonical) {
+        Ok(Value::Object(object)) => object,
+        _ => return Err(failure(58, "canonical bytes did not parse")),
+    };
+    if object.remove("description").is_none() {
+        return Err(failure(58, "canonical bytes carried no defaulted member"));
+    }
+    let elided = serde_jcs::to_vec(&object).map_err(|_| failure(58, "elided encoding failed"))?;
+    if elided == canonical {
+        return Err(failure(58, "fixture failed to produce non-canonical bytes"));
+    }
+    let ranks = crate::definition::canonical_topological_ranks(&definition)
+        .map_err(|_| failure(58, "rank derivation failed"))?;
+    let outcome = publish_canonical_pair(
+        adapter,
+        scope,
+        &principal,
+        58,
+        elided,
+        PublishableDefinition {
+            definition,
+            topological_ranks: ranks,
+        },
+        &schema,
+    )
+    .await?;
+    if !matches!(outcome, Err(StoreError::RevisionInvalid { .. })) {
+        return Err(failure(58, "non-canonical definition bytes were published"));
+    }
+    Ok(())
+}
+
+/// Both stacks reject a typed definition that does not canonicalize to the bytes.
+///
+/// Section 5.2 makes the canonical document authoritative, so a store that stored
+/// the caller's struct would persist an entry node, node set, and ranks that the
+/// `revision_hash` does not cover. Section 1.5 then makes those unverified values
+/// the recovery-order key used by sections 3.4 and 4.
+async fn revision_typed_definition_mismatch_rejected<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (schema, principal) = prepare_canonical_authority(adapter, scope, 59).await?;
+    let definition = publishable_definition(id("conformance-definition"), &schema, &schema);
+    let canonical = crate::definition::canonical_definition_json(&definition)
+        .map_err(|_| failure(59, "canonical encoding failed"))?;
+    let ranks = crate::definition::canonical_topological_ranks(&definition)
+        .map_err(|_| failure(59, "rank derivation failed"))?;
+    let mut divergent = definition;
+    divergent.name = "divergent".to_owned();
+    let outcome = publish_canonical_pair(
+        adapter,
+        scope,
+        &principal,
+        59,
+        canonical,
+        PublishableDefinition {
+            definition: divergent,
+            topological_ranks: ranks,
+        },
+        &schema,
+    )
+    .await?;
+    if !matches!(outcome, Err(StoreError::RevisionInvalid { .. })) {
+        return Err(failure(
+            59,
+            "typed definition diverging from canonical bytes was published",
+        ));
+    }
+    Ok(())
+}
+
+/// Both stacks reject a canonical document naming a different definition.
+///
+/// Section 5.2 requires the canonical document's `definition_id` to equal the
+/// publication target exactly; otherwise a revision attaches to a definition row
+/// its own bytes disclaim.
+async fn revision_definition_id_mismatch_rejected<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (schema, principal) = prepare_canonical_authority(adapter, scope, 60).await?;
+    // Bytes and typed struct agree with each other and disagree only with the
+    // publication target, which is what isolates this from the canonical checks.
+    let definition = publishable_definition(id("other-definition"), &schema, &schema);
+    let canonical = crate::definition::canonical_definition_json(&definition)
+        .map_err(|_| failure(60, "canonical encoding failed"))?;
+    let ranks = crate::definition::canonical_topological_ranks(&definition)
+        .map_err(|_| failure(60, "rank derivation failed"))?;
+    let outcome = publish_canonical_pair(
+        adapter,
+        scope,
+        &principal,
+        60,
+        canonical,
+        PublishableDefinition {
+            definition,
+            topological_ranks: ranks,
+        },
+        &schema,
+    )
+    .await?;
+    if !matches!(outcome, Err(StoreError::RevisionDefinitionIdMismatch)) {
+        return Err(failure(
+            60,
+            "revision naming another definition was published",
+        ));
+    }
+    Ok(())
+}
+
+/// Both stacks reject supplied ranks that are not the canonical lexical Kahn ranks.
+///
+/// Section 1.5 fixes the ranking algorithm and makes the persisted rank the
+/// recovery-order key read by sections 3.4 and 4. A host-chosen rank would make
+/// deterministic bulk recovery ordering host-dependent, which is precisely the
+/// property the W8 recovery fixtures certify.
+async fn revision_topological_ranks_mismatch_rejected<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (schema, principal) = prepare_canonical_authority(adapter, scope, 61).await?;
+    let definition = publishable_definition(id("conformance-definition"), &schema, &schema);
+    let canonical = crate::definition::canonical_definition_json(&definition)
+        .map_err(|_| failure(61, "canonical encoding failed"))?;
+    // The reverse of the canonical ranking: `succeed` cannot precede `action`.
+    let mut ranks = BTreeMap::new();
+    ranks.insert(id("action"), TopologicalRank(1));
+    ranks.insert(id("succeed"), TopologicalRank(0));
+    if ranks
+        == crate::definition::canonical_topological_ranks(&definition)
+            .map_err(|_| failure(61, "rank derivation failed"))?
+    {
+        return Err(failure(61, "fixture ranks match the canonical ranking"));
+    }
+    let outcome = publish_canonical_pair(
+        adapter,
+        scope,
+        &principal,
+        61,
+        canonical,
+        PublishableDefinition {
+            definition,
+            topological_ranks: ranks,
+        },
+        &schema,
+    )
+    .await?;
+    if !matches!(
+        outcome,
+        Err(StoreError::RevisionInvalid {
+            code: ValidationErrorKind::Cycle,
+            ..
+        })
+    ) {
+        return Err(failure(
+            61,
+            "non-canonical topological ranks were published",
+        ));
     }
     Ok(())
 }
@@ -3876,6 +4170,22 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "decide_approval_payload_invalid_applied",
         decide_approval_payload_invalid_applied
+    );
+    run_fixture!(
+        "revision_non_canonical_bytes_rejected",
+        revision_non_canonical_bytes_rejected
+    );
+    run_fixture!(
+        "revision_typed_definition_mismatch_rejected",
+        revision_typed_definition_mismatch_rejected
+    );
+    run_fixture!(
+        "revision_definition_id_mismatch_rejected",
+        revision_definition_id_mismatch_rejected
+    );
+    run_fixture!(
+        "revision_topological_ranks_mismatch_rejected",
+        revision_topological_ranks_mismatch_rejected
     );
     results
 }
