@@ -98,12 +98,26 @@ impl WorkflowAction for MapAction {
     }
 }
 
+/// The narrowest schema the supported subset accepts for an object: section 14.3
+/// requires `type` on every node and a closed field set on every object schema.
+/// A bare `{}` was accepted here only while the in-memory store skipped
+/// publication-time subset validation, which was the E5 defect.
+const SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;
+
+/// The Succeed node here is bound to the Map, so its output is the ordered
+/// aggregate of the children (contract section 3.3 N08), which is an ARRAY and
+/// can never satisfy `SCHEMA`. `resolve_terminal_node` validates that output
+/// against the pinned root output schema per N16, so the root output needs its
+/// own document. `items` is the union of the map items these fixtures echo back:
+/// integers, strings, and `{"same": bool}` objects.
+const ROOT_OUTPUT_SCHEMA: &[u8] = br#"{"items":{"additionalProperties":false,"properties":{"same":{"type":"boolean"}},"type":["integer","object","string"]},"type":"array"}"#;
+
 fn descriptor() -> ActionDescriptor {
     ActionDescriptor {
         name: "fixture.w4-map".to_owned(),
         contract_version: "1".to_owned(),
-        input_schema_digest: hash(b"{}"),
-        output_schema_digest: hash(b"{}"),
+        input_schema_digest: hash(SCHEMA),
+        output_schema_digest: hash(SCHEMA),
         implementation_compatibility_digest: hash(b"w4-map-implementation"),
     }
 }
@@ -115,8 +129,8 @@ fn definition(definition_id: &str, items: Value, max_items: u32) -> WorkflowDefi
         definition_id: id(definition_id),
         name: definition_id.to_owned(),
         description: String::new(),
-        run_input_schema_digest: hash(b"{}"),
-        run_output_schema_digest: hash(b"{}"),
+        run_input_schema_digest: hash(SCHEMA),
+        run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
         entry_node_id: id("map"),
         nodes: vec![
             NodeDefinition::Map {
@@ -165,7 +179,11 @@ async fn publish_and_create(
     run_id: &str,
 ) {
     let schema = objects
-        .put(execution_scope, b"{}", "application/json")
+        .put(execution_scope, SCHEMA, "application/json")
+        .await
+        .unwrap();
+    let root_output_schema = objects
+        .put(execution_scope, ROOT_OUTPUT_SCHEMA, "application/json")
         .await
         .unwrap();
     let canonical = objects
@@ -230,7 +248,7 @@ async fn publish_and_create(
                 expected_definition_version: dagger_workflow_core::ids::Version(1),
                 canonical_definition: canonical.clone(),
                 run_input_schema: schema.clone(),
-                run_output_schema: schema,
+                run_output_schema: root_output_schema,
                 resolved_action_schema_objects: action_schemas,
                 parsed_revision: PublishableDefinition {
                     definition: workflow.clone(),

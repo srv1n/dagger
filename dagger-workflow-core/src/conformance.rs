@@ -11,16 +11,18 @@ use crate::artifact::{
 };
 use crate::definition::{
     ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
-    PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
+    PublishableDefinition, RetryPolicy, TimeoutPolicy, ValidationErrorKind, WorkflowDefinition,
 };
 use crate::ids::{
     map_child_id, map_expansion_digest, CostUnits, Digest, Id, MapChildIdentity, Timestamp,
     TopologicalRank, Version,
 };
-use crate::run::{AttemptState, NodeState, RunLimits, RunState, WorkflowRun};
+use crate::run::{
+    AttemptState, NodeFailureKind, NodeRun, NodeState, RunLimits, RunState, WorkflowRun,
+};
 use crate::scope::ExecutionScope;
 use crate::store::{
-    ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
+    ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult, CompleteMap,
     CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EnginePermit, EventPageRequest,
     ExpandMap, MarkCorruptStorage, OrderedMapItem, PageRequest, PublishRevision, ReleaseRetry,
     RequestApproval, ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError,
@@ -30,7 +32,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 43;
+pub const CASE_COUNT: usize = 53;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -77,6 +79,16 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "corrupt_unreachable_ref_rejected",
     "corrupt_run_produced_ref_accepted",
     "corrupt_pinned_revision_ref_accepted",
+    "pinned_root_schema_subset_enforced",
+    "succeed_output_schema_enforced",
+    "succeed_output_inline_limit_enforced",
+    "succeed_output_inline_limit_boundary_accepted",
+    "succeed_output_aggregate_limit_enforced",
+    "succeed_output_aggregate_limit_boundary_accepted",
+    "map_aggregate_inline_limit_enforced",
+    "map_aggregate_inline_limit_boundary_accepted",
+    "map_aggregate_object_limit_enforced",
+    "map_aggregate_object_limit_boundary_accepted",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -1156,6 +1168,37 @@ async fn prepare_map_conformance<A: ConformanceAdapter>(
     max_concurrency: u32,
     retry: RetryPolicy,
 ) -> Result<MapConformanceFixture, ConformanceFailure> {
+    prepare_map_conformance_with_limits(
+        adapter,
+        scope,
+        case,
+        item_count,
+        max_concurrency,
+        retry,
+        RunLimits {
+            max_dynamic_node_instances: 100,
+            max_total_attempts: 200,
+            max_total_events: 2_000,
+            max_inline_json_bytes_per_value: 10_000,
+            max_artifacts_per_attempt: 10,
+            max_aggregate_object_bytes_per_run: 1_000_000,
+            max_run_lifetime_ms: 31_536_000_000,
+        },
+    )
+    .await
+}
+
+/// Same fixture, with the section 1.4 ceilings chosen by the caller.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_map_conformance_with_limits<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    item_count: u32,
+    max_concurrency: u32,
+    retry: RetryPolicy,
+    limits: RunLimits,
+) -> Result<MapConformanceFixture, ConformanceFailure> {
     let schema = adapter
         .objects()
         .put(
@@ -1285,15 +1328,7 @@ async fn prepare_map_conformance<A: ConformanceAdapter>(
                 revision_hash: canonical.digest().clone(),
                 input: run_input,
                 budget_limit: CostUnits(1_000),
-                limits: RunLimits {
-                    max_dynamic_node_instances: 100,
-                    max_total_attempts: 200,
-                    max_total_events: 2_000,
-                    max_inline_json_bytes_per_value: 10_000,
-                    max_artifacts_per_attempt: 10,
-                    max_aggregate_object_bytes_per_run: 1_000_000,
-                    max_run_lifetime_ms: 31_536_000_000,
-                },
+                limits,
                 principal,
                 idempotency_token: format!("map-case-{case}-create"),
             },
@@ -1982,6 +2017,1096 @@ async fn corrupt_pinned_revision_ref_accepted<A: ConformanceAdapter>(
     Ok(())
 }
 
+/// Publishes one revision differing only in its root input schema object.
+///
+/// Both stacks must reach the schema decision, so everything else the command
+/// validates first is held identical to the passing fixtures above.
+async fn publish_with_root_input_schema<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    principal: &AuthenticatedPrincipal,
+    action_schema: &VerifiedObjectRef,
+    root_input_schema: &VerifiedObjectRef,
+) -> Result<(VerifiedObjectRef, Result<(), StoreError>), ConformanceFailure> {
+    let definition = WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: id("conformance-definition"),
+        name: "conformance".to_owned(),
+        description: String::new(),
+        run_input_schema_digest: root_input_schema.digest().clone(),
+        run_output_schema_digest: action_schema.digest().clone(),
+        entry_node_id: id("action"),
+        nodes: vec![
+            NodeDefinition::Action {
+                id: id("action"),
+                action: ActionReference {
+                    name: "conformance.action".to_owned(),
+                    contract_version: "1".to_owned(),
+                    input_schema_digest: action_schema.digest().clone(),
+                    output_schema_digest: action_schema.digest().clone(),
+                    compatible_implementation_requirement: action_schema.digest().clone(),
+                },
+                bindings: vec![Binding {
+                    target: "/value".to_owned(),
+                    source: BindingSource::RunInput {
+                        pointer: "/value".to_owned(),
+                    },
+                }],
+                retry: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                declared_max_cost_units: CostUnits(2),
+                next: vec![id("succeed")],
+            },
+            NodeDefinition::Succeed {
+                id: id("succeed"),
+                output: BindingSource::NodeOutput {
+                    node_id: id("action"),
+                    pointer: String::new(),
+                },
+            },
+        ],
+    };
+    let canonical = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&definition)
+                .map_err(|_| failure(44, "definition encoding failed"))?,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(44, "definition object publication failed"))?;
+    let mut ranks = BTreeMap::new();
+    ranks.insert(id("action"), TopologicalRank(0));
+    ranks.insert(id("succeed"), TopologicalRank(1));
+    let mut schemas = BTreeMap::new();
+    schemas.insert(
+        "action".to_owned(),
+        ResolvedActionSchemas {
+            input_schema: action_schema.clone(),
+            output_schema: action_schema.clone(),
+        },
+    );
+    let outcome = adapter
+        .store()
+        .publish_revision(
+            scope,
+            PublishRevision {
+                definition_id: id("conformance-definition"),
+                expected_definition_version: Version(1),
+                canonical_definition: canonical.clone(),
+                run_input_schema: root_input_schema.clone(),
+                run_output_schema: action_schema.clone(),
+                resolved_action_schema_objects: schemas,
+                parsed_revision: PublishableDefinition {
+                    definition,
+                    topological_ranks: ranks,
+                },
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map(|_| ());
+    Ok((canonical, outcome))
+}
+
+/// Both stacks reject an out-of-subset root schema and a violating run input.
+///
+/// Contract section 5.2 makes the supported subset a publication precondition and
+/// section 14 requires the same validator at run creation, so a store that pins an
+/// out-of-subset schema or admits an input the pinned schema rejects is
+/// non-conforming. This is the parity direction that hides worst: an oracle weaker
+/// than the adapter it certifies makes every other parity case rest on less than
+/// it appears to.
+async fn pinned_root_schema_subset_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(44, "schema publication failed"))?;
+    // `title` is an annotation keyword section 14.3 forbids outright; the bytes
+    // are otherwise canonical and a full Draft 2020-12 validator would accept them.
+    let annotated_schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"title":"run input","type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(44, "annotated schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "conformance".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(44, "principal construction failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("conformance-definition"),
+                display_name: "conformance".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(44, "definition creation failed"))?;
+    let (_, annotated_outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &annotated_schema)
+            .await?;
+    if !matches!(annotated_outcome, Err(StoreError::SchemaSubsetUnsupported)) {
+        return Err(failure(44, "out-of-subset root schema was published"));
+    }
+    let (canonical, outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &schema).await?;
+    outcome.map_err(|_| failure(44, "in-subset revision publication failed"))?;
+    let input = adapter
+        .objects()
+        .put(scope, br#"{"value":"one"}"#, "application/json")
+        .await
+        .map_err(|_| failure(44, "violating input publication failed"))?;
+    if !matches!(
+        adapter
+            .store()
+            .create_run(
+                scope,
+                CreateRun {
+                    run_id: id("conformance-run"),
+                    definition_id: id("conformance-definition"),
+                    revision_hash: canonical.digest().clone(),
+                    input,
+                    budget_limit: CostUnits(10),
+                    limits: RunLimits {
+                        max_dynamic_node_instances: 10,
+                        max_total_attempts: 10,
+                        max_total_events: 1_000,
+                        max_inline_json_bytes_per_value: 10_000,
+                        max_artifacts_per_attempt: 10,
+                        max_aggregate_object_bytes_per_run: 100_000,
+                        max_run_lifetime_ms: 100_000,
+                    },
+                    principal,
+                    idempotency_token: "conformance-subset-token".to_owned(),
+                },
+            )
+            .await,
+        Err(StoreError::ContractValidation {
+            kind: ValidationErrorKind::SchemaSubsetUnsupported,
+            ..
+        })
+    ) {
+        return Err(failure(
+            44,
+            "input violating the pinned root schema was accepted",
+        ));
+    }
+    if !matches!(
+        adapter.store().get_run(scope, &id("conformance-run")).await,
+        Err(StoreError::NotFound)
+    ) {
+        return Err(failure(44, "rejected run creation left a run row"));
+    }
+    Ok(())
+}
+
+/// Builds run limits differing only in the two section 1.4 value ceilings.
+fn terminal_output_limits(inline_bytes: u64, aggregate_bytes: u64) -> RunLimits {
+    RunLimits {
+        max_dynamic_node_instances: 10,
+        max_total_attempts: 10,
+        max_total_events: 1_000,
+        max_inline_json_bytes_per_value: inline_bytes,
+        max_artifacts_per_attempt: 10,
+        max_aggregate_object_bytes_per_run: aggregate_bytes,
+        max_run_lifetime_ms: 100_000,
+    }
+}
+
+/// Drives one run to a `Ready` Succeed node under caller-chosen limits.
+///
+/// Everything the Succeed resolution validates first is held identical across the
+/// terminal-output fixtures, so the only thing that differs between them is the
+/// output object handed to `resolve_terminal_node`.
+async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    limits: RunLimits,
+) -> Result<(EnginePermit, Version, WorkflowRun), ConformanceFailure> {
+    let claim = adapter
+        .store()
+        .acquire_engine_claim(scope, id("engine-a"))
+        .await
+        .map_err(|_| failure(case, "engine claim failed"))?;
+    let schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "conformance".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "principal construction failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("conformance-definition"),
+                display_name: "conformance".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "definition creation failed"))?;
+    let (canonical, outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &schema).await?;
+    outcome.map_err(|_| failure(case, "revision publication failed"))?;
+    let input = adapter
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "run input publication failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: id("conformance-run"),
+                definition_id: id("conformance-definition"),
+                revision_hash: canonical.digest().clone(),
+                input: input.clone(),
+                budget_limit: CostUnits(10),
+                limits,
+                principal,
+                idempotency_token: "terminal-output-token".to_owned(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "run creation failed"))?;
+    adapter
+        .store()
+        .start_run(
+            scope,
+            StartRun {
+                permit: claim.permit.clone(),
+                run_id: id("conformance-run"),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: schema.digest().clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "run start failed"))?;
+    let node = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("action"))
+        .await
+        .map_err(|_| failure(case, "entry node read failed"))?;
+    let claimed = adapter
+        .store()
+        .claim_node_attempt(
+            scope,
+            ClaimNodeAttempt {
+                permit: claim.permit.clone(),
+                run_id: id("conformance-run"),
+                node_id: id("action"),
+                expected_node_version: node.version,
+                attempt_id: id("attempt"),
+                worker_id: id("worker"),
+                bound_input: input.clone(),
+                binding_derivation_digest: schema.digest().clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "attempt claim failed"))?;
+    let credential = match claimed {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => return Err(failure(case, "claim did not create an attempt")),
+    };
+    let action_output = adapter
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "action output publication failed"))?;
+    adapter
+        .store()
+        .complete_attempt(
+            scope,
+            CompleteAttempt {
+                completion_credential: credential,
+                run_id: id("conformance-run"),
+                node_id: id("action"),
+                attempt_id: id("attempt"),
+                submitted_outcome: ActionOutcome::success(
+                    json!({"value": 1}),
+                    Vec::new(),
+                    CostUnits(1),
+                    None,
+                )
+                .map_err(|_| failure(case, "completion outcome invalid"))?,
+                objects: CompletionObjects {
+                    output: Some(action_output),
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "attempt completion failed"))?;
+    let terminal = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("succeed"))
+        .await
+        .map_err(|_| failure(case, "terminal node read failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(case, "prepared run read failed"))?
+        .run;
+    Ok((claim.permit, terminal.version, run))
+}
+
+/// Offers `output` to the prepared Succeed node and returns the command outcome.
+async fn offer_terminal_output<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    permit: EnginePermit,
+    node_version: Version,
+    output: VerifiedObjectRef,
+) -> Result<WorkflowRun, StoreError> {
+    adapter
+        .store()
+        .resolve_terminal_node(
+            scope,
+            ResolveTerminalNode {
+                permit,
+                run_id: id("conformance-run"),
+                node_id: id("succeed"),
+                expected_node_version: node_version,
+                output: Some(output),
+            },
+        )
+        .await
+}
+
+/// Asserts the N46 plus R08 pair committed nothing the contract forbids.
+///
+/// N46's postcondition is "no attempt/reservation" and section 1.4 charges only
+/// committed values, so a rejected Succeed output must leave the node
+/// non-terminal-successful with no result ref, the run without an `output_ref`,
+/// and the aggregate counter exactly where preparation left it.
+async fn assert_terminal_contract_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    expected_kind: NodeFailureKind,
+    aggregate_before: u64,
+) -> Result<(), ConformanceFailure> {
+    let node = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("succeed"))
+        .await
+        .map_err(|_| failure(case, "terminal node read failed"))?;
+    if node.status != NodeState::ContractFailed {
+        return Err(failure(case, "Succeed node did not reach ContractFailed"));
+    }
+    if node.failure_kind != Some(expected_kind) {
+        return Err(failure(
+            case,
+            "Succeed node recorded the wrong failure kind",
+        ));
+    }
+    if node.result_ref.is_some() {
+        return Err(failure(case, "rejected Succeed output registered a ref"));
+    }
+    let run = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(case, "contract-failed run read failed"))?
+        .run;
+    if run.status != RunState::ContractFailed {
+        return Err(failure(case, "run did not reach ContractFailed"));
+    }
+    if run.output_ref.is_some() {
+        return Err(failure(
+            case,
+            "rejected Succeed output was bound to the run",
+        ));
+    }
+    if run.aggregate_object_bytes != aggregate_before {
+        return Err(failure(case, "rejected Succeed output charged run bytes"));
+    }
+    Ok(())
+}
+
+/// A Succeed output violating the pinned root output schema is rejected.
+///
+/// Contract section 5.3 makes "unique Succeed output validates pinned root output
+/// schema/limit" a precondition and N16 repeats it, so a store that commits the
+/// value unvalidated publishes a run output its own revision forbids.
+async fn succeed_output_schema_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (permit, node_version, run) = prepare_terminal_output_conformance(
+        adapter,
+        scope,
+        45,
+        terminal_output_limits(10_000, 100_000),
+    )
+    .await?;
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":"one"}"#, "application/json")
+        .await
+        .map_err(|_| failure(45, "violating output publication failed"))?;
+    let resolved = offer_terminal_output(adapter, scope, permit, node_version, output)
+        .await
+        .map_err(|_| {
+            failure(
+                45,
+                "terminal resolution errored instead of failing the contract",
+            )
+        })?;
+    if resolved.status != RunState::ContractFailed {
+        return Err(failure(45, "off-schema Succeed output was committed"));
+    }
+    assert_terminal_contract_failure(
+        adapter,
+        scope,
+        45,
+        NodeFailureKind::RunOutputSchemaMismatch,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// A Succeed output over `max_inline_json_bytes_per_value` is rejected.
+///
+/// Section 1.4 applies the value ceiling "before binding, invocation,
+/// event-inline value, or output commit"; the Succeed output is an output commit.
+async fn succeed_output_inline_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (permit, node_version, run) = prepare_terminal_output_conformance(
+        adapter,
+        scope,
+        46,
+        terminal_output_limits(20, 100_000),
+    )
+    .await?;
+    // Twenty-one bytes: schema-valid, exactly one byte over the ceiling.
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":12345678901}"#, "application/json")
+        .await
+        .map_err(|_| failure(46, "oversized output publication failed"))?;
+    let resolved = offer_terminal_output(adapter, scope, permit, node_version, output)
+        .await
+        .map_err(|_| {
+            failure(
+                46,
+                "terminal resolution errored instead of failing the contract",
+            )
+        })?;
+    if resolved.status != RunState::ContractFailed {
+        return Err(failure(46, "oversized Succeed output was committed"));
+    }
+    assert_terminal_contract_failure(
+        adapter,
+        scope,
+        46,
+        NodeFailureKind::InlineJsonLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// A Succeed output exactly at `max_inline_json_bytes_per_value` is committed.
+///
+/// Section 1.4 states the ceiling as an inclusive maximum, so pinning the
+/// accepting side of the boundary keeps the rejection above from being satisfied
+/// by any over-strict check.
+async fn succeed_output_inline_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (permit, node_version, run) = prepare_terminal_output_conformance(
+        adapter,
+        scope,
+        47,
+        terminal_output_limits(20, 100_000),
+    )
+    .await?;
+    // Exactly twenty bytes.
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":1234567890}"#, "application/json")
+        .await
+        .map_err(|_| failure(47, "boundary output publication failed"))?;
+    let size = output.size_bytes();
+    offer_terminal_output(adapter, scope, permit, node_version, output)
+        .await
+        .map_err(|_| failure(47, "boundary Succeed output was rejected"))?;
+    let settled = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(47, "settled run read failed"))?
+        .run;
+    if settled.status != RunState::Succeeded || settled.output_ref.is_none() {
+        return Err(failure(
+            47,
+            "boundary Succeed output did not finish the run",
+        ));
+    }
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size {
+        return Err(failure(47, "committed Succeed output was not charged"));
+    }
+    Ok(())
+}
+
+/// A Succeed output past `max_aggregate_object_bytes_per_run` is rejected.
+///
+/// Section 1.4 lists "Map/Succeed outputs" as charged run data, so the last value
+/// a run commits is bound by the same aggregate ceiling as every earlier one. The
+/// ceiling is calibrated from a throwaway run rather than hardcoded so the case
+/// pins the contract rather than an accounting implementation detail.
+async fn succeed_output_aggregate_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, _, calibration) = prepare_terminal_output_conformance(
+        adapter,
+        scope,
+        48,
+        terminal_output_limits(10_000, 100_000),
+    )
+    .await?;
+    // Eleven bytes of Succeed output, with room for exactly ten of them.
+    let ceiling = calibration.aggregate_object_bytes + 10;
+    let tight = adapter.fresh();
+    let (permit, node_version, run) = prepare_terminal_output_conformance(
+        &tight,
+        scope,
+        48,
+        terminal_output_limits(10_000, ceiling),
+    )
+    .await?;
+    let output = tight
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(48, "output publication failed"))?;
+    let resolved = offer_terminal_output(&tight, scope, permit, node_version, output)
+        .await
+        .map_err(|_| {
+            failure(
+                48,
+                "terminal resolution errored instead of failing the contract",
+            )
+        })?;
+    if resolved.status != RunState::ContractFailed {
+        return Err(failure(48, "over-ceiling Succeed output was committed"));
+    }
+    assert_terminal_contract_failure(
+        &tight,
+        scope,
+        48,
+        NodeFailureKind::AggregateObjectLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// A Succeed output landing exactly on the aggregate ceiling is committed.
+async fn succeed_output_aggregate_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, _, calibration) = prepare_terminal_output_conformance(
+        adapter,
+        scope,
+        49,
+        terminal_output_limits(10_000, 100_000),
+    )
+    .await?;
+    let ceiling = calibration.aggregate_object_bytes + 11;
+    let exact = adapter.fresh();
+    let (permit, node_version, run) = prepare_terminal_output_conformance(
+        &exact,
+        scope,
+        49,
+        terminal_output_limits(10_000, ceiling),
+    )
+    .await?;
+    let output = exact
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(49, "output publication failed"))?;
+    let size = output.size_bytes();
+    offer_terminal_output(&exact, scope, permit, node_version, output)
+        .await
+        .map_err(|_| failure(49, "boundary Succeed output was rejected"))?;
+    let settled = exact
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(49, "settled run read failed"))?
+        .run;
+    if settled.status != RunState::Succeeded || settled.output_ref.is_none() {
+        return Err(failure(
+            49,
+            "boundary Succeed output did not finish the run",
+        ));
+    }
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size
+        || settled.aggregate_object_bytes != ceiling
+    {
+        return Err(failure(49, "committed Succeed output was not charged"));
+    }
+    Ok(())
+}
+
+/// Canonical single-child Map aggregate: the JCS array of the one child output.
+const MAP_AGGREGATE_BYTES: &[u8] = br#"[{"item":0}]"#;
+
+/// Drives one single-item Map to `WaitingChildren` with its only child Succeeded.
+///
+/// Everything `complete_map` validates ahead of the section 1.4 ceilings (fence,
+/// CAS, child completeness, identity recomputation, canonical form, per-child
+/// digest equality) is held identical across the aggregate fixtures, so the only
+/// thing that differs between them is the run's limits.
+async fn prepare_map_aggregate_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    limits: RunLimits,
+) -> Result<(EnginePermit, Version, WorkflowRun), ConformanceFailure> {
+    let fixture = prepare_map_conformance_with_limits(
+        adapter,
+        scope,
+        case,
+        1,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+        limits,
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "aggregate Map expansion failed"))?;
+    let child_id = fixture.ordered_items[0].child_id.clone();
+    let child = adapter
+        .store()
+        .get_node(scope, &run_id, &child_id)
+        .await
+        .map_err(|_| failure(case, "aggregate Map child read failed"))?;
+    let claimed = adapter
+        .store()
+        .claim_node_attempt(
+            scope,
+            ClaimNodeAttempt {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                node_id: child_id.clone(),
+                expected_node_version: child.version,
+                attempt_id: id("map-aggregate-attempt"),
+                worker_id: id("worker"),
+                bound_input: fixture.input.clone(),
+                binding_derivation_digest: fixture.input.digest().clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "aggregate Map child claim failed"))?;
+    let credential = match claimed {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => return Err(failure(case, "aggregate Map child was not claimed")),
+    };
+    let child_output = adapter
+        .objects()
+        .put(scope, br#"{"item":0}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "aggregate Map child output publication failed"))?;
+    adapter
+        .store()
+        .complete_attempt(
+            scope,
+            CompleteAttempt {
+                completion_credential: credential,
+                run_id: run_id.clone(),
+                node_id: child_id,
+                attempt_id: id("map-aggregate-attempt"),
+                submitted_outcome: ActionOutcome::success(
+                    json!({"item": 0}),
+                    Vec::new(),
+                    CostUnits(1),
+                    None,
+                )
+                .map_err(|_| failure(case, "aggregate Map child outcome invalid"))?,
+                objects: CompletionObjects {
+                    output: Some(child_output),
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "aggregate Map child completion failed"))?;
+    let map = adapter
+        .store()
+        .get_node(scope, &run_id, &id("map"))
+        .await
+        .map_err(|_| failure(case, "aggregate Map parent read failed"))?;
+    if map.status != NodeState::WaitingChildren {
+        return Err(failure(case, "aggregate Map parent is not WaitingChildren"));
+    }
+    let run = adapter
+        .store()
+        .get_run(scope, &run_id)
+        .await
+        .map_err(|_| failure(case, "aggregate Map run read failed"))?
+        .run;
+    Ok((fixture.permit, map.version, run))
+}
+
+/// Offers `aggregate` to the prepared Map node and returns the command outcome.
+async fn offer_map_aggregate<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    permit: EnginePermit,
+    node_version: Version,
+    aggregate: VerifiedObjectRef,
+) -> Result<NodeRun, StoreError> {
+    adapter
+        .store()
+        .complete_map(
+            scope,
+            CompleteMap {
+                permit,
+                run_id: id(&format!("map-run-{case}")),
+                map_node_id: id("map"),
+                expected_node_version: node_version,
+                aggregate,
+            },
+        )
+        .await
+}
+
+/// Asserts the N65 plus R08 pair committed nothing the contract forbids.
+///
+/// N65's postcondition is "do not register aggregate ref; R08 with
+/// `AggregateObjectLimitExceeded` or output contract kind; cancel children", and
+/// section 1.4 charges only committed values, so a rejected aggregate must leave
+/// the Map node without a result ref, the run `ContractFailed` with the cascade
+/// run, and the aggregate counter exactly where preparation left it.
+async fn assert_map_contract_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    expected_kind: NodeFailureKind,
+    aggregate_before: u64,
+) -> Result<(), ConformanceFailure> {
+    let run_id = id(&format!("map-run-{case}"));
+    let map = adapter
+        .store()
+        .get_node(scope, &run_id, &id("map"))
+        .await
+        .map_err(|_| failure(case, "contract-failed Map node read failed"))?;
+    if map.status != NodeState::ContractFailed {
+        return Err(failure(case, "Map node did not reach ContractFailed"));
+    }
+    if map.failure_kind != Some(expected_kind) {
+        return Err(failure(case, "Map node recorded the wrong failure kind"));
+    }
+    if map.result_ref.is_some() {
+        return Err(failure(case, "rejected Map aggregate registered a ref"));
+    }
+    // The cancellation half of N65: the only children a rejected aggregate can
+    // have are already Succeeded (complete_map refuses otherwise), so what the
+    // cascade must prove here is that it left no node of the run runnable.
+    let nodes = adapter
+        .store()
+        .list_nodes(
+            scope,
+            &run_id,
+            PageRequest {
+                cursor: None,
+                page_size: 100,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "contract-failed Map nodes read failed"))?
+        .items;
+    if nodes.iter().any(|node| {
+        matches!(
+            node.status,
+            NodeState::Pending
+                | NodeState::Ready
+                | NodeState::Running
+                | NodeState::RetryWaiting
+                | NodeState::BudgetWaiting
+                | NodeState::WaitingApproval
+                | NodeState::WaitingChildren
+                | NodeState::BlockedIncompatible
+        )
+    }) {
+        return Err(failure(case, "rejected Map aggregate left a live node"));
+    }
+    let run = adapter
+        .store()
+        .get_run(scope, &run_id)
+        .await
+        .map_err(|_| failure(case, "contract-failed Map run read failed"))?
+        .run;
+    if run.status != RunState::ContractFailed {
+        return Err(failure(case, "run did not reach ContractFailed"));
+    }
+    if run.aggregate_object_bytes != aggregate_before {
+        return Err(failure(case, "rejected Map aggregate charged run bytes"));
+    }
+    Ok(())
+}
+
+/// A Map aggregate over `max_inline_json_bytes_per_value` is rejected.
+///
+/// Section 1.4 applies the value ceiling "before binding, invocation,
+/// event-inline value, or output commit"; the aggregate is an output commit, and
+/// N65 names the output contract kind as one of its two failure kinds.
+async fn map_aggregate_inline_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let aggregate = adapter
+        .objects()
+        .put(scope, MAP_AGGREGATE_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(50, "aggregate publication failed"))?;
+    // One byte under the aggregate: still above every earlier value this run
+    // commits, so only the aggregate can trip the ceiling.
+    let inline = aggregate.size_bytes() - 1;
+    let (permit, node_version, run) = prepare_map_aggregate_conformance(
+        adapter,
+        scope,
+        50,
+        terminal_output_limits(inline, 100_000),
+    )
+    .await?;
+    let node = offer_map_aggregate(adapter, scope, 50, permit, node_version, aggregate)
+        .await
+        .map_err(|_| failure(50, "Map completion errored instead of failing the contract"))?;
+    if node.status != NodeState::ContractFailed {
+        return Err(failure(50, "oversized Map aggregate was committed"));
+    }
+    assert_map_contract_failure(
+        adapter,
+        scope,
+        50,
+        NodeFailureKind::InlineJsonLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// A Map aggregate exactly at `max_inline_json_bytes_per_value` is committed.
+///
+/// Section 1.4 states the ceiling as an inclusive maximum, so pinning the
+/// accepting side keeps the rejection above from being satisfied by an
+/// over-strict check.
+async fn map_aggregate_inline_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let aggregate = adapter
+        .objects()
+        .put(scope, MAP_AGGREGATE_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(51, "aggregate publication failed"))?;
+    let size = aggregate.size_bytes();
+    let (permit, node_version, run) = prepare_map_aggregate_conformance(
+        adapter,
+        scope,
+        51,
+        terminal_output_limits(size, 100_000),
+    )
+    .await?;
+    let node = offer_map_aggregate(adapter, scope, 51, permit, node_version, aggregate)
+        .await
+        .map_err(|_| failure(51, "boundary Map aggregate was rejected"))?;
+    if node.status != NodeState::Succeeded || node.result_ref.is_none() {
+        return Err(failure(51, "boundary Map aggregate did not succeed"));
+    }
+    let settled = adapter
+        .store()
+        .get_run(scope, &id("map-run-51"))
+        .await
+        .map_err(|_| failure(51, "settled run read failed"))?
+        .run;
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size {
+        return Err(failure(51, "committed Map aggregate was not charged"));
+    }
+    Ok(())
+}
+
+/// A Map aggregate past `max_aggregate_object_bytes_per_run` is rejected.
+///
+/// Section 1.4 lists Map outputs as charged run data and N65 names
+/// `AggregateObjectLimitExceeded` explicitly. The ceiling is calibrated from a
+/// throwaway run rather than hardcoded so the case pins the contract rather than
+/// an accounting implementation detail.
+async fn map_aggregate_object_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, _, calibration) = prepare_map_aggregate_conformance(
+        adapter,
+        scope,
+        52,
+        terminal_output_limits(10_000, 1_000_000),
+    )
+    .await?;
+    let tight = adapter.fresh();
+    let aggregate = tight
+        .objects()
+        .put(scope, MAP_AGGREGATE_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(52, "aggregate publication failed"))?;
+    // Room for everything the identical run already charged, minus one byte of
+    // the aggregate itself.
+    let ceiling = calibration.aggregate_object_bytes + aggregate.size_bytes() - 1;
+    let (permit, node_version, run) = prepare_map_aggregate_conformance(
+        &tight,
+        scope,
+        52,
+        terminal_output_limits(10_000, ceiling),
+    )
+    .await?;
+    let node = offer_map_aggregate(&tight, scope, 52, permit, node_version, aggregate)
+        .await
+        .map_err(|_| failure(52, "Map completion errored instead of failing the contract"))?;
+    if node.status != NodeState::ContractFailed {
+        return Err(failure(52, "over-ceiling Map aggregate was committed"));
+    }
+    assert_map_contract_failure(
+        &tight,
+        scope,
+        52,
+        NodeFailureKind::AggregateObjectLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// A Map aggregate landing exactly on the aggregate ceiling is committed.
+async fn map_aggregate_object_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, _, calibration) = prepare_map_aggregate_conformance(
+        adapter,
+        scope,
+        53,
+        terminal_output_limits(10_000, 1_000_000),
+    )
+    .await?;
+    let exact = adapter.fresh();
+    let aggregate = exact
+        .objects()
+        .put(scope, MAP_AGGREGATE_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(53, "aggregate publication failed"))?;
+    let size = aggregate.size_bytes();
+    let ceiling = calibration.aggregate_object_bytes + size;
+    let (permit, node_version, run) = prepare_map_aggregate_conformance(
+        &exact,
+        scope,
+        53,
+        terminal_output_limits(10_000, ceiling),
+    )
+    .await?;
+    let node = offer_map_aggregate(&exact, scope, 53, permit, node_version, aggregate)
+        .await
+        .map_err(|_| failure(53, "boundary Map aggregate was rejected"))?;
+    if node.status != NodeState::Succeeded || node.result_ref.is_none() {
+        return Err(failure(53, "boundary Map aggregate did not succeed"));
+    }
+    let settled = exact
+        .store()
+        .get_run(scope, &id("map-run-53"))
+        .await
+        .map_err(|_| failure(53, "settled run read failed"))?
+        .run;
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size
+        || settled.aggregate_object_bytes != ceiling
+    {
+        return Err(failure(53, "committed Map aggregate was not charged"));
+    }
+    Ok(())
+}
+
 /// One independently executed conformance result.
 #[derive(Debug)]
 pub struct ConformanceCaseResult {
@@ -2074,6 +3199,46 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "corrupt_pinned_revision_ref_accepted",
         corrupt_pinned_revision_ref_accepted
+    );
+    run_fixture!(
+        "pinned_root_schema_subset_enforced",
+        pinned_root_schema_subset_enforced
+    );
+    run_fixture!(
+        "succeed_output_schema_enforced",
+        succeed_output_schema_enforced
+    );
+    run_fixture!(
+        "succeed_output_inline_limit_enforced",
+        succeed_output_inline_limit_enforced
+    );
+    run_fixture!(
+        "succeed_output_inline_limit_boundary_accepted",
+        succeed_output_inline_limit_boundary_accepted
+    );
+    run_fixture!(
+        "succeed_output_aggregate_limit_enforced",
+        succeed_output_aggregate_limit_enforced
+    );
+    run_fixture!(
+        "succeed_output_aggregate_limit_boundary_accepted",
+        succeed_output_aggregate_limit_boundary_accepted
+    );
+    run_fixture!(
+        "map_aggregate_inline_limit_enforced",
+        map_aggregate_inline_limit_enforced
+    );
+    run_fixture!(
+        "map_aggregate_inline_limit_boundary_accepted",
+        map_aggregate_inline_limit_boundary_accepted
+    );
+    run_fixture!(
+        "map_aggregate_object_limit_enforced",
+        map_aggregate_object_limit_enforced
+    );
+    run_fixture!(
+        "map_aggregate_object_limit_boundary_accepted",
+        map_aggregate_object_limit_boundary_accepted
     );
     results
 }

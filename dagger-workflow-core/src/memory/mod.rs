@@ -886,6 +886,296 @@ pub(crate) fn retry_at(
     checked_add_time(now, delay)
 }
 
+/// Validates one host-supplied SchemaDocument against the supported subset.
+///
+/// Contract section 14.3 fixes the accepted keyword set, and the closing rule of
+/// section 14 requires the same subset validator at publication and at run
+/// creation. The oracle owns the semantics the durable adapter is certified
+/// against, so it must reject exactly what section 14.3 forbids rather than
+/// accepting any well-formed JSON object as a schema.
+fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| StoreError::SchemaSubsetUnsupported)?;
+    if serde_jcs::to_vec(&value).map_err(|_| StoreError::SchemaSubsetUnsupported)? != bytes {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let root = value
+        .as_object()
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    if let Some(schema_uri) = root.get("$schema") {
+        if schema_uri.as_str() != Some("https://json-schema.org/draft/2020-12/schema") {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    }
+    let definitions = match root.get("$defs") {
+        Some(value) => value
+            .as_object()
+            .cloned()
+            .ok_or(StoreError::SchemaSubsetUnsupported)?,
+        None => serde_json::Map::new(),
+    };
+    validate_schema_node(&value, true, 0, &definitions, &mut BTreeSet::new())?;
+    Ok(value)
+}
+
+fn validate_schema_node(
+    schema: &Value,
+    root: bool,
+    depth: usize,
+    definitions: &serde_json::Map<String, Value>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<(), StoreError> {
+    if depth > 64 {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    let object = schema
+        .as_object()
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    const ALLOWED: &[&str] = &[
+        "$schema",
+        "$defs",
+        "$ref",
+        "type",
+        "const",
+        "enum",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minimum",
+        "maximum",
+    ];
+    if object
+        .keys()
+        .any(|keyword| !ALLOWED.contains(&keyword.as_str()))
+        || (!root && (object.contains_key("$schema") || object.contains_key("$defs")))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if let Some(reference) = object.get("$ref") {
+        if object.len() != 1 {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let encoded_name = reference
+            .as_str()
+            .and_then(|value| value.strip_prefix("#/$defs/"))
+            .filter(|value| !value.contains('/'))
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        let name = encoded_name.replace("~1", "/").replace("~0", "~");
+        let target = definitions
+            .get(&name)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        // A repeated name on the current path is the reference cycle section 14.3
+        // forbids; the acyclic check is what makes `schema_accepts` terminate.
+        if !visiting.insert(name.clone()) {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let result = validate_schema_node(target, false, depth + 1, definitions, visiting);
+        visiting.remove(&name);
+        return result;
+    }
+    let schema_type = object
+        .get("type")
+        .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    let mut types = BTreeSet::new();
+    match schema_type {
+        Value::String(name) if valid_schema_type(name) => {
+            types.insert(name.as_str());
+        }
+        Value::Array(names) if !names.is_empty() => {
+            for name in names {
+                let name = name.as_str().ok_or(StoreError::SchemaSubsetUnsupported)?;
+                if !valid_schema_type(name) || !types.insert(name) {
+                    return Err(StoreError::SchemaSubsetUnsupported);
+                }
+            }
+        }
+        _ => return Err(StoreError::SchemaSubsetUnsupported),
+    }
+    if let Some(defs) = object.get("$defs") {
+        for child in defs
+            .as_object()
+            .ok_or(StoreError::SchemaSubsetUnsupported)?
+            .values()
+        {
+            validate_schema_node(child, false, depth + 1, definitions, visiting)?;
+        }
+    }
+    if let Some(values) = object.get("enum") {
+        let values = values
+            .as_array()
+            .filter(|values| values.len() <= 256)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        let mut canonical = BTreeSet::new();
+        for value in values {
+            if !canonical
+                .insert(serde_jcs::to_vec(value).map_err(|_| StoreError::SchemaSubsetUnsupported)?)
+            {
+                return Err(StoreError::SchemaSubsetUnsupported);
+            }
+        }
+    }
+    if types.contains("object") {
+        // Section 14.3 requires a closed field set on every object schema.
+        if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+        let empty_properties = serde_json::Map::new();
+        let properties = object
+            .get("properties")
+            .map(Value::as_object)
+            .unwrap_or(Some(&empty_properties))
+            .filter(|properties| properties.len() <= 1024)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        for child in properties.values() {
+            validate_schema_node(child, false, depth + 1, definitions, visiting)?;
+        }
+        if let Some(required) = object.get("required") {
+            let mut names = BTreeSet::new();
+            for name in required
+                .as_array()
+                .ok_or(StoreError::SchemaSubsetUnsupported)?
+            {
+                let name = name.as_str().ok_or(StoreError::SchemaSubsetUnsupported)?;
+                if !properties.contains_key(name) || !names.insert(name) {
+                    return Err(StoreError::SchemaSubsetUnsupported);
+                }
+            }
+        }
+    } else if object.contains_key("properties")
+        || object.contains_key("required")
+        || object.contains_key("additionalProperties")
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if types.contains("array") {
+        validate_schema_node(
+            object
+                .get("items")
+                .ok_or(StoreError::SchemaSubsetUnsupported)?,
+            false,
+            depth + 1,
+            definitions,
+            visiting,
+        )?;
+        let min = safe_schema_integer(object.get("minItems"))?;
+        let max = safe_schema_integer(object.get("maxItems"))?;
+        if min.zip(max).is_some_and(|(min, max)| min > max)
+            || object
+                .get("uniqueItems")
+                .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    } else if ["items", "minItems", "maxItems", "uniqueItems"]
+        .iter()
+        .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if safe_schema_integer(object.get("minLength"))?
+        .zip(safe_schema_integer(object.get("maxLength"))?)
+        .is_some_and(|(min, max)| min > max)
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if !types.contains("string")
+        && ["minLength", "maxLength", "pattern"]
+            .iter()
+            .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if let Some(pattern) = object.get("pattern") {
+        let pattern = pattern
+            .as_str()
+            .filter(|pattern| pattern.len() <= 1024)
+            .ok_or(StoreError::SchemaSubsetUnsupported)?;
+        // Section 14.3 bans look-around and backreferences outright; the balance
+        // check rejects the syntactically impossible before any engine sees it.
+        if pattern.contains("(?")
+            || pattern
+                .as_bytes()
+                .windows(2)
+                .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_digit())
+            || !pattern_is_syntactically_balanced(pattern)
+        {
+            return Err(StoreError::SchemaSubsetUnsupported);
+        }
+    }
+    if !types.contains("number")
+        && !types.contains("integer")
+        && ["minimum", "maximum"]
+            .iter()
+            .any(|keyword| object.contains_key(*keyword))
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if finite_schema_number(object.get("minimum"))?
+        .zip(finite_schema_number(object.get("maximum"))?)
+        .is_some_and(|(minimum, maximum)| minimum > maximum)
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    Ok(())
+}
+
+fn pattern_is_syntactically_balanced(pattern: &str) -> bool {
+    let mut stack = Vec::new();
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        match character {
+            '[' | '(' | '{' => stack.push(character),
+            ']' if stack.pop() != Some('[') => return false,
+            ')' if stack.pop() != Some('(') => return false,
+            '}' if stack.pop() != Some('{') => return false,
+            _ => {}
+        }
+    }
+    !escaped && stack.is_empty()
+}
+
+fn valid_schema_type(name: &str) -> bool {
+    matches!(
+        name,
+        "null" | "boolean" | "object" | "array" | "number" | "integer" | "string"
+    )
+}
+
+fn safe_schema_integer(value: Option<&Value>) -> Result<Option<u64>, StoreError> {
+    value
+        .map(|value| value.as_u64().ok_or(StoreError::SchemaSubsetUnsupported))
+        .transpose()
+}
+
+fn finite_schema_number(value: Option<&Value>) -> Result<Option<f64>, StoreError> {
+    value
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or(StoreError::SchemaSubsetUnsupported)
+        })
+        .transpose()
+}
+
 fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
     if schema.as_object().is_some_and(serde_json::Map::is_empty) {
         return true;
@@ -2365,6 +2655,72 @@ fn apply_map_contract_failure(
     Ok(node)
 }
 
+/// N46 (`Ready` -> `ContractFailed`, `NodeContractFailed`) paired with R08
+/// (`Running` -> `ContractFailed`, `RunContractFailed`) for a terminal Succeed
+/// node whose output fails a section 1.4 ceiling or the section 5.3 pinned root
+/// output schema. N46's postcondition is "no attempt/reservation", so callers
+/// must reach here before registering any artifact ref, before marking the node
+/// `Succeeded`, and before charging aggregate bytes.
+fn apply_terminal_contract_failure(
+    state: &mut MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    node_id: &NodeInstanceId,
+    failure_kind: NodeFailureKind,
+    now: Timestamp,
+    actor_id: String,
+) -> Result<WorkflowRun, StoreError> {
+    let key = (scope.clone(), run_id.clone(), node_id.clone());
+    let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+    node.status = NodeState::ContractFailed;
+    node.failure_kind = Some(failure_kind);
+    set_node_mutated(&mut node, now)?;
+    state.nodes.insert(key, node);
+    let run_kind = run_failure(failure_kind);
+    let mut specs = vec![event_spec(
+        "N46",
+        Some(node_id),
+        None,
+        None,
+        event_payload::node_contract_failed(
+            &(Option::<&Id>::None),
+            &(failure_kind),
+            &(Option::<&Digest>::None),
+        ),
+    )];
+    let run = terminalize_run(
+        state,
+        scope,
+        run_id,
+        RunState::ContractFailed,
+        Some(run_kind),
+        "ContractFailed",
+        now,
+        &mut specs,
+    )?;
+    specs.push(event_spec(
+        "R08",
+        None,
+        None,
+        None,
+        event_payload::run_contract_failed(&(run_kind), &(Option::<&Digest>::None)),
+    ));
+    append_batch(
+        state,
+        scope,
+        run_id,
+        now,
+        EventActorKind::Engine,
+        actor_id,
+        specs,
+    )?;
+    Ok(state
+        .runs
+        .get(&(scope.clone(), run_id.clone()))
+        .cloned()
+        .unwrap_or(run))
+}
+
 #[derive(Deserialize, Serialize)]
 struct MemoryCursor {
     scope: ExecutionScope,
@@ -2507,6 +2863,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             if command.parsed_revision.definition.definition_id != command.definition_id {
                 return Err(StoreError::RevisionDefinitionIdMismatch);
             }
+            // Section 5.2 requires every root and action schema ref to match both
+            // its digest and the supported subset before a revision exists. Without
+            // this the oracle would pin a schema the section 14 validator rejects,
+            // making every later binding and run-creation check unenforceable.
+            validate_schema_document(command.run_input_schema.verified_bytes())?;
+            validate_schema_document(command.run_output_schema.verified_bytes())?;
             let revision_hash = command.canonical_definition.digest().clone();
             if command.parsed_revision.definition.run_input_schema_digest
                 != *command.run_input_schema.digest()
@@ -2578,6 +2940,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 {
                     return Err(StoreError::DigestMismatch);
                 }
+                validate_schema_document(schemas.input_schema.verified_bytes())?;
+                validate_schema_document(schemas.output_schema.verified_bytes())?;
                 pins.push(ActionPin {
                     reference_location: pin.reference_location,
                     name: pin.name,
@@ -2838,13 +3202,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     revision.run_input_schema_ref.0.digest.clone(),
                 ))
                 .ok_or(StoreError::CorruptControlPlane)?;
-            let schema: Value = serde_json::from_slice(schema_bytes)
+            // Section 14 mandates the same subset validator at run creation as at
+            // publication. A pinned schema that no longer passes it cannot have been
+            // published by a conforming store, so it is control-plane corruption.
+            let schema = validate_schema_document(schema_bytes)
                 .map_err(|_| StoreError::CorruptControlPlane)?;
-            if !schema.is_object()
-                || serde_jcs::to_vec(&schema).ok().as_deref() != Some(schema_bytes.as_slice())
-            {
-                return Err(StoreError::CorruptControlPlane);
-            }
             let input: Value =
                 serde_json::from_slice(command.input.verified_bytes()).map_err(|_| {
                     StoreError::ContractValidation {
@@ -6212,6 +6574,78 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         .output
                         .as_ref()
                         .ok_or(StoreError::ObjectNotVerified)?;
+                    if output.media_type() != "application/json" {
+                        return Err(StoreError::InvalidField);
+                    }
+                    // Section 5.3 precondition and transition N16 both require the unique
+                    // Succeed output to validate the pinned root output schema and the
+                    // section 1.4 value limit before it is committed, and section 1.4
+                    // charges Succeed outputs against the run aggregate ceiling. All three
+                    // are checked before any mutation so a violation leaves no artifact
+                    // ref, a non-terminal node, and an uncharged aggregate counter.
+                    let run_key = (scope.clone(), command.run_id.clone());
+                    let run_snapshot = state
+                        .runs
+                        .get(&run_key)
+                        .cloned()
+                        .ok_or(StoreError::NotFound)?;
+                    let actor_id = command.permit.instance_id().as_str().to_owned();
+                    if output.size_bytes() > run_snapshot.limits.max_inline_json_bytes_per_value {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::InlineJsonLimitExceeded,
+                            now,
+                            actor_id,
+                        );
+                    }
+                    let aggregate_after = run_snapshot
+                        .aggregate_object_bytes
+                        .checked_add(output.size_bytes())
+                        .ok_or(StoreError::ArithmeticOverflow)?;
+                    if aggregate_after > run_snapshot.limits.max_aggregate_object_bytes_per_run {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::AggregateObjectLimitExceeded,
+                            now,
+                            actor_id,
+                        );
+                    }
+                    // The Succeed node is the run root, so the pinned schema is the
+                    // revision's root output schema, not an action pin.
+                    let revision = state
+                        .revisions
+                        .get(&(
+                            scope.clone(),
+                            run_snapshot.definition_id.clone(),
+                            run_snapshot.revision_hash.clone(),
+                        ))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let schema_digest = &revision.run_output_schema_ref.0.digest;
+                    let schema_bytes = state
+                        .verified_object_bytes
+                        .get(&(scope.clone(), schema_digest.clone()))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let schema: Value = serde_json::from_slice(schema_bytes)
+                        .map_err(|_| StoreError::CorruptControlPlane)?;
+                    let output_value: Value = serde_json::from_slice(output.verified_bytes())
+                        .map_err(|_| StoreError::InvalidField)?;
+                    if !schema_accepts(&schema, &schema, &output_value) {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::RunOutputSchemaMismatch,
+                            now,
+                            actor_id,
+                        );
+                    }
                     node.status = NodeState::Succeeded;
                     node.result_ref = Some(json_ref(
                         &mut state,
@@ -6258,6 +6692,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     run.status = RunState::Succeeded;
                     run.output_ref = result_ref;
                     run.finished_at = Some(now);
+                    // Section 1.4 counts Succeed outputs as charged run data; json_ref
+                    // does not charge, so the caller must.
+                    run.aggregate_object_bytes = aggregate_after;
                     set_run_mutated(run, now)?;
                     specs.push(event_spec(
                         "R06",

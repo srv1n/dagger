@@ -389,8 +389,9 @@ the fix is structural.
 
 ## E5. Suspected create_run parity divergence between the oracle and the SQLite adapter
 
-**Status:** open, unverified. Observed 2026-08-01 while adding corruption
-reachability fixtures.
+**Status:** CLOSED 2026-08-01. Suspicion refuted as stated; the underlying defect
+was real and sat one command earlier. See the resolution at the end of this
+section.
 
 The in-memory store is the semantic oracle for the SQLite adapter, and the
 conformance suite exists to hold them identical. While writing a new fixture, the
@@ -410,3 +411,79 @@ what it certifies.
 Next step is not a ruling. It is a fixture: submit a run input that violates the
 pinned root schema and assert both stacks reject it identically. Whichever stack
 is wrong then gets fixed against the contract, not against the other stack.
+
+### E5 resolution
+
+`create_run` does not diverge. Both stores validate run input against the pinned
+root schema with byte-identical logic (`memory/mod.rs:2860`,
+`sqlite/reducer.rs:2956`), and the two `schema_accepts` bodies are line-for-line
+identical.
+
+The divergence was in `publish_revision`. SQLite validated the root input/output
+SchemaDocuments and every action-pin schema against the supported subset
+(`sqlite/reducer.rs:2610-2611`, `:2682-2683`); memory validated none of them and
+would pin any well-formed JSON object as a schema. The observed
+`SchemaSubsetUnsupported` was therefore the right error from the right cause,
+attributed to the wrong call.
+
+Contract section 5.2 lists `SchemaSubsetUnsupported` among `publish_revision`'s
+preconditions, and section 14 requires the same subset validator at publication,
+binding validation, action output validation, run creation, and Succeed output
+validation. SQLite was conforming; the oracle was not. Memory now runs
+`validate_schema_document` at all three contract-mandated points.
+
+Covered by conformance case 44, `pinned_root_schema_subset_enforced`
+(`CASE_COUNT` 43 -> 44). Red-proven: removing the publish-time validation from
+memory fails the case with "out-of-subset root schema was published". The
+run-input half of the case was already green on both stacks and is a regression
+guard, not a bug reveal.
+
+**The lesson generalises past this instance.** The oracle was weaker than the
+implementation it certifies, which is the direction that makes parity claims
+worthless rather than merely noisy. A parity harness cannot detect a gap in a
+command no fixture exercises, so the absence of a failing conformance case is not
+evidence of parity. E6 is the same class of defect, found by looking rather than
+by testing.
+
+## E6. The oracle accepts unverified revision structure that SQLite re-derives
+
+**Status:** open, confirmed by source inspection 2026-08-01. Not yet fixed.
+
+`sqlite/reducer.rs:2603-2606` passes the caller's `parsed_revision` through
+`parse_canonical_revision` (`reducer.rs:382-433`) and uses the re-derived value
+thereafter. That helper enforces four properties:
+
+1. the canonical bytes are valid UTF-8 JSON parseable as a definition;
+2. the bytes are exactly `canonical_definition_json(parsed)`, i.e. genuinely RFC
+   8785 canonical;
+3. the caller-supplied typed definition canonicalizes to those same bytes;
+4. the caller-supplied `topological_ranks` equal `canonical_topological_ranks`
+   (lexical Kahn).
+
+`memory/mod.rs:2507` takes `command.parsed_revision.definition.definition_id` on
+faith and builds the revision from the supplied struct at `:2613-2634`. None of
+the four properties is checked. A host can therefore publish, against the oracle,
+a revision whose stored node ranks, entry node, and node set disagree with the
+canonical bytes its `revision_hash` is derived from.
+
+This is worse than a publication-hygiene gap. Section 1.5 makes the persisted
+rank the recovery-order key used in sections 3.4 and 4, so an unverified rank
+corrupts deterministic bulk recovery ordering -- the exact property W8's
+recovery fixtures and the W11 acceptance matrix are supposed to certify.
+
+Deliberately not fixed in the E5 pass. The fix flips memory's publish outcome
+from success to `RevisionInvalid` for any hand-built fixture whose typed
+definition does not canonicalize byte-exactly, and default expansion for the root
+`description` and Approval `on_expiry` fields is an easy trap. Every `w1`-`w7`
+engine fixture publishes against the memory store, so the change needs those test
+files in scope. Conformance fixtures are unaffected, since they already satisfy
+SQLite; the blast radius is memory-only tests.
+
+Scope evidence that this is the last gap of its kind: after the E5 fix, the two
+reducers differ by exactly two SQLite-only free functions,
+`parse_canonical_revision` and its `revision_invalid` helper. The `StoreError`
+variant multisets differ by `RevisionInvalid` 5-vs-0 (this gap), plus memory
+raising marginally more `NotFound` (52/51) and `InvalidField` (20/17) -- the safe
+direction, with the `InvalidField` surplus confined to memory's snapshot serde
+code, which SQLite has no counterpart for. Those three were not chased
+exhaustively.

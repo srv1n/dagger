@@ -884,8 +884,8 @@ fn validate_publication_bindings(
                 }
             } else if let Some(source) = source {
                 match binding_source_schema(definition, schemas, source) {
-                    Some(source_schema) if schemas_are_assignable(source_schema, target_schema) => {
-                    }
+                    Some(source_schema)
+                        if schemas_are_assignable(&source_schema, target_schema) => {}
                     _ => errors.push(error(
                         ValidationErrorKind::BindingTypeMismatch,
                         format!("/nodes/{}/bindings", node_id(node).as_str()),
@@ -900,14 +900,14 @@ fn validate_publication_bindings(
     }
 }
 
-fn binding_source_schema<'a>(
-    definition: &'a WorkflowDefinition,
-    schemas: &'a BTreeMap<Digest, Value>,
+fn binding_source_schema(
+    definition: &WorkflowDefinition,
+    schemas: &BTreeMap<Digest, Value>,
     source: &BindingSource,
-) -> Option<&'a Value> {
+) -> Option<Value> {
     match source {
         BindingSource::RunInput { pointer } => {
-            schema_at_pointer(schemas.get(&definition.run_input_schema_digest)?, pointer)
+            schema_at_pointer(schemas.get(&definition.run_input_schema_digest)?, pointer).cloned()
         }
         BindingSource::NodeOutput {
             node_id: source_node_id,
@@ -917,13 +917,31 @@ fn binding_source_schema<'a>(
                 .nodes
                 .iter()
                 .find(|candidate| node_id(candidate) == source_node_id)?;
-            let output_digest = match source_node {
-                NodeDefinition::Action { action, .. } | NodeDefinition::Map { action, .. } => {
-                    &action.output_schema_digest
+            let source_schema = match source_node {
+                NodeDefinition::Action { action, .. } => {
+                    schemas.get(&action.output_schema_digest)?.clone()
+                }
+                // A Map node's output is the ordered aggregate of its children
+                // (contract section 3.3 N08), not one child output. The pinned
+                // action schema describes a single child, so the schema a
+                // downstream binding must satisfy is that schema wrapped in an
+                // array. Resolving to the bare child schema made every
+                // Map-to-Action binding unsatisfiable: a correctly typed array
+                // target failed as BindingTypeMismatch, and dropping `type` from
+                // the target to dodge the check was then rejected by the schema
+                // subset validator, which requires `type` on every node.
+                NodeDefinition::Map { action, .. } => {
+                    let mut aggregate = serde_json::Map::new();
+                    aggregate.insert("type".to_string(), Value::String("array".to_string()));
+                    aggregate.insert(
+                        "items".to_string(),
+                        schemas.get(&action.output_schema_digest)?.clone(),
+                    );
+                    Value::Object(aggregate)
                 }
                 _ => return None,
             };
-            schema_at_pointer(schemas.get(output_digest)?, pointer)
+            schema_at_pointer(&source_schema, pointer).cloned()
         }
         BindingSource::Constant { .. } | BindingSource::ArtifactRef { .. } => None,
     }

@@ -548,7 +548,19 @@ mod durable {
         let StoreError::CommittedObjectCorrupt { bad_ref, proof } = error else {
             panic!("object corruption is CommittedObjectCorrupt and nothing else: {error:?}");
         };
-        assert_eq!(bad_ref, revision.run_input_schema_ref.0);
+        // Both root schema refs carry the same bytes in this fixture, so hydration
+        // has two equally valid typed uses of the armed digest and which one it
+        // reaches first is incidental ordering, not a property. This case owns the
+        // first-proof and no-run-created guarantees; discriminating which typed use
+        // gets named belongs to hydration_names_the_typed_use_whose_read_actually_failed.
+        assert!(
+            [
+                &revision.run_input_schema_ref.0,
+                &revision.run_output_schema_ref.0,
+            ]
+            .contains(&&bad_ref),
+            "the named ref must be a pinned root schema use: {bad_ref:?}"
+        );
         assert_eq!(proof.error_class(), FailedReadClass::DigestInvalid);
         // One read: the proof that arrived is the one the failure minted, not a
         // proof recovered by reading again.

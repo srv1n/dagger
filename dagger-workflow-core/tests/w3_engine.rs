@@ -67,6 +67,39 @@ fn hash(bytes: &[u8]) -> Digest {
     .unwrap()
 }
 
+/// The fixture schema every w3 definition pins for its run input, run output and
+/// action pins. Section 14.3 requires a `type` keyword on every node and a closed
+/// field set on every object schema, so the bare `{}` these fixtures used is not a
+/// legal schema; it only passed while the in-memory store skipped publication-time
+/// subset validation, which was the E5 defect. The property set is exactly the
+/// union of what these fixtures feed through the two values the store actually
+/// validates: the run input at create_run and each Map child result at
+/// complete_map. None of these tests are about schema content, so scaffolding one
+/// shared document keeps a single digest across every pin site.
+const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"approval":{"type":"string"},"artifact":{"additionalProperties":false,"properties":{"artifact_ref_id":{"type":"string"},"digest":{"type":"string"},"media_type":{"type":"string"},"size_bytes":{"type":"string"}},"type":"object"},"index":{"type":"integer"},"item":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"type":["integer","object"]},"scope":{"type":"string"},"value":{"type":"integer"}},"type":"object"}"#;
+
+/// The fixture schema every `prepare_definition` revision pins for its RUN OUTPUT.
+/// Transition N16 and section 5.3 make the Succeed output subject to the pinned
+/// root output schema, so this can no longer be `SCHEMA`: the Succeed nodes here
+/// are bound to values `SCHEMA` cannot describe.
+///
+/// `type` is the `["array","object"]` union because both arms genuinely occur:
+/// - array: a Succeed bound to a Map node receives the ordered aggregate, which is
+///   an array of the children's outputs. `items` is therefore the Map child result
+///   shape these fixtures produce, which is the bound input echoed back by
+///   `RetryOnce`/`SerialProbe`: `/index` (Map index), `/item` (the Map item, either
+///   a bare integer for `[0,1,2]` or `{"value":n}`), and `/artifact` (the section
+///   8.1 ArtifactRef value the literal-binding fixture injects).
+/// - object: the two other Succeed bindings. `{}` from the constant-bound Succeed
+///   nodes, admitted because nothing is `required`; and the engine-owned
+///   `ApprovalResult` envelope of section 3.5 for a Succeed bound to an Approval
+///   node, whose four closed fields are `decision`, `source`, `payload_ref` (an
+///   ArtifactRef value or null) and `principal` (a principal ID, or null on an
+///   expiry resolution).
+///
+/// The action pins stay on `SCHEMA`; only the root output moves.
+const ROOT_OUTPUT_SCHEMA: &[u8] = br#"{"additionalProperties":false,"items":{"additionalProperties":false,"properties":{"artifact":{"additionalProperties":false,"properties":{"artifact_ref_id":{"type":"string"},"digest":{"type":"string"},"media_type":{"type":"string"},"size_bytes":{"type":"string"}},"type":"object"},"index":{"type":"integer"},"item":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"type":["integer","object"]}},"type":"object"},"properties":{"decision":{"type":"string"},"payload_ref":{"additionalProperties":false,"properties":{"artifact_ref_id":{"type":"string"},"digest":{"type":"string"},"media_type":{"type":"string"},"size_bytes":{"type":"string"}},"type":["null","object"]},"principal":{"type":["null","string"]},"source":{"type":"string"}},"type":["array","object"]}"#;
+
 fn id(value: &str) -> Id {
     Id::new(value).unwrap()
 }
@@ -87,7 +120,14 @@ async fn prepare_definition(
     max_run_lifetime_ms: u64,
 ) {
     let schema = objects
-        .put(execution_scope, b"{}", "application/json")
+        .put(execution_scope, SCHEMA, "application/json")
+        .await
+        .unwrap();
+    // The root output document must be published alongside the pin it changes:
+    // `run_output_schema_digest` and this object move together or the revision is
+    // rejected for a digest mismatch instead of validating anything.
+    let output_schema = objects
+        .put(execution_scope, ROOT_OUTPUT_SCHEMA, "application/json")
         .await
         .unwrap();
     let canonical = objects
@@ -162,7 +202,7 @@ async fn prepare_definition(
                 expected_definition_version: dagger_workflow_core::ids::Version(1),
                 canonical_definition: canonical.clone(),
                 run_input_schema: schema.clone(),
-                run_output_schema: schema,
+                run_output_schema: output_schema,
                 resolved_action_schema_objects,
                 parsed_revision: PublishableDefinition {
                     definition: definition.clone(),
@@ -571,8 +611,8 @@ fn map_workflow(
         definition_id: id(definition_id),
         name: definition_id.to_owned(),
         description: String::new(),
-        run_input_schema_digest: hash(b"{}"),
-        run_output_schema_digest: hash(b"{}"),
+        run_input_schema_digest: hash(SCHEMA),
+        run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
         entry_node_id: id("map"),
         nodes: vec![
             NodeDefinition::Map {
@@ -646,8 +686,8 @@ fn two_map_workflow(definition_id: &str, descriptor: &ActionDescriptor) -> Workf
         definition_id: id(definition_id),
         name: definition_id.to_owned(),
         description: String::new(),
-        run_input_schema_digest: hash(b"{}"),
-        run_output_schema_digest: hash(b"{}"),
+        run_input_schema_digest: hash(SCHEMA),
+        run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
         entry_node_id: id("fanout"),
         nodes: vec![
             NodeDefinition::Action {
@@ -682,7 +722,7 @@ async fn prepare_scoped_run(
     descriptor: &ActionDescriptor,
 ) {
     let schema = objects
-        .put(execution_scope, b"{}", "application/json")
+        .put(execution_scope, SCHEMA, "application/json")
         .await
         .unwrap();
     let definition = WorkflowDefinition {
@@ -833,7 +873,7 @@ fn runtime_scopes_have_disjoint_attempts_events_and_budgets() {
         let clock = Arc::new(TestClock::new(Timestamp(1_000)));
         let store = Arc::new(InMemoryStore::new(clock.clone()));
         let objects = Arc::new(InMemoryObjectStore::new(clock));
-        let schema_digest = hash(b"{}");
+        let schema_digest = hash(SCHEMA);
         let descriptor = ActionDescriptor {
             name: "fixture.scoped".to_owned(),
             contract_version: "1".to_owned(),
@@ -956,7 +996,7 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
         let store = Arc::new(InMemoryStore::new(clock.clone()));
         let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
         let schema = objects
-            .put(&execution_scope, b"{}", "application/json")
+            .put(&execution_scope, SCHEMA, "application/json")
             .await
             .unwrap();
         let descriptor = ActionDescriptor {
@@ -1363,8 +1403,8 @@ fn approval_expiry_advances_downstream_frontier_through_engine_ticks() {
             definition_id: id("approval-definition"),
             name: "approval-expiry".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
@@ -1470,8 +1510,8 @@ fn approval_decision_winning_between_due_scan_and_expiry_is_benign() {
             definition_id: id("approval-race-definition"),
             name: "approval-race".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
@@ -1600,8 +1640,8 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
         let descriptor = ActionDescriptor {
             name: "fixture.map".to_owned(),
             contract_version: "1".to_owned(),
-            input_schema_digest: hash(b"{}"),
-            output_schema_digest: hash(b"{}"),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
             implementation_compatibility_digest: hash(b"map-implementation"),
         };
         let definition = WorkflowDefinition {
@@ -1609,8 +1649,8 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
             definition_id: id("map-definition"),
             name: "map".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("map"),
             nodes: vec![
                 NodeDefinition::Map {
@@ -1732,8 +1772,8 @@ fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
         let descriptor = ActionDescriptor {
             name: "fixture.serial-map".to_owned(),
             contract_version: "1".to_owned(),
-            input_schema_digest: hash(b"{}"),
-            output_schema_digest: hash(b"{}"),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
             implementation_compatibility_digest: hash(b"serial-map-implementation"),
         };
         let definition = map_workflow(
@@ -1849,8 +1889,8 @@ fn map_child_accepts_literal_artifact_ref_binding() {
             definition_id: id("artifact-seed-definition"),
             name: "artifact-seed".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("succeed"),
             nodes: vec![NodeDefinition::Succeed {
                 id: id("succeed"),
@@ -1883,8 +1923,8 @@ fn map_child_accepts_literal_artifact_ref_binding() {
         let descriptor = ActionDescriptor {
             name: "fixture.artifact-map".to_owned(),
             contract_version: "1".to_owned(),
-            input_schema_digest: hash(b"{}"),
-            output_schema_digest: hash(b"{}"),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
             implementation_compatibility_digest: hash(b"artifact-map-implementation"),
         };
         let definition = map_workflow(
@@ -1976,8 +2016,8 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
         let descriptor = ActionDescriptor {
             name: "fixture.corrupt-map".to_owned(),
             contract_version: "1".to_owned(),
-            input_schema_digest: hash(b"{}"),
-            output_schema_digest: hash(b"{}"),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
             implementation_compatibility_digest: hash(b"corrupt-map-implementation"),
         };
         let definition = map_workflow(
@@ -2173,8 +2213,8 @@ fn corrupting_one_map_does_not_complete_another_from_a_stale_snapshot() {
         let descriptor = ActionDescriptor {
             name: "fixture.two-map-corruption".to_owned(),
             contract_version: "1".to_owned(),
-            input_schema_digest: hash(b"{}"),
-            output_schema_digest: hash(b"{}"),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
             implementation_compatibility_digest: hash(b"two-map-corruption-implementation"),
         };
         prepare_definition(
@@ -2247,8 +2287,8 @@ fn run_lifetime_expiry_terminalizes_through_engine_ticks() {
             definition_id: id("lifetime-definition"),
             name: "lifetime-expiry".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
@@ -2347,8 +2387,8 @@ fn blocked_run_fence_precedes_exact_approval_replay() {
             definition_id: id("blocked-approval-definition"),
             name: "blocked-approval".to_owned(),
             description: String::new(),
-            run_input_schema_digest: hash(b"{}"),
-            run_output_schema_digest: hash(b"{}"),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
             entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
