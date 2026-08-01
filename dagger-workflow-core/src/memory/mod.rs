@@ -145,19 +145,25 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
             .expect("object lock poisoned")
             .get(&(scope.clone(), requested.clone()))
             .cloned()
-            .ok_or_else(|| ObjectReadError {
-                proof: self.proof(scope, requested, FailedReadClass::Missing, None),
+            // An absent map entry is authoritative absence: the volatile store is
+            // the whole world, so nothing can have prevented the lookup.
+            .ok_or_else(|| {
+                ObjectReadError::Corrupt(self.proof(
+                    scope,
+                    requested,
+                    FailedReadClass::Missing,
+                    None,
+                ))
             })?;
         let observed = digest(&object.bytes);
         if &observed != requested {
-            return Err(ObjectReadError {
-                proof: self.proof(
-                    scope,
-                    requested,
-                    FailedReadClass::DigestInvalid,
-                    Some(observed),
-                ),
-            });
+            // Verification completed and failed. Parity with FsObjectStore.
+            return Err(ObjectReadError::Corrupt(self.proof(
+                scope,
+                requested,
+                FailedReadClass::DigestInvalid,
+                Some(observed),
+            )));
         }
         Ok(VerifiedObject {
             reference: VerifiedObjectRef::new(
@@ -554,28 +560,39 @@ fn artifact(
         producer_attempt_id: attempt_id,
         ordinal,
     });
-    let reference = ArtifactRef {
-        scope: scope.clone(),
-        artifact_ref_id: id,
-        digest: object.digest().clone(),
-        size_bytes: object.size_bytes(),
-        media_type: object.media_type().to_owned(),
-        kind,
-        producer_run_id: run_id.cloned(),
-        producer_node_id: node_id.cloned(),
-        producer_attempt_id: attempt_id.cloned(),
-        ordinal,
-        created_at: now,
-    };
-    let key = (scope.clone(), reference.artifact_ref_id.clone());
+    let key = (scope.clone(), id.clone());
     if let Some(existing) = state.artifact_refs.get(&key) {
-        if existing != &reference {
+        if existing.scope != *scope
+            || existing.artifact_ref_id != id
+            || existing.digest != *object.digest()
+            || existing.size_bytes != object.size_bytes()
+            || existing.media_type != object.media_type()
+            || existing.kind != kind
+            || existing.producer_run_id.as_ref() != run_id
+            || existing.producer_node_id.as_ref() != node_id
+            || existing.producer_attempt_id.as_ref() != attempt_id
+            || existing.ordinal != ordinal
+        {
             return Err(StoreError::ArtifactMetadataConflict);
         }
+        return Ok(existing.clone());
     } else {
+        let reference = ArtifactRef {
+            scope: scope.clone(),
+            artifact_ref_id: id,
+            digest: object.digest().clone(),
+            size_bytes: object.size_bytes(),
+            media_type: object.media_type().to_owned(),
+            kind,
+            producer_run_id: run_id.cloned(),
+            producer_node_id: node_id.cloned(),
+            producer_attempt_id: attempt_id.cloned(),
+            ordinal,
+            created_at: now,
+        };
         state.artifact_refs.insert(key, reference.clone());
+        Ok(reference)
     }
-    Ok(reference)
 }
 
 fn json_ref(

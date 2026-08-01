@@ -1,4 +1,4 @@
-use dagger_workflow_core::artifact::{FailedReadClass, ObjectStore};
+use dagger_workflow_core::artifact::{FailedReadClass, ObjectReadError, ObjectStore};
 use dagger_workflow_core::engine::{Clock, TestClock};
 use dagger_workflow_core::ids::{Id, Timestamp};
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
@@ -133,7 +133,10 @@ fn object_store_mints_closed_failed_read_proofs() {
         let missing =
             dagger_workflow_core::ids::Digest::new(format!("sha256:{}", "0".repeat(64))).unwrap();
         let error = store.get(&execution_scope, &missing).await.unwrap_err();
-        assert_eq!(error.proof.error_class(), FailedReadClass::Missing);
+        let ObjectReadError::Corrupt(proof) = error else {
+            panic!("an absent object is authoritative absence, not unavailability");
+        };
+        assert_eq!(proof.error_class(), FailedReadClass::Missing);
     });
 }
 

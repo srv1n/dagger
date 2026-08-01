@@ -2087,6 +2087,9 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
             .get(&execution_scope, &other.digest)
             .await
             .unwrap_err();
+        let ObjectReadError::Corrupt(other_proof) = other_failure else {
+            panic!("deliberately corrupted bytes must mint a proof, not report unavailability");
+        };
         assert!(matches!(
             store
                 .mark_corrupt_storage(
@@ -2094,7 +2097,7 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
                     MarkCorruptStorage {
                         run_id: id("corrupt-map-run"),
                         bad_ref: other,
-                        proof: other_failure.proof,
+                        proof: other_proof,
                         owner_node_id: Some(id("map")),
                     },
                 )
@@ -2106,13 +2109,16 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
             .get(&execution_scope, &consumed.digest)
             .await
             .unwrap_err();
+        let ObjectReadError::Corrupt(consumed_proof) = consumed_failure else {
+            panic!("deliberately corrupted bytes must mint a proof, not report unavailability");
+        };
         store
             .mark_corrupt_storage(
                 &execution_scope,
                 MarkCorruptStorage {
                     run_id: id("corrupt-map-run"),
                     bad_ref: consumed,
-                    proof: consumed_failure.proof,
+                    proof: consumed_proof,
                     owner_node_id: Some(id("map")),
                 },
             )
