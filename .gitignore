@@ -28,3 +28,11 @@ Cargo.lock
 CLAUDE.md
 .claude/
 .cursor/
+# ChatGPT browser handoff local state
+.chatgpt-handoff/*
+!.chatgpt-handoff/
+!.chatgpt-handoff/profile.md
+.chatgpt-handoff.json
+
+# ChatGPT handoff code bundles
+artifacts/
