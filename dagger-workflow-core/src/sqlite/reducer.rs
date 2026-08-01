@@ -2461,6 +2461,72 @@ fn apply_map_contract_failure(
     Ok(node)
 }
 
+/// N46 (`Ready` -> `ContractFailed`, `NodeContractFailed`) paired with R08
+/// (`Running` -> `ContractFailed`, `RunContractFailed`) for a terminal Succeed
+/// node whose output fails a section 1.4 ceiling or the section 5.3 pinned root
+/// output schema. N46's postcondition is "no attempt/reservation", so callers
+/// must reach here before registering any artifact ref, before marking the node
+/// `Succeeded`, and before charging aggregate bytes.
+fn apply_terminal_contract_failure(
+    state: &mut ReducerState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    node_id: &NodeInstanceId,
+    failure_kind: NodeFailureKind,
+    now: Timestamp,
+    actor_id: String,
+) -> Result<WorkflowRun, StoreError> {
+    let key = (scope.clone(), run_id.clone(), node_id.clone());
+    let mut node = state.nodes.get(&key).cloned().ok_or(StoreError::NotFound)?;
+    node.status = NodeState::ContractFailed;
+    node.failure_kind = Some(failure_kind);
+    set_node_mutated(&mut node, now)?;
+    state.nodes.insert(key, node);
+    let run_kind = run_failure(failure_kind);
+    let mut specs = vec![event_spec(
+        "N46",
+        Some(node_id),
+        None,
+        None,
+        event_payload::node_contract_failed(
+            &(Option::<&Id>::None),
+            &(failure_kind),
+            &(Option::<&Digest>::None),
+        ),
+    )];
+    let run = terminalize_run(
+        state,
+        scope,
+        run_id,
+        RunState::ContractFailed,
+        Some(run_kind),
+        "ContractFailed",
+        now,
+        &mut specs,
+    )?;
+    specs.push(event_spec(
+        "R08",
+        None,
+        None,
+        None,
+        event_payload::run_contract_failed(&(run_kind), &(Option::<&Digest>::None)),
+    ));
+    append_batch(
+        state,
+        scope,
+        run_id,
+        now,
+        EventActorKind::Engine,
+        actor_id,
+        specs,
+    )?;
+    Ok(state
+        .runs
+        .get(&(scope.clone(), run_id.clone()))
+        .cloned()
+        .unwrap_or(run))
+}
+
 #[derive(Deserialize, Serialize)]
 struct MemoryCursor {
     scope: ExecutionScope,
@@ -6308,6 +6374,78 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         .output
                         .as_ref()
                         .ok_or(StoreError::ObjectNotVerified)?;
+                    if output.media_type() != "application/json" {
+                        return Err(StoreError::InvalidField);
+                    }
+                    // Section 5.3 precondition and transition N16 both require the unique
+                    // Succeed output to validate the pinned root output schema and the
+                    // section 1.4 value limit before it is committed, and section 1.4
+                    // charges Succeed outputs against the run aggregate ceiling. All three
+                    // are checked before any mutation so a violation leaves no artifact
+                    // ref, a non-terminal node, and an uncharged aggregate counter.
+                    let run_key = (scope.clone(), command.run_id.clone());
+                    let run_snapshot = state
+                        .runs
+                        .get(&run_key)
+                        .cloned()
+                        .ok_or(StoreError::NotFound)?;
+                    let actor_id = command.permit.instance_id().as_str().to_owned();
+                    if output.size_bytes() > run_snapshot.limits.max_inline_json_bytes_per_value {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::InlineJsonLimitExceeded,
+                            now,
+                            actor_id,
+                        );
+                    }
+                    let aggregate_after = run_snapshot
+                        .aggregate_object_bytes
+                        .checked_add(output.size_bytes())
+                        .ok_or(StoreError::ArithmeticOverflow)?;
+                    if aggregate_after > run_snapshot.limits.max_aggregate_object_bytes_per_run {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::AggregateObjectLimitExceeded,
+                            now,
+                            actor_id,
+                        );
+                    }
+                    // The Succeed node is the run root, so the pinned schema is the
+                    // revision's root output schema, not an action pin.
+                    let revision = state
+                        .revisions
+                        .get(&(
+                            scope.clone(),
+                            run_snapshot.definition_id.clone(),
+                            run_snapshot.revision_hash.clone(),
+                        ))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let schema_digest = &revision.run_output_schema_ref.0.digest;
+                    let schema_bytes = state
+                        .verified_object_bytes
+                        .get(&(scope.clone(), schema_digest.clone()))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let schema: Value = serde_json::from_slice(schema_bytes)
+                        .map_err(|_| StoreError::CorruptControlPlane)?;
+                    let output_value: Value = serde_json::from_slice(output.verified_bytes())
+                        .map_err(|_| StoreError::InvalidField)?;
+                    if !schema_accepts(&schema, &schema, &output_value) {
+                        return apply_terminal_contract_failure(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &command.node_id,
+                            NodeFailureKind::RunOutputSchemaMismatch,
+                            now,
+                            actor_id,
+                        );
+                    }
                     node.status = NodeState::Succeeded;
                     node.result_ref = Some(json_ref(
                         &mut state,
@@ -6354,6 +6492,9 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     run.status = RunState::Succeeded;
                     run.output_ref = result_ref;
                     run.finished_at = Some(now);
+                    // Section 1.4 counts Succeed outputs as charged run data; json_ref
+                    // does not charge, so the caller must.
+                    run.aggregate_object_bytes = aggregate_after;
                     set_run_mutated(run, now)?;
                     specs.push(event_spec(
                         "R06",

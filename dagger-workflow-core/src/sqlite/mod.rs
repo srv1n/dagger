@@ -1956,7 +1956,15 @@ where
         Self::commit(connection).await?;
         let (data,) = row.ok_or(StoreError::NotFound)?;
         let authority: RevisionAuthority = decode_row(&data)?;
-        let mut refs = vec![authority.revision.run_input_schema_ref.0];
+        // Both root schemas, not just the input. `resolve_terminal_node` validates
+        // the Succeed output against the pinned root output schema (contract N16),
+        // and a store reopened after a restart holds no process-local bytes, so
+        // omitting the output ref made that check fail as CorruptControlPlane on
+        // every post-restart run.
+        let mut refs = vec![
+            authority.revision.run_input_schema_ref.0,
+            authority.revision.run_output_schema_ref.0,
+        ];
         if include_action_schemas {
             refs.extend(
                 authority
@@ -2697,7 +2705,14 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     sql_command!(
         resolve_terminal_node(command: ResolveTerminalNode) -> WorkflowRun;
         AuthorityLoad::run(&command.run_id)
-            .objects(command.output.iter().map(VerifiedObjectRef::digest))
+            .objects(command.output.iter().map(VerifiedObjectRef::digest));
+        // The bounded run load does not carry revision-pinned schema bytes, so the
+        // root output schema check needs the same follow-up hydration complete_map
+        // uses. Without it a reopened store cannot validate the Succeed output.
+        |store, workflow_scope| store.hydrate_run_action_schemas(
+            workflow_scope,
+            &command.run_id,
+        ).await?
     );
     sql_command!(
         fail_contract(command: FailContract) -> WorkflowRun;
