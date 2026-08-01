@@ -5,29 +5,32 @@ use crate::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
     AuthenticatedPrincipal, DecisionAuthorizationPolicy,
 };
-use crate::artifact::{ObjectRecord, ObjectStore, ObjectStoreError, VerifiedObjectRef};
+use crate::artifact::{
+    ArtifactRef, FailedReadClass, FailedReadProof, ObjectRecord, ObjectStore, ObjectStoreError,
+    VerifiedObjectRef,
+};
 use crate::definition::{
     ActionReference, ApprovalGateConfig, BackoffPolicy, Binding, BindingSource, NodeDefinition,
     PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
 };
 use crate::ids::{
-    map_child_id, map_expansion_digest, CostUnits, Digest, Id, MapChildIdentity, TopologicalRank,
-    Version,
+    map_child_id, map_expansion_digest, CostUnits, Digest, Id, MapChildIdentity, Timestamp,
+    TopologicalRank, Version,
 };
-use crate::run::{AttemptState, NodeState, RunLimits, RunState};
+use crate::run::{AttemptState, NodeState, RunLimits, RunState, WorkflowRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
     CompletionObjects, CreateDefinition, CreateRun, DecideApproval, EnginePermit, EventPageRequest,
-    ExpandMap, OrderedMapItem, PageRequest, PublishRevision, ReleaseRetry, RequestApproval,
-    ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, SuspendIncompatible,
-    WorkflowStore,
+    ExpandMap, MarkCorruptStorage, OrderedMapItem, PageRequest, PublishRevision, ReleaseRetry,
+    RequestApproval, ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError,
+    SuspendIncompatible, WorkflowStore,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 40;
+pub const CASE_COUNT: usize = 43;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -71,6 +74,9 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "expand_map_recomputes_identity",
     "map_concurrency_admission",
     "exponential_backoff_cap",
+    "corrupt_unreachable_ref_rejected",
+    "corrupt_run_produced_ref_accepted",
+    "corrupt_pinned_revision_ref_accepted",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -1767,6 +1773,215 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
     Ok(())
 }
 
+struct CorruptionConformanceFixture {
+    run: WorkflowRun,
+    store_instance_nonce: Vec<u8>,
+}
+
+/// Prepares one started run plus the object-store binding a proof must carry.
+async fn prepare_corruption_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<CorruptionConformanceFixture, ConformanceFailure> {
+    prepare_map_conformance(
+        adapter,
+        scope,
+        case,
+        1,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    let binding = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(case, "corruption nonce publication failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, &id(&format!("map-run-{case}")))
+        .await
+        .map_err(|_| failure(case, "corruption run read failed"))?
+        .run;
+    Ok(CorruptionConformanceFixture {
+        run,
+        store_instance_nonce: binding.store_instance_nonce().to_vec(),
+    })
+}
+
+/// Mints the object-store proof a corruption mark requires. Contract section 12.3.
+fn corruption_proof(
+    scope: &ExecutionScope,
+    bad_ref: &ArtifactRef,
+    store_instance_nonce: Vec<u8>,
+    case: usize,
+) -> FailedReadProof {
+    FailedReadProof::mint(
+        scope.clone(),
+        bad_ref.digest.clone(),
+        FailedReadClass::Missing,
+        None,
+        store_instance_nonce,
+        format!("conformance-corruption-{case}").into_bytes(),
+        Timestamp(0),
+    )
+}
+
+async fn corrupt_unreachable_ref_rejected<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let fixture = prepare_corruption_conformance(adapter, scope, 41).await?;
+    let unrelated_input = adapter
+        .objects()
+        .put(scope, br#"{"item":7}"#, "application/json")
+        .await
+        .map_err(|_| failure(41, "unrelated input publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "corruption-case-41".to_owned(),
+        Vec::new(),
+        unrelated_input.digest().clone(),
+    )
+    .map_err(|_| failure(41, "unrelated principal construction failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: id("unrelated-run-41"),
+                definition_id: fixture.run.definition_id.clone(),
+                revision_hash: fixture.run.revision_hash.clone(),
+                input: unrelated_input,
+                budget_limit: CostUnits(1_000),
+                limits: fixture.run.limits.clone(),
+                principal,
+                idempotency_token: "corruption-case-41-create".to_owned(),
+            },
+        )
+        .await
+        .map_err(|_| failure(41, "unrelated run creation failed"))?;
+    let unrelated_ref = adapter
+        .store()
+        .get_run(scope, &id("unrelated-run-41"))
+        .await
+        .map_err(|_| failure(41, "unrelated run read failed"))?
+        .run
+        .input_ref
+        .0;
+    let proof = corruption_proof(scope, &unrelated_ref, fixture.store_instance_nonce, 41);
+    if !matches!(
+        adapter
+            .store()
+            .mark_corrupt_storage(
+                scope,
+                MarkCorruptStorage {
+                    run_id: fixture.run.run_id.clone(),
+                    bad_ref: unrelated_ref,
+                    proof,
+                    owner_node_id: None,
+                },
+            )
+            .await,
+        Err(StoreError::InvalidFailedReadProof)
+    ) {
+        return Err(failure(
+            41,
+            "unreachable bad ref corrupted an unrelated run",
+        ));
+    }
+    if adapter
+        .store()
+        .get_run(scope, &fixture.run.run_id)
+        .await
+        .map_err(|_| failure(41, "target run read failed"))?
+        .run
+        .status
+        == RunState::CorruptStorage
+    {
+        return Err(failure(41, "refused corruption mark terminalized the run"));
+    }
+    Ok(())
+}
+
+async fn corrupt_run_produced_ref_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let fixture = prepare_corruption_conformance(adapter, scope, 42).await?;
+    let bad_ref = fixture.run.input_ref.0.clone();
+    let proof = corruption_proof(scope, &bad_ref, fixture.store_instance_nonce, 42);
+    let run = adapter
+        .store()
+        .mark_corrupt_storage(
+            scope,
+            MarkCorruptStorage {
+                run_id: fixture.run.run_id.clone(),
+                bad_ref: bad_ref.clone(),
+                proof,
+                owner_node_id: None,
+            },
+        )
+        .await
+        .map_err(|_| failure(42, "run-produced corruption mark was refused"))?;
+    if run.status != RunState::CorruptStorage
+        || run.corrupt_bad_artifact_ref_id != Some(bad_ref.artifact_ref_id)
+    {
+        return Err(failure(42, "run-produced corruption mark was not recorded"));
+    }
+    Ok(())
+}
+
+async fn corrupt_pinned_revision_ref_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let fixture = prepare_corruption_conformance(adapter, scope, 43).await?;
+    let revision = adapter
+        .store()
+        .get_revision(
+            scope,
+            &fixture.run.definition_id,
+            &fixture.run.revision_hash,
+        )
+        .await
+        .map_err(|_| failure(43, "pinned revision read failed"))?;
+    let bad_ref = revision.run_input_schema_ref.0.clone();
+    if bad_ref.producer_run_id.is_some() {
+        return Err(failure(43, "pinned schema ref was run-attributed"));
+    }
+    let proof = corruption_proof(scope, &bad_ref, fixture.store_instance_nonce, 43);
+    let run = adapter
+        .store()
+        .mark_corrupt_storage(
+            scope,
+            MarkCorruptStorage {
+                run_id: fixture.run.run_id.clone(),
+                bad_ref: bad_ref.clone(),
+                proof,
+                owner_node_id: None,
+            },
+        )
+        .await
+        .map_err(|_| failure(43, "pinned schema corruption mark was refused"))?;
+    if run.status != RunState::CorruptStorage
+        || run.corrupt_bad_artifact_ref_id != Some(bad_ref.artifact_ref_id)
+    {
+        return Err(failure(
+            43,
+            "pinned schema corruption mark was not recorded",
+        ));
+    }
+    Ok(())
+}
+
 /// One independently executed conformance result.
 #[derive(Debug)]
 pub struct ConformanceCaseResult {
@@ -1848,6 +2063,18 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     );
     run_fixture!("map_concurrency_admission", map_concurrency_admission);
     run_fixture!("exponential_backoff_cap", exponential_backoff_cap);
+    run_fixture!(
+        "corrupt_unreachable_ref_rejected",
+        corrupt_unreachable_ref_rejected
+    );
+    run_fixture!(
+        "corrupt_run_produced_ref_accepted",
+        corrupt_run_produced_ref_accepted
+    );
+    run_fixture!(
+        "corrupt_pinned_revision_ref_accepted",
+        corrupt_pinned_revision_ref_accepted
+    );
     results
 }
 

@@ -34,7 +34,7 @@ use dagger_workflow_core::store::{
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -2305,31 +2305,263 @@ async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_determin
 
 #[test]
 fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
-    fn top_level_sql(statement: &str) -> String {
-        let mut result = String::with_capacity(statement.len());
-        let mut depth = 0_u32;
-        let mut quoted = false;
-        for character in statement.chars() {
-            match character {
-                '\'' => {
-                    quoted = !quoted;
-                    if depth == 0 {
-                        result.push(character);
-                    }
-                }
-                '(' if !quoted => {
-                    depth += 1;
-                    result.push(' ');
-                }
-                ')' if !quoted => {
-                    depth = depth.saturating_sub(1);
-                    result.push(' ');
-                }
-                _ if depth == 0 => result.push(character),
-                _ => result.push(' '),
+    // Word presence is not scoping. This checker resolves every table reference in a statement to
+    // its alias, then requires that alias to be transitively equated to a bound tenant_id AND
+    // namespace value inside the same statement. A scoped outer query with an unscoped join -- the
+    // exact shape that once shipped in LIST_RUNS_SQL -- fails, because the joined alias is in no
+    // bound equality component even though the words appear in the text.
+
+    /// Lowercase and split into tokens with punctuation separated, so `x.tenant_id=?` and
+    /// `x.tenant_id = ?` tokenize identically. Splitting `=` on its own also keeps `<=` and `>=`
+    /// from being mistaken for equality: they tokenize as `<` `=`, and the equality scan only
+    /// accepts `=` in the position directly after the column.
+    fn tokenize(statement: &str) -> Vec<String> {
+        let mut spaced = String::with_capacity(statement.len() * 2);
+        for character in statement.to_ascii_lowercase().chars() {
+            if matches!(character, '(' | ')' | ',' | '=' | '<' | '>' | '!') {
+                spaced.push(' ');
+                spaced.push(character);
+                spaced.push(' ');
+            } else {
+                spaced.push(character);
             }
         }
-        result.split_whitespace().collect::<Vec<_>>().join(" ")
+        spaced.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn is_bound_value(token: &str) -> bool {
+        token.starts_with('?')
+            || token.starts_with(':')
+            || token.starts_with('\'')
+            || token.starts_with('{')
+            || token.chars().all(|character| character.is_ascii_digit())
+    }
+
+    fn is_domain_table(token: &str) -> bool {
+        (token.starts_with("dagger_workflow_") && token != "dagger_workflow_schema_migrations")
+            || token.starts_with('{')
+    }
+
+    /// `(table, alias)` for every FROM / JOIN / UPDATE / INSERT INTO target in the branch. Alias is
+    /// empty when the reference is unaliased, which is only legal in a single-table branch.
+    fn table_references(tokens: &[String]) -> Vec<(String, String)> {
+        const NOT_AN_ALIAS: [&str; 14] = [
+            "where", "on", "join", "set", "values", "order", "limit", "group", "union", "left",
+            "inner", "cross", "using", "select",
+        ];
+        let mut references = Vec::new();
+        for index in 0..tokens.len() {
+            if !matches!(tokens[index].as_str(), "from" | "join" | "into" | "update") {
+                continue;
+            }
+            let Some(table) = tokens.get(index + 1) else {
+                continue;
+            };
+            if !is_domain_table(table) {
+                continue;
+            }
+            let alias = match tokens.get(index + 2).map(String::as_str) {
+                Some("as") => tokens.get(index + 3).cloned().unwrap_or_default(),
+                Some(next)
+                    if !NOT_AN_ALIAS.contains(&next)
+                        && next.chars().all(|character| {
+                            character.is_ascii_alphanumeric() || character == '_'
+                        }) =>
+                {
+                    next.to_owned()
+                }
+                _ => String::new(),
+            };
+            references.push((table.clone(), alias));
+        }
+        references
+    }
+
+    /// Aliases transitively equated to a bound value on `column`. `a.tenant_id = ?` binds `a`;
+    /// `b.tenant_id = a.tenant_id` then carries that binding to `b`. Nothing else counts.
+    fn bound_aliases(tokens: &[String], column: &str) -> std::collections::BTreeSet<String> {
+        let suffix = format!(".{column}");
+        let alias_of = |token: &str| -> Option<String> {
+            if token == column {
+                Some(String::new())
+            } else {
+                token
+                    .strip_suffix(&suffix)
+                    .map(|alias| alias.trim_start_matches('(').to_owned())
+            }
+        };
+        let mut equivalences: Vec<(String, String)> = Vec::new();
+        let mut bound: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for index in 0..tokens.len() {
+            let Some(left) = alias_of(&tokens[index]) else {
+                continue;
+            };
+            if tokens.get(index + 1).map(String::as_str) != Some("=") {
+                continue;
+            }
+            let Some(right) = tokens.get(index + 2) else {
+                continue;
+            };
+            if is_bound_value(right) {
+                bound.insert(left);
+            } else if let Some(other) = alias_of(right) {
+                equivalences.push((left, other));
+            }
+        }
+        // Closure over the equality edges; the statement is tiny, so iterate to a fixed point.
+        loop {
+            let before = bound.len();
+            for (left, right) in &equivalences {
+                if bound.contains(left) {
+                    bound.insert(right.clone());
+                }
+                if bound.contains(right) {
+                    bound.insert(left.clone());
+                }
+            }
+            if bound.len() == before {
+                break;
+            }
+        }
+        bound
+    }
+
+    /// `None` when the statement is properly scoped, `Some(reason)` otherwise.
+    fn scoping_violation(statement: &str) -> Option<String> {
+        let tokens = tokenize(statement);
+        if tokens.first().map(String::as_str) == Some("insert") {
+            // INSERT has no predicate to scope: the scope must be written, so it must appear in the
+            // target column list. INSERT ... SELECT would need the SELECT scoped too; the crate has
+            // none, and this rejects one if it ever appears rather than passing it silently.
+            if tokens.iter().any(|token| token == "select") {
+                return Some("INSERT ... SELECT is not scope-checked by this gate".to_owned());
+            }
+            let columns: Vec<&String> = tokens
+                .iter()
+                .skip_while(|token| token.as_str() != "(")
+                .take_while(|token| token.as_str() != ")")
+                .collect();
+            let missing: Vec<&str> = ["tenant_id", "namespace"]
+                .into_iter()
+                .filter(|column| !columns.iter().any(|token| token.as_str() == *column))
+                .collect();
+            return (!missing.is_empty()).then(|| {
+                format!(
+                    "insert target column list is missing {}",
+                    missing.join(" and ")
+                )
+            });
+        }
+        // UNION branches are scoped independently; a scoped first branch must not vouch for an
+        // unscoped second one.
+        for branch in tokens.split(|token| token == "union") {
+            let branch_tokens: Vec<String> = branch
+                .iter()
+                .filter(|token| token.as_str() != "all")
+                .cloned()
+                .collect();
+            let references = table_references(&branch_tokens);
+            if references.is_empty() {
+                continue;
+            }
+            let tenant_bound = bound_aliases(&branch_tokens, "tenant_id");
+            let namespace_bound = bound_aliases(&branch_tokens, "namespace");
+            for (table, alias) in &references {
+                if alias.is_empty() && references.len() > 1 {
+                    return Some(format!(
+                        "{table} is unaliased in a multi-table statement, so its scope predicate \
+                         cannot be attributed"
+                    ));
+                }
+                let missing: Vec<&str> = [
+                    ("tenant_id", &tenant_bound),
+                    ("namespace", &namespace_bound),
+                ]
+                .into_iter()
+                .filter(|(_, bound)| !bound.contains(alias))
+                .map(|(column, _)| column)
+                .collect();
+                if !missing.is_empty() {
+                    return Some(format!(
+                        "{table}{}{alias} is not bound on {}",
+                        if alias.is_empty() { "" } else { " AS " },
+                        missing.join(" and ")
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    // RED FIXTURES. A gate with no proof that it can fail is how the previous word-presence scan
+    // survived. Each of these must be rejected, and the last must be accepted so the checker is not
+    // trivially rejecting everything.
+    let red_fixtures: [(&str, &str); 5] = [
+        (
+            "scoped outer query with an unscoped join",
+            "SELECT rr.row_data
+               FROM dagger_workflow_runs AS r
+               JOIN dagger_workflow_run_rows AS rr
+                 ON rr.entity_id = r.run_id AND rr.sub_id = ''
+              WHERE r.tenant_id = ? AND r.namespace = ? AND r.run_id > ?",
+        ),
+        (
+            "missing namespace predicate",
+            "SELECT row_data FROM dagger_workflow_run_rows
+              WHERE tenant_id = ? AND entity_id = ? AND sub_id = ''",
+        ),
+        (
+            "missing tenant_id entirely",
+            "SELECT row_data FROM dagger_workflow_run_rows
+              WHERE namespace = ? AND entity_id = ? AND sub_id = ''",
+        ),
+        (
+            "unscoped second UNION branch",
+            "SELECT rr.row_data FROM dagger_workflow_run_rows AS rr
+              WHERE rr.tenant_id = ? AND rr.namespace = ?
+             UNION ALL
+             SELECT rr.row_data FROM dagger_workflow_run_rows AS rr
+              WHERE rr.entity_id = ?",
+        ),
+        (
+            "insert without the scope columns",
+            "INSERT INTO dagger_workflow_runs (run_id, status, version) VALUES (?, ?, ?)",
+        ),
+    ];
+    for (name, statement) in red_fixtures {
+        assert!(
+            scoping_violation(statement).is_some(),
+            "red fixture '{name}' was accepted by the scoping checker: {statement}"
+        );
+    }
+    // Green fixture: transitive binding through a join equality is legitimate scoping and must be
+    // accepted, or the checker is just rejecting everything.
+    assert_eq!(
+        scoping_violation(
+            "SELECT ar.row_data
+               FROM dagger_workflow_artifact_refs AS a
+               JOIN dagger_workflow_artifact_rows AS ar
+                 ON ar.tenant_id = a.tenant_id AND ar.namespace = a.namespace
+                AND ar.entity_id = a.artifact_ref_id
+              WHERE a.tenant_id = ? AND a.namespace = ?"
+        ),
+        None
+    );
+
+    // Registry half: the scheduler scan statements the crate exports are checked by name, so a
+    // constant that stops being discovered by the source scan is still covered.
+    for (name, statement) in [
+        ("SCHEDULER_NODES_SCAN_SQL", SCHEDULER_NODES_SCAN_SQL),
+        ("SCHEDULER_DEADLINES_SCAN_SQL", SCHEDULER_DEADLINES_SCAN_SQL),
+        ("SCHEDULER_RECOVERY_SCAN_SQL", SCHEDULER_RECOVERY_SCAN_SQL),
+        (
+            "SCHEDULER_COMPATIBILITY_SCAN_SQL",
+            SCHEDULER_COMPATIBILITY_SCAN_SQL,
+        ),
+        ("SCHEDULER_GATES_SCAN_SQL", SCHEDULER_GATES_SCAN_SQL),
+        ("SCHEDULER_LIFETIMES_SCAN_SQL", SCHEDULER_LIFETIMES_SCAN_SQL),
+    ] {
+        assert_eq!(scoping_violation(statement), None, "{name} is not scoped");
     }
 
     fn string_literals(source: &str) -> Vec<String> {
@@ -2400,13 +2632,29 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
         literals
     }
 
-    let sqlite_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sqlite");
-    let mut violations = Vec::new();
-    for entry in std::fs::read_dir(sqlite_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
-            continue;
+    // The whole crate source is scanned, not just src/sqlite. Scoping is a property of
+    // every domain statement wherever it is written, and a gate that only looks in one
+    // module fails open the moment domain SQL lands outside it. Contract section 2.3.
+    fn rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, sources);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+                sources.push(path);
+            }
         }
+    }
+
+    let mut source_paths = Vec::new();
+    rust_sources(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut source_paths,
+    );
+    source_paths.sort();
+    let mut violations = Vec::new();
+    let mut checked = 0_usize;
+    for path in source_paths {
         let source = std::fs::read_to_string(&path).unwrap();
         for statement in string_literals(&source) {
             let normalized = statement.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2428,35 +2676,25 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
             if schema_ddl || migration_bookkeeping {
                 continue;
             }
-            let top_level = top_level_sql(&lower);
-            let scoped = if lower.starts_with("insert ") {
-                let target_columns = lower
-                    .split_once(" values ")
-                    .or_else(|| lower.split_once(" select "))
-                    .map_or(lower.as_str(), |(prefix, _)| prefix);
-                target_columns.contains("tenant_id") && target_columns.contains("namespace")
-            } else if lower.starts_with("update ") || lower.starts_with("delete ") {
-                top_level
-                    .split_once(" where ")
-                    .is_some_and(|(_, predicate)| {
-                        predicate.contains("tenant_id") && predicate.contains("namespace")
-                    })
-            } else {
-                top_level.contains("tenant_id") && top_level.contains("namespace")
-            };
-            if !scoped {
+            checked += 1;
+            if let Some(reason) = scoping_violation(&normalized) {
                 violations.push(format!(
-                    "{}: {}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    normalized
+                    "{}: {reason}\n    {normalized}",
+                    path.file_name().unwrap().to_string_lossy()
                 ));
             }
         }
     }
     assert!(
         violations.is_empty(),
-        "tenant-free domain SQL is not allowlisted:\n{}",
+        "domain SQL is not statically tenant-scoped:\n{}",
         violations.join("\n")
+    );
+    // A checker that discovers nothing passes vacuously. This floor makes a desynchronized literal
+    // scan or a moved module fail the gate instead of silently checking zero statements.
+    assert!(
+        checked >= 30,
+        "only {checked} domain statements were discovered; the literal scan is not finding the crate's SQL"
     );
 }
 
@@ -2758,6 +2996,50 @@ async fn gate_11_definition_and_list_runs_cost_is_bounded_by_page_not_history() 
         steps.load(Ordering::Relaxed)
     }
 
+    /// The pre-bound shape of `list_runs`: the same scoped join, but without the keyset predicate
+    /// and without LIMIT, so the whole history is materialized and paged in memory. This is the
+    /// negative control for the bounded measurement -- without it, a `list_runs` number that is
+    /// identical at both history sizes proves nothing, because a broken progress handler and a
+    /// bounded query are indistinguishable.
+    async fn measure_unbounded_list_runs(
+        store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+        scope: &ExecutionScope,
+    ) -> u64 {
+        let steps = Arc::new(AtomicU64::new(0));
+        let mut connection = store.pool().acquire().await.unwrap();
+        connection
+            .lock_handle()
+            .await
+            .unwrap()
+            .set_progress_handler(1, {
+                let steps = steps.clone();
+                move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            });
+        drop(connection);
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT rr.row_data
+             FROM dagger_workflow_runs AS r
+             JOIN dagger_workflow_run_rows AS rr
+               ON rr.tenant_id = r.tenant_id AND rr.namespace = r.namespace
+              AND rr.entity_id = r.run_id AND rr.sub_id = ''
+             WHERE r.tenant_id = ? AND r.namespace = ?
+               AND rr.tenant_id = ? AND rr.namespace = ?
+             ORDER BY r.run_id",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+        assert!(!rows.is_empty());
+        steps.load(Ordering::Relaxed)
+    }
+
     let clock = Arc::new(TestClock::new(Timestamp(0)));
     let small_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
     let large_objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
@@ -2832,9 +3114,21 @@ async fn gate_11_definition_and_list_runs_cost_is_bounded_by_page_not_history() 
             .map(|_| ())
     })
     .await;
+    let small_unbounded_steps = measure_unbounded_list_runs(&small, &small_fixture.scope).await;
+    let large_unbounded_steps = measure_unbounded_list_runs(&large, &large_fixture.scope).await;
     eprintln!(
         "gate_11 VM steps: definition update {small_definition_steps}/{large_definition_steps}; \
-         list_runs {small_list_steps}/{large_list_steps} (50/500 runs)"
+         list_runs {small_list_steps}/{large_list_steps}; \
+         unbounded list_runs {small_unbounded_steps}/{large_unbounded_steps} (50/500 runs)"
+    );
+    // Red proof for the list_runs half: the same measurement apparatus, against the same seeded
+    // histories, with only the page bound removed. If this does not scale, the bounded numbers
+    // above are measuring nothing.
+    assert!(
+        large_unbounded_steps > small_unbounded_steps.saturating_mul(4),
+        "removing the page bound did not make cost scale with history: unbounded list_runs used \
+         {small_unbounded_steps} steps at 50 runs and {large_unbounded_steps} at 500, so the \
+         bounded numbers {small_list_steps}/{large_list_steps} prove nothing"
     );
     for (name, small_steps, large_steps) in [
         (
@@ -2855,7 +3149,7 @@ async fn gate_11_definition_and_list_runs_cost_is_bounded_by_page_not_history() 
 
 #[cfg(feature = "conformance")]
 #[test]
-fn all_forty_conformance_fixtures_pass_unchanged() {
+fn all_conformance_fixtures_pass_unchanged() {
     struct Adapter {
         _directory: TempDir,
         clock: Arc<TestClock>,
@@ -2951,7 +3245,7 @@ fn all_forty_conformance_fixtures_pass_unchanged() {
                     &scope("tenant-b"),
                 )
                 .await;
-                assert_eq!(results.len(), 40);
+                assert_eq!(results.len(), dagger_workflow_core::conformance::CASE_COUNT);
                 assert!(
                     results.iter().all(|result| result.passed()),
                     "{:?}",

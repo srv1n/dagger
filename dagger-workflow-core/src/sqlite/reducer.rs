@@ -1155,6 +1155,45 @@ fn validate_limits(limits: &crate::run::RunLimits) -> bool {
         && limits.max_run_lifetime_ms <= 31_536_000_000
 }
 
+/// Returns whether one committed ArtifactRef belongs to the named run.
+///
+/// A failed-read proof only proves that some committed object is unreadable; it
+/// carries no run attribution. A corruption mark may therefore only invalidate a
+/// run the bad ref is actually reachable from. Every run-produced ref (run
+/// input, run output, node output, node artifact, node diagnostics, Map child
+/// output, Choice and Map inputs, bound action input, compatibility evidence,
+/// approval request and decision payload) records the producing run at
+/// registration, and the only remaining refs a run reads are the immutable
+/// definition, revision, and schema refs pinned by its revision. Contract
+/// sections 5.3 and 12.3.
+pub(crate) fn corrupt_ref_reachable_from_run(
+    state: &ReducerState,
+    scope: &ExecutionScope,
+    run: &WorkflowRun,
+    bad_ref: &ArtifactRef,
+) -> bool {
+    if bad_ref.producer_run_id.as_ref() == Some(&run.run_id) {
+        return true;
+    }
+    let pinned = |candidate: &JsonRef| candidate.0 == *bad_ref;
+    state
+        .revisions
+        .get(&(
+            scope.clone(),
+            run.definition_id.clone(),
+            run.revision_hash.clone(),
+        ))
+        .is_some_and(|revision| {
+            pinned(&revision.canonical_definition_ref)
+                || pinned(&revision.run_input_schema_ref)
+                || pinned(&revision.run_output_schema_ref)
+                || revision
+                    .action_pins
+                    .iter()
+                    .any(|pin| pinned(&pin.input_schema_ref) || pinned(&pin.output_schema_ref))
+        })
+}
+
 pub(crate) fn corruption_run_transition(status: RunState) -> Option<&'static str> {
     match status {
         RunState::Pending => Some("R14"),
@@ -6705,6 +6744,9 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 .ok_or(StoreError::NotFound)?;
             if prior.status == RunState::CorruptStorage {
                 return Ok(prior);
+            }
+            if !corrupt_ref_reachable_from_run(&state, scope, &prior, &command.bad_ref) {
+                return Err(StoreError::InvalidFailedReadProof);
             }
             let proof_fingerprint = digest(&command.proof.fingerprint_material());
             let mut specs = Vec::new();

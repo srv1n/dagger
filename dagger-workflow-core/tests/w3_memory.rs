@@ -140,6 +140,53 @@ fn object_store_mints_closed_failed_read_proofs() {
     });
 }
 
+/// The semantic oracle is always available, so absence in it is authoritative.
+///
+/// `InMemoryObjectStore` holds the whole world in process: nothing can prevent
+/// a lookup, so no read of it may ever report `StorageUnavailable`. Every
+/// failure it can produce is a verified integrity failure carrying a proof.
+/// A refactor that quietly makes the oracle unavailable would silently weaken
+/// every conformance case that reads through it. Contract section 12.3.
+#[test]
+fn memory_object_store_never_reports_storage_unavailable() {
+    block_on(async {
+        let clock = Arc::new(TestClock::new(Timestamp(300)));
+        let store = InMemoryObjectStore::new(clock);
+        let present = scope("tenant-a");
+        let empty = scope("tenant-empty");
+        let committed = store
+            .put(&present, br#"{"value":1}"#, "application/json")
+            .await
+            .unwrap();
+        let absent =
+            dagger_workflow_core::ids::Digest::new(format!("sha256:{}", "1".repeat(64))).unwrap();
+        assert!(store.corrupt_bytes(&present, committed.digest(), b"tampered".to_vec()));
+
+        let failures = [
+            // Committed here, bytes replaced: verification completed and failed.
+            store.get(&present, committed.digest()).await,
+            // Never committed anywhere.
+            store.get(&present, &absent).await,
+            // Committed, but not in the scope being read: absence is confined.
+            store.get(&empty, committed.digest()).await,
+            // Nothing at all in the scope.
+            store.get(&empty, &absent).await,
+        ];
+        for failure in failures {
+            match failure {
+                Err(ObjectReadError::Corrupt(proof)) => assert!(matches!(
+                    proof.error_class(),
+                    FailedReadClass::Missing | FailedReadClass::DigestInvalid
+                )),
+                Err(ObjectReadError::StorageUnavailable) => {
+                    panic!("the in-memory oracle is always available: absence is authoritative")
+                }
+                Ok(_) => panic!("a tampered or absent object never verifies"),
+            }
+        }
+    });
+}
+
 #[test]
 fn singleton_claim_rejects_live_peer_and_increments_takeover_generation() {
     block_on(async {

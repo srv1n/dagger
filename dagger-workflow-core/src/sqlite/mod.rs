@@ -1956,34 +1956,46 @@ where
         Self::commit(connection).await?;
         let (data,) = row.ok_or(StoreError::NotFound)?;
         let authority: RevisionAuthority = decode_row(&data)?;
-        let mut digests = vec![authority.revision.run_input_schema_ref.0.digest];
+        let mut refs = vec![authority.revision.run_input_schema_ref.0];
         if include_action_schemas {
-            digests.extend(authority.revision.action_pins.into_iter().flat_map(|pin| {
-                [
-                    pin.input_schema_ref.0.digest,
-                    pin.output_schema_ref.0.digest,
-                ]
-            }));
+            refs.extend(
+                authority
+                    .revision
+                    .action_pins
+                    .into_iter()
+                    .flat_map(|pin| [pin.input_schema_ref.0, pin.output_schema_ref.0]),
+            );
         }
-        digests.sort();
-        digests.dedup();
+        // Dedup on the typed use, not the digest: distinct ArtifactRefs may share a
+        // digest, and a corruption report must name a ref that genuinely failed.
+        let refs: BTreeMap<(Id, Digest), ArtifactRef> = refs
+            .into_iter()
+            .map(|artifact_ref| {
+                (
+                    (
+                        artifact_ref.artifact_ref_id.clone(),
+                        artifact_ref.digest.clone(),
+                    ),
+                    artifact_ref,
+                )
+            })
+            .collect();
         let mut staged = BTreeMap::new();
-        for digest in digests {
-            let object = self
-                .objects
-                .get(scope, &digest)
-                .await
-                .map_err(|error| match error {
-                    // Availability is not corruption: hydration is retryable and
-                    // must not label the control plane corrupt.
-                    ObjectReadError::StorageUnavailable => StoreError::StorageUnavailable,
-                    // The frozen StoreError taxonomy cannot transport FailedReadProof.
-                    // CorruptControlPlane is the closest no-write command failure; the
-                    // engine can repeat ObjectStore::get to receive the minted proof
-                    // and submit mark_corrupt_storage.
-                    ObjectReadError::Corrupt(_) => StoreError::CorruptControlPlane,
-                })?;
-            staged.insert((scope.clone(), digest), object.bytes);
+        for (_, bad_ref) in refs {
+            let object =
+                self.objects
+                    .get(scope, &bad_ref.digest)
+                    .await
+                    .map_err(|error| match error {
+                        // Availability is not corruption: hydration is retryable and
+                        // must not label the control plane corrupt.
+                        ObjectReadError::StorageUnavailable => StoreError::StorageUnavailable,
+                        ObjectReadError::Corrupt(proof) => StoreError::CommittedObjectCorrupt {
+                            bad_ref: bad_ref.clone(),
+                            proof,
+                        },
+                    })?;
+            staged.insert((scope.clone(), bad_ref.digest), object.bytes);
         }
         self.verified_bytes
             .lock()
@@ -2703,7 +2715,13 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     );
     sql_command!(
         mark_corrupt_storage(command: MarkCorruptStorage) -> WorkflowRun;
+        // The run-scoped artifact query filters on producer_run_id, so a ref pinned by
+        // the revision (definition, run input/output schema, action pin) has a NULL
+        // producer and is never hydrated by the run load alone. Without this the
+        // registered-ref equality check rejects every pinned ref, and a corrupt root
+        // input schema could not mark its own run corrupt. Contract section 12.3.
         AuthorityLoad::run(&command.run_id)
+            .artifacts([command.bad_ref.artifact_ref_id.clone()])
     );
 
     async fn get_definition(

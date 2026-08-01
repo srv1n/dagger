@@ -362,6 +362,19 @@ pub enum StoreError {
     /// A corruption proof is invalid. Contract section 5.5.
     #[error("invalid failed read proof")]
     InvalidFailedReadProof,
+    /// A committed prerequisite object failed verification during hydration. Contract section 5.5.
+    ///
+    /// This is the only variant that reports object-store corruption. It carries
+    /// the proof minted by the first failed read, so the caller never has to
+    /// repeat the read to obtain a `mark_corrupt_storage` capability.
+    /// `CorruptControlPlane` never means this.
+    #[error("committed object corrupt")]
+    CommittedObjectCorrupt {
+        /// The exact committed typed use that failed verification.
+        bad_ref: ArtifactRef,
+        /// The original proof minted by the first failed read.
+        proof: FailedReadProof,
+    },
     /// Publication target and canonical definition IDs differ. Contract section 5.5.
     #[error("revision definition id mismatch")]
     RevisionDefinitionIdMismatch,
@@ -375,6 +388,10 @@ pub enum StoreError {
     #[error("database clock is non-monotonic")]
     ClockNonMonotonic,
     /// A derived view found impossible durable state. Contract section 5.5.
+    ///
+    /// This never represents object-store corruption. It is reserved for a
+    /// durable control-plane projection that cannot exist under section 3;
+    /// object corruption is always `CommittedObjectCorrupt`.
     #[error("corrupt control plane")]
     CorruptControlPlane,
     /// Checked arithmetic overflowed or found a broken invariant. Contract section 5.5.

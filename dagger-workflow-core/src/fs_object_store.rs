@@ -313,7 +313,35 @@ impl<C: Clock> FsObjectStore<C> {
         self.finalize_candidate(scope, candidate_digest, bytes, media_type, false)
     }
 
-    /// Establishes the data-path directory-entry barrier before returning a verified ref.
+    /// Establishes the publication barrier for an object: the directory entries that name its
+    /// data file and its media sidecar are durable once this returns.
+    ///
+    /// Every path that mints a `VerifiedObjectRef` crosses this, readers included. Raw namespace
+    /// visibility before the publisher's own barrier is normal for a link-and-fsync protocol --
+    /// the entry has to exist before its directory can be synced -- so a reader that finds an
+    /// object may be seeing an entry the publisher has not yet made durable. A reader that
+    /// returned a committable reference from that observation would let the control plane commit
+    /// to an object a publisher crash could still erase, and a process-local lock cannot close it
+    /// because the store is shared by many server processes. The reader therefore establishes the
+    /// barrier itself.
+    fn sync_publication_barrier(
+        &self,
+        scope: &ExecutionScope,
+        digest: &Digest,
+    ) -> Result<(), io::Error> {
+        sync_directory(
+            self.object_path(scope, digest)
+                .parent()
+                .expect("object paths always have a parent"),
+        )?;
+        sync_directory(
+            self.media_path(scope, digest)
+                .parent()
+                .expect("media paths always have a parent"),
+        )
+    }
+
+    /// Establishes the publication barrier before returning a verified ref.
     fn finalize_candidate(
         &self,
         scope: &ExecutionScope,
@@ -323,10 +351,8 @@ impl<C: Clock> FsObjectStore<C> {
         created: bool,
     ) -> Result<VerifiedObjectRef, ObjectStoreError> {
         let final_path = self.object_path(scope, candidate_digest);
-        let parent = final_path
-            .parent()
-            .expect("object paths always have a parent");
-        sync_directory(parent).map_err(storage_error)?;
+        self.sync_publication_barrier(scope, candidate_digest)
+            .map_err(storage_error)?;
         let verified = self.read_verified(&final_path).map_err(unavailable)?;
         let existing_media =
             read_media_type(&self.media_path(scope, candidate_digest)).map_err(unavailable)?;
@@ -381,6 +407,12 @@ impl<C: Clock> ObjectStore for FsObjectStore<C> {
         let media_path = self.media_path(scope, requested);
         let media_type = read_media_type(&media_path)
             .map_err(|failure| self.missing_or_unavailable(scope, requested, failure))?;
+        // The read path pays an fsync per successful get so that no committable reference can
+        // escape ahead of the publication barrier. Splitting this return into a non-committable
+        // verified-read capability, distinct from the durable put capability, would remove the
+        // cost; that is a type-level change to the artifact contract, not to this store.
+        self.sync_publication_barrier(scope, requested)
+            .map_err(|_| ObjectReadError::StorageUnavailable)?;
         let reference = self.verified_reference(
             scope,
             requested.clone(),

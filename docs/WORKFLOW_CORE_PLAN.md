@@ -576,6 +576,55 @@ and deterministic bulk recovery by persisted topological rank. Both store
 implementations and both reference workflows pass those rows without
 linking a legacy runtime module.
 
+W11 is a mandatory pre-alpha gate. It passes only when every applicable gate
+below is green. Gates are defined by the architect ruling adopted as contract
+erratum 0.1.1 (`docs/WORKFLOW_CORE_CONTRACT_ERRATUM_0_1_1.md`).
+
+- **W11-A — Integrity propagation.** The proof-bearing store error preserves the
+  first proof and the exact committed ref through hydration to the command
+  caller. Red fixture: corrupt a hydrated schema and assert the original proof
+  arrives, not a re-minted one.
+- **W11-B — Host boundary.** A server-shaped endpoint proves corruption is
+  committed before response emission, that unavailability causes no transition,
+  and that a failed mark is never presented as applied corruption.
+- **W11-C — Relationship authority.** Arbitrary same-scope proofs cannot corrupt
+  unrelated runs. Red fixture: two runs, one corrupt registered artifact, no
+  owner node; the unrelated mark must return InvalidFailedReadProof.
+- **W11-D — Local protocol model.** Exhaustive stateful crash simulation over the
+  publication protocol, with negative controls. See below.
+- **W11-E — Local qualification.** Every locally supported filesystem profile
+  passes real abrupt-crash testing against a block device, or is explicitly
+  excluded from the support claim.
+- **W11-F — Remote conformance.** A non-filesystem adapter passes conditional
+  publication, failure classification, retry, and tenant isolation fixtures.
+- **W11-G — Deployment adapter.** The concrete server storage adapter passes live
+  integration tests against the selected service.
+- **W11-H — Server topology.** Multi-tenant load, cross-process engine-claim
+  contention, and long-run descriptor/memory stability, per escalation E3.
+
+W11-D requires a stateful crash model implemented with FUSE, syscall
+interception, or an equivalent test filesystem. It must represent file data
+durability separately from directory-entry durability: fsyncing a temporary file
+makes inode contents durable, and only fsyncing the containing directory
+establishes the link entry. Crashes must be injectable after every state-mutating
+syscall, immediately before each barrier, immediately after each successful
+barrier, and immediately before the public method returns. The model must not
+simply discard every unsynced change -- real filesystems persist some unbarriered
+changes and lose others, so the harness explores permitted combinations where
+unsynced entries disappear, survive, or survive in one directory while another
+does not. Every restart constructs a fresh store instance in a fresh
+process-equivalent state.
+
+W11-D must include negative controls. For each critical barrier, a mutated build
+omits the fsync, moves it after the successful return, or makes it a no-op, and
+at least one crash fixture must fail for each mutation. Without this the harness
+only replays the implementation's own assumptions.
+
+A process SIGKILL is not a crash-consistency test: the kernel page cache and
+filesystem keep running, so unsynced data can still be written after the process
+dies. A userspace model without W11-E supports the claim "protocol-model
+verified" and may not support "crash-durable on local filesystem X".
+
 ### W12 — Deferred ledger (explicitly out of v0.1)
 - Distributed worker leases (attempt fencing is IN v0.1; multi-process
   scheduling is not).
