@@ -490,7 +490,12 @@ exhaustively.
 
 ## E7. An action's output commit escapes the per-value inline ceiling
 
-**Status:** open, confirmed by demonstration 2026-08-01. Not yet fixed.
+**Status:** DECIDED LOCALLY 2026-08-02 and implemented; architect ruling still
+required. Option A was taken: the ceiling now applies at `complete_attempt`,
+folded into the existing A05/N21/R08 branch. The full reasoning, the rejected
+alternative, the revert cost, and the one consideration that could overturn it
+are written up as entry R1 in `WORKFLOW_CORE_ARCHITECT_REVIEW_QUEUE.md`. The
+original statement of the defect follows unchanged.
 
 Contract section 1.4 applies `max_inline_json_bytes_per_value` "before binding,
 invocation, event-inline value, or **output commit**". The enforcement sites are

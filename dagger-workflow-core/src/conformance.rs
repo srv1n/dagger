@@ -1,6 +1,6 @@
 //! Adapter-neutral black-box checks shared by volatile and durable stores.
 
-use crate::action::{ActionOutcome, CompatibilityReport};
+use crate::action::{ActionOutcome, ArtifactOutput, CompatibilityReport, CompletionCredential};
 use crate::approval::{
     canonical_human_approval_result, ApprovalDecision, ApprovalExpiryPolicy,
     AuthenticatedPrincipal, DecisionAuthorizationPolicy,
@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 61;
+pub const CASE_COUNT: usize = 67;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -98,6 +98,12 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "revision_typed_definition_mismatch_rejected",
     "revision_definition_id_mismatch_rejected",
     "revision_topological_ranks_mismatch_rejected",
+    "action_output_inline_limit_enforced",
+    "action_output_inline_limit_boundary_accepted",
+    "action_artifacts_per_attempt_limit_enforced",
+    "action_artifacts_per_attempt_limit_boundary_accepted",
+    "action_output_aggregate_limit_enforced",
+    "action_output_aggregate_limit_boundary_accepted",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -2536,17 +2542,18 @@ fn terminal_output_limits(inline_bytes: u64, aggregate_bytes: u64) -> RunLimits 
     }
 }
 
-/// Drives one run to a `Ready` Succeed node under caller-chosen limits.
+/// Drives one run to a `Started` attempt on its entry Action node.
 ///
-/// Everything the Succeed resolution validates first is held identical across the
-/// terminal-output fixtures, so the only thing that differs between them is the
-/// output object handed to `resolve_terminal_node`.
-async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
+/// Everything `complete_attempt` validates ahead of the section 1.4 ceilings
+/// (credential, fence, active attempt, run state, diagnostics, media type) is held
+/// identical across the action-output fixtures, so the only thing that differs
+/// between them is the output object handed to `complete_attempt`.
+async fn prepare_action_attempt_conformance<A: ConformanceAdapter>(
     adapter: &A,
     scope: &ExecutionScope,
     case: usize,
     limits: RunLimits,
-) -> Result<(EnginePermit, Version, WorkflowRun), ConformanceFailure> {
+) -> Result<(EnginePermit, CompletionCredential, WorkflowRun), ConformanceFailure> {
     let claim = adapter
         .store()
         .acquire_engine_claim(scope, id("engine-a"))
@@ -2651,11 +2658,28 @@ async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
         } => completion_credential,
         _ => return Err(failure(case, "claim did not create an attempt")),
     };
-    let action_output = adapter
-        .objects()
-        .put(scope, br#"{"value":1}"#, "application/json")
+    let run = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
         .await
-        .map_err(|_| failure(case, "action output publication failed"))?;
+        .map_err(|_| failure(case, "claimed run read failed"))?
+        .run;
+    Ok((claim.permit, credential, run))
+}
+
+/// Offers `output` plus `artifacts` as the prepared Action attempt's committed result.
+///
+/// `artifacts` must mirror the outcome's own `ArtifactOutput` list: section 7.2 pairs
+/// each declared artifact with exactly one verified object, and `complete_attempt`
+/// rejects a mismatched pair before it reaches the section 1.4 ceilings.
+async fn offer_action_output<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    credential: CompletionCredential,
+    outcome: ActionOutcome,
+    output: VerifiedObjectRef,
+    artifacts: Vec<VerifiedObjectRef>,
+) -> Result<CompleteAttemptResult, StoreError> {
     adapter
         .store()
         .complete_attempt(
@@ -2665,22 +2689,46 @@ async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
                 run_id: id("conformance-run"),
                 node_id: id("action"),
                 attempt_id: id("attempt"),
-                submitted_outcome: ActionOutcome::success(
-                    json!({"value": 1}),
-                    Vec::new(),
-                    CostUnits(1),
-                    None,
-                )
-                .map_err(|_| failure(case, "completion outcome invalid"))?,
+                submitted_outcome: outcome,
                 objects: CompletionObjects {
-                    output: Some(action_output),
-                    artifacts: Vec::new(),
+                    output: Some(output),
+                    artifacts,
                     diagnostics: None,
                 },
             },
         )
         .await
-        .map_err(|_| failure(case, "attempt completion failed"))?;
+}
+
+/// Drives one run to a `Ready` Succeed node under caller-chosen limits.
+///
+/// Everything the Succeed resolution validates first is held identical across the
+/// terminal-output fixtures, so the only thing that differs between them is the
+/// output object handed to `resolve_terminal_node`.
+async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    limits: RunLimits,
+) -> Result<(EnginePermit, Version, WorkflowRun), ConformanceFailure> {
+    let (permit, credential, _) =
+        prepare_action_attempt_conformance(adapter, scope, case, limits).await?;
+    let action_output = adapter
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "action output publication failed"))?;
+    offer_action_output(
+        adapter,
+        scope,
+        credential,
+        ActionOutcome::success(json!({"value": 1}), Vec::new(), CostUnits(1), None)
+            .map_err(|_| failure(case, "completion outcome invalid"))?,
+        action_output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| failure(case, "attempt completion failed"))?;
     let terminal = adapter
         .store()
         .get_node(scope, &id("conformance-run"), &id("succeed"))
@@ -2692,7 +2740,7 @@ async fn prepare_terminal_output_conformance<A: ConformanceAdapter>(
         .await
         .map_err(|_| failure(case, "prepared run read failed"))?
         .run;
-    Ok((claim.permit, terminal.version, run))
+    Ok((permit, terminal.version, run))
 }
 
 /// Offers `output` to the prepared Succeed node and returns the command outcome.
@@ -3001,6 +3049,555 @@ async fn succeed_output_aggregate_limit_boundary_accepted<A: ConformanceAdapter>
         || settled.aggregate_object_bytes != ceiling
     {
         return Err(failure(49, "committed Succeed output was not charged"));
+    }
+    Ok(())
+}
+
+/// Twenty-one canonical bytes: schema-valid, and the calibration subject of both
+/// action-output ceiling cases. Neither case hardcodes that count; each reads the
+/// published object's own `size_bytes` and derives its ceiling from it.
+const ACTION_OUTPUT_BYTES: &[u8] = br#"{"value":12345678901}"#;
+
+/// Asserts the A05/N21 plus R08 triple an oversized action output must produce.
+///
+/// N21's postcondition clears the active attempt and section 1.4 charges only
+/// committed values, so a rejected output must leave the attempt and node
+/// `ContractFailed` with the closed kind, no result ref, no active attempt, the
+/// run `ContractFailed`, and the aggregate counter exactly where the claim left it.
+async fn assert_action_output_contract_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+    expected_kind: NodeFailureKind,
+    expected_run_kind: RunFailureKind,
+    aggregate_before: u64,
+) -> Result<(), ConformanceFailure> {
+    let attempt = adapter
+        .store()
+        .get_attempt(scope, &id("conformance-run"), &id("attempt"))
+        .await
+        .map_err(|_| failure(case, "attempt read failed"))?;
+    if attempt.status != AttemptState::ContractFailed {
+        return Err(failure(case, "attempt did not reach ContractFailed"));
+    }
+    if attempt.output_ref.is_some() {
+        return Err(failure(case, "rejected action output registered a ref"));
+    }
+    let node = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("action"))
+        .await
+        .map_err(|_| failure(case, "action node read failed"))?;
+    if node.status != NodeState::ContractFailed {
+        return Err(failure(case, "Action node did not reach ContractFailed"));
+    }
+    if node.failure_kind != Some(expected_kind) {
+        return Err(failure(case, "Action node recorded the wrong failure kind"));
+    }
+    if node.active_attempt_id.is_some() {
+        return Err(failure(
+            case,
+            "contract-failed node kept its active attempt",
+        ));
+    }
+    if node.result_ref.is_some() {
+        return Err(failure(case, "rejected action output bound a result ref"));
+    }
+    let run = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(case, "contract-failed run read failed"))?
+        .run;
+    if run.status != RunState::ContractFailed {
+        return Err(failure(case, "run did not reach ContractFailed"));
+    }
+    if run.failure_kind != Some(expected_run_kind) {
+        return Err(failure(case, "run recorded the wrong failure kind"));
+    }
+    if run.aggregate_object_bytes != aggregate_before {
+        return Err(failure(case, "rejected action output charged run bytes"));
+    }
+    Ok(())
+}
+
+/// An action output over `max_inline_json_bytes_per_value` is rejected.
+///
+/// Section 1.4 applies the value ceiling "before binding, invocation, event-inline
+/// value, or output commit"; an Action's own result is an output commit, so the
+/// ceiling holds at `complete_attempt` and not merely at whatever later node
+/// happens to bind the value. Escalation E7.
+async fn action_output_inline_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let probe = adapter.fresh();
+    let sized = probe
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(62, "calibration output publication failed"))?;
+    // One byte under the value the action commits, and still above every earlier
+    // value this run publishes, so only the output commit can trip the ceiling.
+    let ceiling = sized.size_bytes() - 1;
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        adapter,
+        scope,
+        62,
+        terminal_output_limits(ceiling, 100_000),
+    )
+    .await?;
+    let output = adapter
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(62, "oversized output publication failed"))?;
+    let completed = offer_action_output(
+        adapter,
+        scope,
+        credential,
+        ActionOutcome::success(
+            json!({"value": 12345678901u64}),
+            Vec::new(),
+            CostUnits(1),
+            None,
+        )
+        .map_err(|_| failure(62, "completion outcome invalid"))?,
+        output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| {
+        failure(
+            62,
+            "attempt completion errored instead of failing the contract",
+        )
+    })?;
+    match completed {
+        CompleteAttemptResult::TerminalRun(terminal) => {
+            if terminal.status != RunState::ContractFailed {
+                return Err(failure(62, "oversized action output was committed"));
+            }
+        }
+        _ => return Err(failure(62, "oversized action output was committed")),
+    }
+    assert_action_output_contract_failure(
+        adapter,
+        scope,
+        62,
+        NodeFailureKind::InlineJsonLimitExceeded,
+        RunFailureKind::InlineJsonLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// An action output exactly at `max_inline_json_bytes_per_value` is committed.
+///
+/// Section 1.4 states the ceiling as an inclusive maximum. Without this the case
+/// above is satisfied by any check strict enough to reject, including one placed
+/// on the wrong value or one off by a byte.
+async fn action_output_inline_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let probe = adapter.fresh();
+    let sized = probe
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(63, "calibration output publication failed"))?;
+    let ceiling = sized.size_bytes();
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        adapter,
+        scope,
+        63,
+        terminal_output_limits(ceiling, 100_000),
+    )
+    .await?;
+    let output = adapter
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(63, "boundary output publication failed"))?;
+    let size = output.size_bytes();
+    offer_action_output(
+        adapter,
+        scope,
+        credential,
+        ActionOutcome::success(
+            json!({"value": 12345678901u64}),
+            Vec::new(),
+            CostUnits(1),
+            None,
+        )
+        .map_err(|_| failure(63, "completion outcome invalid"))?,
+        output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| failure(63, "boundary action output was rejected"))?;
+    let node = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("action"))
+        .await
+        .map_err(|_| failure(63, "action node read failed"))?;
+    if node.status != NodeState::Succeeded || node.result_ref.is_none() {
+        return Err(failure(63, "boundary action output did not succeed"));
+    }
+    let settled = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(63, "settled run read failed"))?
+        .run;
+    if settled.status != RunState::Running {
+        return Err(failure(63, "boundary action output terminated the run"));
+    }
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size {
+        return Err(failure(63, "committed action output was not charged"));
+    }
+    Ok(())
+}
+
+/// Publishes the two distinct artifact objects the artifact-ceiling cases submit.
+///
+/// The bytes differ so the pair is two objects rather than one deduplicated digest,
+/// which is what makes the section 1.4 per-attempt *count* observable at all. Both
+/// are tiny, so the per-value and aggregate ceilings the cases leave wide open
+/// cannot be what rejects them.
+async fn action_artifact_pair<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<Vec<VerifiedObjectRef>, ConformanceFailure> {
+    let mut objects = Vec::new();
+    for bytes in [br#"{"artifact":1}"#, br#"{"artifact":2}"#] {
+        objects.push(
+            adapter
+                .objects()
+                .put(scope, bytes, "application/json")
+                .await
+                .map_err(|_| failure(case, "artifact publication failed"))?,
+        );
+    }
+    Ok(objects)
+}
+
+/// Builds the success outcome declaring one `ArtifactOutput` per submitted object.
+fn action_success_with_artifacts(
+    case: usize,
+    artifacts: &[VerifiedObjectRef],
+) -> Result<ActionOutcome, ConformanceFailure> {
+    ActionOutcome::success(
+        json!({"value": 1}),
+        artifacts
+            .iter()
+            .map(|object| ArtifactOutput {
+                media_type: "application/json".to_owned(),
+                object: object.clone(),
+            })
+            .collect(),
+        CostUnits(1),
+        None,
+    )
+    .map_err(|_| failure(case, "completion outcome invalid"))
+}
+
+/// An accepted completion over `max_artifacts_per_attempt` is rejected.
+///
+/// Section 1.4 bounds artifacts per attempt and lists the ceiling among those
+/// enforced "before accepted action completion", so `complete_attempt` is the call
+/// site that must hold it: no later node ever revisits an attempt's artifact count.
+/// The per-value and aggregate ceilings are left wide open here, so the count is the
+/// only ceiling in the chain the submission can breach, and the recorded closed kind
+/// confirms which of the three fired.
+async fn action_artifacts_per_attempt_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        adapter,
+        scope,
+        64,
+        RunLimits {
+            max_artifacts_per_attempt: 1,
+            ..terminal_output_limits(100_000, 1_000_000)
+        },
+    )
+    .await?;
+    let artifacts = action_artifact_pair(adapter, scope, 64).await?;
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(64, "output publication failed"))?;
+    let completed = offer_action_output(
+        adapter,
+        scope,
+        credential,
+        action_success_with_artifacts(64, &artifacts)?,
+        output,
+        artifacts,
+    )
+    .await
+    .map_err(|_| {
+        failure(
+            64,
+            "attempt completion errored instead of failing the contract",
+        )
+    })?;
+    match completed {
+        CompleteAttemptResult::TerminalRun(terminal) => {
+            if terminal.status != RunState::ContractFailed {
+                return Err(failure(64, "over-count artifact set was committed"));
+            }
+        }
+        _ => return Err(failure(64, "over-count artifact set was committed")),
+    }
+    assert_action_output_contract_failure(
+        adapter,
+        scope,
+        64,
+        NodeFailureKind::ArtifactsPerAttemptLimitExceeded,
+        RunFailureKind::ArtifactsPerAttemptLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// An accepted completion at exactly `max_artifacts_per_attempt` is committed.
+///
+/// Section 1.4 states the ceiling as an inclusive maximum. Without this the case
+/// above is satisfied by any check strict enough to reject, including one off by one
+/// or one that rejects every artifact-bearing completion outright.
+async fn action_artifacts_per_attempt_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        adapter,
+        scope,
+        65,
+        RunLimits {
+            max_artifacts_per_attempt: 2,
+            ..terminal_output_limits(100_000, 1_000_000)
+        },
+    )
+    .await?;
+    let artifacts = action_artifact_pair(adapter, scope, 65).await?;
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":1}"#, "application/json")
+        .await
+        .map_err(|_| failure(65, "output publication failed"))?;
+    // Section 1.4 charges the output and every artifact against the run aggregate.
+    let charged = artifacts.iter().fold(output.size_bytes(), |total, object| {
+        total + object.size_bytes()
+    });
+    offer_action_output(
+        adapter,
+        scope,
+        credential,
+        action_success_with_artifacts(65, &artifacts)?,
+        output,
+        artifacts,
+    )
+    .await
+    .map_err(|_| failure(65, "boundary artifact set was rejected"))?;
+    let node = adapter
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("action"))
+        .await
+        .map_err(|_| failure(65, "action node read failed"))?;
+    if node.status != NodeState::Succeeded || node.result_ref.is_none() {
+        return Err(failure(65, "boundary artifact set did not succeed"));
+    }
+    let attempt = adapter
+        .store()
+        .get_attempt(scope, &id("conformance-run"), &id("attempt"))
+        .await
+        .map_err(|_| failure(65, "attempt read failed"))?;
+    if attempt.artifact_refs.len() != 2 {
+        return Err(failure(65, "boundary artifact set was not registered"));
+    }
+    let settled = adapter
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(65, "settled run read failed"))?
+        .run;
+    if settled.status != RunState::Running {
+        return Err(failure(65, "boundary artifact set terminated the run"));
+    }
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + charged {
+        return Err(failure(65, "committed artifacts were not charged"));
+    }
+    Ok(())
+}
+
+/// An accepted completion past `max_aggregate_object_bytes_per_run` is rejected.
+///
+/// Section 1.4 charges committed action outputs against the run aggregate, so the
+/// ceiling binds at `complete_attempt` and not merely at the Map or Succeed commits
+/// the rest of the suite covers. The ceiling is calibrated from a throwaway run
+/// rather than hardcoded, so the case pins the contract and not an accounting
+/// detail. The per-value ceiling is left far above the submitted output and no
+/// artifacts are submitted, so neither earlier check in the chain can fire; the
+/// recorded closed kind confirms which one did.
+async fn action_output_aggregate_limit_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let probe = adapter.fresh();
+    let (_, _, calibration) = prepare_action_attempt_conformance(
+        &probe,
+        scope,
+        66,
+        terminal_output_limits(100_000, 1_000_000),
+    )
+    .await?;
+    let sized = probe
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(66, "calibration output publication failed"))?;
+    // Room for every byte the prepared run already charged, and one short of the
+    // output it is about to commit.
+    let ceiling = calibration.aggregate_object_bytes + sized.size_bytes() - 1;
+    let tight = adapter.fresh();
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        &tight,
+        scope,
+        66,
+        terminal_output_limits(100_000, ceiling),
+    )
+    .await?;
+    let output = tight
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(66, "output publication failed"))?;
+    let completed = offer_action_output(
+        &tight,
+        scope,
+        credential,
+        ActionOutcome::success(
+            json!({"value": 12345678901u64}),
+            Vec::new(),
+            CostUnits(1),
+            None,
+        )
+        .map_err(|_| failure(66, "completion outcome invalid"))?,
+        output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| {
+        failure(
+            66,
+            "attempt completion errored instead of failing the contract",
+        )
+    })?;
+    match completed {
+        CompleteAttemptResult::TerminalRun(terminal) => {
+            if terminal.status != RunState::ContractFailed {
+                return Err(failure(66, "over-ceiling action output was committed"));
+            }
+        }
+        _ => return Err(failure(66, "over-ceiling action output was committed")),
+    }
+    assert_action_output_contract_failure(
+        &tight,
+        scope,
+        66,
+        NodeFailureKind::AggregateObjectLimitExceeded,
+        RunFailureKind::AggregateObjectLimitExceeded,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
+/// An action output landing exactly on the aggregate ceiling is committed.
+///
+/// Section 1.4 states the ceiling as an inclusive maximum, so pinning the accepting
+/// side keeps the rejection above from being satisfied by a check placed a byte
+/// early or on the wrong quantity.
+async fn action_output_aggregate_limit_boundary_accepted<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let probe = adapter.fresh();
+    let (_, _, calibration) = prepare_action_attempt_conformance(
+        &probe,
+        scope,
+        67,
+        terminal_output_limits(100_000, 1_000_000),
+    )
+    .await?;
+    let sized = probe
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(67, "calibration output publication failed"))?;
+    let ceiling = calibration.aggregate_object_bytes + sized.size_bytes();
+    let exact = adapter.fresh();
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        &exact,
+        scope,
+        67,
+        terminal_output_limits(100_000, ceiling),
+    )
+    .await?;
+    let output = exact
+        .objects()
+        .put(scope, ACTION_OUTPUT_BYTES, "application/json")
+        .await
+        .map_err(|_| failure(67, "boundary output publication failed"))?;
+    let size = output.size_bytes();
+    offer_action_output(
+        &exact,
+        scope,
+        credential,
+        ActionOutcome::success(
+            json!({"value": 12345678901u64}),
+            Vec::new(),
+            CostUnits(1),
+            None,
+        )
+        .map_err(|_| failure(67, "completion outcome invalid"))?,
+        output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| failure(67, "boundary action output was rejected"))?;
+    let node = exact
+        .store()
+        .get_node(scope, &id("conformance-run"), &id("action"))
+        .await
+        .map_err(|_| failure(67, "action node read failed"))?;
+    if node.status != NodeState::Succeeded || node.result_ref.is_none() {
+        return Err(failure(67, "boundary action output did not succeed"));
+    }
+    let settled = exact
+        .store()
+        .get_run(scope, &id("conformance-run"))
+        .await
+        .map_err(|_| failure(67, "settled run read failed"))?
+        .run;
+    if settled.status != RunState::Running {
+        return Err(failure(67, "boundary action output terminated the run"));
+    }
+    if settled.aggregate_object_bytes != run.aggregate_object_bytes + size
+        || settled.aggregate_object_bytes != ceiling
+    {
+        return Err(failure(67, "committed action output was not charged"));
     }
     Ok(())
 }
@@ -4045,12 +4642,16 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     scope_b: &ExecutionScope,
 ) -> Vec<ConformanceCaseResult> {
     let mut results = Vec::with_capacity(CASE_COUNT);
+    // Each fixture future is boxed rather than inlined. Awaiting every case inline
+    // makes this one state machine the sum of all of them, which overflows an
+    // ordinary 2 MiB test-thread stack once the suite is large enough; the box keeps
+    // the runner's frame flat as cases are added.
     macro_rules! run_fixture {
         ($name:literal, $fixture:ident) => {{
             let adapter = adapter_factory.fresh();
             results.push(ConformanceCaseResult {
                 name: $name,
-                failure: $fixture(&adapter, scope_a, scope_b).await.err(),
+                failure: Box::pin($fixture(&adapter, scope_a, scope_b)).await.err(),
             });
         }};
     }
@@ -4186,6 +4787,30 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "revision_topological_ranks_mismatch_rejected",
         revision_topological_ranks_mismatch_rejected
+    );
+    run_fixture!(
+        "action_output_inline_limit_enforced",
+        action_output_inline_limit_enforced
+    );
+    run_fixture!(
+        "action_output_inline_limit_boundary_accepted",
+        action_output_inline_limit_boundary_accepted
+    );
+    run_fixture!(
+        "action_artifacts_per_attempt_limit_enforced",
+        action_artifacts_per_attempt_limit_enforced
+    );
+    run_fixture!(
+        "action_artifacts_per_attempt_limit_boundary_accepted",
+        action_artifacts_per_attempt_limit_boundary_accepted
+    );
+    run_fixture!(
+        "action_output_aggregate_limit_enforced",
+        action_output_aggregate_limit_enforced
+    );
+    run_fixture!(
+        "action_output_aggregate_limit_boundary_accepted",
+        action_output_aggregate_limit_boundary_accepted
     );
     results
 }
