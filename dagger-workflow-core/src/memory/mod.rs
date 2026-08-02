@@ -4538,7 +4538,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     });
                 }
             }
-            // Section 1.4 enforces both ceilings "before accepted action completion", and
+            // Section 1.4 enforces these ceilings "before accepted action completion", and
             // N21/A05 is the transition for an accepted completion that breaches an output
             // or artifact limit: settle, contract-fail the attempt and node, R08. The kind
             // is recorded here and applied with the cost-protocol branch below, after the
@@ -4582,6 +4582,17 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     > run.limits.max_artifacts_per_attempt
                 {
                     limit_failure = Some(NodeFailureKind::ArtifactsPerAttemptLimitExceeded);
+                } else if output.size_bytes() > run.limits.max_inline_json_bytes_per_value {
+                    // Section 1.4 applies `max_inline_json_bytes_per_value` "before
+                    // binding, invocation, event-inline value, or output commit"; an
+                    // Action's own result is an output commit, so the ceiling holds here
+                    // as it already does for the Succeed output and the Map aggregate.
+                    // Only the output is scoped: artifacts are opaque objects bounded by
+                    // the per-attempt count and the aggregate byte ceiling, and
+                    // diagnostics are excluded from charged run data and carry their own
+                    // fixed 65,536-byte maximum checked above. Per-value is tested before
+                    // aggregate, matching `resolve_terminal_node` and `complete_map`.
+                    limit_failure = Some(NodeFailureKind::InlineJsonLimitExceeded);
                 } else if run
                     .aggregate_object_bytes
                     .checked_add(charged_bytes)
@@ -4783,6 +4794,13 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         // it here would mean output and artifact refs are already staged, so
                         // fail closed rather than let `transaction`'s applied-error path
                         // commit them without the transition.
+                        return Err(StoreError::TransactionFailed);
+                    }
+                    if output.size_bytes() > run_snapshot.limits.max_inline_json_bytes_per_value {
+                        // Unreachable for the same reason as the artifact limit above: the
+                        // section 1.4 per-value ceiling on the output commit is checked
+                        // before the deadline branch. Fail closed rather than stage a ref
+                        // for a value the contract says may not be committed.
                         return Err(StoreError::TransactionFailed);
                     }
                     let output_ref = json_ref(

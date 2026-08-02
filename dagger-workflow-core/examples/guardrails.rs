@@ -721,7 +721,7 @@ fn scenarios() -> Vec<Scenario> {
         },
         Scenario {
             title:
-                "Guardrail 4: the max_inline_json_bytes_per_value ceiling refuses the root output",
+                "Guardrail 4: the max_inline_json_bytes_per_value ceiling refuses the producing node's output",
             definition_id: "guardrail_inline_json_ceiling",
             template: WORKFLOW_TEMPLATE,
             action: "guard.bloat",
@@ -729,7 +729,9 @@ fn scenarios() -> Vec<Scenario> {
             setup: &[
                 "action: guard.bloat succeeds with a 4096-character payload string",
                 "node retry policy: max_attempts=1",
-                "run limits: max_inline_json_bytes_per_value=2048, below the Succeed output size",
+                "run limits: max_inline_json_bytes_per_value=2048, below the value the action commits",
+                "the ceiling applies at output commit (contract 1.4), so the producing",
+                "node fails and the failure is attributed to it, not to a downstream consumer",
             ],
             limits: RunLimits {
                 max_inline_json_bytes_per_value: 2_048,
