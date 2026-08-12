@@ -1,6 +1,6 @@
 //! Parse one workflow YAML file through dagger-workflow-core's strict authority.
 
-use dagger_workflow_core::definition::parse_yaml_definition;
+use dagger_workflow_core::definition::{parse_yaml_definition, validate_definition};
 use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,6 +10,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: definition-lint <definition.yaml>")?;
     let source = std::fs::read_to_string(&path)?;
     let definition = parse_yaml_definition(&source)?;
+    validate_definition(&definition).map_err(|errors| {
+        errors
+            .into_iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })?;
     println!(
         "{{\"definition_id\":\"{}\",\"node_count\":{},\"status\":\"accepted\"}}",
         definition.definition_id.as_str(),
