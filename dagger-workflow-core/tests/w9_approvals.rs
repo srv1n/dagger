@@ -1,10 +1,9 @@
 #![cfg(feature = "sqlite")]
 //! W9 acceptance specs: durable approval gates.
 //!
-//! Normative source: docs/WORKFLOW_CORE_CONTRACT.md section 1.9 (ApprovalGate
-//! entity), section 3.4 transitions N11-N15/N39/N67, section 3.5 (G01-G06, the
-//! decision fingerprint, and the engine-owned `ApprovalResult` envelope), and
-//! sections 5.3/5.4 (`request_approval`, `decide_approval`, `expire_approval`).
+//! The implemented contract is in `src/approval.rs`, `src/run.rs`, and the
+//! `WorkflowStore` approval commands. The host rules are in
+//! `docs/system/operations-and-limits.md`.
 //!
 //! Two deliberate choices, both mirroring `tests/w10_budgets.rs`.
 //!
@@ -16,8 +15,8 @@
 //! one copy is later edited and the other is not.
 //!
 //! Second, the negative fixtures assert on the *state that did not change*,
-//! not merely on the returned error. Contract section 3.5 says unauthorized
-//! input "cannot win or perturb the race"; an error return with a silently
+//! not merely on the returned error. Unauthorized input cannot win or perturb
+//! the race. An error return with a silently
 //! bumped gate version would satisfy a naive assertion while breaking the
 //! first-valid-decision-wins property that the whole workstream rests on. So
 //! every rejection fixture captures the gate version, the run version, and the
@@ -55,7 +54,7 @@ use tempfile::TempDir;
 const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#;
 const RUN_INPUT: &[u8] = br#"{"value":1}"#;
 const CLOCK_ORIGIN: Timestamp = Timestamp(1_000_000);
-/// Contract section 1.9: `expires_at` is computed from DB time at request.
+/// `expires_at` is computed from DB time at request.
 /// Deliberately shorter than the 20s engine-claim lifetime so one claim
 /// acquired at seed time is still live when the gate falls due.
 const EXPIRES_AFTER_MS: u64 = 10_000;
@@ -114,8 +113,8 @@ struct Opened {
 /// The `advance` argument is not a convenience. The two stores keep time in
 /// different places: the in-memory reducer reads the injected `TestClock`,
 /// while the SQLite store's authoritative time is SQLite's own `now` plus a
-/// durable `clock_offset_ms` column (contract section 16.2 forbids process
-/// clocks for approval expiry). A fixture that advanced only the `TestClock`
+/// durable `clock_offset_ms` column. Process clocks cannot control approval
+/// expiry. A fixture that advanced only the `TestClock`
 /// would silently prove nothing on the SQLite side.
 macro_rules! both_stores {
     ($body:ident) => {{
@@ -160,8 +159,8 @@ macro_rules! both_stores {
 }
 
 /// Publishes `approval -> succeed`, with a gate policy that names one
-/// principal ID and one role ID. Both allowlist arms matter: contract section
-/// 3.5 authorizes on principal ID *or* role membership, so a fixture that only
+/// principal ID and one role ID. Both allowlist arms matter. The policy
+/// authorizes on principal ID *or* role membership, so a fixture that only
 /// exercised the principal arm could not tell an implemented role check from a
 /// missing one.
 async fn seed<S: WorkflowStore>(
@@ -362,7 +361,7 @@ async fn open_gate<S: WorkflowStore>(
 }
 
 /// The (gate version, run version, last event seq) triple that a rejected
-/// command must leave untouched. Contract section 3.5: unauthorized or losing
+/// command must leave untouched. unauthorized or losing
 /// input "cannot win or perturb the race".
 async fn watermark<S: WorkflowStore>(
     store: &S,
@@ -439,7 +438,7 @@ async fn canonical_output(
 
 /// The durable state that an `ApprovalPayloadInvalid` refusal must leave behind.
 ///
-/// Contract section 5.5 classifies `ContractValidationApplied` as an *applied*
+/// `ContractValidationApplied` is an *applied*
 /// error: unlike every other rejection in this file, it does not mean "nothing
 /// happened", it means the transaction committed N67 (`WaitingApproval` ->
 /// `ContractFailed`) together with the R08 run cascade and the G06 cancellation
@@ -508,7 +507,7 @@ async fn assert_payload_invalid_applied<S: WorkflowStore>(
 // and an arbitrary host request.
 // -------------------------------------------------------------------------
 
-/// Contract section 3.5: `decide_approval` first validates that the capability
+/// `decide_approval` first validates that the capability
 /// was minted for the gate's `ExecutionScope`; "a capability minted for scope B
 /// is structurally invalid in scope A". This fixture mints the capability with
 /// the *same principal ID that the policy allows*, so passing the policy check
@@ -557,7 +556,7 @@ async fn cross_scope_principal_cannot_perturb_the_gate() {
     both_stores!(body);
 }
 
-/// Contract section 3.5: the immutable policy authorizes on principal ID or on
+/// the immutable policy authorizes on principal ID or on
 /// role membership. Three arms, so a check that collapsed to "always true" or
 /// "always false" fails either the negative or the positive arm.
 #[tokio::test]
@@ -639,7 +638,7 @@ async fn only_a_policy_satisfying_principal_can_decide() {
 }
 
 // -------------------------------------------------------------------------
-// Idempotency and fail-closed conflict. Contract section 3.5: "Exactly
+// Idempotency and fail-closed conflict. "Exactly
 // identical replay of G02/G03, determined by `decision_fingerprint`, returns
 // the existing decision and emits no event. A different decision, payload,
 // approval output, authenticated principal, or authentication-context digest
@@ -689,7 +688,7 @@ async fn identical_replay_is_a_no_op_and_any_difference_fails_closed() {
         );
 
         // Conflict 1: same principal ID and same decision, different
-        // authentication-context digest. Contract section 3.5 puts that digest
+        // authentication-context digest. puts that digest
         // in the fingerprint precisely so a re-authenticated session cannot
         // pass as the committed decision.
         let other_context = principal_in(
@@ -738,7 +737,7 @@ async fn identical_replay_is_a_no_op_and_any_difference_fails_closed() {
 }
 
 // -------------------------------------------------------------------------
-// ApprovalResult byte exactness. Contract section 3.5: the engine constructs
+// ApprovalResult byte exactness. the engine constructs
 // the expected canonical bytes and `decide_approval` verifies byte-for-byte
 // equality, media type, size, and digest before G02.
 // -------------------------------------------------------------------------
@@ -810,7 +809,7 @@ async fn approved_output_is_the_exact_canonical_envelope() {
         assert_payload_invalid_applied(store, &fixture, &opened, label).await;
 
         // Arm 3: a decision payload is supplied but the envelope carries
-        // `payload_ref: null`. Contract section 3.5 requires the human
+        // `payload_ref: null`. requires the human
         // envelope to use "the exact decision-payload ArtifactRef value or
         // null", so this must fail closed. It is the arm that proves the
         // envelope is bound to the *registered* payload ref rather than merely
@@ -868,7 +867,7 @@ async fn approved_output_is_the_exact_canonical_envelope() {
             expected_bytes.len() as u64,
             "{label}: committed envelope size differs from the canonical bytes"
         );
-        // Contract section 3.5: the approval-output digest participates in the
+        // the approval-output digest participates in the
         // decision fingerprint, so an approve can never carry the null tag.
         assert!(gate.decision_fingerprint.is_some(), "{label}");
     }
@@ -876,7 +875,7 @@ async fn approved_output_is_the_exact_canonical_envelope() {
 }
 
 // -------------------------------------------------------------------------
-// Expiry. Contract section 16.2: "Process wall clocks and monotonic clocks are
+// Expiry. "Process wall clocks and monotonic clocks are
 // never used for ownership, expiry, retry eligibility, attempt deadlines, or
 // approval expiry."
 // -------------------------------------------------------------------------
@@ -887,7 +886,7 @@ async fn approved_output_is_the_exact_canonical_envelope() {
 /// time differently and the difference is exactly what the fixture measures.
 /// The in-memory reducer reads a frozen `TestClock`, so the boundary can be
 /// probed at one millisecond -- tight enough to catch a `>` written where
-/// contract G05 says `DB-now >= expires_at`. The SQLite store's authoritative
+/// the rule is `DB-now >= expires_at`. The SQLite store's authoritative
 /// time is real Unix time plus a durable offset column, so a one-millisecond
 /// probe there would only measure how long the test itself took to run. It
 /// gets a coarse margin and proves the weaker but still real claim that a gate
@@ -905,7 +904,7 @@ async fn expiry_boundary_body<
 ) {
     let fixture = seed(store, objects, "expiry-clock", ApprovalExpiryPolicy::Reject).await;
     let opened = open_gate(store, objects, &fixture, "run").await;
-    // Contract section 1.9: `expires_at` is "computed from DB time". The
+    // `expires_at` is "computed from DB time". The
     // approval node's `updated_at` is stamped from the same in-transaction
     // `now`, so their difference is exactly the configured lifetime -- an
     // assertion that holds whichever clock the store reads, and that fails if
@@ -944,7 +943,7 @@ async fn expiry_boundary_body<
         "{label}: a not-due expiry perturbed state"
     );
 
-    // At or past the deadline: due. Contract G05 is `DB-now >= expires_at`.
+    // At or past the deadline: due. The rule is `DB-now >= expires_at`.
     advance(slack).await;
     let gate = store
         .expire_approval(&fixture.scope, expire())
@@ -999,7 +998,7 @@ async fn expiry_is_not_due_before_the_database_deadline_in_sqlite() {
     .await;
 }
 
-/// Contract G04/G05 and N14/N15: `on_expiry` selects the terminal behaviour,
+/// `on_expiry` selects the terminal behaviour,
 /// and the approve arm must supply the canonical *expiry* envelope, which
 /// differs from the human envelope in `source` and `principal`.
 #[tokio::test]
@@ -1060,7 +1059,7 @@ async fn on_expiry_selects_the_terminal_behaviour() {
         )
         .await;
         let opened = open_gate(store, objects, &approving, "run").await;
-        // The wrong-envelope probe gets its own run and gate. Contract N67
+        // The wrong-envelope probe gets its own run and gate. The state rule
         // makes an invalid envelope terminal for the gate and the run, so it
         // cannot share a gate with the behaviour assertions below.
         let forged = open_gate(store, objects, &approving, "run-human-envelope").await;
@@ -1144,7 +1143,7 @@ async fn on_expiry_selects_the_terminal_behaviour() {
 }
 
 // -------------------------------------------------------------------------
-// First-valid-decision-wins. Contract section 3.5: the loser of the Gate
+// First-valid-decision-wins. the loser of the Gate
 // Pending CAS gets `ApprovalRaceLost` (expiry/cancellation) or
 // `ApprovalAlreadyResolved` (a differing human decision); the winner is chosen
 // by the store transaction, not by the caller.
@@ -1317,7 +1316,7 @@ async fn first_valid_resolution_wins_against_expiry_and_cancellation() {
 }
 
 // -------------------------------------------------------------------------
-// Restart. Contract section 5.4: "The Pending gate, request ref, expiry, and
+// Restart. "The Pending gate, request ref, expiry, and
 // node WaitingApproval state survive. Recovery neither approves nor recreates
 // it."
 // -------------------------------------------------------------------------

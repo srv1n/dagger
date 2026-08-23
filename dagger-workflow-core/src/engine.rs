@@ -1,4 +1,4 @@
-//! Minimal engine construction surface reserved for W3. Contract sections 5 and 6.
+//! Minimal engine construction surface reserved for W3.
 
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
@@ -93,24 +93,24 @@ pub enum ClockError {
     Overflow,
 }
 
-/// Scheduler-wide non-durable execution configuration. Contract section 10.3.
+/// Scheduler-wide non-durable execution configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EngineConfig {
-    /// Engine instance label used by the singleton claim. Contract section 6.
+    /// Engine instance label used by the singleton claim.
     pub instance_id: Id,
-    /// Maximum concurrently invoked actions in this process. Contract section 10.3.
+    /// Maximum concurrently invoked actions in this process.
     pub max_concurrency: usize,
 }
 
-/// Engine construction failure. Contract section 6.
+/// Engine construction failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EngineBuildError {
-    /// The configured concurrency is zero. Contract section 10.3.
+    /// The configured concurrency is zero.
     #[error("engine concurrency must be positive")]
     InvalidConcurrency,
 }
 
-/// Durable workflow scheduler shell implemented by W3. Contract section 5.
+/// Durable workflow scheduler shell implemented by W3.
 #[allow(dead_code)]
 pub struct WorkflowEngine<S, O, R>
 where
@@ -133,7 +133,7 @@ where
     O: ObjectStore,
     R: ActionRegistry,
 {
-    /// Constructs an engine without acquiring its scoped claim. Contract section 6.
+    /// Constructs an engine without acquiring its scoped claim.
     pub fn new(
         store: Arc<S>,
         object_store: Arc<O>,
@@ -214,7 +214,7 @@ where
         {
             Ok(_) => Ok(()),
             // The run already exists, so hydration corruption is marked before
-            // the integrity failure is surfaced. Contract sections 5.5 and 12.3.
+            // the integrity failure is surfaced.
             Err(StoreError::CommittedObjectCorrupt { bad_ref, proof }) => Err(self
                 .apply_committed_corruption(scope, run_id, bad_ref, proof, None)
                 .await),
@@ -559,7 +559,7 @@ where
     /// engine's mapping of its four outcomes onto `EngineError`. A failed
     /// `mark_corrupt_storage` surfaces as the store failure, never as the
     /// integrity failure, because the run has not been invalidated in that
-    /// case. Contract sections 5.5 and 12.3.
+    /// case.
     async fn read_committed(
         &self,
         scope: &ExecutionScope,
@@ -587,7 +587,7 @@ where
     /// a committed prerequisite. The proof it carries is the same capability a
     /// direct read would have minted, so the run is marked here before the
     /// integrity failure is surfaced. A failed mark surfaces as the store
-    /// failure. Contract sections 5.5 and 12.3.
+    /// failure.
     async fn apply_committed_corruption(
         &self,
         scope: &ExecutionScope,
@@ -1191,7 +1191,7 @@ where
                     Err(StoreError::CasConflict | StoreError::ChildrenIncomplete) => {}
                     // The store hydrated a committed child object and found it
                     // corrupt. The run exists, so it is marked before the
-                    // integrity failure is surfaced. Contract sections 5.5 and 12.3.
+                    // integrity failure is surfaced.
                     Err(StoreError::CommittedObjectCorrupt { bad_ref, proof }) => {
                         return Err(self
                             .apply_committed_corruption(
@@ -1314,7 +1314,7 @@ pub enum EngineError {
     /// unchanged. `create_run` is a no-write pre-run failure: no run exists, so
     /// no `mark_corrupt_storage` is attempted, no run and no control-plane state
     /// are created, and the carried proof stays available for diagnostics.
-    /// Contract sections 5.5 and 12.3.
+    ///.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The scope has no acquired local scheduler permit.

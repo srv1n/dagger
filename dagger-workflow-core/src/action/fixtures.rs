@@ -135,7 +135,7 @@ pub fn descriptor(name: &str) -> ActionDescriptor {
 
 /// Returns the single schema every deterministic fixture pin points at.
 ///
-/// Contract section 14.3 has no permissive object schema: every object node is
+///.
 /// closed by construction (`additionalProperties: false` plus a declared
 /// property set), so this cannot be `{}`. It is therefore the exact union of
 /// the fields the three store-side validators actually see for the legal

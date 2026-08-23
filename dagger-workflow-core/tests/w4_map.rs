@@ -105,7 +105,7 @@ impl WorkflowAction for MapAction {
 const SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;
 
 /// The Succeed node here is bound to the Map, so its output is the ordered
-/// aggregate of the children (contract section 3.3 N08), which is an ARRAY and
+/// aggregate of the children (), which is an ARRAY and
 /// can never satisfy `SCHEMA`. `resolve_terminal_node` validates that output
 /// against the pinned root output schema per N16, so the root output needs its
 /// own document. `items` is the union of the map items these fixtures echo back:

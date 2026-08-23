@@ -1,197 +1,197 @@
-//! Durable run, node, attempt, edge, state, and operational-view types from contract sections 1 and 2.
+//! Durable run, node, attempt, edge, state, and operational-view types.
 
 use crate::artifact::{ArtifactRef, FailedReadClass, JsonRef};
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp, TopologicalRank, Version};
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 
-/// The closed durable run state vocabulary. Contract section 2.1.
+/// The closed durable run state vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RunState {
-    /// Awaiting compatibility acceptance. Contract section 2.1.
+    /// Awaiting compatibility acceptance.
     Pending,
-    /// Scheduling and clock transitions are allowed. Contract section 2.1.
+    /// Scheduling and clock transitions are allowed.
     Running,
-    /// Recoverably suspended for incompatible pins. Contract section 2.1.
+    /// Recoverably suspended for incompatible pins.
     BlockedIncompatible,
-    /// Successful terminal state. Contract section 2.1.
+    /// Successful terminal state.
     Succeeded,
-    /// Permanent domain failure. Contract section 2.1.
+    /// Permanent domain failure.
     Failed,
-    /// Runtime contract failure. Contract section 2.1.
+    /// Runtime contract failure.
     ContractFailed,
-    /// Retry ceiling exhaustion. Contract section 2.1.
+    /// Retry ceiling exhaustion.
     RetriesExhausted,
-    /// Permanently infeasible budget. Contract section 2.1.
+    /// Permanently infeasible budget.
     BudgetExhausted,
-    /// Cancellation terminal state. Contract section 2.1.
+    /// Cancellation terminal state.
     Cancelled,
-    /// Absorbing committed-object corruption. Contract section 2.1.
+    /// Absorbing committed-object corruption.
     CorruptStorage,
 }
 
-/// The closed durable node state vocabulary. Contract section 2.2.
+/// The closed durable node state vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeState {
-    /// Incoming facts are incomplete. Contract section 2.2.
+    /// Incoming facts are incomplete.
     Pending,
-    /// Node is eligible for execution. Contract section 2.2.
+    /// Node is eligible for execution.
     Ready,
-    /// An Action attempt is active. Contract section 2.2.
+    /// An Action attempt is active.
     Running,
-    /// Persisted retry delay is pending. Contract section 2.2.
+    /// Persisted retry delay is pending.
     RetryWaiting,
-    /// Reservation pressure temporarily blocks admission. Contract section 2.2.
+    /// Reservation pressure temporarily blocks admission.
     BudgetWaiting,
-    /// A durable approval gate is pending. Contract section 2.2.
+    /// A durable approval gate is pending.
     WaitingApproval,
-    /// A Map awaits children. Contract section 2.2.
+    /// A Map awaits children.
     WaitingChildren,
-    /// The node is recoverably incompatible. Contract section 2.2.
+    /// The node is recoverably incompatible.
     BlockedIncompatible,
-    /// Successful terminal state. Contract section 2.2.
+    /// Successful terminal state.
     Succeeded,
-    /// Permanent node failure. Contract section 2.2.
+    /// Permanent node failure.
     Failed,
-    /// Runtime contract failure. Contract section 2.2.
+    /// Runtime contract failure.
     ContractFailed,
-    /// Retry ceiling exhaustion. Contract section 2.2.
+    /// Retry ceiling exhaustion.
     RetriesExhausted,
-    /// Permanently infeasible budget. Contract section 2.2.
+    /// Permanently infeasible budget.
     BudgetExhausted,
-    /// Cancellation terminal state. Contract section 2.2.
+    /// Cancellation terminal state.
     Cancelled,
-    /// Absorbing committed-object corruption. Contract section 2.2.
+    /// Absorbing committed-object corruption.
     CorruptStorage,
-    /// No active incoming path reaches this node. Contract section 2.2.
+    /// No active incoming path reaches this node.
     Skipped,
 }
 
-/// Node states that may be saved during compatibility suspension. Contract section 1.5.
+/// Node states that may be saved during compatibility suspension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BlockedFromState {
-    /// Previously Pending. Contract section 1.5.
+    /// Previously Pending.
     Pending,
-    /// Previously Ready. Contract section 1.5.
+    /// Previously Ready.
     Ready,
-    /// Previously RetryWaiting. Contract section 1.5.
+    /// Previously RetryWaiting.
     RetryWaiting,
-    /// Previously BudgetWaiting. Contract section 1.5.
+    /// Previously BudgetWaiting.
     BudgetWaiting,
 }
 
-/// The closed immutable attempt state vocabulary. Contract section 2.3.
+/// The closed immutable attempt state vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AttemptState {
-    /// Live reserved attempt. Contract section 2.3.
+    /// Live reserved attempt.
     Started,
-    /// Accepted successful result. Contract section 2.3.
+    /// Accepted successful result.
     Succeeded,
-    /// Structured retryable failure. Contract section 2.3.
+    /// Structured retryable failure.
     RetryableFailed,
-    /// Structured permanent failure. Contract section 2.3.
+    /// Structured permanent failure.
     PermanentFailed,
-    /// Pinned contract violation. Contract section 2.3.
+    /// Pinned contract violation.
     ContractFailed,
-    /// Database deadline elapsed. Contract section 2.3.
+    /// Database deadline elapsed.
     TimedOut,
-    /// Dead-generation recovery outcome. Contract section 2.3.
+    /// Dead-generation recovery outcome.
     UnknownOutcome,
-    /// Run-terminalization cancellation. Contract section 2.3.
+    /// Run-terminalization cancellation.
     Cancelled,
-    /// Live completion lost the active-attempt fence. Contract section 2.3.
+    /// Live completion lost the active-attempt fence.
     Stale,
 }
 
-/// The closed approval gate state vocabulary. Contract section 2.4.
+/// The closed approval gate state vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GateState {
-    /// Awaiting first valid resolution. Contract section 2.4.
+    /// Awaiting first valid resolution.
     Pending,
-    /// Human-approved terminal state. Contract section 2.4.
+    /// Human-approved terminal state.
     Approved,
-    /// Human-rejected terminal state. Contract section 2.4.
+    /// Human-rejected terminal state.
     Rejected,
-    /// Expiry-approved terminal state. Contract section 2.4.
+    /// Expiry-approved terminal state.
     ExpiredApproved,
-    /// Expiry-rejected terminal state. Contract section 2.4.
+    /// Expiry-rejected terminal state.
     ExpiredRejected,
-    /// Cancellation terminal state. Contract section 2.4.
+    /// Cancellation terminal state.
     Cancelled,
 }
 
-/// The closed edge-fact state vocabulary. Contract section 2.4.
+/// The closed edge-fact state vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EdgeState {
-    /// Unresolved edge fact. Contract section 2.4.
+    /// Unresolved edge fact.
     Dormant,
-    /// Active successful path. Contract section 2.4.
+    /// Active successful path.
     Satisfied,
-    /// Inactive path. Contract section 2.4.
+    /// Inactive path.
     Skipped,
 }
 
-/// The closed node kind vocabulary. Contract section 1.5.
+/// The closed node kind vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
-    /// Executable Action. Contract section 1.5.
+    /// Executable Action.
     Action,
-    /// Bounded Map. Contract section 1.5.
+    /// Bounded Map.
     Map,
-    /// Deterministic Choice. Contract section 1.5.
+    /// Deterministic Choice.
     Choice,
-    /// Durable Approval. Contract section 1.5.
+    /// Durable Approval.
     Approval,
-    /// Successful terminal. Contract section 1.5.
+    /// Successful terminal.
     Succeed,
-    /// Explicit failure terminal. Contract section 1.5.
+    /// Explicit failure terminal.
     Fail,
 }
 
 macro_rules! failure_kind {
     ($name:ident, $section:literal) => {
-        #[doc = concat!("The closed workflow failure vocabulary. Contract section ", $section, ".")]
+        #[doc = "The closed workflow failure vocabulary."]
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
         pub enum $name {
-            /// Permanent action error. Contract section 1.4.
+            /// Permanent action error.
             ActionPermanent,
-            /// Explicit Fail node. Contract section 1.4.
+            /// Explicit Fail node.
             ExplicitFailNode,
-            /// Failed Map child. Contract section 1.4.
+            /// Failed Map child.
             MapChildFailed,
-            /// Human rejection. Contract section 1.4.
+            /// Human rejection.
             ApprovalRejected,
-            /// Reject-on-expiry. Contract section 1.4.
+            /// Reject-on-expiry.
             ApprovalExpiredRejected,
-            /// Dynamic-node ceiling. Contract section 1.4.
+            /// Dynamic-node ceiling.
             RunDynamicNodeLimitExceeded,
-            /// Total-attempt ceiling. Contract section 1.4.
+            /// Total-attempt ceiling.
             RunAttemptLimitExceeded,
-            /// Inline JSON ceiling. Contract section 1.4.
+            /// Inline JSON ceiling.
             InlineJsonLimitExceeded,
-            /// Per-attempt artifact ceiling. Contract section 1.4.
+            /// Per-attempt artifact ceiling.
             ArtifactsPerAttemptLimitExceeded,
-            /// Aggregate object-byte ceiling. Contract section 1.4.
+            /// Aggregate object-byte ceiling.
             AggregateObjectLimitExceeded,
-            /// Root output schema mismatch. Contract section 1.4.
+            /// Root output schema mismatch.
             RunOutputSchemaMismatch,
-            /// Unavailable binding source. Contract section 1.4.
+            /// Unavailable binding source.
             BindingSourceUnavailable,
-            /// Missing binding pointer. Contract section 1.4.
+            /// Missing binding pointer.
             BindingPointerMissing,
-            /// Binding type mismatch. Contract section 1.4.
+            /// Binding type mismatch.
             BindingTypeMismatch,
-            /// Action output schema mismatch. Contract section 1.4.
+            /// Action output schema mismatch.
             ActionOutputSchemaMismatch,
-            /// Invalid Choice input. Contract section 1.4.
+            /// Invalid Choice input.
             ChoiceInputInvalid,
-            /// Invalid Map input. Contract section 1.4.
+            /// Invalid Map input.
             MapInputInvalid,
-            /// Map bound exceeded. Contract section 1.4.
+            /// Map bound exceeded.
             MapBoundExceeded,
-            /// Invalid approval payload. Contract section 1.4.
+            /// Invalid approval payload.
             ApprovalPayloadInvalid,
-            /// Action reported cost beyond its declaration. Contract section 1.4.
+            /// Action reported cost beyond its declaration.
             ActionCostProtocolViolation,
         }
     };
@@ -200,314 +200,314 @@ macro_rules! failure_kind {
 failure_kind!(RunFailureKind, "1.4");
 failure_kind!(NodeFailureKind, "1.5");
 
-/// The closed attempt error-class vocabulary. Contract section 1.7.
+/// The closed attempt error-class vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AttemptErrorClass {
-    /// Retryable action failure. Contract section 1.7.
+    /// Retryable action failure.
     Retryable,
-    /// Permanent action failure. Contract section 1.7.
+    /// Permanent action failure.
     Permanent,
-    /// Contract violation. Contract section 1.7.
+    /// Contract violation.
     Contract,
 }
 
-/// Immutable seven-ceiling run limits. Contract section 1.4.
+/// Immutable seven-ceiling run limits.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunLimits {
-    /// Total synthetic Map child ceiling. Contract section 1.4.
+    /// Total synthetic Map child ceiling.
     pub max_dynamic_node_instances: u64,
-    /// Total started attempt ceiling. Contract section 1.4.
+    /// Total started attempt ceiling.
     pub max_total_attempts: u64,
-    /// Total event ceiling. Contract section 1.4.
+    /// Total event ceiling.
     pub max_total_events: u64,
-    /// Per-value canonical JSON byte ceiling. Contract section 1.4.
+    /// Per-value canonical JSON byte ceiling.
     pub max_inline_json_bytes_per_value: u64,
-    /// Per-attempt action artifact ceiling. Contract section 1.4.
+    /// Per-attempt action artifact ceiling.
     pub max_artifacts_per_attempt: u64,
-    /// Per-run charged ArtifactRef byte ceiling. Contract section 1.4.
+    /// Per-run charged ArtifactRef byte ceiling.
     pub max_aggregate_object_bytes_per_run: u64,
-    /// Run lifetime ceiling in milliseconds. Contract section 1.4.
+    /// Run lifetime ceiling in milliseconds.
     pub max_run_lifetime_ms: u64,
 }
 
-/// One durable workflow run. Contract section 1.4.
+/// One durable workflow run.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowRun {
-    /// Run scope. Contract section 1.4.
+    /// Run scope.
     pub scope: ExecutionScope,
-    /// Run ID. Contract section 1.4.
+    /// Run ID.
     pub run_id: Id,
-    /// Pinned definition ID. Contract section 1.4.
+    /// Pinned definition ID.
     pub definition_id: Id,
-    /// Pinned revision hash. Contract section 1.4.
+    /// Pinned revision hash.
     pub revision_hash: Digest,
-    /// Immutable canonical input ref. Contract section 1.4.
+    /// Immutable canonical input ref.
     pub input_ref: JsonRef,
-    /// Scope-bound creation fingerprint. Contract section 1.4.
+    /// Scope-bound creation fingerprint.
     pub create_request_fingerprint: Digest,
-    /// Durable run state. Contract section 2.1.
+    /// Durable run state.
     pub status: RunState,
-    /// Closed terminal failure kind. Contract section 1.4.
+    /// Closed terminal failure kind.
     pub failure_kind: Option<RunFailureKind>,
-    /// Optional terminal diagnostics. Contract section 1.4.
+    /// Optional terminal diagnostics.
     pub failure_diagnostics_ref: Option<JsonRef>,
-    /// Successful root output. Contract section 1.4.
+    /// Successful root output.
     pub output_ref: Option<JsonRef>,
-    /// Immutable budget limit. Contract section 1.4.
+    /// Immutable budget limit.
     pub budget_limit: CostUnits,
-    /// Monotonic consumed cost. Contract section 1.4.
+    /// Monotonic consumed cost.
     pub budget_consumed: CostUnits,
-    /// Currently reserved cost. Contract section 1.4.
+    /// Currently reserved cost.
     pub budget_reserved: CostUnits,
-    /// Monotonic dynamic-node count. Contract section 1.4.
+    /// Monotonic dynamic-node count.
     pub dynamic_node_count: u64,
-    /// Monotonic attempt count. Contract section 1.4.
+    /// Monotonic attempt count.
     pub total_attempt_count: u64,
-    /// Charged ArtifactRef byte count. Contract section 1.4.
+    /// Charged ArtifactRef byte count.
     pub aggregate_object_bytes: u64,
-    /// Immutable run limits. Contract section 1.4.
+    /// Immutable run limits.
     pub limits: RunLimits,
-    /// Immutable database-clock lifetime deadline. Contract section 1.4.
+    /// Immutable database-clock lifetime deadline.
     pub lifetime_deadline_at: Timestamp,
-    /// Frontier change epoch. Contract section 1.4.
+    /// Frontier change epoch.
     pub frontier_epoch: u64,
-    /// Last allocated event sequence. Contract section 1.4.
+    /// Last allocated event sequence.
     pub last_event_seq: u64,
-    /// Creation timestamp. Contract section 1.4.
+    /// Creation timestamp.
     pub created_at: Timestamp,
-    /// Last mutation timestamp. Contract section 1.4.
+    /// Last mutation timestamp.
     pub updated_at: Timestamp,
-    /// First Running timestamp. Contract section 1.4.
+    /// First Running timestamp.
     pub started_at: Option<Timestamp>,
-    /// Terminal or integrity-override timestamp. Contract section 1.4.
+    /// Terminal or integrity-override timestamp.
     pub finished_at: Option<Timestamp>,
-    /// Incompatibility evidence ref. Contract section 1.4.
+    /// Incompatibility evidence ref.
     pub blocked_incompatibilities_ref: Option<JsonRef>,
-    /// Exact suspension replay fingerprint. Contract section 1.4.
+    /// Exact suspension replay fingerprint.
     pub blocked_incompatibility_fingerprint: Option<Digest>,
-    /// Bad committed ArtifactRef ID. Contract section 1.4.
+    /// Bad committed ArtifactRef ID.
     pub corrupt_bad_artifact_ref_id: Option<Id>,
-    /// Optional node owning the corrupt ref. Contract section 1.4.
+    /// Optional node owning the corrupt ref.
     pub corrupt_owner_node_id: Option<NodeInstanceId>,
-    /// Closed corruption class. Contract section 1.4.
+    /// Closed corruption class.
     pub corrupt_error_class: Option<FailedReadClass>,
-    /// Opaque proof fingerprint. Contract section 1.4.
+    /// Opaque proof fingerprint.
     pub corrupt_proof_fingerprint: Option<Digest>,
-    /// Run CAS version. Contract section 1.4.
+    /// Run CAS version.
     pub version: Version,
 }
 
-/// One durable static or synthetic node instance. Contract section 1.5.
+/// One durable static or synthetic node instance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeRun {
-    /// Node scope. Contract section 1.5.
+    /// Node scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.5.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Static or synthetic instance ID. Contract section 1.5.
+    /// Static or synthetic instance ID.
     pub node_instance_id: NodeInstanceId,
-    /// Definition node ID. Contract section 1.5.
+    /// Definition node ID.
     pub definition_node_id: Id,
-    /// Immutable node kind. Contract section 1.5.
+    /// Immutable node kind.
     pub kind: NodeKind,
-    /// Optional parent Map instance. Contract section 1.5.
+    /// Optional parent Map instance.
     pub parent_map_instance_id: Option<NodeInstanceId>,
-    /// Optional Map item index. Contract section 1.5.
+    /// Optional Map item index.
     pub map_item_index: Option<u32>,
-    /// Optional Map item digest. Contract section 1.5.
+    /// Optional Map item digest.
     pub map_item_digest: Option<Digest>,
-    /// Persisted canonical recovery rank. Contract section 1.5.
+    /// Persisted canonical recovery rank.
     pub topological_rank: TopologicalRank,
-    /// Durable node state. Contract section 2.2.
+    /// Durable node state.
     pub status: NodeState,
-    /// Saved compatibility-suspension state. Contract section 1.5.
+    /// Saved compatibility-suspension state.
     pub blocked_from_status: Option<BlockedFromState>,
-    /// Only attempt permitted to complete. Contract section 1.5.
+    /// Only attempt permitted to complete.
     pub active_attempt_id: Option<Id>,
-    /// Started attempt count. Contract section 1.5.
+    /// Started attempt count.
     pub attempt_count: u32,
-    /// Persisted retry eligibility. Contract section 1.5.
+    /// Persisted retry eligibility.
     pub next_eligible_at: Option<Timestamp>,
-    /// Declared cost while BudgetWaiting. Contract section 1.5.
+    /// Declared cost while BudgetWaiting.
     pub budget_wait_amount: Option<CostUnits>,
-    /// Successful result ref. Contract section 1.5.
+    /// Successful result ref.
     pub result_ref: Option<JsonRef>,
-    /// Closed terminal failure kind. Contract section 1.5.
+    /// Closed terminal failure kind.
     pub failure_kind: Option<NodeFailureKind>,
-    /// Optional terminal diagnostics. Contract section 1.5.
+    /// Optional terminal diagnostics.
     pub failure_diagnostics_ref: Option<JsonRef>,
-    /// Immutable incoming edge count. Contract section 1.5.
+    /// Immutable incoming edge count.
     pub incoming_total: u32,
-    /// Satisfied incoming edge count. Contract section 1.5.
+    /// Satisfied incoming edge count.
     pub incoming_satisfied: u32,
-    /// Skipped incoming edge count. Contract section 1.5.
+    /// Skipped incoming edge count.
     pub incoming_skipped: u32,
-    /// Committed Choice input. Contract section 1.5.
+    /// Committed Choice input.
     pub choice_input_ref: Option<JsonRef>,
-    /// Committed Choice selection. Contract section 1.5.
+    /// Committed Choice selection.
     pub choice_selected_case: Option<ChoiceSelection>,
-    /// Committed Map input. Contract section 1.5.
+    /// Committed Map input.
     pub map_input_ref: Option<JsonRef>,
-    /// Map expansion digest. Contract section 1.5.
+    /// Map expansion digest.
     pub map_expansion_digest: Option<Digest>,
-    /// Persisted Map child count. Contract section 1.5.
+    /// Persisted Map child count.
     pub map_child_count: Option<u32>,
-    /// Durable approval gate ID. Contract section 1.5.
+    /// Durable approval gate ID.
     pub approval_gate_id: Option<Id>,
-    /// Creation timestamp. Contract section 1.5.
+    /// Creation timestamp.
     pub created_at: Timestamp,
-    /// Last mutation timestamp. Contract section 1.5.
+    /// Last mutation timestamp.
     pub updated_at: Timestamp,
-    /// Node CAS version. Contract section 1.5.
+    /// Node CAS version.
     pub version: Version,
 }
 
-/// The closed committed Choice selection. Contract section 1.5.
+/// The closed committed Choice selection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChoiceSelection {
-    /// An ordered matching case. Contract section 1.5.
+    /// An ordered matching case.
     Case {
-        /// Zero-based case index. Contract section 1.5.
+        /// Zero-based case index.
         case_index: u32,
-        /// Selected deterministic edge ID. Contract section 1.5.
+        /// Selected deterministic edge ID.
         edge_id: Id,
     },
-    /// The required default branch. Contract section 1.5.
+    /// The required default branch.
     Default {
-        /// Selected deterministic edge ID. Contract section 1.5.
+        /// Selected deterministic edge ID.
         edge_id: Id,
     },
 }
 
-/// One immutable attempt row. Contract section 1.7.
+/// One immutable attempt row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeAttempt {
-    /// Attempt scope. Contract section 1.7.
+    /// Attempt scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.7.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Attempt ID. Contract section 1.7.
+    /// Attempt ID.
     pub attempt_id: Id,
-    /// Owning node instance. Contract section 1.7.
+    /// Owning node instance.
     pub node_instance_id: NodeInstanceId,
-    /// One-based attempt number. Contract section 1.7.
+    /// One-based attempt number.
     pub attempt_number: u32,
-    /// Worker label. Contract section 1.7.
+    /// Worker label.
     pub worker_id: Id,
-    /// Claiming engine label. Contract section 1.7.
+    /// Claiming engine label.
     pub engine_instance_id: Id,
-    /// Claiming engine generation. Contract section 1.7.
+    /// Claiming engine generation.
     pub engine_generation: u64,
-    /// Persisted completion capability digest. Contract section 1.7.
+    /// Persisted completion capability digest.
     pub completion_credential_digest: Digest,
-    /// Immutable ActionInvocation ID. Contract section 1.7.
+    /// Immutable ActionInvocation ID.
     pub invocation_id: Id,
-    /// Retry-stable external idempotency key. Contract section 1.7.
+    /// Retry-stable external idempotency key.
     pub idempotency_key: String,
-    /// Durable attempt state. Contract section 2.3.
+    /// Durable attempt state.
     pub status: AttemptState,
-    /// Declared maximum cost. Contract section 1.7.
+    /// Declared maximum cost.
     pub declared_max_cost: CostUnits,
-    /// Immutable reserved cost. Contract section 1.7.
+    /// Immutable reserved cost.
     pub reserved_cost: CostUnits,
-    /// Terminal settled cost. Contract section 1.7.
+    /// Terminal settled cost.
     pub settled_cost: Option<CostUnits>,
-    /// Database-clock deadline. Contract section 1.7.
+    /// Database-clock deadline.
     pub deadline_at: Timestamp,
-    /// Start timestamp. Contract section 1.7.
+    /// Start timestamp.
     pub started_at: Timestamp,
-    /// Terminal timestamp. Contract section 1.7.
+    /// Terminal timestamp.
     pub finished_at: Option<Timestamp>,
-    /// Successful output ref. Contract section 1.7.
+    /// Successful output ref.
     pub output_ref: Option<JsonRef>,
-    /// Ordered action artifacts. Contract section 1.7.
+    /// Ordered action artifacts.
     pub artifact_refs: Vec<ArtifactRef>,
-    /// Closed terminal error class. Contract section 1.7.
+    /// Closed terminal error class.
     pub error_class: Option<AttemptErrorClass>,
-    /// Namespaced action error code. Contract section 1.7.
+    /// Namespaced action error code.
     pub error_code: Option<String>,
-    /// Optional diagnostics ref. Contract section 1.7.
+    /// Optional diagnostics ref.
     pub diagnostics_ref: Option<JsonRef>,
 }
 
-/// One immutable control-edge fact. Contract section 1.6.
+/// One immutable control-edge fact.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EdgeFact {
-    /// Edge scope. Contract section 1.6.
+    /// Edge scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.6.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Deterministic edge ID. Contract section 1.6.
+    /// Deterministic edge ID.
     pub edge_id: Id,
-    /// Source node instance. Contract section 1.6.
+    /// Source node instance.
     pub from_node_id: NodeInstanceId,
-    /// Target node instance. Contract section 1.6.
+    /// Target node instance.
     pub to_node_id: NodeInstanceId,
-    /// Optional Choice case index. Contract section 1.6.
+    /// Optional Choice case index.
     pub choice_case_index: Option<u32>,
-    /// Durable edge state. Contract section 2.4.
+    /// Durable edge state.
     pub state: EdgeState,
-    /// Terminal resolution timestamp. Contract section 1.6.
+    /// Terminal resolution timestamp.
     pub resolved_at: Option<Timestamp>,
-    /// Edge CAS version. Contract section 1.6.
+    /// Edge CAS version.
     pub version: Version,
 }
 
-/// The non-durable operational phase vocabulary. Contract section 5.4.
+/// The non-durable operational phase vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OperationalPhase {
-    /// Ready or active attempt work exists. Contract section 5.4.
+    /// Ready or active attempt work exists.
     Executing,
-    /// Only or partly budget-waiting work exists. Contract section 5.4.
+    /// Only or partly budget-waiting work exists.
     AwaitingBudget,
-    /// Only or partly pending approvals exist. Contract section 5.4.
+    /// Only or partly pending approvals exist.
     AwaitingApproval,
-    /// Only or partly persisted retry delays exist. Contract section 5.4.
+    /// Only or partly persisted retry delays exist.
     RetryDelay,
-    /// Only or partly Maps waiting for children exist. Contract section 5.4.
+    /// Only or partly Maps waiting for children exist.
     WaitingChildren,
-    /// Two or more operational categories are active. Contract section 5.4.
+    /// Two or more operational categories are active.
     Mixed,
 }
 
-/// Snapshot counts used to derive operational phase. Contract section 5.4.
+/// Snapshot counts used to derive operational phase.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunOperationalCounts {
-    /// Ready node count. Contract section 5.4.
+    /// Ready node count.
     pub ready: u64,
-    /// Started active-attempt count. Contract section 5.4.
+    /// Started active-attempt count.
     pub running_attempts: u64,
-    /// BudgetWaiting node count. Contract section 5.4.
+    /// BudgetWaiting node count.
     pub budget_waiting: u64,
-    /// Pending approval count. Contract section 5.4.
+    /// Pending approval count.
     pub pending_approvals: u64,
-    /// RetryWaiting node count. Contract section 5.4.
+    /// RetryWaiting node count.
     pub retry_waiting: u64,
-    /// WaitingChildren Map count. Contract section 5.4.
+    /// WaitingChildren Map count.
     pub maps_waiting_children: u64,
 }
 
-/// One computed run operational snapshot. Contract section 5.4.
+/// One computed run operational snapshot.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunOperationalView {
-    /// Derived phase. Contract section 5.4.
+    /// Derived phase.
     pub phase: OperationalPhase,
-    /// Category counts. Contract section 5.4.
+    /// Category counts.
     pub counts: RunOperationalCounts,
-    /// Earliest durable deadline. Contract section 5.4.
+    /// Earliest durable deadline.
     pub next_due_at: Option<Timestamp>,
 }
 
-/// A run projection with its non-durable view. Contract section 5.4.
+/// A run projection with its non-durable view.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowRunView {
-    /// Durable run entity. Contract section 5.4.
+    /// Durable run entity.
     pub run: WorkflowRun,
-    /// Present only for a conforming Running run. Contract section 5.4.
+    /// Present only for a conforming Running run.
     pub operational: Option<RunOperationalView>,
 }
 

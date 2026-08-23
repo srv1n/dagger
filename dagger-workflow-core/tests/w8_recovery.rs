@@ -6,7 +6,7 @@
 //! involved, a fresh `WorkflowEngine`) opened on the same durable files. Nothing survives in
 //! process memory, so every post-crash assertion is a statement about the ledger.
 //!
-//! Contract sections 5.1, 5.3, 5.4, 5.5, 12.1, and 12.3.
+//!
 
 use dagger_workflow_core::action::{
     ActionContext, ActionDescriptor, ActionOutcome, CompatibilityReport, CompletionCredential,
@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 /// The engine lease is database-clock authoritative and 20s long; a crashed generation is only
-/// reclaimable once the persisted clock has moved past it. Contract section 6.
+/// reclaimable once the persisted clock has moved past it.
 const CLAIM_LIFETIME_MS: i64 = 20_000;
 
 type Objects = FsObjectStore<TestClock>;
@@ -472,7 +472,7 @@ fn chain_definition(schema: &Digest) -> WorkflowDefinition {
 ///
 /// The pre-crash frontier is captured, the deployment is killed, and a fresh store is inspected
 /// BEFORE any tick: the ready set must already be correct with no engine having run against it.
-/// Contract sections 5.1 and 5.4.
+///
 #[tokio::test]
 async fn restart_reconstructs_the_frontier_and_never_reruns_committed_work() {
     let deployment = Deployment::new("frontier");
@@ -550,7 +550,7 @@ async fn restart_reconstructs_the_frontier_and_never_reruns_committed_work() {
     );
     assert_eq!(log.count("bravo"), 1);
     // The key the recovered generation delivered is the persisted scope-bound derivation, not a
-    // per-process value the second engine invented. Contract section 7.1.
+    // per-process value the second engine invented.
     assert_eq!(
         log.idempotency_keys("bravo"),
         vec![dagger_workflow_core::ids::idempotency_key(
@@ -689,7 +689,7 @@ async fn claim(
 /// Fixture 3. A kill between the object-store put and the SQLite commit leaves an orphan object
 /// and no committed reference. The recovered generation re-invokes the node under the SAME
 /// versioned scope-bound idempotency key, and the orphan is tolerated rather than reconciled.
-/// Contract sections 5.3, 7.1, and 12.1.
+///
 #[tokio::test]
 async fn a_kill_between_object_put_and_commit_reuses_the_versioned_idempotency_key() {
     let deployment = Deployment::new("orphan");
@@ -828,7 +828,7 @@ async fn a_kill_between_object_put_and_commit_reuses_the_versioned_idempotency_k
 
 /// Fixture 4. An attempt whose outcome the crash made unknowable consumes a retry from the
 /// ceiling AND settles its whole reservation against the run budget. Neither may be refunded on
-/// the optimistic assumption that the action never ran. Contract sections 5.3 and 12.1.
+/// the optimistic assumption that the action never ran.
 #[tokio::test]
 async fn a_crash_unknown_attempt_consumes_the_retry_ceiling_and_the_full_reservation() {
     let deployment = Deployment::new("ceiling");
@@ -925,7 +925,7 @@ async fn a_crash_unknown_attempt_consumes_the_retry_ceiling_and_the_full_reserva
 /// Fixture 5. A result from the killed generation arriving after restart is admitted or refused
 /// on its `CompletionCredential` alone. The run/node/attempt triple is not an authenticator, a
 /// credential is not transferable to a newer attempt, and a stale admission may not mutate node
-/// or run state. Contract sections 5.3 and 5.5.
+/// or run state.
 #[tokio::test]
 async fn a_late_completion_is_authenticated_only_by_its_completion_credential() {
     let deployment = Deployment::new("fencing");
@@ -1184,7 +1184,7 @@ async fn expansion(
 /// Fixture 6. A kill in the Map expansion window is survivable in both directions: an expansion
 /// that never committed is re-derived to a byte-identical child set, and an expansion that did
 /// commit is not duplicated by the retry the restarted scheduler would naturally issue.
-/// Contract sections 5.3, 10.1, and 12.1.
+///
 #[tokio::test]
 async fn map_re_expansion_after_a_crash_converges_on_an_identical_child_set() {
     let deployment = Deployment::new("mapcrash");
@@ -1498,7 +1498,7 @@ async fn takeover(claim_order: [&str; 2], attempt_ids: [&str; 2]) -> TakeoverOut
 
     let (store, _objects) = deployment.open().await;
     // Ranks are read back from the ledger, not assumed, so the fixture asserts against what the
-    // store actually persisted at publication. Contract section 1.3.
+    // store actually persisted at publication.
     let alfa_rank = store
         .get_node(&deployment.scope, &id("run"), &id("alfa"))
         .await
@@ -1583,7 +1583,7 @@ async fn takeover(claim_order: [&str; 2], attempt_ids: [&str; 2]) -> TakeoverOut
 /// set, and the single primary exhaustion is selected by persisted topological rank rather than
 /// by the order the rows happen to arrive in or sort by. The four permutations differ only in
 /// row order and attempt-ID collation, so an identical outcome across them is the order
-/// independence the plan requires. Contract sections 5.3 and 12.1.
+/// independence the plan requires.
 #[tokio::test]
 async fn multi_attempt_takeover_is_decided_by_rank_and_not_by_row_order() {
     let mut outcomes = Vec::new();

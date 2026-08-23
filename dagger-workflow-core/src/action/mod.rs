@@ -1,4 +1,4 @@
-//! Action registry, invocation, context, and outcome contracts from contract sections 1.8, 7, and 13.
+//! Action registry, invocation, context, and outcome contracts.
 
 use crate::artifact::{ArtifactRefValue, JsonRef, VerifiedObjectRef};
 use crate::definition::ActionPin;
@@ -15,7 +15,7 @@ use std::sync::{
     Arc, RwLock,
 };
 
-/// Opaque per-attempt result-intake capability. Contract section 1.1.
+/// Opaque per-attempt result-intake capability.
 #[derive(Clone, Eq, PartialEq)]
 pub struct CompletionCredential(Vec<u8>);
 
@@ -43,9 +43,9 @@ impl CompletionCredential {
     }
 }
 
-/// Cooperative advisory cancellation observed by actions. Contract section 7.1.
+/// Cooperative advisory cancellation observed by actions.
 pub trait CancellationToken: Send + Sync {
-    /// Reports whether cancellation was requested. Contract section 7.1.
+    /// Reports whether cancellation was requested.
     fn is_cancelled(&self) -> bool;
 }
 
@@ -78,37 +78,37 @@ impl CancellationToken for CancellationSource {
     }
 }
 
-/// Read-only declared budget made available to an action. Contract section 7.1.
+/// Read-only declared budget made available to an action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BudgetHandle {
-    /// Provider-enforceable declared maximum. Contract section 7.1.
+    /// Provider-enforceable declared maximum.
     pub declared_max_cost_units: CostUnits,
 }
 
-/// The exact context for one action attempt. Contract section 7.1.
+/// The exact context for one action attempt.
 #[derive(Clone)]
 pub struct ActionContext {
-    /// Execution scope. Contract section 7.1.
+    /// Execution scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 7.1.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Pinned revision hash. Contract section 7.1.
+    /// Pinned revision hash.
     pub revision_hash: Digest,
-    /// Logical node instance ID. Contract section 7.1.
+    /// Logical node instance ID.
     pub node_instance_id: NodeInstanceId,
-    /// Per-attempt ID. Contract section 7.1.
+    /// Per-attempt ID.
     pub attempt_id: Id,
-    /// One-based attempt number. Contract section 7.1.
+    /// One-based attempt number.
     pub attempt_number: u32,
-    /// Retry-stable scope-bound external key. Contract section 7.1.
+    /// Retry-stable scope-bound external key.
     pub idempotency_key: String,
-    /// Result-intake capability for this attempt only. Contract section 7.1.
+    /// Result-intake capability for this attempt only.
     pub completion_credential: CompletionCredential,
-    /// Persisted database-clock deadline. Contract section 7.1.
+    /// Persisted database-clock deadline.
     pub deadline: Timestamp,
-    /// Cooperative advisory cancellation. Contract section 7.1.
+    /// Cooperative advisory cancellation.
     pub cancellation_token: Arc<dyn CancellationToken>,
-    /// Read-only declared budget. Contract section 7.1.
+    /// Read-only declared budget.
     pub budget: BudgetHandle,
 }
 
@@ -186,124 +186,124 @@ impl ActionContext {
     }
 }
 
-/// One immutable action invocation snapshot. Contract section 1.8.
+/// One immutable action invocation snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionInvocation {
-    /// Invocation scope. Contract section 1.8.
+    /// Invocation scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.8.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Invocation ID, equal to attempt ID in v0.1. Contract section 1.8.
+    /// Invocation ID, equal to attempt ID in v0.1.
     pub invocation_id: Id,
-    /// Owning node instance. Contract section 1.8.
+    /// Owning node instance.
     pub node_instance_id: NodeInstanceId,
-    /// Owning attempt ID. Contract section 1.8.
+    /// Owning attempt ID.
     pub attempt_id: Id,
-    /// Node or Map action reference location. Contract section 1.8.
+    /// Node or Map action reference location.
     pub action_reference_location: String,
-    /// Pinned action name. Contract section 1.8.
+    /// Pinned action name.
     pub action_name: String,
-    /// Pinned contract version. Contract section 1.8.
+    /// Pinned contract version.
     pub contract_version: String,
-    /// Owning revision hash. Contract section 1.8.
+    /// Owning revision hash.
     pub revision_hash: Digest,
-    /// Pinned input schema digest. Contract section 1.8.
+    /// Pinned input schema digest.
     pub input_schema_digest: Digest,
-    /// Pinned output schema digest. Contract section 1.8.
+    /// Pinned output schema digest.
     pub output_schema_digest: Digest,
-    /// Pinned semantic implementation requirement. Contract section 1.8.
+    /// Pinned semantic implementation requirement.
     pub compatible_implementation_requirement: Digest,
-    /// Exact canonical bound input ref. Contract section 1.8.
+    /// Exact canonical bound input ref.
     pub bound_input_ref: JsonRef,
-    /// Digest of exact delivered bytes. Contract section 1.8.
+    /// Digest of exact delivered bytes.
     pub bound_input_digest: Digest,
-    /// Exact delivered byte length. Contract section 1.8.
+    /// Exact delivered byte length.
     pub bound_input_size_bytes: u64,
-    /// Ordered binding derivation digest. Contract section 1.8.
+    /// Ordered binding derivation digest.
     pub binding_derivation_digest: Digest,
-    /// Creation database timestamp. Contract section 1.8.
+    /// Creation database timestamp.
     pub created_at: Timestamp,
 }
 
-/// One action-produced artifact before domain registration. Contract section 7.2.
+/// One action-produced artifact before domain registration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactOutput {
-    /// Normalized artifact media type. Contract section 7.2.
+    /// Normalized artifact media type.
     pub media_type: String,
-    /// Verified durable object capability. Contract section 7.2.
+    /// Verified durable object capability.
     pub object: VerifiedObjectRef,
 }
 
-/// One bounded diagnostics fact value. Contract section 1.1.
+/// One bounded diagnostics fact value.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum DiagnosticScalar {
-    /// String scalar. Contract section 1.1.
+    /// String scalar.
     String(String),
-    /// Boolean scalar. Contract section 1.1.
+    /// Boolean scalar.
     Boolean(bool),
-    /// JSON number scalar. Contract section 1.1.
+    /// JSON number scalar.
     Number(serde_json::Number),
-    /// Null scalar. Contract section 1.1.
+    /// Null scalar.
     Null,
 }
 
-/// One named diagnostics fact. Contract section 1.1.
+/// One named diagnostics fact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticFact {
-    /// Unique persistence-safe fact name. Contract section 1.1.
+    /// Unique persistence-safe fact name.
     pub name: String,
-    /// Scalar fact value. Contract section 1.1.
+    /// Scalar fact value.
     pub value: DiagnosticScalar,
 }
 
-/// The closed persistence-safe diagnostics envelope. Contract section 1.1.
+/// The closed persistence-safe diagnostics envelope.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiagnosticsEnvelope {
-    /// Optional bounded summary. Contract section 1.1.
+    /// Optional bounded summary.
     pub summary: Option<String>,
-    /// Ordered bounded facts. Contract section 1.1.
+    /// Ordered bounded facts.
     pub facts: Vec<DiagnosticFact>,
-    /// Ordered related artifact refs. Contract section 1.1.
+    /// Ordered related artifact refs.
     pub related_artifact_refs: Vec<ArtifactRefValue>,
 }
 
-/// The closed action outcome vocabulary. Contract section 7.2.
+/// The closed action outcome vocabulary.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ActionOutcome {
-    /// Typed JSON success with ordered artifacts. Contract section 7.2.
+    /// Typed JSON success with ordered artifacts.
     Success {
-        /// Typed JSON output. Contract section 7.2.
+        /// Typed JSON output.
         output: Value,
-        /// Ordered verified artifacts. Contract section 7.2.
+        /// Ordered verified artifacts.
         artifacts: Vec<ArtifactOutput>,
-        /// Trusted reported actual cost. Contract section 7.2.
+        /// Trusted reported actual cost.
         actual_cost_units: CostUnits,
-        /// Optional closed diagnostics. Contract section 7.2.
+        /// Optional closed diagnostics.
         diagnostics: Option<DiagnosticsEnvelope>,
     },
-    /// Structured retryable action error. Contract section 7.2.
+    /// Structured retryable action error.
     Retryable {
-        /// Namespaced action code. Contract section 7.2.
+        /// Namespaced action code.
         code: String,
-        /// Persistence-safe message. Contract section 7.2.
+        /// Persistence-safe message.
         message: String,
-        /// Optional closed diagnostics. Contract section 7.2.
+        /// Optional closed diagnostics.
         diagnostics: Option<DiagnosticsEnvelope>,
-        /// Trusted reported actual cost. Contract section 7.2.
+        /// Trusted reported actual cost.
         actual_cost_units: CostUnits,
     },
-    /// Structured permanent action error. Contract section 7.2.
+    /// Structured permanent action error.
     Permanent {
-        /// Namespaced action code. Contract section 7.2.
+        /// Namespaced action code.
         code: String,
-        /// Persistence-safe message. Contract section 7.2.
+        /// Persistence-safe message.
         message: String,
-        /// Optional closed diagnostics. Contract section 7.2.
+        /// Optional closed diagnostics.
         diagnostics: Option<DiagnosticsEnvelope>,
-        /// Trusted reported actual cost. Contract section 7.2.
+        /// Trusted reported actual cost.
         actual_cost_units: CostUnits,
     },
 }
@@ -505,37 +505,37 @@ pub enum ActionOutcomeValidationError {
     Diagnostics(#[from] DiagnosticsValidationError),
 }
 
-/// A registered implementation's exact compatibility descriptor. Contract section 13.2.
+/// A registered implementation's exact compatibility descriptor.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ActionDescriptor {
-    /// Registry action name. Contract section 13.2.
+    /// Registry action name.
     pub name: String,
-    /// Action contract version. Contract section 13.2.
+    /// Action contract version.
     pub contract_version: String,
-    /// Input schema digest. Contract section 13.2.
+    /// Input schema digest.
     pub input_schema_digest: Digest,
-    /// Output schema digest. Contract section 13.2.
+    /// Output schema digest.
     pub output_schema_digest: Digest,
-    /// Advertised semantic compatibility digest. Contract section 13.2.
+    /// Advertised semantic compatibility digest.
     pub implementation_compatibility_digest: Digest,
 }
 
-/// A compatibility mismatch dimension. Contract section 13.2.
+/// A compatibility mismatch dimension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub enum CompatibilityMismatch {
-    /// Action name differs. Contract section 13.2.
+    /// Action name differs.
     Name,
-    /// Contract version differs. Contract section 13.2.
+    /// Contract version differs.
     ContractVersion,
-    /// Input schema digest differs. Contract section 13.2.
+    /// Input schema digest differs.
     InputSchemaDigest,
-    /// Output schema digest differs. Contract section 13.2.
+    /// Output schema digest differs.
     OutputSchemaDigest,
-    /// Semantic compatibility digest differs. Contract section 13.2.
+    /// Semantic compatibility digest differs.
     ImplementationCompatibilityDigest,
 }
 
-/// Checks all five compatibility dimensions byte-for-byte. Contract section 13.2.
+/// Checks all five compatibility dimensions byte-for-byte.
 pub fn check_compatibility(
     pin: &ActionPin,
     implementation: &ActionDescriptor,
@@ -557,12 +557,12 @@ pub fn check_compatibility(
     }
 }
 
-/// One host-provided workflow action. Contract section 7.
+/// One host-provided workflow action.
 pub trait WorkflowAction: Send + Sync {
-    /// Returns the implementation's exact descriptor. Contract section 13.2.
+    /// Returns the implementation's exact descriptor.
     fn descriptor(&self) -> &ActionDescriptor;
 
-    /// Executes against exact canonical invocation bytes. Contract section 7.1.
+    /// Executes against exact canonical invocation bytes.
     fn invoke<'a>(
         &'a self,
         context: ActionContext,
@@ -570,12 +570,12 @@ pub trait WorkflowAction: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>>;
 }
 
-/// Name-addressed action implementation registry. Contract section 13.3.
+/// Name-addressed action implementation registry.
 pub trait ActionRegistry: Send + Sync {
-    /// Resolves a name-addressed action implementation. Contract section 13.2.
+    /// Resolves a name-addressed action implementation.
     fn resolve(&self, name: &str) -> Option<Arc<dyn WorkflowAction>>;
 
-    /// Checks whether every exact revision pin is available. Contract section 13.3.
+    /// Checks whether every exact revision pin is available.
     fn check_pins(&self, pins: &[ActionPin]) -> CompatibilityReport;
 }
 
@@ -726,12 +726,12 @@ pub struct PinCompatibilityEvidence {
     pub mismatch: Option<CompatibilityMismatch>,
 }
 
-/// Exact compatibility evidence produced from one registry snapshot. Contract section 13.3.
+/// Exact compatibility evidence produced from one registry snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompatibilityReport {
-    /// Digest of the complete canonical evidence. Contract section 13.3.
+    /// Digest of the complete canonical evidence.
     pub evidence_digest: Digest,
-    /// Reference locations whose exact pin is unavailable. Contract section 13.3.
+    /// Reference locations whose exact pin is unavailable.
     pub incompatible_reference_locations: Vec<String>,
     /// Complete deterministic observation supporting suspension or resume.
     pub evidence: Vec<PinCompatibilityEvidence>,

@@ -1,101 +1,101 @@
-//! Content-addressed object and typed artifact APIs from contract sections 1.10 and 12.
+//! Content-addressed object and typed artifact APIs.
 
 use crate::ids::{Digest, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 
-/// The closed typed-use vocabulary for artifact references. Contract section 1.10.
+/// The closed typed-use vocabulary for artifact references.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum ArtifactKind {
-    /// Immutable run input. Contract section 1.10.
+    /// Immutable run input.
     RunInput,
-    /// A supported-subset schema document. Contract section 1.10.
+    /// A supported-subset schema document.
     SchemaDocument,
-    /// Canonical workflow definition bytes. Contract section 1.10.
+    /// Canonical workflow definition bytes.
     Definition,
-    /// A successful node output. Contract section 1.10.
+    /// A successful node output.
     NodeOutput,
-    /// Exact action invocation input bytes. Contract section 1.10.
+    /// Exact action invocation input bytes.
     ActionInvocationInput,
-    /// An ordered action-produced artifact. Contract section 1.10.
+    /// An ordered action-produced artifact.
     ActionArtifact,
-    /// A persistence-safe diagnostics envelope. Contract section 1.10.
+    /// A persistence-safe diagnostics envelope.
     Diagnostics,
-    /// Compatibility evidence. Contract section 1.10.
+    /// Compatibility evidence.
     CompatibilityEvidence,
-    /// A committed Choice input. Contract section 1.10.
+    /// A committed Choice input.
     ChoiceInput,
-    /// A committed Map input. Contract section 1.10.
+    /// A committed Map input.
     MapInput,
-    /// An ordered Map aggregate. Contract section 1.10.
+    /// An ordered Map aggregate.
     MapAggregate,
-    /// An approval request. Contract section 1.10.
+    /// An approval request.
     ApprovalRequest,
-    /// A human approval decision payload. Contract section 1.10.
+    /// A human approval decision payload.
     ApprovalDecisionPayload,
 }
 
-/// Reusable content metadata scoped by digest. Contract section 1.10.
+/// Reusable content metadata scoped by digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObjectRecord {
-    /// Object scope. Contract section 1.10.
+    /// Object scope.
     pub scope: ExecutionScope,
-    /// Verified content digest. Contract section 1.10.
+    /// Verified content digest.
     pub digest: Digest,
-    /// Verified byte length. Contract section 1.10.
+    /// Verified byte length.
     pub size_bytes: u64,
-    /// Store-private scope-qualified key. Contract section 1.10.
+    /// Store-private scope-qualified key.
     pub object_key: String,
-    /// First registration timestamp. Contract section 1.10.
+    /// First registration timestamp.
     pub created_at: Timestamp,
 }
 
-/// One immutable typed use of an ObjectRecord. Contract section 1.10.
+/// One immutable typed use of an ObjectRecord.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactRef {
-    /// Artifact scope. Contract section 1.10.
+    /// Artifact scope.
     pub scope: ExecutionScope,
-    /// Deterministic typed-use ID. Contract section 1.10.
+    /// Deterministic typed-use ID.
     pub artifact_ref_id: Id,
-    /// Referenced content digest. Contract section 1.10.
+    /// Referenced content digest.
     pub digest: Digest,
-    /// Referenced content size. Contract section 1.10.
+    /// Referenced content size.
     pub size_bytes: u64,
-    /// Normalized media type. Contract section 1.10.
+    /// Normalized media type.
     pub media_type: String,
-    /// Closed artifact role. Contract section 1.10.
+    /// Closed artifact role.
     pub kind: ArtifactKind,
-    /// Optional producer run. Contract section 1.10.
+    /// Optional producer run.
     pub producer_run_id: Option<Id>,
-    /// Optional producer node. Contract section 1.10.
+    /// Optional producer node.
     pub producer_node_id: Option<NodeInstanceId>,
-    /// Optional producer attempt. Contract section 1.10.
+    /// Optional producer attempt.
     pub producer_attempt_id: Option<Id>,
-    /// Producer-local ordinal. Contract section 1.10.
+    /// Producer-local ordinal.
     pub ordinal: u32,
-    /// Registration timestamp. Contract section 1.10.
+    /// Registration timestamp.
     pub created_at: Timestamp,
 }
 
-/// The canonical JSON-safe ArtifactRef projection. Contract section 8.1.
+/// The canonical JSON-safe ArtifactRef projection.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRefValue {
-    /// Typed-use identifier. Contract section 8.1.
+    /// Typed-use identifier.
     pub artifact_ref_id: Id,
-    /// Content digest. Contract section 8.1.
+    /// Content digest.
     pub digest: Digest,
-    /// Decimal byte length. Contract section 8.1.
+    /// Decimal byte length.
     pub size_bytes: String,
-    /// Normalized media type. Contract section 8.1.
+    /// Normalized media type.
     pub media_type: String,
 }
 
-/// An ArtifactRef proven to contain canonical JSON. Contract section 1.1.
+/// An ArtifactRef proven to contain canonical JSON.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JsonRef(pub ArtifactRef);
 
-/// Opaque proof that an object was durably published and verified. Contract section 5.1.
+/// Opaque proof that an object was durably published and verified.
 ///
 /// `Debug` is implemented by hand and redacts the store-instance nonce and the
 /// verified bytes. Both are capability material, and this type rides inside
@@ -133,19 +133,19 @@ impl VerifiedObjectRef {
         }
     }
 
-    /// Returns the capability scope. Contract section 5.1.
+    /// Returns the capability scope.
     pub fn scope(&self) -> &ExecutionScope {
         &self.scope
     }
-    /// Returns the verified content digest. Contract section 5.1.
+    /// Returns the verified content digest.
     pub fn digest(&self) -> &Digest {
         &self.digest
     }
-    /// Returns the verified byte length. Contract section 5.1.
+    /// Returns the verified byte length.
     pub fn size_bytes(&self) -> u64 {
         self.size_bytes
     }
-    /// Returns the normalized media type. Contract section 5.1.
+    /// Returns the normalized media type.
     pub fn media_type(&self) -> &str {
         &self.media_type
     }
@@ -181,16 +181,16 @@ impl std::fmt::Debug for VerifiedObjectRef {
     }
 }
 
-/// Closed failed-read classes. Contract section 1.1.
+/// Closed failed-read classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FailedReadClass {
-    /// Committed content is missing. Contract section 12.3.
+    /// Committed content is missing.
     Missing,
-    /// Committed bytes do not match the requested digest. Contract section 12.3.
+    /// Committed bytes do not match the requested digest.
     DigestInvalid,
 }
 
-/// Opaque object-store proof for a failed committed read. Contract section 12.3.
+/// Opaque object-store proof for a failed committed read.
 ///
 /// `Debug` is implemented by hand and redacts both nonces. This proof is the
 /// only capability that authorizes `mark_corrupt_storage`, and it now travels
@@ -230,7 +230,7 @@ impl FailedReadProof {
         }
     }
 
-    /// Returns the closed read-failure class. Contract section 1.1.
+    /// Returns the closed read-failure class.
     pub fn error_class(&self) -> FailedReadClass {
         self.error_class
     }
@@ -284,16 +284,16 @@ impl std::fmt::Debug for FailedReadProof {
     }
 }
 
-/// Bytes returned only after read verification. Contract section 12.3.
+/// Bytes returned only after read verification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedObject {
-    /// Verified object capability. Contract section 12.3.
+    /// Verified object capability.
     pub reference: VerifiedObjectRef,
-    /// Exact verified bytes. Contract section 12.3.
+    /// Exact verified bytes.
     pub bytes: Vec<u8>,
 }
 
-/// A failed read of a committed object. Contract section 12.3.
+/// A failed read of a committed object.
 ///
 /// The two variants are not interchangeable. `Corrupt` asserts an integrity
 /// failure and carries the only capability that may invoke
@@ -306,43 +306,43 @@ pub struct VerifiedObject {
 /// implement this trait without corrupting runs on routine operational errors.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ObjectReadError {
-    /// Verified integrity failure carrying the only valid corruption proof. Contract section 12.3.
+    /// Verified integrity failure carrying the only valid corruption proof.
     #[error("committed object failed verification")]
     Corrupt(FailedReadProof),
-    /// The store could not complete a verification. Mints no proof. Contract section 5.5.
+    /// The store could not complete a verification. Mints no proof.
     #[error("object storage unavailable")]
     StorageUnavailable,
 }
 
-/// A conflicting same-digest publication. Contract section 12.1.
+/// A conflicting same-digest publication.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("artifact metadata conflicts with existing scoped content")]
 pub struct ArtifactMetadataConflict {
-    /// Candidate digest. Contract section 12.1.
+    /// Candidate digest.
     pub digest: Digest,
-    /// Existing verified byte length. Contract section 12.1.
+    /// Existing verified byte length.
     pub existing_size_bytes: u64,
-    /// Candidate byte length. Contract section 12.1.
+    /// Candidate byte length.
     pub candidate_size_bytes: u64,
 }
 
-/// Object-store infrastructure and publication errors. Contract section 12.
+/// Object-store infrastructure and publication errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ObjectStoreError {
-    /// Same-digest content or metadata conflicts. Contract section 12.1.
+    /// Same-digest content or metadata conflicts.
     #[error(transparent)]
     ArtifactMetadataConflict(#[from] ArtifactMetadataConflict),
-    /// Durable storage is unavailable. Contract section 12.1.
+    /// Durable storage is unavailable.
     #[error("object storage unavailable")]
     StorageUnavailable,
-    /// Input or metadata is malformed. Contract section 12.1.
+    /// Input or metadata is malformed.
     #[error("invalid object field")]
     InvalidField,
 }
 
-/// Scope-confined content-addressed object storage. Contract sections 12.1 and 12.3.
+/// Scope-confined content-addressed object storage.
 pub trait ObjectStore: Send + Sync {
-    /// Durably publishes bytes if absent and returns a verified capability. Contract section 12.1.
+    /// Durably publishes bytes if absent and returns a verified capability.
     async fn put(
         &self,
         scope: &ExecutionScope,
@@ -350,14 +350,14 @@ pub trait ObjectStore: Send + Sync {
         media_type: &str,
     ) -> Result<VerifiedObjectRef, ObjectStoreError>;
 
-    /// Reads and verifies committed bytes or mints a failed-read proof. Contract section 12.3.
+    /// Reads and verifies committed bytes or mints a failed-read proof.
     async fn get(
         &self,
         scope: &ExecutionScope,
         digest: &Digest,
     ) -> Result<VerifiedObject, ObjectReadError>;
 
-    /// Publishes a prepared object without replacement. Contract section 12.1.
+    /// Publishes a prepared object without replacement.
     async fn publish_if_absent(
         &self,
         scope: &ExecutionScope,

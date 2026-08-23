@@ -2,9 +2,9 @@
 //! W10 acceptance specs: RunLimits ceilings, event correlation, and the
 //! temporary-versus-permanent budget distinction.
 //!
-//! Normative source: docs/WORKFLOW_CORE_CONTRACT.md sections 1.4 (RunLimits and
-//! the run row's budget ledger fields), 1.12 and 15.1 (event envelope, batch
-//! identity), 2.x/3.x (N59/N60/N27, R10), 5.3 and 5.4.
+//! The implemented contract is in `src/run.rs`, `src/budget.rs`,
+//! `src/event.rs`, and the `WorkflowStore` command boundary. The host rules
+//! are in `docs/system/operations-and-limits.md`.
 //!
 //! Two things this file deliberately does that a looser suite would not.
 //! First, every ceiling is asserted from both sides at its exact arithmetic
@@ -253,7 +253,7 @@ async fn seed_action<S: WorkflowStore>(
 
 /// A Map whose children are concurrently claimable. Map children are the only
 /// v0.1 way to hold two live reservations in one run, which is what the
-/// reservation-pressure branch of contract section 11.1 requires.
+/// reservation-pressure branch requires.
 async fn seed_map<S: WorkflowStore>(
     store: &S,
     objects: &Arc<InMemoryObjectStore<TestClock>>,
@@ -438,7 +438,7 @@ async fn events<S: WorkflowStore>(
 }
 
 // ---------------------------------------------------------------------------
-// The seven RunLimits ceilings. Contract section 1.4.
+// The seven RunLimits ceilings.
 // ---------------------------------------------------------------------------
 
 /// `max_total_events` is refused at run creation by exact arithmetic.
@@ -1183,7 +1183,7 @@ async fn max_run_lifetime_ms_ceiling_is_exact_in_sqlite() {
 }
 
 // ---------------------------------------------------------------------------
-// Event ordering, batch identity, correlation. Contract sections 1.12 and 15.1.
+// Event ordering, batch identity, correlation.
 // ---------------------------------------------------------------------------
 
 /// Drives a full success lifecycle and returns the run's complete event stream.
@@ -1811,7 +1811,7 @@ async fn expand_two<S: WorkflowStore>(
 
 /// Reservation-only shortage waits, and settlement revives the waiter.
 ///
-/// Contract section 11.1 and transition N59: when the declared maximum still
+/// and transition N59: when the declared maximum still
 /// fits `limit - consumed` but not `limit - consumed - reserved`, the node is
 /// suspended by accounting and the run stays Running. Once the live reservation
 /// settles below its reservation, the same node must claim normally. Proving
@@ -1953,7 +1953,7 @@ async fn reservation_pressure_waits_and_resumes_after_settlement() {
 
 /// Permanent infeasibility terminalizes and cannot be revived.
 ///
-/// Contract sections 2.1 and 3: `BudgetExhausted` is terminal subject only to
+/// `BudgetExhausted` is terminal subject only to
 /// integrity override. The distinguishing input is consumption, not
 /// reservation: once `limit - consumed` is smaller than the declared maximum no
 /// settlement can ever make the node feasible, so the same claim that produced
@@ -2079,7 +2079,7 @@ async fn permanent_infeasibility_exhausts_and_cannot_revive() {
 }
 
 // ---------------------------------------------------------------------------
-// Budget ledger durability. Contract section 1.15.
+// Budget ledger durability.
 // ---------------------------------------------------------------------------
 
 /// The in-memory store's ledger records the reservation and its settlement.

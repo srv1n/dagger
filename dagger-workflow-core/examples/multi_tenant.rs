@@ -8,7 +8,7 @@
 //!
 //! This crate is meant to be embedded in a server that holds many tenants in
 //! one process and one database, so scope isolation is the first property such
-//! a host has to be able to demonstrate. Every durable key in contract section
+//! a host has to be able to demonstrate. Every durable key in the data model
 //! 1.1 is `(ExecutionScope, id)`, never `id` alone, and every store command and
 //! query takes the scope explicitly.
 //!

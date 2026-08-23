@@ -1,11 +1,11 @@
-//! Primitive identifiers and deterministic derivations from contract sections 1 and 7.
+//! Primitive identifiers and deterministic derivations.
 
 use crate::artifact::ArtifactKind;
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 
-/// An opaque case-sensitive entity identifier. Contract section 1.1.
+/// An opaque case-sensitive entity identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Id(pub(crate) String);
@@ -46,7 +46,7 @@ impl<'de> Deserialize<'de> for Id {
     }
 }
 
-/// An ID validation failure. Contract section 1.1.
+/// An ID validation failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum IdError {
     /// The input contains no bytes.
@@ -57,7 +57,7 @@ pub enum IdError {
     TooLong,
 }
 
-/// A lowercase SHA-256 digest with its algorithm prefix. Contract section 1.1.
+/// A lowercase SHA-256 digest with its algorithm prefix.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct Digest(pub(crate) String);
@@ -102,7 +102,7 @@ impl<'de> Deserialize<'de> for Digest {
     }
 }
 
-/// A digest validation failure. Contract section 1.1.
+/// A digest validation failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("digest must be sha256: followed by 64 lowercase hexadecimal characters")]
 pub enum DigestError {
@@ -110,12 +110,12 @@ pub enum DigestError {
     Invalid,
 }
 
-/// A database-clock UTC Unix epoch millisecond value. Contract section 1.1.
+/// A database-clock UTC Unix epoch millisecond value.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Timestamp(pub i64);
 
-/// Opaque host-defined budget units. Contract section 1.1.
+/// Opaque host-defined budget units.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CostUnits(pub u64);
 
@@ -146,39 +146,39 @@ impl<'de> Deserialize<'de> for CostUnits {
     }
 }
 
-/// A mutable-row compare-and-swap counter. Contract section 1.1.
+/// A mutable-row compare-and-swap counter.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Version(pub u64);
 
-/// A static definition node ID or synthetic Map child ID. Contract section 1.1.
+/// A static definition node ID or synthetic Map child ID.
 pub type NodeInstanceId = Id;
 
-/// A persisted canonical Kahn rank used for deterministic recovery. Contract section 1.5.
+/// A persisted canonical Kahn rank used for deterministic recovery.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TopologicalRank(pub u32);
 
-/// Correlation inputs to deterministic ArtifactRef ID derivation. Contract section 1.10.
+/// Correlation inputs to deterministic ArtifactRef ID derivation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactRefIdentity<'a> {
-    /// Scope included in the derivation. Contract section 1.10.
+    /// Scope included in the derivation.
     pub scope: &'a ExecutionScope,
-    /// Content digest included in the derivation. Contract section 1.10.
+    /// Content digest included in the derivation.
     pub digest: &'a Digest,
-    /// Typed artifact use included in the derivation. Contract section 1.10.
+    /// Typed artifact use included in the derivation.
     pub kind: ArtifactKind,
-    /// Optional producer run correlation. Contract section 1.10.
+    /// Optional producer run correlation.
     pub producer_run_id: Option<&'a Id>,
-    /// Optional producer node correlation. Contract section 1.10.
+    /// Optional producer node correlation.
     pub producer_node_id: Option<&'a NodeInstanceId>,
-    /// Optional producer attempt correlation. Contract section 1.10.
+    /// Optional producer attempt correlation.
     pub producer_attempt_id: Option<&'a Id>,
-    /// Producer-local ordinal. Contract section 1.10.
+    /// Producer-local ordinal.
     pub ordinal: u32,
 }
 
-/// Derives the stable control-edge identifier. Contract section 1.6.
+/// Derives the stable control-edge identifier.
 pub fn edge_id(
     _revision_hash: &Digest,
     _from_node_id: &Id,
@@ -193,7 +193,7 @@ pub fn edge_id(
     Id::new(format!("edge_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
-/// Derives the typed content-use identifier. Contract section 1.10.
+/// Derives the typed content-use identifier.
 pub fn artifact_ref_id(_identity: ArtifactRefIdentity<'_>) -> Id {
     let mut bytes = lp(b"dagger-artifact-ref-v1");
     bytes.extend(lp(_identity.scope.tenant_id.as_str().as_bytes()));
@@ -215,7 +215,7 @@ pub fn artifact_ref_id(_identity: ArtifactRefIdentity<'_>) -> Id {
     Id::new(format!("artifact_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
-/// Derives a static logical node's external idempotency key. Contract section 7.1.
+/// Derives a static logical node's external idempotency key.
 pub fn idempotency_key(
     _scope: &ExecutionScope,
     _run_id: &Id,
@@ -225,7 +225,7 @@ pub fn idempotency_key(
     format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
 }
 
-/// Derives a Map child's external idempotency key. Contract section 7.1.
+/// Derives a Map child's external idempotency key.
 pub fn map_child_idempotency_key(
     _scope: &ExecutionScope,
     _run_id: &Id,
@@ -242,7 +242,7 @@ pub fn map_child_idempotency_key(
     format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
 }
 
-/// Derives a synthetic Map child node identifier. Contract section 10.1.
+/// Derives a synthetic Map child node identifier.
 pub fn map_child_id(
     _run_id: &Id,
     _map_node_instance_id: &NodeInstanceId,
@@ -257,7 +257,7 @@ pub fn map_child_id(
     Id::new(format!("mapchild_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
 }
 
-/// Derives the ordered Map expansion digest. Contract section 10.1.
+/// Derives the ordered Map expansion digest.
 pub fn map_expansion_digest(_children: &[MapChildIdentity]) -> Digest {
     let mut bytes = lp(b"dagger-map-expansion-v1");
     for child in _children {
@@ -326,14 +326,14 @@ fn digest_bytes(digest: &Digest) -> [u8; 32] {
     bytes
 }
 
-/// One ordered tuple included in the Map expansion digest. Contract section 10.1.
+/// One ordered tuple included in the Map expansion digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MapChildIdentity {
-    /// Zero-based item index. Contract section 10.1.
+    /// Zero-based item index.
     pub item_index: u32,
-    /// Digest of canonical item JSON. Contract section 10.1.
+    /// Digest of canonical item JSON.
     pub item_digest: Digest,
-    /// Derived synthetic child ID. Contract section 10.1.
+    /// Derived synthetic child ID.
     pub child_id: NodeInstanceId,
 }

@@ -980,7 +980,7 @@ pub(crate) fn retry_at(
 
 /// Validates one host-supplied SchemaDocument against the supported subset.
 ///
-/// Contract section 14.3 fixes the accepted keyword set, and the closing rule of
+///.
 /// section 14 requires the same subset validator at publication and at run
 /// creation. The oracle owns the semantics the durable adapter is certified
 /// against, so it must reject exactly what section 14.3 forbids rather than

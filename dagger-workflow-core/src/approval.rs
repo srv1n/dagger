@@ -1,4 +1,4 @@
-//! Durable approval types from contract sections 1.9 and 3.5.
+//! Durable approval types.
 
 use crate::artifact::JsonRef;
 use crate::ids::{Digest, Id, NodeInstanceId, Timestamp, Version};
@@ -6,50 +6,50 @@ use crate::run::GateState;
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 
-/// The closed decision vocabulary. Contract section 3.5.
+/// The closed decision vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
-    /// Approve the gate. Contract section 3.5.
+    /// Approve the gate.
     Approve,
-    /// Reject the gate. Contract section 3.5.
+    /// Reject the gate.
     Reject,
 }
 
-/// The closed gate expiry policy. Contract section 1.9.
+/// The closed gate expiry policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalExpiryPolicy {
-    /// Approve when the gate expires. Contract section 3.5.
+    /// Approve when the gate expires.
     Approve,
-    /// Reject when the gate expires. Contract section 3.5.
+    /// Reject when the gate expires.
     #[default]
     Reject,
 }
 
-/// The closed gate resolution source vocabulary. Contract section 1.9.
+/// The closed gate resolution source vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalResolutionSource {
-    /// An authenticated human decision. Contract section 3.5.
+    /// An authenticated human decision.
     Human,
-    /// Database-clock expiry. Contract section 3.5.
+    /// Database-clock expiry.
     Expiry,
-    /// Run terminalization cancellation. Contract section 3.5.
+    /// Run terminalization cancellation.
     Cancellation,
 }
 
-/// Immutable principal and role allowlists. Contract section 1.9.
+/// Immutable principal and role allowlists.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionAuthorizationPolicy {
-    /// Ordered unique allowed principal IDs. Contract section 1.9.
+    /// Ordered unique allowed principal IDs.
     pub allowed_principal_ids: Vec<String>,
-    /// Ordered unique allowed role IDs. Contract section 1.9.
+    /// Ordered unique allowed role IDs.
     pub allowed_role_ids: Vec<String>,
 }
 
-/// An opaque host-authentication capability bound to one scope. Contract section 1.1.
+/// An opaque host-authentication capability bound to one scope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedPrincipal {
     scope: ExecutionScope,
@@ -59,7 +59,7 @@ pub struct AuthenticatedPrincipal {
 }
 
 impl AuthenticatedPrincipal {
-    /// Mints a scope-bound principal from host-authenticated facts. Contract section 16.1.
+    /// Mints a scope-bound principal from host-authenticated facts.
     pub fn mint(
         scope: ExecutionScope,
         principal_id: String,
@@ -85,98 +85,98 @@ impl AuthenticatedPrincipal {
         })
     }
 
-    /// Returns the bound scope. Contract section 16.1.
+    /// Returns the bound scope.
     pub fn scope(&self) -> &ExecutionScope {
         &self.scope
     }
 
-    /// Returns the authenticated principal ID. Contract section 3.5.
+    /// Returns the authenticated principal ID.
     pub fn principal_id(&self) -> &str {
         &self.principal_id
     }
 
-    /// Returns the authenticated role IDs. Contract section 3.5.
+    /// Returns the authenticated role IDs.
     pub fn role_ids(&self) -> &[String] {
         &self.role_ids
     }
 
-    /// Returns the authentication-context digest. Contract section 3.5.
+    /// Returns the authentication-context digest.
     pub fn authentication_context_digest(&self) -> &Digest {
         &self.authentication_context_digest
     }
 }
 
-/// A principal-capability construction failure. Contract section 16.1.
+/// A principal-capability construction failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PrincipalError {
-    /// The principal ID violates its byte bounds. Contract section 3.5.
+    /// The principal ID violates its byte bounds.
     #[error("invalid principal id")]
     InvalidPrincipalId,
-    /// A role ID violates its byte bounds. Contract section 3.5.
+    /// A role ID violates its byte bounds.
     #[error("invalid role id")]
     InvalidRoleId,
 }
 
-/// One durable first-valid-decision gate. Contract section 1.9.
+/// One durable first-valid-decision gate.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalGate {
-    /// Gate scope. Contract section 1.9.
+    /// Gate scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.9.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Gate ID. Contract section 1.9.
+    /// Gate ID.
     pub gate_id: Id,
-    /// Owning node instance. Contract section 1.9.
+    /// Owning node instance.
     pub node_instance_id: NodeInstanceId,
-    /// Immutable request ref. Contract section 1.9.
+    /// Immutable request ref.
     pub request_ref: JsonRef,
-    /// Durable gate state. Contract section 2.4.
+    /// Durable gate state.
     pub status: GateState,
-    /// Database-clock expiry. Contract section 1.9.
+    /// Database-clock expiry.
     pub expires_at: Timestamp,
-    /// Immutable expiry behavior. Contract section 1.9.
+    /// Immutable expiry behavior.
     pub on_expiry: ApprovalExpiryPolicy,
-    /// Immutable decision authorization. Contract section 1.9.
+    /// Immutable decision authorization.
     pub authorization_policy: DecisionAuthorizationPolicy,
-    /// Optional human decision payload. Contract section 1.9.
+    /// Optional human decision payload.
     pub decision_payload_ref: Option<JsonRef>,
-    /// Optional authenticated deciding principal ID. Contract section 1.9.
+    /// Optional authenticated deciding principal ID.
     pub deciding_principal: Option<String>,
-    /// Optional terminal resolution source. Contract section 1.9.
+    /// Optional terminal resolution source.
     pub resolution_source: Option<ApprovalResolutionSource>,
-    /// Optional decision timestamp. Contract section 1.9.
+    /// Optional decision timestamp.
     pub decided_at: Option<Timestamp>,
-    /// Optional exact replay fingerprint. Contract section 3.5.
+    /// Optional exact replay fingerprint.
     pub decision_fingerprint: Option<Digest>,
-    /// Gate CAS version. Contract section 1.9.
+    /// Gate CAS version.
     pub version: Version,
 }
 
-/// The fixed successful approval-node output envelope. Contract section 3.5.
+/// The fixed successful approval-node output envelope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalResult {
-    /// Always approve for a successful approval result. Contract section 3.5.
+    /// Always approve for a successful approval result.
     pub decision: ApprovalDecision,
-    /// Human or expiry resolution source. Contract section 3.5.
+    /// Human or expiry resolution source.
     pub source: ApprovalResultSource,
-    /// Exact canonical decision-payload ArtifactRef value. Contract section 3.5.
+    /// Exact canonical decision-payload ArtifactRef value.
     pub payload_ref: Option<crate::artifact::ArtifactRefValue>,
-    /// Human principal ID or null for expiry. Contract section 3.5.
+    /// Human principal ID or null for expiry.
     pub principal: Option<String>,
 }
 
-/// The closed successful ApprovalResult source. Contract section 3.5.
+/// The closed successful ApprovalResult source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalResultSource {
-    /// An authenticated human approval. Contract section 3.5.
+    /// An authenticated human approval.
     Human,
-    /// An approve-on-expiry resolution. Contract section 3.5.
+    /// An approve-on-expiry resolution.
     Expiry,
 }
 
-/// Constructs the canonical human approval result bytes. Contract section 3.5.
+/// Constructs the canonical human approval result bytes.
 pub fn canonical_human_approval_result(
     payload_ref: Option<crate::artifact::ArtifactRefValue>,
     principal: &AuthenticatedPrincipal,
@@ -190,7 +190,7 @@ pub fn canonical_human_approval_result(
     .expect("closed approval result serializes")
 }
 
-/// Constructs the canonical expiry approval result bytes. Contract section 3.5.
+/// Constructs the canonical expiry approval result bytes.
 pub fn canonical_expiry_approval_result() -> Vec<u8> {
     serde_jcs::to_vec(&ApprovalResult {
         decision: ApprovalDecision::Approve,

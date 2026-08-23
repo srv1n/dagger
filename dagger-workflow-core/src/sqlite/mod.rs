@@ -1957,7 +1957,7 @@ where
         let (data,) = row.ok_or(StoreError::NotFound)?;
         let authority: RevisionAuthority = decode_row(&data)?;
         // Both root schemas, not just the input. `resolve_terminal_node` validates
-        // the Succeed output against the pinned root output schema (contract N16),
+        // the Succeed output against the pinned root output schema,
         // and a store reopened after a restart holds no process-local bytes, so
         // omitting the output ref made that check fail as CorruptControlPlane on
         // every post-restart run.
@@ -2765,7 +2765,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         // the revision (definition, run input/output schema, action pin) has a NULL
         // producer and is never hydrated by the run load alone. Without this the
         // registered-ref equality check rejects every pinned ref, and a corrupt root
-        // input schema could not mark its own run corrupt. Contract section 12.3.
+        // input schema could not mark its own run corrupt.
         AuthorityLoad::run(&command.run_id)
             .artifacts([command.bad_ref.artifact_ref_id.clone()])
     );

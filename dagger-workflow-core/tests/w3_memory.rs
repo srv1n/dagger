@@ -146,7 +146,7 @@ fn object_store_mints_closed_failed_read_proofs() {
 /// a lookup, so no read of it may ever report `StorageUnavailable`. Every
 /// failure it can produce is a verified integrity failure carrying a proof.
 /// A refactor that quietly makes the oracle unavailable would silently weaken
-/// every conformance case that reads through it. Contract section 12.3.
+/// every conformance case that reads through it.
 #[test]
 fn memory_object_store_never_reports_storage_unavailable() {
     block_on(async {

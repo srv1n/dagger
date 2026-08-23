@@ -832,7 +832,7 @@ async fn print_new_events(
         )
         .await?;
     for event in events {
-        // The transition ID is the contract section 3 row that produced the
+        // The transition ID is the state-transition row that produced the
         // event, so a reviewer can look each refusal up directly.
         let line = format!(
             "      #{:02} {:<6} {:<22}{}",

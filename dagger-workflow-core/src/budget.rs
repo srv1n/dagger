@@ -1,84 +1,84 @@
-//! Immutable budget ledger types from contract sections 1.15 and 11.
+//! Immutable budget ledger types.
 
 use crate::ids::{CostUnits, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 
-/// The closed budget-ledger operation vocabulary. Contract section 1.15.
+/// The closed budget-ledger operation vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BudgetLedgerKind {
-    /// Add one live reservation. Contract section 11.1.
+    /// Add one live reservation.
     Reserve,
-    /// Settle with trusted actual cost. Contract section 11.2.
+    /// Settle with trusted actual cost.
     SettleActual,
-    /// Settle the full reservation without trusted actual cost. Contract section 11.2.
+    /// Settle the full reservation without trusted actual cost.
     SettleFullUnknown,
 }
 
-/// The closed budget-ledger reason vocabulary. Contract section 1.15.
+/// The closed budget-ledger reason vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BudgetLedgerReason {
-    /// Attempt started. Contract section 1.15.
+    /// Attempt started.
     Started,
-    /// Attempt succeeded. Contract section 1.15.
+    /// Attempt succeeded.
     Succeeded,
-    /// Retryable result. Contract section 1.15.
+    /// Retryable result.
     Retryable,
-    /// Permanent result. Contract section 1.15.
+    /// Permanent result.
     Permanent,
-    /// Contract result. Contract section 1.15.
+    /// Contract result.
     Contract,
-    /// Deadline timeout. Contract section 1.15.
+    /// Deadline timeout.
     TimedOut,
-    /// Crash-unknown result. Contract section 1.15.
+    /// Crash-unknown result.
     UnknownOutcome,
-    /// Run cancellation. Contract section 1.15.
+    /// Run cancellation.
     Cancelled,
-    /// Live completion lost its fence. Contract section 1.15.
+    /// Live completion lost its fence.
     Stale,
 }
 
-/// One immutable reservation or settlement ledger entry. Contract section 1.15.
+/// One immutable reservation or settlement ledger entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetLedgerEntry {
-    /// Ledger scope. Contract section 1.15.
+    /// Ledger scope.
     pub scope: ExecutionScope,
-    /// Owning run ID. Contract section 1.15.
+    /// Owning run ID.
     pub run_id: Id,
-    /// Run-local ledger sequence. Contract section 1.15.
+    /// Run-local ledger sequence.
     pub ledger_seq: u64,
-    /// Correlated attempt ID. Contract section 1.15.
+    /// Correlated attempt ID.
     pub attempt_id: Id,
-    /// Correlated node instance ID. Contract section 1.15.
+    /// Correlated node instance ID.
     pub node_instance_id: NodeInstanceId,
-    /// Closed ledger operation. Contract section 1.15.
+    /// Closed ledger operation.
     pub kind: BudgetLedgerKind,
-    /// Signed reserved-cost change. Contract section 1.15.
+    /// Signed reserved-cost change.
     pub reserved_delta: i128,
-    /// Consumed-cost increase. Contract section 1.15.
+    /// Consumed-cost increase.
     pub consumed_delta: CostUnits,
-    /// Original reservation amount. Contract section 1.15.
+    /// Original reservation amount.
     pub reservation_amount: CostUnits,
-    /// Closed accounting reason. Contract section 1.15.
+    /// Closed accounting reason.
     pub reason: BudgetLedgerReason,
-    /// Database creation timestamp. Contract section 1.15.
+    /// Database creation timestamp.
     pub created_at: Timestamp,
 }
 
-/// Inputs to an atomic pre-invocation reservation. Contract section 11.1.
+/// Inputs to an atomic pre-invocation reservation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BudgetReservation {
-    /// Declared maximum to reserve. Contract section 11.1.
+    /// Declared maximum to reserve.
     pub declared_max: CostUnits,
 }
 
-/// Inputs to an accepted trusted-cost settlement. Contract section 11.2.
+/// Inputs to an accepted trusted-cost settlement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BudgetSettlement {
-    /// Immutable original reservation. Contract section 11.2.
+    /// Immutable original reservation.
     pub reservation: CostUnits,
-    /// Trusted actual cost or full reservation. Contract section 11.2.
+    /// Trusted actual cost or full reservation.
     pub consumed: CostUnits,
-    /// Closed settlement reason. Contract section 11.2.
+    /// Closed settlement reason.
     pub reason: BudgetLedgerReason,
 }

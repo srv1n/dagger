@@ -1,4 +1,4 @@
-//! Definition-format model and validation boundary from contract sections 8, 9, 10, 13, and 14.
+//! Definition-format model and validation boundary.
 
 use crate::approval::{ApprovalExpiryPolicy, DecisionAuthorizationPolicy};
 use crate::ids::{CostUnits, Digest, Id, TopologicalRank};
@@ -8,149 +8,149 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-/// The strict, normalized workflow definition document. Contract section 14.1.
+/// The strict, normalized workflow definition document.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowDefinition {
-    /// Required format version, exactly `0.1`. Contract section 13.1.
+    /// Required format version, exactly `0.1`.
     pub definition_format_version: String,
-    /// Definition identity matched at publication. Contract section 13.1.
+    /// Definition identity matched at publication.
     pub definition_id: Id,
-    /// Human-readable definition name. Contract section 14.1.
+    /// Human-readable definition name.
     pub name: String,
-    /// Human-readable definition description. Contract section 14.1.
+    /// Human-readable definition description.
     #[serde(default)]
     pub description: String,
-    /// Pinned root input schema digest. Contract section 13.1.
+    /// Pinned root input schema digest.
     pub run_input_schema_digest: Digest,
-    /// Pinned root output schema digest. Contract section 13.1.
+    /// Pinned root output schema digest.
     pub run_output_schema_digest: Digest,
-    /// Unique entry node identifier. Contract section 14.1.
+    /// Unique entry node identifier.
     pub entry_node_id: Id,
-    /// Closed list of definition nodes. Contract section 14.1.
+    /// Closed list of definition nodes.
     pub nodes: Vec<NodeDefinition>,
 }
 
-/// The closed definition node vocabulary. Contract section 14.1.
+/// The closed definition node vocabulary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", deny_unknown_fields)]
 pub enum NodeDefinition {
-    /// An executable action node. Contract section 14.1.
+    /// An executable action node.
     Action {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Pinned action contract. Contract section 13.2.
+        /// Pinned action contract.
         action: ActionReference,
-        /// Explicit action input bindings. Contract section 8.1.
+        /// Explicit action input bindings.
         bindings: Vec<Binding>,
-        /// Retry policy. Contract section 14.1.
+        /// Retry policy.
         retry: RetryPolicy,
-        /// Attempt timeout policy. Contract section 14.1.
+        /// Attempt timeout policy.
         timeout: TimeoutPolicy,
-        /// Maximum reserved cost represented as decimal in JSON. Contract section 13.1.
+        /// Maximum reserved cost represented as decimal in JSON.
         declared_max_cost_units: CostUnits,
-        /// Normal outgoing targets. Contract section 14.2.
+        /// Normal outgoing targets.
         next: Vec<Id>,
     },
-    /// A bounded action fan-out node. Contract section 10.
+    /// A bounded action fan-out node.
     Map {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Source resolving to the input array. Contract section 10.1.
+        /// Source resolving to the input array.
         items: ValueSource,
-        /// Maximum number of child items. Contract section 10.3.
+        /// Maximum number of child items.
         max_items: u32,
-        /// Maximum concurrent children. Contract section 10.3.
+        /// Maximum concurrent children.
         max_concurrency: u32,
-        /// Pinned child action contract. Contract section 13.2.
+        /// Pinned child action contract.
         action: ActionReference,
-        /// Explicit child input bindings. Contract section 10.2.
+        /// Explicit child input bindings.
         bindings: Vec<MapBinding>,
-        /// Child retry policy. Contract section 14.1.
+        /// Child retry policy.
         retry: RetryPolicy,
-        /// Child timeout policy. Contract section 14.1.
+        /// Child timeout policy.
         timeout: TimeoutPolicy,
-        /// Per-child maximum reserved cost. Contract section 10.5.
+        /// Per-child maximum reserved cost.
         declared_max_cost_units: CostUnits,
-        /// Normal outgoing targets. Contract section 14.2.
+        /// Normal outgoing targets.
         next: Vec<Id>,
     },
-    /// A deterministic first-match branch node. Contract section 9.
+    /// A deterministic first-match branch node.
     Choice {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Source forming the immutable Choice input. Contract section 9.
+        /// Source forming the immutable Choice input.
         input: ValueSource,
-        /// Selector RFC 6901 pointer. Contract section 9.
+        /// Selector RFC 6901 pointer.
         selector: String,
-        /// Ordered non-empty cases. Contract section 9.
+        /// Ordered non-empty cases.
         cases: Vec<ChoiceCase>,
-        /// Required default target. Contract section 9.
+        /// Required default target.
         default: Id,
     },
-    /// A durable human approval node. Contract section 3.5.
+    /// A durable human approval node.
     Approval {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Source forming the approval request. Contract section 14.1.
+        /// Source forming the approval request.
         request: ValueSource,
-        /// Immutable gate configuration. Contract section 3.5.
+        /// Immutable gate configuration.
         gate: ApprovalGateConfig,
-        /// Normal outgoing targets. Contract section 14.2.
+        /// Normal outgoing targets.
         next: Vec<Id>,
     },
-    /// The unique successful terminal node. Contract section 14.2.
+    /// The unique successful terminal node.
     Succeed {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Source forming the root workflow output. Contract section 14.1.
+        /// Source forming the root workflow output.
         output: ValueSource,
     },
-    /// An explicit failing terminal node. Contract section 14.2.
+    /// An explicit failing terminal node.
     Fail {
-        /// Node identifier. Contract section 14.1.
+        /// Node identifier.
         id: Id,
-        /// Persistence-safe failure code. Contract section 14.1.
+        /// Persistence-safe failure code.
         code: String,
-        /// Persistence-safe failure message. Contract section 14.1.
+        /// Persistence-safe failure message.
         message: String,
     },
 }
 
-/// An executable action reference as represented in definition JSON. Contract section 14.1.
+/// An executable action reference as represented in definition JSON.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionReference {
-    /// Registry action name. Contract section 13.2.
+    /// Registry action name.
     pub name: String,
-    /// Action contract version. Contract section 13.2.
+    /// Action contract version.
     pub contract_version: String,
-    /// Pinned input schema digest. Contract section 13.2.
+    /// Pinned input schema digest.
     pub input_schema_digest: Digest,
-    /// Pinned output schema digest. Contract section 13.2.
+    /// Pinned output schema digest.
     pub output_schema_digest: Digest,
-    /// Required semantic compatibility digest. Contract section 13.2.
+    /// Required semantic compatibility digest.
     pub compatible_implementation_requirement: Digest,
 }
 
-/// A published executable pin keyed by its derived reference location. Contract section 1.3.
+/// A published executable pin keyed by its derived reference location.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionPin {
-    /// Node ID or derived `node_id/map_action` location. Contract section 1.3.
+    /// Node ID or derived `node_id/map_action` location.
     pub reference_location: String,
-    /// Registry action name. Contract section 13.2.
+    /// Registry action name.
     pub name: String,
-    /// Action contract version. Contract section 13.2.
+    /// Action contract version.
     pub contract_version: String,
-    /// Pinned input schema digest. Contract section 13.2.
+    /// Pinned input schema digest.
     pub input_schema_digest: Digest,
-    /// Pinned output schema digest. Contract section 13.2.
+    /// Pinned output schema digest.
     pub output_schema_digest: Digest,
-    /// Required semantic compatibility digest. Contract section 13.2.
+    /// Required semantic compatibility digest.
     pub compatible_implementation_requirement: Digest,
-    /// Durable supported-subset input schema ref. Contract section 1.3.
+    /// Durable supported-subset input schema ref.
     pub input_schema_ref: crate::artifact::JsonRef,
-    /// Durable supported-subset output schema ref. Contract section 1.3.
+    /// Durable supported-subset output schema ref.
     pub output_schema_ref: crate::artifact::JsonRef,
 }
 
@@ -171,239 +171,239 @@ pub struct ExtractedActionPin {
     pub compatible_implementation_requirement: Digest,
 }
 
-/// A timeout policy for one attempt. Contract section 14.1.
+/// A timeout policy for one attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimeoutPolicy {
-    /// Positive timeout in milliseconds. Contract section 14.1.
+    /// Positive timeout in milliseconds.
     pub timeout_ms: u64,
 }
 
-/// Retry ceiling and deterministic backoff. Contract section 14.1.
+/// Retry ceiling and deterministic backoff.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryPolicy {
-    /// Maximum number of started attempts. Contract section 14.2.
+    /// Maximum number of started attempts.
     pub max_attempts: u32,
-    /// Closed no-jitter backoff policy. Contract section 14.2.
+    /// Closed no-jitter backoff policy.
     pub backoff: BackoffPolicy,
 }
 
-/// The closed retry backoff vocabulary. Contract section 14.2.
+/// The closed retry backoff vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BackoffPolicy {
-    /// A constant delay. Contract section 14.2.
+    /// A constant delay.
     Fixed {
-        /// Delay in milliseconds. Contract section 14.1.
+        /// Delay in milliseconds.
         delay_ms: u64,
     },
-    /// A capped deterministic exponential delay. Contract section 14.2.
+    /// A capped deterministic exponential delay.
     Exponential {
-        /// Initial delay in milliseconds. Contract section 14.1.
+        /// Initial delay in milliseconds.
         initial_delay_ms: u64,
-        /// Integer exponential multiplier. Contract section 14.1.
+        /// Integer exponential multiplier.
         multiplier: u32,
-        /// Maximum delay in milliseconds. Contract section 14.1.
+        /// Maximum delay in milliseconds.
         max_delay_ms: u64,
     },
 }
 
-/// One explicit target-field assignment. Contract section 8.1.
+/// One explicit target-field assignment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
-    /// Target RFC 6901 pointer. Contract section 8.1.
+    /// Target RFC 6901 pointer.
     pub target: String,
-    /// Closed source descriptor. Contract section 8.1.
+    /// Closed source descriptor.
     pub source: BindingSource,
 }
 
-/// One explicit Map-child target-field assignment. Contract section 10.2.
+/// One explicit Map-child target-field assignment.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MapBinding {
-    /// Target RFC 6901 pointer. Contract section 8.1.
+    /// Target RFC 6901 pointer.
     pub target: String,
-    /// Closed Map-aware source descriptor. Contract section 10.2.
+    /// Closed Map-aware source descriptor.
     pub source: MapBindingSource,
 }
 
-/// A single-value source used by Choice, Map, Approval, and Succeed. Contract section 14.1.
+/// A single-value source used by Choice, Map, Approval, and Succeed.
 pub type ValueSource = BindingSource;
 
-/// The closed ordinary binding-source vocabulary. Contract section 8.1.
+/// The closed ordinary binding-source vocabulary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BindingSource {
-    /// An exact literal JSON value. Contract section 8.1.
+    /// An exact literal JSON value.
     Constant {
-        /// Literal value. Contract section 8.1.
+        /// Literal value.
         value: Value,
     },
-    /// A pointer into immutable run input. Contract section 8.1.
+    /// A pointer into immutable run input.
     RunInput {
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
-    /// A pointer into a named successful upstream output. Contract section 8.1.
+    /// A pointer into a named successful upstream output.
     NodeOutput {
-        /// Static upstream node identifier. Contract section 8.1.
+        /// Static upstream node identifier.
         node_id: Id,
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
-    /// A typed ArtifactRef locator. Contract section 8.1.
+    /// A typed ArtifactRef locator.
     ArtifactRef {
-        /// Closed artifact locator. Contract section 8.1.
+        /// Closed artifact locator.
         source: ArtifactLocator,
     },
 }
 
-/// The closed Map-child binding-source vocabulary. Contract section 10.2.
+/// The closed Map-child binding-source vocabulary.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MapBindingSource {
-    /// An exact literal JSON value. Contract section 8.1.
+    /// An exact literal JSON value.
     Constant {
-        /// Literal value. Contract section 8.1.
+        /// Literal value.
         value: Value,
     },
-    /// A pointer into immutable run input. Contract section 8.1.
+    /// A pointer into immutable run input.
     RunInput {
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
-    /// A pointer into a named successful upstream output. Contract section 8.1.
+    /// A pointer into a named successful upstream output.
     NodeOutput {
-        /// Static upstream node identifier. Contract section 8.1.
+        /// Static upstream node identifier.
         node_id: Id,
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
-    /// A typed ArtifactRef locator. Contract section 8.1.
+    /// A typed ArtifactRef locator.
     ArtifactRef {
-        /// Closed artifact locator. Contract section 8.1.
+        /// Closed artifact locator.
         source: ArtifactLocator,
     },
-    /// The current Map item or a pointer within it. Contract section 10.2.
+    /// The current Map item or a pointer within it.
     MapItem {
-        /// Item RFC 6901 pointer. Contract section 10.2.
+        /// Item RFC 6901 pointer.
         pointer: String,
     },
-    /// The current zero-based Map item index. Contract section 10.2.
+    /// The current zero-based Map item index.
     MapIndex,
 }
 
-/// The closed ArtifactRef locator vocabulary. Contract section 8.1.
+/// The closed ArtifactRef locator vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactLocator {
-    /// An exact pre-existing scoped artifact identity. Contract section 8.1.
+    /// An exact pre-existing scoped artifact identity.
     Literal {
-        /// ArtifactRef identifier. Contract section 8.1.
+        /// ArtifactRef identifier.
         artifact_ref_id: Id,
-        /// Required content digest. Contract section 8.1.
+        /// Required content digest.
         digest: Digest,
-        /// Required normalized media type. Contract section 8.1.
+        /// Required normalized media type.
         media_type: String,
     },
-    /// An ArtifactRef value selected from run input. Contract section 8.1.
+    /// An ArtifactRef value selected from run input.
     RunInput {
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
-    /// An ArtifactRef value selected from upstream output. Contract section 8.1.
+    /// An ArtifactRef value selected from upstream output.
     NodeOutput {
-        /// Static upstream node identifier. Contract section 8.1.
+        /// Static upstream node identifier.
         node_id: Id,
-        /// Source RFC 6901 pointer. Contract section 8.1.
+        /// Source RFC 6901 pointer.
         pointer: String,
     },
 }
 
-/// One ordered Choice comparison and target. Contract section 9.
+/// One ordered Choice comparison and target.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum ChoiceCase {
-    /// Exact scalar equality. Contract section 9.
+    /// Exact scalar equality.
     Equals {
-        /// Scalar to compare exactly. Contract section 9.
+        /// Scalar to compare exactly.
         equals: Value,
-        /// Singular case target. Contract section 9.
+        /// Singular case target.
         next: Id,
     },
-    /// Exact membership in a non-empty scalar set. Contract section 9.
+    /// Exact membership in a non-empty scalar set.
     In {
-        /// Canonical-unique scalar candidates. Contract section 9.
+        /// Canonical-unique scalar candidates.
         r#in: Vec<Value>,
-        /// Singular case target. Contract section 9.
+        /// Singular case target.
         next: Id,
     },
 }
 
-/// Immutable durable gate configuration. Contract section 14.1.
+/// Immutable durable gate configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalGateConfig {
-    /// Gate lifetime after request in milliseconds. Contract section 14.1.
+    /// Gate lifetime after request in milliseconds.
     pub expires_after_ms: u64,
-    /// Closed expiry behavior, defaulting to reject. Contract section 3.5.
+    /// Closed expiry behavior, defaulting to reject.
     #[serde(default)]
     pub on_expiry: ApprovalExpiryPolicy,
-    /// Immutable decision authorization policy. Contract section 3.5.
+    /// Immutable decision authorization policy.
     pub authorization: DecisionAuthorizationPolicy,
 }
 
-/// Structured, closed validation error categories. Contract sections 5.5 and 14.2.
+/// Structured, closed validation error categories.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValidationErrorKind {
-    /// A field failed syntactic constraints. Contract section 14.1.
+    /// A field failed syntactic constraints.
     InvalidField,
-    /// An unknown structural field was present. Contract section 14.1.
+    /// An unknown structural field was present.
     UnknownField,
-    /// A node ID was duplicated. Contract section 14.2.
+    /// A node ID was duplicated.
     DuplicateNodeId,
-    /// An entry or edge target does not exist. Contract section 14.2.
+    /// An entry or edge target does not exist.
     MissingNode,
-    /// A graph contains a cycle. Contract section 14.2.
+    /// A graph contains a cycle.
     Cycle,
-    /// A node is unreachable from the entry. Contract section 14.2.
+    /// A node is unreachable from the entry.
     UnreachableNode,
-    /// A maximal path has no explicit terminal. Contract section 14.2.
+    /// A maximal path has no explicit terminal.
     UnterminatedPath,
-    /// The definition does not contain exactly one reachable Succeed node. Contract section 14.2.
+    /// The definition does not contain exactly one reachable Succeed node.
     InvalidSucceedCount,
-    /// A Choice is missing its required default. Contract section 9.
+    /// A Choice is missing its required default.
     ChoiceDefaultMissing,
-    /// Choice cases overlap or target the same branch. Contract section 9.
+    /// Choice cases overlap or target the same branch.
     ChoiceCaseInvalid,
-    /// A Map is unbounded or has inconsistent bounds. Contract section 10.3.
+    /// A Map is unbounded or has inconsistent bounds.
     MapBoundsInvalid,
-    /// A retry policy is invalid. Contract section 14.2.
+    /// A retry policy is invalid.
     RetryPolicyInvalid,
-    /// A timeout policy is invalid. Contract section 14.1.
+    /// A timeout policy is invalid.
     TimeoutPolicyInvalid,
-    /// An action or root schema pin is unresolved. Contract section 13.1.
+    /// An action or root schema pin is unresolved.
     SchemaPinUnresolved,
-    /// A schema uses unsupported features. Contract section 14.3.
+    /// A schema uses unsupported features.
     SchemaSubsetUnsupported,
-    /// A binding target is absent, duplicated, or overlapping. Contract section 8.3.
+    /// A binding target is absent, duplicated, or overlapping.
     BindingTargetInvalid,
-    /// A binding source is missing or unsafe on an activating path. Contract section 8.3.
+    /// A binding source is missing or unsafe on an activating path.
     BindingSourceInvalid,
-    /// Source and target schema types are not assignable. Contract section 8.3.
+    /// Source and target schema types are not assignable.
     BindingTypeMismatch,
-    /// An RFC 6901 pointer is invalid. Contract section 8.3.
+    /// An RFC 6901 pointer is invalid.
     JsonPointerInvalid,
-    /// A literal artifact does not resolve exactly. Contract section 8.3.
+    /// A literal artifact does not resolve exactly.
     ArtifactLocatorInvalid,
-    /// A decimal cost value overflows u64. Contract section 13.1.
+    /// A decimal cost value overflows u64.
     CostUnitsInvalid,
-    /// The canonical definition exceeds its byte limit. Contract section 14.2.
+    /// The canonical definition exceeds its byte limit.
     DefinitionTooLarge,
-    /// Approval authorization is empty or invalid. Contract section 14.2.
+    /// Approval authorization is empty or invalid.
     ApprovalAuthorizationInvalid,
 }
 
@@ -419,22 +419,9 @@ pub fn parse_yaml_definition(input: &str) -> Result<WorkflowDefinition, Definiti
     yaml::parse(input)
 }
 
-/// Returns the normative Draft 2020-12 schema embedded in the frozen contract.
-///
-/// Keeping this verbatim source-of-truth extraction avoids a hand-maintained schema
-/// drifting from the frozen contract while the crate has no schema-code generator.
+/// Returns the normative Draft 2020-12 workflow definition schema.
 pub fn definition_json_schema() -> String {
-    const CONTRACT: &str = include_str!("../../../docs/WORKFLOW_CORE_CONTRACT.md");
-    let marker = "### 14.1 Normative schema\n\n```json\n";
-    let start = CONTRACT
-        .find(marker)
-        .expect("frozen contract has definition schema")
-        + marker.len();
-    let end = CONTRACT[start..]
-        .find("\n```\n")
-        .expect("frozen schema fence")
-        + start;
-    CONTRACT[start..end].to_owned()
+    include_str!("../../schema/workflow-definition-0.1.json").to_owned()
 }
 
 /// Extracts every executable action pin in deterministic reference-location order.
@@ -464,21 +451,21 @@ pub fn extract_action_pins(definition: &WorkflowDefinition) -> Vec<ExtractedActi
     pins
 }
 
-/// One LLM-correctable definition validation failure. Contract section 5.5.
+/// One LLM-correctable definition validation failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("{kind:?} at {path}: {message}")]
 pub struct DefinitionValidationError {
-    /// Closed validation category. Contract section 5.5.
+    /// Closed validation category.
     pub kind: ValidationErrorKind,
-    /// Bounded document path. Contract section 1.1.
+    /// Bounded document path.
     pub path: String,
-    /// Bounded corrective message. Contract section 1.1.
+    /// Bounded corrective message.
     pub message: String,
-    /// Bounded valid alternatives. Contract section 5.5.
+    /// Bounded valid alternatives.
     pub valid_alternatives: Vec<String>,
 }
 
-/// Validates syntax and all mandatory semantic constraints. Contract section 14.2.
+/// Validates syntax and all mandatory semantic constraints.
 pub fn validate_definition(
     definition: &WorkflowDefinition,
 ) -> Result<UnresolvedDefinition, Vec<DefinitionValidationError>> {
@@ -607,9 +594,9 @@ pub fn validate_definition(
 /// sections 5.2, 8.3, 13.1, 13.2, and 14.3.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UnresolvedDefinition {
-    /// Normalized typed definition. Contract section 13.1.
+    /// Normalized typed definition.
     pub definition: WorkflowDefinition,
-    /// Canonical Kahn ranks keyed by node ID. Contract section 1.5.
+    /// Canonical Kahn ranks keyed by node ID.
     pub topological_ranks: BTreeMap<Id, TopologicalRank>,
 }
 
@@ -922,7 +909,7 @@ fn binding_source_schema(
                     schemas.get(&action.output_schema_digest)?.clone()
                 }
                 // A Map node's output is the ordered aggregate of its children
-                // (contract section 3.3 N08), not one child output. The pinned
+                // (), not one child output. The pinned
                 // action schema describes a single child, so the schema a
                 // downstream binding must satisfy is that schema wrapped in an
                 // array. Resolving to the bare child schema made every
@@ -988,7 +975,7 @@ fn json_value_matches_schema(value: &Value, schema: &Value) -> bool {
     }
 }
 
-/// Expands schema defaults into a normalized typed definition. Contract section 14.2.
+/// Expands schema defaults into a normalized typed definition.
 pub fn normalize_definition(
     mut definition: WorkflowDefinition,
 ) -> Result<WorkflowDefinition, DefinitionValidationError> {
@@ -1022,7 +1009,7 @@ pub fn normalize_definition(
     Ok(definition)
 }
 
-/// Produces RFC 8785 canonical definition bytes. Contract section 13.1.
+/// Produces RFC 8785 canonical definition bytes.
 pub fn canonical_definition_json(
     definition: &WorkflowDefinition,
 ) -> Result<Vec<u8>, DefinitionValidationError> {
@@ -1040,7 +1027,7 @@ pub fn canonical_definition_json(
     Ok(bytes)
 }
 
-/// Computes the revision digest from canonical definition bytes. Contract section 13.1.
+/// Computes the revision digest from canonical definition bytes.
 pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
     Digest::new(format!(
         "sha256:{}",
@@ -1049,7 +1036,7 @@ pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
     .expect("SHA-256 output is valid")
 }
 
-/// Computes lexical Kahn topological ranks. Contract section 1.5.
+/// Computes lexical Kahn topological ranks.
 pub fn canonical_topological_ranks(
     definition: &WorkflowDefinition,
 ) -> Result<BTreeMap<Id, TopologicalRank>, DefinitionValidationError> {

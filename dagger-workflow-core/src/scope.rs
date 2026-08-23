@@ -1,15 +1,15 @@
-//! Scope-confined key types from contract sections 1.1, 1.13, and 16.
+//! Scope-confined key types.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::marker::PhantomData;
 
-/// A validated tenant or namespace component. Contract section 1.1.
+/// A validated tenant or namespace component.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ScopeAtom(String);
 
 impl ScopeAtom {
-    /// Validates and constructs a scope atom. Contract section 1.1.
+    /// Validates and constructs a scope atom.
     pub fn new(value: impl Into<String>) -> Result<Self, ScopeAtomError> {
         let value = value.into();
         if value.is_empty() {
@@ -30,7 +30,7 @@ impl ScopeAtom {
         Ok(Self(value))
     }
 
-    /// Returns the validated atom text. Contract section 1.1.
+    /// Returns the validated atom text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -46,44 +46,44 @@ impl<'de> Deserialize<'de> for ScopeAtom {
     }
 }
 
-/// A scope-atom validation failure. Contract section 1.1.
+/// A scope-atom validation failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ScopeAtomError {
-    /// The atom is empty. Contract section 1.1.
+    /// The atom is empty.
     #[error("scope atom is empty")]
     Empty,
-    /// The atom exceeds 128 UTF-8 bytes. Contract section 1.1.
+    /// The atom exceeds 128 UTF-8 bytes.
     #[error("scope atom exceeds 128 bytes")]
     TooLong,
-    /// The atom does not match the closed character grammar. Contract section 1.1.
+    /// The atom does not match the closed character grammar.
     #[error("scope atom has invalid characters")]
     InvalidCharacters,
 }
 
-/// The immutable tenant and namespace boundary. Contract section 1.13.
+/// The immutable tenant and namespace boundary.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionScope {
-    /// Tenant component of the scope. Contract section 1.1.
+    /// Tenant component of the scope.
     pub tenant_id: ScopeAtom,
-    /// Namespace component of the scope. Contract section 1.1.
+    /// Namespace component of the scope.
     pub namespace: ScopeAtom,
 }
 
-/// A logical identifier paired with its mandatory scope. Contract section 1.1.
+/// A logical identifier paired with its mandatory scope.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopedId<T> {
-    /// Scope containing the identifier. Contract section 16.1.
+    /// Scope containing the identifier.
     pub scope: ExecutionScope,
-    /// Identifier value within the scope. Contract section 1.1.
+    /// Identifier value within the scope.
     pub id: T,
     #[serde(skip)]
     marker: PhantomData<fn() -> T>,
 }
 
 impl<T> ScopedId<T> {
-    /// Constructs an explicitly scoped identifier. Contract section 1.13.
+    /// Constructs an explicitly scoped identifier.
     pub fn new(scope: ExecutionScope, id: T) -> Self {
         Self {
             scope,

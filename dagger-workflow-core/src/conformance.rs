@@ -1863,7 +1863,7 @@ async fn prepare_corruption_conformance<A: ConformanceAdapter>(
     })
 }
 
-/// Mints the object-store proof a corruption mark requires. Contract section 12.3.
+/// Mints the object-store proof a corruption mark requires.
 fn corruption_proof(
     scope: &ExecutionScope,
     bad_ref: &ArtifactRef,
@@ -2143,7 +2143,7 @@ async fn publish_with_root_input_schema<A: ConformanceAdapter>(
 
 /// Both stacks reject an out-of-subset root schema and a violating run input.
 ///
-/// Contract section 5.2 makes the supported subset a publication precondition and
+///.
 /// section 14 requires the same validator at run creation, so a store that pins an
 /// out-of-subset schema or admits an input the pinned schema rejects is
 /// non-conforming. This is the parity direction that hides worst: an oracle weaker
@@ -2819,7 +2819,7 @@ async fn assert_terminal_contract_failure<A: ConformanceAdapter>(
 
 /// A Succeed output violating the pinned root output schema is rejected.
 ///
-/// Contract section 5.3 makes "unique Succeed output validates pinned root output
+///.
 /// schema/limit" a precondition and N16 repeats it, so a store that commits the
 /// value unvalidated publishes a run output its own revision forbids.
 async fn succeed_output_schema_enforced<A: ConformanceAdapter>(

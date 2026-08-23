@@ -1,7 +1,7 @@
 //! W11-A integrity propagation and W11-B host boundary acceptance specs.
 //!
-//! Normative source: docs/WORKFLOW_CORE_CONTRACT_ERRATUM_0_1_1.md sections A
-//! and B. Two properties are proved here that a green pass alone never shows:
+//! The implemented contract is in `src/artifact.rs`, `src/committed_read.rs`,
+//! and the store corruption commands. Two properties are proved here:
 //! the proof and the typed use that reach the caller are the ones the failing
 //! read actually produced, and the host reader's four outcomes are ordered
 //! against durable control-plane state rather than against a return value.

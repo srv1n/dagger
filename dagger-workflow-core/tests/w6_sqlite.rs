@@ -2634,7 +2634,7 @@ fn gate_9_every_sqlite_domain_statement_is_statically_tenant_scoped() {
 
     // The whole crate source is scanned, not just src/sqlite. Scoping is a property of
     // every domain statement wherever it is written, and a gate that only looks in one
-    // module fails open the moment domain SQL lands outside it. Contract section 2.3.
+    // module fails open the moment domain SQL lands outside it.
     fn rust_sources(directory: &Path, sources: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
