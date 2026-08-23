@@ -77,6 +77,19 @@ The action returns `Success`, `Retryable`, or `Permanent`. A success result can 
 
 The engine checks size, digest, deadline, registration, and action pins before it commits a result.
 
+## Action progress for embedders
+
+Actions may `await context.report_progress(...)` for low-frequency durable checkpoints,
+phase labels, and external handles. Each record is appended to the ordinary run event stream
+as an action-attempt-correlated event; it is not a harness trace channel.
+
+The engine permits 64 progress records per attempt by default. An embedder can set a different
+positive cap with `WorkflowEngine::with_max_progress_events_per_attempt` before sharing the
+engine. Records are limited to one per second, and over-cap or over-rate reports return typed
+errors; nothing is silently dropped. A report is accepted only while its credentialed attempt is
+Started, active, and owned by the current engine generation. Event-cap exhaustion follows the
+normal `RunEventLimitExceeded` terminalization path.
+
 ## Scheduler claim and recovery
 
 Each scope has one live engine claim. The claim and completion credentials fence an old generation. One engine process can hold claims for more than one scope.
