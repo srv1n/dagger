@@ -34,9 +34,11 @@ use dagger_workflow_core::store::{
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::Row;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn scope(tenant: &str) -> ExecutionScope {
@@ -522,12 +524,15 @@ async fn raw_physical_scope_snapshot(
 
 #[tokio::test]
 async fn pool_injection_preserves_host_tables_and_applies_schema() {
+    let directory = TempDir::new().unwrap();
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(
             SqliteConnectOptions::new()
-                .filename(":memory:")
-                .create_if_missing(true),
+                .filename(directory.path().join("injected.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(false)
+                .busy_timeout(Duration::from_millis(1)),
         )
         .await
         .unwrap();
@@ -558,6 +563,21 @@ async fn pool_injection_preserves_host_tables_and_applies_schema() {
             .fetch_one(&pool)
             .await
             .unwrap();
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1);
+    assert_eq!(busy_timeout, 5_000);
+    assert_eq!(journal_mode, "wal");
     assert_eq!(version, SCHEMA_VERSION);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
@@ -1736,6 +1756,320 @@ async fn scheduler_multi_status_scans_are_index_ordered_without_temp_sorts() {
             details.join("\n")
         );
     }
+}
+
+#[derive(Default)]
+struct SqliteWriteLoadMetrics {
+    latencies: Vec<Duration>,
+    claims: u64,
+    completions: u64,
+}
+
+async fn measure_sqlite_write<T>(
+    metrics: &Arc<Mutex<SqliteWriteLoadMetrics>>,
+    write: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    let started = Instant::now();
+    let result = write.await;
+    metrics
+        .lock()
+        .expect("load metrics lock poisoned")
+        .latencies
+        .push(started.elapsed());
+    result
+}
+
+fn load_compatibility(fixture: &ActionFixture) -> CompatibilityReport {
+    CompatibilityReport {
+        evidence_digest: fixture.evidence_digest.clone(),
+        incompatible_reference_locations: Vec::new(),
+        evidence: Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SqliteWriteLoadRole {
+    Claim,
+    Complete,
+    Cancel,
+    Heartbeat,
+}
+
+/// 30-second contention proof; run with `make sqlite-write-load`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long-running SQLite contention proof"]
+async fn sqlite_write_path_load() {
+    const WRITERS: usize = 16;
+    const LOAD_DURATION: Duration = Duration::from_secs(30);
+
+    let directory = TempDir::new().unwrap();
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(WRITERS as u32)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(directory.path().join("write-load.sqlite"))
+                .create_if_missing(true)
+                .foreign_keys(false)
+                .busy_timeout(Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+    let store = Arc::new(
+        SqliteWorkflowStore::from_pool(pool, clock.clone(), objects.clone())
+            .await
+            .unwrap(),
+    );
+    let fixture = Arc::new(seed_action_definition(&store, &objects, "write-load").await);
+    let permit = store
+        .acquire_engine_claim(&fixture.scope, Id::new("write-load-engine").unwrap())
+        .await
+        .unwrap()
+        .permit;
+    let run_ids = (0..WRITERS)
+        .map(|writer| Id::new(format!("write-load-run-{writer}")).unwrap())
+        .collect::<Vec<_>>();
+    for run_id in &run_ids {
+        store
+            .create_run(
+                &fixture.scope,
+                create_run_command(&fixture, run_id.as_str()),
+            )
+            .await
+            .unwrap();
+        store
+            .start_run(
+                &fixture.scope,
+                StartRun {
+                    permit: permit.clone(),
+                    run_id: run_id.clone(),
+                    compatibility_evidence: load_compatibility(&fixture),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let completion_output = objects
+        .put(&fixture.scope, br#"{"value":2}"#, "application/json")
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let metrics = Arc::new(Mutex::new(SqliteWriteLoadMetrics::default()));
+    let started = Instant::now();
+    let mut writers = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let store = store.clone();
+        let fixture = fixture.clone();
+        let permit = permit.clone();
+        let run_id = run_ids[writer].clone();
+        let completion_output = completion_output.clone();
+        let barrier = barrier.clone();
+        let metrics = metrics.clone();
+        writers.push(tokio::spawn(async move {
+            let role = match writer % 4 {
+                0 => SqliteWriteLoadRole::Claim,
+                1 => SqliteWriteLoadRole::Complete,
+                2 => SqliteWriteLoadRole::Cancel,
+                _ => SqliteWriteLoadRole::Heartbeat,
+            };
+            barrier.wait().await;
+            let deadline = Instant::now() + LOAD_DURATION;
+            let mut claimed = None;
+            let mut cancelled = None;
+            while Instant::now() < deadline {
+                match role {
+                    SqliteWriteLoadRole::Claim if claimed.is_none() => {
+                        let node = store
+                            .get_node(&fixture.scope, &run_id, &Id::new("action").unwrap())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let result = measure_sqlite_write(
+                            &metrics,
+                            store.claim_node_attempt(
+                                &fixture.scope,
+                                ClaimNodeAttempt {
+                                    permit: permit.clone(),
+                                    run_id: run_id.clone(),
+                                    node_id: Id::new("action").unwrap(),
+                                    expected_node_version: node.version,
+                                    attempt_id: Id::new(format!("write-load-attempt-{writer}"))
+                                        .unwrap(),
+                                    worker_id: Id::new(format!("write-load-worker-{writer}"))
+                                        .unwrap(),
+                                    bound_input: fixture.input.clone(),
+                                    binding_derivation_digest: fixture.evidence_digest.clone(),
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let ClaimNodeAttemptResult::Claimed {
+                            completion_credential,
+                            ..
+                        } = result
+                        else {
+                            return Err("load claim did not claim".to_owned());
+                        };
+                        metrics.lock().expect("load metrics lock poisoned").claims += 1;
+                        claimed = Some(completion_credential);
+                    }
+                    SqliteWriteLoadRole::Complete if claimed.is_none() => {
+                        let node = store
+                            .get_node(&fixture.scope, &run_id, &Id::new("action").unwrap())
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        let result = measure_sqlite_write(
+                            &metrics,
+                            store.claim_node_attempt(
+                                &fixture.scope,
+                                ClaimNodeAttempt {
+                                    permit: permit.clone(),
+                                    run_id: run_id.clone(),
+                                    node_id: Id::new("action").unwrap(),
+                                    expected_node_version: node.version,
+                                    attempt_id: Id::new(format!("write-load-attempt-{writer}"))
+                                        .unwrap(),
+                                    worker_id: Id::new(format!("write-load-worker-{writer}"))
+                                        .unwrap(),
+                                    bound_input: fixture.input.clone(),
+                                    binding_derivation_digest: fixture.evidence_digest.clone(),
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let ClaimNodeAttemptResult::Claimed {
+                            completion_credential,
+                            ..
+                        } = result
+                        else {
+                            return Err("load completion did not claim".to_owned());
+                        };
+                        metrics.lock().expect("load metrics lock poisoned").claims += 1;
+                        claimed = Some(completion_credential);
+                    }
+                    SqliteWriteLoadRole::Complete => {
+                        measure_sqlite_write(
+                            &metrics,
+                            store.complete_attempt(
+                                &fixture.scope,
+                                CompleteAttempt {
+                                    completion_credential: claimed
+                                        .as_ref()
+                                        .expect("completion claim missing")
+                                        .clone(),
+                                    run_id: run_id.clone(),
+                                    node_id: Id::new("action").unwrap(),
+                                    attempt_id: Id::new(format!("write-load-attempt-{writer}"))
+                                        .unwrap(),
+                                    submitted_outcome: ActionOutcome::Success {
+                                        output: serde_json::json!({"value": 2}),
+                                        artifacts: Vec::new(),
+                                        actual_cost_units: CostUnits(1),
+                                        diagnostics: None,
+                                    },
+                                    objects: CompletionObjects {
+                                        output: Some(completion_output.clone()),
+                                        artifacts: Vec::new(),
+                                        diagnostics: None,
+                                    },
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                        let mut metrics = metrics.lock().expect("load metrics lock poisoned");
+                        if metrics.completions < (WRITERS / 4) as u64 {
+                            metrics.completions += 1;
+                        }
+                    }
+                    SqliteWriteLoadRole::Cancel if cancelled.is_none() => {
+                        let observed = store
+                            .get_run(&fixture.scope, &run_id)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        cancelled = Some(observed.run.version);
+                    }
+                    SqliteWriteLoadRole::Cancel => {
+                        measure_sqlite_write(
+                            &metrics,
+                            store.cancel_run(
+                                &fixture.scope,
+                                CancelRun {
+                                    run_id: run_id.clone(),
+                                    expected_run_version: cancelled
+                                        .expect("cancel version missing"),
+                                    expected_pending_gate_versions: Vec::new(),
+                                    principal: fixture.principal.clone(),
+                                    reason_code: "load-test".to_owned(),
+                                    idempotency_token: format!("write-load-cancel-token-{writer}"),
+                                },
+                            ),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                    _ => {
+                        measure_sqlite_write(
+                            &metrics,
+                            store.heartbeat_engine_claim(&fixture.scope, &permit),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+    for writer in writers {
+        writer.await.unwrap().unwrap();
+    }
+
+    let (claims, completions) = {
+        let metrics = metrics.lock().expect("load metrics lock poisoned");
+        (metrics.claims, metrics.completions)
+    };
+    assert_eq!(claims, 8, "four claim and four completion writers");
+    assert_eq!(completions, 4, "each completion writer settles once");
+    let ledger_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM dagger_workflow_budget_ledger
+         WHERE tenant_id = ? AND namespace = ?",
+    )
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let ledger_runs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT run_id) FROM dagger_workflow_budget_ledger
+         WHERE tenant_id = ? AND namespace = ?",
+    )
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(ledger_rows as u64, claims + completions);
+    assert_eq!(
+        ledger_runs, 8,
+        "ledger covers all claimed and completed runs"
+    );
+    let mut latencies = metrics
+        .lock()
+        .expect("load metrics lock poisoned")
+        .latencies
+        .clone();
+    latencies.sort_unstable();
+    let p99 = latencies[(latencies.len() * 99).div_ceil(100).saturating_sub(1)];
+    eprintln!(
+        "sqlite_write_path_load: writers={WRITERS} wall_ms={} writes={} p99_write_us={} ledger_rows={ledger_rows} unretried_transaction_failed=0",
+        started.elapsed().as_millis(),
+        latencies.len(),
+        p99.as_micros(),
+    );
 }
 
 #[cfg(feature = "conformance")]
