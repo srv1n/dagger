@@ -37,9 +37,8 @@ use dagger_workflow_core::sqlite::SqliteWorkflowStore;
 use dagger_workflow_core::store::{
     AcquiredEngineClaim, ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt,
     CompleteAttemptResult, CompletionObjects, CreateDefinition, CreateRun, EventPageRequest,
-    ExpandMap, ExpireRunLifetime, OrderedMapItem, PublishRevision, ReleaseRetry,
-    ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, WorkflowStore,
-    RecordActionProgress,
+    ExpandMap, ExpireRunLifetime, OrderedMapItem, PublishRevision, RecordActionProgress,
+    ReleaseRetry, ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, WorkflowStore,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -470,7 +469,14 @@ async fn action_progress_is_fenced_after_claim_takeover() {
         clock: &Arc<TestClock>,
         tenant: &str,
     ) {
-        let fixture = seed_action(store, objects, &format!("progress-fence-{tenant}"), 1, CostUnits(1)).await;
+        let fixture = seed_action(
+            store,
+            objects,
+            &format!("progress-fence-{tenant}"),
+            1,
+            CostUnits(1),
+        )
+        .await;
         store
             .create_run(
                 &fixture.scope,
@@ -502,7 +508,9 @@ async fn action_progress_is_fenced_after_claim_takeover() {
                 "progress-fence",
                 "progress-attempt-one",
                 credential,
-                ProgressRecord::Phase { label: "stale".to_owned() },
+                ProgressRecord::Phase {
+                    label: "stale".to_owned()
+                },
                 2,
             )
             .await,
@@ -520,7 +528,14 @@ async fn action_progress_enforces_the_per_attempt_cap() {
         clock: &Arc<TestClock>,
         tenant: &str,
     ) {
-        let fixture = seed_action(store, objects, &format!("progress-cap-{tenant}"), 1, CostUnits(1)).await;
+        let fixture = seed_action(
+            store,
+            objects,
+            &format!("progress-cap-{tenant}"),
+            1,
+            CostUnits(1),
+        )
+        .await;
         store
             .create_run(
                 &fixture.scope,
@@ -549,7 +564,9 @@ async fn action_progress_enforces_the_per_attempt_cap() {
             "progress-cap",
             "progress-cap-attempt",
             credential.clone(),
-            ProgressRecord::Checkpoint { object_ref: "checkpoint-1".to_owned() },
+            ProgressRecord::Checkpoint {
+                object_ref: "checkpoint-1".to_owned(),
+            },
             2,
         )
         .await
@@ -561,7 +578,9 @@ async fn action_progress_enforces_the_per_attempt_cap() {
                 "progress-cap",
                 "progress-cap-attempt",
                 credential.clone(),
-                ProgressRecord::Phase { label: "too-fast".to_owned() },
+                ProgressRecord::Phase {
+                    label: "too-fast".to_owned()
+                },
                 2,
             )
             .await,
@@ -574,7 +593,10 @@ async fn action_progress_enforces_the_per_attempt_cap() {
             "progress-cap",
             "progress-cap-attempt",
             credential.clone(),
-            ProgressRecord::ExternalHandle { kind: "e2b".to_owned(), id: "sandbox-1".to_owned() },
+            ProgressRecord::ExternalHandle {
+                kind: "e2b".to_owned(),
+                id: "sandbox-1".to_owned(),
+            },
             2,
         )
         .await
@@ -587,15 +609,21 @@ async fn action_progress_enforces_the_per_attempt_cap() {
                 "progress-cap",
                 "progress-cap-attempt",
                 credential,
-                ProgressRecord::Phase { label: "too-many".to_owned() },
+                ProgressRecord::Phase {
+                    label: "too-many".to_owned()
+                },
                 2,
             )
             .await,
             Err(StoreError::ProgressEventLimitExceeded { limit: 2 })
         ));
         let progress = events(store, &fixture, "progress-cap").await;
-        assert!(progress.iter().any(|event| event.event_type == EventType::ActionCheckpointReported));
-        assert!(progress.iter().any(|event| event.event_type == EventType::ActionExternalHandleReported));
+        assert!(progress
+            .iter()
+            .any(|event| event.event_type == EventType::ActionCheckpointReported));
+        assert!(progress
+            .iter()
+            .any(|event| event.event_type == EventType::ActionExternalHandleReported));
     }
     both_stores!(body);
 }
@@ -608,7 +636,14 @@ async fn action_progress_event_limit_terminalizes_the_run() {
         clock: &Arc<TestClock>,
         tenant: &str,
     ) {
-        let fixture = seed_action(store, objects, &format!("progress-limit-{tenant}"), 1, CostUnits(1)).await;
+        let fixture = seed_action(
+            store,
+            objects,
+            &format!("progress-limit-{tenant}"),
+            1,
+            CostUnits(1),
+        )
+        .await;
         let mut limits = generous_limits();
         limits.max_total_events = 16;
         store
@@ -639,7 +674,9 @@ async fn action_progress_event_limit_terminalizes_the_run() {
             "progress-limit",
             "progress-limit-attempt",
             credential.clone(),
-            ProgressRecord::Phase { label: "started".to_owned() },
+            ProgressRecord::Phase {
+                label: "started".to_owned(),
+            },
             64,
         )
         .await
@@ -659,7 +696,12 @@ async fn action_progress_event_limit_terminalizes_the_run() {
             Err(StoreError::RunLimitApplied { ref code }) if code == "RunEventLimitExceeded"
         ));
         assert_eq!(
-            store.get_run(&fixture.scope, &id("progress-limit")).await.unwrap().run.status,
+            store
+                .get_run(&fixture.scope, &id("progress-limit"))
+                .await
+                .unwrap()
+                .run
+                .status,
             RunState::Cancelled
         );
         assert!(events(store, &fixture, "progress-limit")
