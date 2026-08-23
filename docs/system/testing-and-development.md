@@ -5,7 +5,7 @@ part_of: System overview
 describes: [.github/workflows/ci.yml, dagger-workflow-core/tests, run_tests.sh, Makefile]
 status: canonical
 created: 2026-08-23
-last_verified: 2026-08-23 @ ef3df5d2232f1a7b2365b99287e80f31b7d510ee
+last_verified: 2026-08-23 @ 94e8bc4543ccf2c8f57c30715071e7c0b9352b57
 read_when: "You change code or prepare a review."
 skip_when: "You only need a system overview."
 ---

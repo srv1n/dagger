@@ -5,7 +5,7 @@ part_of:
 describes: [Cargo.toml, dagger-workflow-core/src, dagger-workflow-core/schema]
 status: canonical
 created: 2026-08-23
-last_verified: 2026-08-23 @ ef3df5d2232f1a7b2365b99287e80f31b7d510ee
+last_verified: 2026-08-23 @ 94e8bc4543ccf2c8f57c30715071e7c0b9352b57
 read_when: "You need the top-level map of Dagger."
 skip_when: "You need one command only; read Getting started."
 ---
