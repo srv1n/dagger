@@ -12,29 +12,12 @@ use dagger_workflow_core::store::{CreateRun, EventPageRequest, PageRequest, Work
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread;
 
 use support::{principal, publish_legal_research_reference, PublishedReference};
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct ThreadWake(thread::Thread);
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::new(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
 
 fn id(value: &str) -> Id {
@@ -65,6 +48,7 @@ fn engine(
         EngineConfig {
             instance_id: id(instance_id),
             max_concurrency: 3,
+            cancellation_grace: std::time::Duration::from_secs(1),
         },
     )
     .unwrap()
@@ -259,7 +243,7 @@ fn repinned_legal_research_completes_both_choice_paths_and_recovers_without_repl
             .await
             .unwrap();
         dead_engine
-            .run_until_idle(&execution_scope, 4)
+            .run_until_idle(&execution_scope, 6)
             .await
             .unwrap();
         let before_recovery = attempt_counts(&store, &execution_scope, "second-round").await;

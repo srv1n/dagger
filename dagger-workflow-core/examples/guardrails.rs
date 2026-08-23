@@ -1020,6 +1020,7 @@ async fn main() -> DemoResult<()> {
         EngineConfig {
             instance_id: Id::new("guardrails-engine")?,
             max_concurrency: 2,
+            cancellation_grace: std::time::Duration::from_secs(1),
         },
     )?;
     engine.acquire_scope(&scope).await?;

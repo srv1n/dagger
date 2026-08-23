@@ -1938,6 +1938,7 @@ async fn gate_7_two_connection_races_preserve_all_domain_fences() {
             completion_result,
             Ok(CompleteAttemptResult::TimedOutAndStaleRecorded(_))
                 | Ok(CompleteAttemptResult::StaleRecorded(_))
+                | Err(StoreError::AttemptFenced)
         ),
         "completion must observe the timeout fence"
     );

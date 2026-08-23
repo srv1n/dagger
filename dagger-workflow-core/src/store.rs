@@ -13,6 +13,7 @@ use crate::run::{
 };
 use crate::scope::ExecutionScope;
 use std::collections::BTreeMap;
+use std::future::Future;
 
 /// Mutable definition metadata entity.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,11 +879,11 @@ pub trait WorkflowStore: Send + Sync {
     ) -> Result<AcquiredEngineClaim, StoreError>;
 
     /// Renews a live engine claim.
-    async fn heartbeat_engine_claim(
-        &self,
-        scope: &ExecutionScope,
-        permit: &EnginePermit,
-    ) -> Result<EngineClaim, StoreError>;
+    fn heartbeat_engine_claim<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        permit: &'a EnginePermit,
+    ) -> impl Future<Output = Result<EngineClaim, StoreError>> + Send + 'a;
 
     /// Gracefully expires a matching engine claim.
     async fn release_engine_claim(
@@ -927,11 +928,11 @@ pub trait WorkflowStore: Send + Sync {
     ) -> Result<ClaimNodeAttemptResult, StoreError>;
 
     /// Accepts or observes a credential-authenticated result.
-    async fn complete_attempt(
-        &self,
-        scope: &ExecutionScope,
+    fn complete_attempt<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
         command: CompleteAttempt,
-    ) -> Result<CompleteAttemptResult, StoreError>;
+    ) -> impl Future<Output = Result<CompleteAttemptResult, StoreError>> + Send + 'a;
 
     /// Applies a due database-clock timeout.
     async fn timeout_attempt(
@@ -1047,11 +1048,11 @@ pub trait WorkflowStore: Send + Sync {
     ) -> Result<WorkflowRevision, StoreError>;
 
     /// Reads a run and its derived operational view.
-    async fn get_run(
-        &self,
-        scope: &ExecutionScope,
-        run_id: &Id,
-    ) -> Result<WorkflowRunView, StoreError>;
+    fn get_run<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        run_id: &'a Id,
+    ) -> impl Future<Output = Result<WorkflowRunView, StoreError>> + Send + 'a;
 
     /// Reads one node instance.
     async fn get_node(

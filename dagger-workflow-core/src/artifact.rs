@@ -3,6 +3,7 @@
 use crate::ids::{Digest, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 
 /// The closed typed-use vocabulary for artifact references.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -343,12 +344,12 @@ pub enum ObjectStoreError {
 /// Scope-confined content-addressed object storage.
 pub trait ObjectStore: Send + Sync {
     /// Durably publishes bytes if absent and returns a verified capability.
-    async fn put(
-        &self,
-        scope: &ExecutionScope,
-        bytes: &[u8],
-        media_type: &str,
-    ) -> Result<VerifiedObjectRef, ObjectStoreError>;
+    fn put<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        bytes: &'a [u8],
+        media_type: &'a str,
+    ) -> impl Future<Output = Result<VerifiedObjectRef, ObjectStoreError>> + Send + 'a;
 
     /// Reads and verifies committed bytes or mints a failed-read proof.
     async fn get(

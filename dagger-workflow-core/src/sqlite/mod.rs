@@ -35,6 +35,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use schema::SCHEMA_VERSION;
 
@@ -822,7 +823,8 @@ where
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full);
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -838,7 +840,8 @@ where
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Full);
+            .synchronous(SqliteSynchronous::Full)
+            .busy_timeout(Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(if url.contains(":memory:") { 1 } else { 5 })
             .connect_with(options)

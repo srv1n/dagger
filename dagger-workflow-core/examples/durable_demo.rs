@@ -668,6 +668,7 @@ fn engine(
         EngineConfig {
             instance_id: Id::new(instance_id)?,
             max_concurrency: 2,
+            cancellation_grace: std::time::Duration::from_secs(1),
         },
     )?)
 }

@@ -14,6 +14,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, RwLock,
 };
+use tokio::sync::Notify;
 
 /// Opaque per-attempt result-intake capability.
 #[derive(Clone, Eq, PartialEq)]
@@ -47,12 +48,21 @@ impl CompletionCredential {
 pub trait CancellationToken: Send + Sync {
     /// Reports whether cancellation was requested.
     fn is_cancelled(&self) -> bool;
+
+    /// Waits until cancellation is requested.
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
-/// A no-dependency cancellation source paired with a cooperative token.
+/// A cancellation source paired with a cooperative token.
 #[derive(Clone, Debug, Default)]
 pub struct CancellationSource {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<CancellationState>,
+}
+
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
 }
 
 impl CancellationSource {
@@ -63,7 +73,9 @@ impl CancellationSource {
 
     /// Requests cooperative cancellation for every clone of this token.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            self.state.notify.notify_waiters();
+        }
     }
 
     /// Returns a token suitable for an [`ActionContext`].
@@ -74,7 +86,21 @@ impl CancellationSource {
 
 impl CancellationToken for CancellationSource {
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                let notified = self.state.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.is_cancelled() {
+                    return;
+                }
+                notified.await;
+            }
+        })
     }
 }
 

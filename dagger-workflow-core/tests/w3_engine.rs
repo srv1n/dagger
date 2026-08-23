@@ -14,7 +14,7 @@ use dagger_workflow_core::definition::{
     MapBinding, MapBindingSource, NodeDefinition, PublishableDefinition, RetryPolicy,
     TimeoutPolicy, WorkflowDefinition,
 };
-use dagger_workflow_core::engine::{EngineConfig, TestClock, WorkflowEngine};
+use dagger_workflow_core::engine::{EngineConfig, EngineError, TestClock, WorkflowEngine};
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
 use dagger_workflow_core::run::{AttemptState, RunLimits, RunState};
@@ -34,26 +34,11 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
-use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct ThreadWake(thread::Thread);
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::new(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
 
 fn hash(bytes: &[u8]) -> Digest {
@@ -935,6 +920,7 @@ fn runtime_scopes_have_disjoint_attempts_events_and_budgets() {
             EngineConfig {
                 instance_id: id("scoped-engine"),
                 max_concurrency: 1,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -1310,6 +1296,7 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
             EngineConfig {
                 instance_id: id("engine-2"),
                 max_concurrency: 2,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -1448,6 +1435,7 @@ fn approval_expiry_advances_downstream_frontier_through_engine_ticks() {
             EngineConfig {
                 instance_id: id("approval-engine"),
                 max_concurrency: 1,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -1555,6 +1543,7 @@ fn approval_decision_winning_between_due_scan_and_expiry_is_benign() {
                 EngineConfig {
                     instance_id: id("approval-race-engine"),
                     max_concurrency: 1,
+                    cancellation_grace: std::time::Duration::from_secs(1),
                 },
             )
             .unwrap(),
@@ -1721,6 +1710,7 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
             EngineConfig {
                 instance_id: id("map-engine"),
                 max_concurrency: 2,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -1818,6 +1808,7 @@ fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
             EngineConfig {
                 instance_id: id("serial-map-engine"),
                 max_concurrency: 3,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -1828,40 +1819,50 @@ fn map_max_concurrency_one_serializes_children_with_engine_concurrency_three() {
             .unwrap();
         engine.tick(&execution_scope).await.unwrap();
         for invocation in 1..=3 {
-            thread::scope(|thread_scope| {
-                let handle = thread_scope.spawn(|| {
-                    block_on(engine.tick(&execution_scope)).unwrap();
-                });
-                action.wait_until_started(invocation);
-                let children = block_on(store.list_nodes(
+            engine.tick(&execution_scope).await.unwrap();
+            action.wait_until_started(invocation);
+            let children = store
+                .list_nodes(
                     &execution_scope,
                     &id("serial-map-run"),
                     PageRequest {
                         cursor: None,
                         page_size: 100,
                     },
-                ))
+                )
+                .await
                 .unwrap()
                 .items
                 .into_iter()
                 .filter(|node| node.parent_map_instance_id.as_ref() == Some(&id("map")))
                 .collect::<Vec<_>>();
-                let mut started = 0;
-                for child in children {
-                    if let Some(attempt_id) = child.active_attempt_id {
-                        let attempt = block_on(store.get_attempt(
-                            &execution_scope,
-                            &id("serial-map-run"),
-                            &attempt_id,
-                        ))
+            let mut started = 0;
+            let mut active_attempts = Vec::new();
+            for child in children {
+                if let Some(attempt_id) = child.active_attempt_id {
+                    let attempt = store
+                        .get_attempt(&execution_scope, &id("serial-map-run"), &attempt_id)
+                        .await
                         .unwrap();
-                        started += usize::from(attempt.status == AttemptState::Started);
+                    if attempt.status == AttemptState::Started {
+                        started += 1;
+                        active_attempts.push(attempt_id);
                     }
                 }
-                assert_eq!(started, 1, "invocation {invocation} violated Map cap");
-                action.release(invocation);
-                handle.join().unwrap();
-            });
+            }
+            assert_eq!(started, 1, "invocation {invocation} violated Map cap");
+            action.release(invocation);
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while store
+                .get_attempt(&execution_scope, &id("serial-map-run"), &active_attempts[0])
+                .await
+                .unwrap()
+                .status
+                == AttemptState::Started
+            {
+                assert!(std::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
         engine.run_until_idle(&execution_scope, 4).await.unwrap();
         assert_eq!(action.calls(), 3);
@@ -1967,6 +1968,7 @@ fn map_child_accepts_literal_artifact_ref_binding() {
             EngineConfig {
                 instance_id: id("artifact-map-engine"),
                 max_concurrency: 2,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -2064,6 +2066,7 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
             EngineConfig {
                 instance_id: id("corrupt-map-engine"),
                 max_concurrency: 1,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -2074,6 +2077,31 @@ fn map_parent_corruption_authority_is_exactly_the_consumed_child_result() {
             .unwrap();
         engine.tick(&execution_scope).await.unwrap();
         engine.tick(&execution_scope).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let child_finished = store
+                .list_nodes(
+                    &execution_scope,
+                    &id("corrupt-map-run"),
+                    PageRequest {
+                        cursor: None,
+                        page_size: 100,
+                    },
+                )
+                .await
+                .unwrap()
+                .items
+                .iter()
+                .any(|node| {
+                    node.parent_map_instance_id.as_ref() == Some(&id("map"))
+                        && node.status == dagger_workflow_core::run::NodeState::Succeeded
+                });
+            if child_finished {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         let nodes = store
             .list_nodes(
                 &execution_scope,
@@ -2240,6 +2268,7 @@ fn corrupting_one_map_does_not_complete_another_from_a_stale_snapshot() {
             EngineConfig {
                 instance_id: id("two-map-corruption-engine"),
                 max_concurrency: 2,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();
@@ -2249,8 +2278,10 @@ fn corrupting_one_map_does_not_complete_another_from_a_stale_snapshot() {
             .await
             .unwrap();
         engine.tick(&execution_scope).await.unwrap();
-        engine.tick(&execution_scope).await.unwrap();
-        engine.tick(&execution_scope).await.unwrap();
+        match engine.run_until_idle(&execution_scope, 8).await {
+            Ok(_) | Err(EngineError::ObjectRead) => {}
+            Err(error) => panic!("unexpected engine error: {error}"),
+        }
         assert_eq!(
             store
                 .get_run(&execution_scope, &id("two-map-corruption-run"))
@@ -2328,6 +2359,7 @@ fn run_lifetime_expiry_terminalizes_through_engine_ticks() {
             EngineConfig {
                 instance_id: id("lifetime-engine"),
                 max_concurrency: 1,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )
         .unwrap();

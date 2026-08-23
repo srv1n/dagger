@@ -2008,6 +2008,19 @@ fn permit_check(
     Ok(())
 }
 
+fn completion_fence(
+    state: &ReducerState,
+    scope: &ExecutionScope,
+    attempt: &NodeAttempt,
+    now: Timestamp,
+) -> Result<(), StoreError> {
+    let claim = state.claims.get(scope).ok_or(StoreError::AttemptFenced)?;
+    if claim.claim.generation != attempt.engine_generation || claim.claim.expires_at <= now {
+        return Err(StoreError::AttemptFenced);
+    }
+    Ok(())
+}
+
 fn command_fence(
     state: &ReducerState,
     scope: &ExecutionScope,
@@ -4183,6 +4196,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 state.attempts.insert(attempt_key, attempt.clone());
                 return Ok(CompleteAttemptResult::AlreadyObserved(attempt));
             }
+            completion_fence(&state, scope, &attempt, now)?;
             running_fence(&state, scope, &command.run_id, None, now)?;
             let node_key = (
                 scope.clone(),

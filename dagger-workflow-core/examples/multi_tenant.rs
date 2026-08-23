@@ -633,6 +633,7 @@ async fn main() -> DemoResult<()> {
                 // served by its own claim. Contract section 6.
                 instance_id: Id::new(format!("rollup-engine-{name}"))?,
                 max_concurrency: 2,
+                cancellation_grace: std::time::Duration::from_secs(1),
             },
         )?;
         engine.acquire_scope(&scope).await?;

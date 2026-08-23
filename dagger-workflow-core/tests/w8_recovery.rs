@@ -417,6 +417,7 @@ fn engine(
         EngineConfig {
             instance_id: id(instance),
             max_concurrency: 2,
+            cancellation_grace: std::time::Duration::from_secs(1),
         },
     )
     .unwrap()
@@ -499,7 +500,7 @@ async fn restart_reconstructs_the_frontier_and_never_reruns_committed_work() {
     );
     first.acquire_scope(&deployment.scope).await.unwrap();
     first.start(&deployment.scope, &id("run")).await.unwrap();
-    first.tick(&deployment.scope).await.unwrap();
+    first.run_until_idle(&deployment.scope, 1).await.unwrap();
 
     // The crash point: alfa is committed Succeeded, bravo has never been claimed.
     let alfa_before = store

@@ -23,25 +23,9 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread;
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct ThreadWake(thread::Thread);
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::new(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
+    tokio::runtime::Runtime::new().unwrap().block_on(future)
 }
 
 fn hash(bytes: &[u8]) -> Digest {
@@ -308,6 +292,7 @@ fn engine(
         EngineConfig {
             instance_id: id(instance_id),
             max_concurrency: 1,
+            cancellation_grace: std::time::Duration::from_secs(1),
         },
     )
     .unwrap()
@@ -596,7 +581,7 @@ fn fail_fast_child_failure_fails_parent_and_cancels_siblings() {
             .await
             .unwrap();
         engine.tick(&execution_scope).await.unwrap();
-        engine.tick(&execution_scope).await.unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
         let parent = store
             .get_node(&execution_scope, &id("fail-fast"), &id("map"))
             .await

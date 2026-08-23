@@ -2,6 +2,7 @@
 
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
+    CancellationToken,
 };
 use crate::artifact::{
     ArtifactRef, ArtifactRefValue, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject,
@@ -24,13 +25,13 @@ use crate::store::{
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
+use std::io::Read;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::sync::{atomic::AtomicU64, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
-use std::thread;
+use std::sync::Mutex;
+use std::time::Duration;
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::ids::Timestamp;
 
@@ -100,6 +101,8 @@ pub struct EngineConfig {
     pub instance_id: Id,
     /// Maximum concurrently invoked actions in this process.
     pub max_concurrency: usize,
+    /// Time allowed for cooperative cleanup before the action future is dropped.
+    pub cancellation_grace: Duration,
 }
 
 /// Engine construction failure.
@@ -123,14 +126,107 @@ where
     registry: Arc<R>,
     config: EngineConfig,
     permits: Mutex<BTreeMap<ExecutionScope, crate::store::EnginePermit>>,
-    cancellation: Mutex<BTreeMap<(ExecutionScope, Id, Id), CancellationSource>>,
-    id_counter: AtomicU64,
+    supervisor: Arc<AttemptSupervisor>,
+}
+
+type AttemptKey = (ExecutionScope, Id, Id);
+
+struct AttemptSupervisor {
+    semaphore: Arc<Semaphore>,
+    active: Mutex<BTreeMap<AttemptKey, CancellationSource>>,
+    errors: Mutex<Vec<(ExecutionScope, EngineError)>>,
+    last_heartbeat: Mutex<BTreeMap<ExecutionScope, Instant>>,
+    commands: TokioMutex<()>,
+    activity: Notify,
+}
+
+impl AttemptSupervisor {
+    fn new(max_concurrency: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrency)),
+            active: Mutex::new(BTreeMap::new()),
+            errors: Mutex::new(Vec::new()),
+            last_heartbeat: Mutex::new(BTreeMap::new()),
+            commands: TokioMutex::new(()),
+            activity: Notify::new(),
+        }
+    }
+
+    fn register(&self, key: AttemptKey, source: CancellationSource) {
+        self.active
+            .lock()
+            .expect("supervisor lock poisoned")
+            .insert(key, source);
+    }
+
+    fn finish(&self, key: &AttemptKey, result: Result<(), EngineError>) {
+        self.active
+            .lock()
+            .expect("supervisor lock poisoned")
+            .remove(key);
+        if let Err(error) = result {
+            self.errors
+                .lock()
+                .expect("supervisor error lock poisoned")
+                .push((key.0.clone(), error));
+        }
+        if !self.has_scope(&key.0) {
+            self.last_heartbeat
+                .lock()
+                .expect("heartbeat lock poisoned")
+                .remove(&key.0);
+        }
+        self.activity.notify_waiters();
+    }
+
+    fn signal_run(&self, scope: &ExecutionScope, run_id: &Id) {
+        for ((token_scope, token_run, _), source) in
+            self.active.lock().expect("supervisor lock poisoned").iter()
+        {
+            if token_scope == scope && token_run == run_id {
+                source.cancel();
+            }
+        }
+    }
+
+    fn has_scope(&self, scope: &ExecutionScope) -> bool {
+        self.active
+            .lock()
+            .expect("supervisor lock poisoned")
+            .keys()
+            .any(|(active_scope, _, _)| active_scope == scope)
+    }
+
+    fn take_error(&self, scope: &ExecutionScope) -> Option<EngineError> {
+        let mut errors = self.errors.lock().expect("supervisor error lock poisoned");
+        errors
+            .iter()
+            .position(|(error_scope, _)| error_scope == scope)
+            .map(|index| errors.remove(index).1)
+    }
+
+    fn heartbeat_due(&self, scope: &ExecutionScope) -> bool {
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+        let now = Instant::now();
+        let mut heartbeats = self.last_heartbeat.lock().expect("heartbeat lock poisoned");
+        match heartbeats.get_mut(scope) {
+            Some(last) if now.duration_since(*last) < HEARTBEAT_INTERVAL => false,
+            Some(last) => {
+                *last = now;
+                true
+            }
+            None => {
+                heartbeats.insert(scope.clone(), now);
+                true
+            }
+        }
+    }
 }
 
 impl<S, O, R> WorkflowEngine<S, O, R>
 where
-    S: WorkflowStore,
-    O: ObjectStore,
+    S: WorkflowStore + 'static,
+    O: ObjectStore + 'static,
     R: ActionRegistry,
 {
     /// Constructs an engine without acquiring its scoped claim.
@@ -143,6 +239,7 @@ where
         if config.max_concurrency == 0 {
             return Err(EngineBuildError::InvalidConcurrency);
         }
+        let supervisor = Arc::new(AttemptSupervisor::new(config.max_concurrency));
         Ok(Self {
             reader: CommittedObjectReader::new(store.clone(), object_store.clone()),
             store,
@@ -150,8 +247,7 @@ where
             registry,
             config,
             permits: Mutex::new(BTreeMap::new()),
-            cancellation: Mutex::new(BTreeMap::new()),
-            id_counter: AtomicU64::new(0),
+            supervisor,
         })
     }
 
@@ -224,6 +320,9 @@ where
 
     /// Executes one deterministic scheduler pass and returns committed work count.
     pub async fn tick(&self, scope: &ExecutionScope) -> Result<usize, EngineError> {
+        if let Some(error) = self.supervisor.take_error(scope) {
+            return Err(error);
+        }
         let permit = self.permit(scope)?;
         let mut changed = self.run_maintenance_scans(scope).await?;
         let retries = self
@@ -309,61 +408,20 @@ where
                 _ => {}
             }
         }
-        let mut claimed = Vec::new();
-        for node in action_nodes {
-            if let Some(invocation) = self.claim_action(scope, &permit, node).await? {
-                claimed.push(invocation);
-            }
-        }
-        if !claimed.is_empty() {
-            let completions = thread::scope(|thread_scope| {
-                let handles = claimed
-                    .into_iter()
-                    .map(|claimed| {
-                        thread_scope.spawn(move || {
-                            let outcome = block_on(
-                                claimed
-                                    .action
-                                    .invoke(claimed.context.clone(), &claimed.input_bytes),
-                            );
-                            (claimed, outcome)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("action thread panicked"))
-                    .collect::<Vec<_>>()
-            });
-            for (claimed, outcome) in completions {
-                let objects = self
-                    .completion_objects(scope, &claimed.context, &outcome)
-                    .await?;
-                self.store
-                    .complete_attempt(
-                        scope,
-                        CompleteAttempt {
-                            completion_credential: claimed.context.completion_credential.clone(),
-                            run_id: claimed.context.run_id.clone(),
-                            node_id: claimed.context.node_instance_id.clone(),
-                            attempt_id: claimed.context.attempt_id.clone(),
-                            submitted_outcome: outcome,
-                            objects,
-                        },
-                    )
-                    .await?;
-                self.cancellation
-                    .lock()
-                    .expect("cancellation lock poisoned")
-                    .remove(&(
-                        scope.clone(),
-                        claimed.context.run_id,
-                        claimed.context.attempt_id,
-                    ));
-                changed += 1;
-            }
-        }
         changed += self.complete_waiting_maps(scope, &permit).await?;
+        for node in action_nodes {
+            let Ok(slot) = self.supervisor.semaphore.clone().try_acquire_owned() else {
+                break;
+            };
+            match self.claim_action(scope, &permit, node).await {
+                Ok(Some(invocation)) => {
+                    self.spawn_attempt(scope.clone(), permit.clone(), invocation, slot);
+                    changed += 1;
+                }
+                Ok(None) | Err(EngineError::Store(StoreError::CasConflict)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(changed)
     }
 
@@ -374,28 +432,42 @@ where
         max_passes: usize,
     ) -> Result<usize, EngineError> {
         let mut total = 0;
-        for _ in 0..max_passes {
+        let mut passes = 0;
+        while passes < max_passes {
+            self.wait_for_in_flight(scope).await?;
             let changed = self.tick(scope).await?;
             total += changed;
             if changed == 0 {
                 break;
             }
+            passes += 1;
+        }
+        self.wait_for_in_flight(scope).await?;
+        if let Some(error) = self.supervisor.take_error(scope) {
+            return Err(error);
         }
         Ok(total)
     }
 
-    /// Signals all locally running attempts for an already-terminalizing run.
-    pub fn signal_run_cancellation(&self, scope: &ExecutionScope, run_id: &Id) {
-        for ((token_scope, token_run, _), source) in self
-            .cancellation
-            .lock()
-            .expect("cancellation lock poisoned")
-            .iter()
-        {
-            if token_scope == scope && token_run == run_id {
-                source.cancel();
+    async fn wait_for_in_flight(&self, scope: &ExecutionScope) -> Result<(), EngineError> {
+        while self.supervisor.has_scope(scope) {
+            let activity = self.supervisor.activity.notified();
+            tokio::pin!(activity);
+            activity.as_mut().enable();
+            if !self.supervisor.has_scope(scope) {
+                break;
+            }
+            activity.await;
+            if let Some(error) = self.supervisor.take_error(scope) {
+                return Err(error);
             }
         }
+        Ok(())
+    }
+
+    /// Signals all locally running attempts for an already-terminalizing run.
+    pub fn signal_run_cancellation(&self, scope: &ExecutionScope, run_id: &Id) {
+        self.supervisor.signal_run(scope, run_id);
     }
 
     /// Commits authenticated cancellation, then signals locally running actions.
@@ -419,9 +491,55 @@ where
             .ok_or(EngineError::ScopeNotAcquired)
     }
 
-    fn next_id(&self, prefix: &str) -> Id {
-        let number = self.id_counter.fetch_add(1, Ordering::AcqRel) + 1;
-        Id::new(format!("{prefix}_{number:016x}")).expect("generated ID is valid")
+    fn next_attempt_id(&self, generation: u64) -> Result<Id, EngineError> {
+        let mut random = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut random))
+            .map_err(|_| EngineError::AttemptIdentity)?;
+        let random = random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Id::new(format!("attempt_{generation:016x}_{random}"))
+            .map_err(|_| EngineError::AttemptIdentity)
+    }
+
+    fn spawn_attempt(
+        &self,
+        scope: ExecutionScope,
+        permit: crate::store::EnginePermit,
+        claimed: ClaimedAction,
+        slot: OwnedSemaphorePermit,
+    ) {
+        let key = (
+            scope.clone(),
+            claimed.context.run_id.clone(),
+            claimed.context.attempt_id.clone(),
+        );
+        let source = claimed.cancellation.clone();
+        self.supervisor.register(key.clone(), source.clone());
+        let supervisor = self.supervisor.clone();
+        let store = self.store.clone();
+        let object_store = self.object_store.clone();
+        let grace = self.config.cancellation_grace;
+        tokio::spawn(async move {
+            let task = tokio::spawn(supervise_attempt(
+                store,
+                object_store,
+                supervisor.clone(),
+                scope,
+                permit,
+                claimed,
+                source,
+                grace,
+                slot,
+            ));
+            let result = match task.await {
+                Ok(result) => result,
+                Err(_) => Err(EngineError::ActionTaskFailed),
+            };
+            supervisor.finish(&key, result);
+        });
     }
 
     async fn run_maintenance_scans(&self, scope: &ExecutionScope) -> Result<usize, EngineError> {
@@ -683,7 +801,7 @@ where
             .put(scope, &bound, "application/json")
             .await
             .map_err(|_| EngineError::ObjectWrite)?;
-        let attempt_id = self.next_id(&format!("attempt_{}", self.config.instance_id.as_str()));
+        let attempt_id = self.next_attempt_id(permit.generation())?;
         let result = self
             .store
             .claim_node_attempt(
@@ -712,13 +830,6 @@ where
             .get_attempt(scope, &node.run_id, &attempt_id)
             .await?;
         let source = CancellationSource::new();
-        self.cancellation
-            .lock()
-            .expect("cancellation lock poisoned")
-            .insert(
-                (scope.clone(), node.run_id.clone(), attempt_id.clone()),
-                source.clone(),
-            );
         let context = ActionContext::new(
             scope.clone(),
             node.run_id,
@@ -741,6 +852,7 @@ where
             action,
             context,
             input_bytes: bound,
+            cancellation: source,
             _invocation: invocation,
         }))
     }
@@ -1245,63 +1357,13 @@ where
             .await?;
         Ok(())
     }
-
-    async fn completion_objects(
-        &self,
-        scope: &ExecutionScope,
-        context: &ActionContext,
-        outcome: &ActionOutcome,
-    ) -> Result<CompletionObjects, EngineError> {
-        let output = match outcome {
-            ActionOutcome::Success { output, .. } => {
-                let bytes = serde_jcs::to_vec(output).map_err(|_| EngineError::ObjectWrite)?;
-                Some(
-                    self.object_store
-                        .put(scope, &bytes, "application/json")
-                        .await
-                        .map_err(|_| EngineError::ObjectWrite)?,
-                )
-            }
-            _ => None,
-        };
-        let artifacts = match outcome {
-            ActionOutcome::Success { artifacts, .. } => artifacts
-                .iter()
-                .map(|artifact| artifact.object.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
-        let diagnostics = match outcome {
-            ActionOutcome::Success { diagnostics, .. }
-            | ActionOutcome::Retryable { diagnostics, .. }
-            | ActionOutcome::Permanent { diagnostics, .. } => {
-                if let Some(diagnostics) = diagnostics {
-                    let bytes =
-                        serde_jcs::to_vec(diagnostics).map_err(|_| EngineError::ObjectWrite)?;
-                    Some(
-                        self.object_store
-                            .put(scope, &bytes, "application/json")
-                            .await
-                            .map_err(|_| EngineError::ObjectWrite)?,
-                    )
-                } else {
-                    None
-                }
-            }
-        };
-        let _ = context;
-        Ok(CompletionObjects {
-            output,
-            artifacts,
-            diagnostics,
-        })
-    }
 }
 
 struct ClaimedAction {
     action: Arc<dyn crate::action::WorkflowAction>,
     context: ActionContext,
     input_bytes: Vec<u8>,
+    cancellation: CancellationSource,
     _invocation: crate::action::ActionInvocation,
 }
 
@@ -1338,6 +1400,172 @@ pub enum EngineError {
     /// A pinned action disappeared after compatibility checking.
     #[error("pinned action implementation missing")]
     ActionMissing,
+    /// Secure attempt identity generation failed.
+    #[error("attempt identity generation failed")]
+    AttemptIdentity,
+    /// The Tokio action task panicked or was cancelled unexpectedly.
+    #[error("action task failed")]
+    ActionTaskFailed,
+}
+
+async fn supervise_attempt<S, O>(
+    store: Arc<S>,
+    object_store: Arc<O>,
+    supervisor: Arc<AttemptSupervisor>,
+    scope: ExecutionScope,
+    permit: crate::store::EnginePermit,
+    claimed: ClaimedAction,
+    cancellation: CancellationSource,
+    grace: Duration,
+    _slot: OwnedSemaphorePermit,
+) -> Result<(), EngineError>
+where
+    S: WorkflowStore + 'static,
+    O: ObjectStore + 'static,
+{
+    let run_id = claimed.context.run_id.clone();
+    let execution = execute_attempt(
+        store.clone(),
+        object_store,
+        supervisor.clone(),
+        scope.clone(),
+        claimed,
+    );
+    tokio::pin!(execution);
+    let monitor = monitor_attempt(
+        store,
+        supervisor,
+        scope,
+        run_id,
+        permit,
+        cancellation.clone(),
+    );
+    tokio::pin!(monitor);
+    tokio::select! {
+        biased;
+        monitor_result = &mut monitor => {
+            cancellation.cancel();
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(grace) => {}
+                _ = &mut execution => {}
+            }
+            monitor_result
+        }
+        result = &mut execution => result,
+    }
+}
+
+async fn monitor_attempt<S>(
+    store: Arc<S>,
+    supervisor: Arc<AttemptSupervisor>,
+    scope: ExecutionScope,
+    run_id: Id,
+    permit: crate::store::EnginePermit,
+    cancellation: CancellationSource,
+) -> Result<(), EngineError>
+where
+    S: WorkflowStore + 'static,
+{
+    let mut poll = tokio::time::interval(Duration::from_millis(250));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(()),
+            _ = poll.tick() => {
+                if supervisor.heartbeat_due(&scope) {
+                    let _command = supervisor.commands.lock().await;
+                    store.heartbeat_engine_claim(&scope, &permit).await?;
+                }
+                if store.get_run(&scope, &run_id).await?.run.status
+                    != crate::run::RunState::Running
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn execute_attempt<S, O>(
+    store: Arc<S>,
+    object_store: Arc<O>,
+    supervisor: Arc<AttemptSupervisor>,
+    scope: ExecutionScope,
+    claimed: ClaimedAction,
+) -> Result<(), EngineError>
+where
+    S: WorkflowStore + 'static,
+    O: ObjectStore + 'static,
+{
+    let outcome = claimed
+        .action
+        .invoke(claimed.context.clone(), &claimed.input_bytes)
+        .await;
+    let objects = completion_objects(&*object_store, &scope, &outcome).await?;
+    let _command = supervisor.commands.lock().await;
+    store
+        .complete_attempt(
+            &scope,
+            CompleteAttempt {
+                completion_credential: claimed.context.completion_credential.clone(),
+                run_id: claimed.context.run_id.clone(),
+                node_id: claimed.context.node_instance_id.clone(),
+                attempt_id: claimed.context.attempt_id.clone(),
+                submitted_outcome: outcome,
+                objects,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn completion_objects<O: ObjectStore>(
+    object_store: &O,
+    scope: &ExecutionScope,
+    outcome: &ActionOutcome,
+) -> Result<CompletionObjects, EngineError> {
+    let output = match outcome {
+        ActionOutcome::Success { output, .. } => {
+            let bytes = serde_jcs::to_vec(output).map_err(|_| EngineError::ObjectWrite)?;
+            Some(
+                object_store
+                    .put(scope, &bytes, "application/json")
+                    .await
+                    .map_err(|_| EngineError::ObjectWrite)?,
+            )
+        }
+        _ => None,
+    };
+    let artifacts = match outcome {
+        ActionOutcome::Success { artifacts, .. } => artifacts
+            .iter()
+            .map(|artifact| artifact.object.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let diagnostics = match outcome {
+        ActionOutcome::Success { diagnostics, .. }
+        | ActionOutcome::Retryable { diagnostics, .. }
+        | ActionOutcome::Permanent { diagnostics, .. } => match diagnostics {
+            Some(diagnostics) => {
+                let bytes = serde_jcs::to_vec(diagnostics).map_err(|_| EngineError::ObjectWrite)?;
+                Some(
+                    object_store
+                        .put(scope, &bytes, "application/json")
+                        .await
+                        .map_err(|_| EngineError::ObjectWrite)?,
+                )
+            }
+            None => None,
+        },
+    };
+    Ok(CompletionObjects {
+        output,
+        artifacts,
+        diagnostics,
+    })
 }
 
 fn first_page() -> PageRequest {
@@ -1418,24 +1646,4 @@ fn approval_gate_id(run_id: &Id, node_id: &Id) -> Id {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Id::new(format!("approval_{hex}")).expect("SHA-256 gate ID is valid")
-}
-
-struct ThreadWake(thread::Thread);
-
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match Pin::new(&mut future).poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
 }

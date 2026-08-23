@@ -8,7 +8,7 @@ use dagger_workflow_core::action::{
     WorkflowAction,
 };
 use dagger_workflow_core::approval::AuthenticatedPrincipal;
-use dagger_workflow_core::artifact::{ObjectStore, VerifiedObjectRef};
+use dagger_workflow_core::artifact::ObjectStore;
 use dagger_workflow_core::definition::{
     ActionReference, BackoffPolicy, Binding, BindingSource, NodeDefinition, PublishableDefinition,
     RetryPolicy, TimeoutPolicy, WorkflowDefinition,
@@ -23,7 +23,8 @@ use dagger_workflow_core::sqlite::SqliteWorkflowStore;
 use dagger_workflow_core::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
     CompletionObjects, CreateDefinition, CreateRun, ExpectedGateVersion, PublishRevision,
-    RecoverAbandonedAttemptsForRun, ReleaseRetry, ResolvedActionSchemas, StartRun, WorkflowStore,
+    RecoverAbandonedAttemptsForRun, ReleaseRetry, ResolvedActionSchemas, StartRun, StoreError,
+    WorkflowStore,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -36,7 +37,6 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
-use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -124,38 +124,6 @@ fn definition(
     }
 }
 
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    struct ThreadWake(thread::Thread);
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
-}
-
-struct YieldOnce(bool);
-impl Future for YieldOnce {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if self.0 {
-            Poll::Ready(())
-        } else {
-            self.0 = true;
-            context.waker().wake_by_ref();
-            Poll::Pending
-        }
-    }
-}
-
 #[derive(Default)]
 struct Probe {
     started: AtomicBool,
@@ -206,9 +174,11 @@ impl WorkflowAction for SlowAction {
                 }
             } else {
                 let deadline = Instant::now() + duration;
-                while Instant::now() < deadline && !context.cancellation_token.is_cancelled() {
-                    thread::sleep(Duration::from_millis(20));
-                    YieldOnce(false).await;
+                while Instant::now() < deadline {
+                    tokio::select! {
+                        _ = context.cancellation_token.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                    }
                 }
             }
             *probe.stopped.lock().unwrap() = Some(Instant::now());
@@ -219,6 +189,71 @@ impl WorkflowAction for SlowAction {
 
 struct FastAction {
     descriptor: ActionDescriptor,
+}
+
+struct GateAction {
+    descriptor: ActionDescriptor,
+    started: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl WorkflowAction for GateAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _: ActionContext,
+        _: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        let started = self.started.clone();
+        let active = self.active.clone();
+        let maximum = self.maximum.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            started.fetch_add(1, Ordering::AcqRel);
+            let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+            maximum.fetch_max(now, Ordering::AcqRel);
+            release.acquire().await.unwrap().forget();
+            active.fetch_sub(1, Ordering::AcqRel);
+            ActionOutcome::success(json!({"value":1}), Vec::new(), CostUnits(1), None).unwrap()
+        })
+    }
+}
+
+struct NeverAction {
+    descriptor: ActionDescriptor,
+    started: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl WorkflowAction for NeverAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _: ActionContext,
+        _: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let started = self.started.clone();
+        let dropped = self.dropped.clone();
+        Box::pin(async move {
+            let _drop = DropFlag(dropped);
+            started.store(true, Ordering::Release);
+            std::future::pending::<ActionOutcome>().await
+        })
+    }
 }
 impl WorkflowAction for FastAction {
     fn descriptor(&self) -> &ActionDescriptor {
@@ -375,8 +410,8 @@ async fn start<S, O>(
     execution_scope: &ExecutionScope,
     run_id: &str,
 ) where
-    S: WorkflowStore,
-    O: ObjectStore,
+    S: WorkflowStore + 'static,
+    O: ObjectStore + 'static,
 {
     engine.start(execution_scope, &id(run_id)).await.unwrap();
 }
@@ -476,23 +511,34 @@ async fn concurrent_progress_and_cancellation_latency() {
             registry,
             EngineConfig {
                 instance_id: id("agent-adversarial-engine"),
-                max_concurrency: 1,
+                max_concurrency: 2,
+                cancellation_grace: Duration::from_secs(1),
             },
         )
         .unwrap(),
     );
     engine.acquire_scope(&execution_scope).await.unwrap();
     start(&engine, &execution_scope, "run-a").await;
-    let tick_engine = engine.clone();
-    let tick_scope = execution_scope.clone();
-    let a_tick = thread::spawn(move || block_on(tick_engine.tick(&tick_scope)));
+    engine.tick(&execution_scope).await.unwrap();
     slow_probe.wait_started();
     for run in ["run-b", "run-c", "run-d", "run-e", "run-f"] {
         start(&engine, &execution_scope, run).await;
     }
     let loaded_start = Instant::now();
     for run in ["run-b", "run-c", "run-d", "run-e", "run-f"] {
-        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while store
+            .get_run(&execution_scope, &id(run))
+            .await
+            .unwrap()
+            .run
+            .status
+            != RunState::Succeeded
+        {
+            assert!(Instant::now() < deadline, "fast run {run} did not finish");
+            engine.tick(&execution_scope).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
             store
                 .get_run(&execution_scope, &id(run))
@@ -535,7 +581,8 @@ async fn concurrent_progress_and_cancellation_latency() {
     }
     let baseline_start = Instant::now();
     for _ in 0..5 {
-        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let baseline_latency = baseline_start.elapsed();
     eprintln!(
@@ -565,12 +612,12 @@ async fn concurrent_progress_and_cancellation_latency() {
         )
         .await
         .unwrap();
-    a_tick.join().unwrap().unwrap();
+    while slow_probe.stopped.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(a_before_cancel.elapsed() < Duration::from_secs(2));
     start(&engine, &execution_scope, "run-cancel").await;
-    let cancel_engine = engine.clone();
-    let cancel_scope = execution_scope.clone();
-    let cancel_tick = thread::spawn(move || block_on(cancel_engine.tick(&cancel_scope)));
+    engine.tick(&execution_scope).await.unwrap();
     cancel_probe.wait_started();
     let cancellation_started = Instant::now();
     let live = store
@@ -592,7 +639,9 @@ async fn concurrent_progress_and_cancellation_latency() {
         )
         .await
         .unwrap();
-    cancel_tick.join().unwrap().unwrap();
+    while cancel_probe.stopped.lock().unwrap().is_none() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let stop_latency = cancel_probe
         .stopped
         .lock()
@@ -629,12 +678,249 @@ async fn concurrent_progress_and_cancellation_latency() {
     );
 }
 
-#[tokio::test]
-async fn stale_completion_is_fenced_after_takeover() {
-    let execution_scope = scope("fence");
-    let clock = Arc::new(TestClock::new(Timestamp(10_000)));
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_semaphore_caps_two_concurrent_scheduler_calls() {
+    let execution_scope = scope("global-cap");
+    let clock = Arc::new(TestClock::new(Timestamp(5_000)));
+    let store = Arc::new(InMemoryStore::new(clock.clone()));
+    let objects = Arc::new(InMemoryObjectStore::new(clock));
+    let schema = digest(SCHEMA);
+    let owner = principal(&execution_scope, &schema);
+    let started = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let registry = Arc::new(InMemoryActionRegistry::new());
+    registry
+        .register(Arc::new(GateAction {
+            descriptor: descriptor("gate", &schema),
+            started: started.clone(),
+            active: active.clone(),
+            maximum: maximum.clone(),
+            release: release.clone(),
+        }))
+        .unwrap();
+    let revision = publish(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        definition("gate-def", "gate", &schema, 1),
+    )
+    .await;
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            store.clone(),
+            objects.clone(),
+            registry,
+            EngineConfig {
+                instance_id: id("global-cap-engine"),
+                max_concurrency: 2,
+                cancellation_grace: Duration::from_millis(50),
+            },
+        )
+        .unwrap(),
+    );
+    engine.acquire_scope(&execution_scope).await.unwrap();
+    for run in ["cap-a", "cap-b", "cap-c", "cap-d"] {
+        create_run(
+            &*store,
+            &*objects,
+            &execution_scope,
+            &owner,
+            "gate-def",
+            &revision,
+            run,
+        )
+        .await;
+        start(&engine, &execution_scope, run).await;
+    }
+    let (left, right) = tokio::join!(engine.tick(&execution_scope), engine.tick(&execution_scope));
+    left.unwrap();
+    right.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while started.load(Ordering::Acquire) < 2 {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    engine.tick(&execution_scope).await.unwrap();
+    assert_eq!(active.load(Ordering::Acquire), 2);
+    assert_eq!(maximum.load(Ordering::Acquire), 2);
+    assert_eq!(started.load(Ordering::Acquire), 2);
+    release.add_permits(4);
+    engine.run_until_idle(&execution_scope, 16).await.unwrap();
+    assert_eq!(maximum.load(Ordering::Acquire), 2);
+    assert_eq!(started.load(Ordering::Acquire), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_cancellation_drops_a_non_cooperative_action_after_grace() {
+    let execution_scope = scope("forced-cancel");
+    let clock = Arc::new(TestClock::new(Timestamp(7_000)));
+    let store = Arc::new(InMemoryStore::new(clock.clone()));
+    let objects = Arc::new(InMemoryObjectStore::new(clock));
+    let schema = digest(SCHEMA);
+    let owner = principal(&execution_scope, &schema);
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let registry = Arc::new(InMemoryActionRegistry::new());
+    registry
+        .register(Arc::new(NeverAction {
+            descriptor: descriptor("never", &schema),
+            started: started.clone(),
+            dropped: dropped.clone(),
+        }))
+        .unwrap();
+    let revision = publish(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        definition("never-def", "never", &schema, 1),
+    )
+    .await;
+    create_run(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        "never-def",
+        &revision,
+        "run-never",
+    )
+    .await;
+    let engine = WorkflowEngine::new(
+        store.clone(),
+        objects,
+        registry,
+        EngineConfig {
+            instance_id: id("forced-cancel-engine"),
+            max_concurrency: 1,
+            cancellation_grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    engine.acquire_scope(&execution_scope).await.unwrap();
+    start(&engine, &execution_scope, "run-never").await;
+    engine.tick(&execution_scope).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let run = store
+        .get_run(&execution_scope, &id("run-never"))
+        .await
+        .unwrap()
+        .run;
+    let cancelled_at = Instant::now();
+    store
+        .cancel_run(
+            &execution_scope,
+            dagger_workflow_core::store::CancelRun {
+                run_id: id("run-never"),
+                expected_run_version: run.version,
+                expected_pending_gate_versions: Vec::new(),
+                principal: owner,
+                reason_code: "durable-external-cancel".to_owned(),
+                idempotency_token: "durable-external-cancel".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    while !dropped.load(Ordering::Acquire) {
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(cancelled_at.elapsed() >= Duration::from_millis(50));
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_keeps_the_claim_live_for_a_scaled_sixty_second_action() {
+    let execution_scope = scope("heartbeat");
+    let clock = Arc::new(TestClock::new(Timestamp(20_000)));
     let store = Arc::new(InMemoryStore::new(clock.clone()));
     let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let schema = digest(SCHEMA);
+    let owner = principal(&execution_scope, &schema);
+    let started = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let registry = Arc::new(InMemoryActionRegistry::new());
+    registry
+        .register(Arc::new(GateAction {
+            descriptor: descriptor("heartbeat-gate", &schema),
+            started: started.clone(),
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+            release: release.clone(),
+        }))
+        .unwrap();
+    let revision = publish(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        definition("heartbeat-def", "heartbeat-gate", &schema, 1),
+    )
+    .await;
+    create_run(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        "heartbeat-def",
+        &revision,
+        "run-heartbeat",
+    )
+    .await;
+    let engine = WorkflowEngine::new(
+        store.clone(),
+        objects,
+        registry,
+        EngineConfig {
+            instance_id: id("heartbeat-engine"),
+            max_concurrency: 1,
+            cancellation_grace: Duration::from_millis(50),
+        },
+    )
+    .unwrap();
+    engine.acquire_scope(&execution_scope).await.unwrap();
+    start(&engine, &execution_scope, "run-heartbeat").await;
+    engine.tick(&execution_scope).await.unwrap();
+    while started.load(Ordering::Acquire) == 0 {
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..4 {
+        clock.advance_ms(15_000).unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        store
+            .acquire_engine_claim(&execution_scope, id("takeover"))
+            .await,
+        Err(StoreError::EngineAlreadyLive { .. })
+    ));
+    release.add_permits(1);
+    engine.run_until_idle(&execution_scope, 8).await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_completion_is_fenced_after_takeover() {
+    let directory = TempDir::new().unwrap();
+    let execution_scope = scope("fence");
+    let clock = Arc::new(TestClock::new(Timestamp(10_000)));
+    let objects =
+        Arc::new(FsObjectStore::open(directory.path().join("objects"), clock.clone()).unwrap());
+    let store = Arc::new(
+        SqlStore::open(
+            directory.path().join("workflow.sqlite"),
+            clock,
+            objects.clone(),
+        )
+        .await
+        .unwrap(),
+    );
     let schema = digest(SCHEMA);
     let owner = principal(&execution_scope, &schema);
     let revision = publish(
@@ -705,11 +991,38 @@ async fn stale_completion_is_fenced_after_takeover() {
         } => completion_credential,
         _ => panic!("first attempt was not claimed"),
     };
-    clock.advance_ms(CLAIM_LIFETIME_MS + 1).unwrap();
+    store
+        .advance_database_clock_ms(CLAIM_LIFETIME_MS + 1)
+        .await
+        .unwrap();
     let second = store
         .acquire_engine_claim(&execution_scope, id("fence-two"))
         .await
         .unwrap();
+    let pre_recovery = store
+        .complete_attempt(
+            &execution_scope,
+            CompleteAttempt {
+                completion_credential: stale.clone(),
+                run_id: id("run-fence"),
+                node_id: id("work"),
+                attempt_id: id("attempt-one"),
+                submitted_outcome: ActionOutcome::success(
+                    json!({"value":1}),
+                    Vec::new(),
+                    CostUnits(1),
+                    None,
+                )
+                .unwrap(),
+                objects: CompletionObjects {
+                    output: Some(input.clone()),
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await;
+    assert!(matches!(pre_recovery, Err(StoreError::AttemptFenced)));
     store
         .recover_abandoned_attempts_for_run(
             &execution_scope,
@@ -909,17 +1222,14 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
             EngineConfig {
                 instance_id: id("restart-one"),
                 max_concurrency: 1,
+                cancellation_grace: Duration::from_secs(1),
             },
         )
         .unwrap(),
     );
     first.acquire_scope(&execution_scope).await.unwrap();
     start(&first, &execution_scope, "run-restart").await;
-    let first_tick = {
-        let engine = first.clone();
-        let execution_scope = execution_scope.clone();
-        thread::spawn(move || block_on(engine.tick(&execution_scope)))
-    };
+    first.tick(&execution_scope).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !log.first_started.load(Ordering::Acquire) {
         assert!(Instant::now() < deadline, "marker action did not start");
@@ -935,9 +1245,10 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
         *lock.lock().unwrap() = true;
         wake.notify_all();
     }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        first_tick.join().unwrap().is_err(),
-        "closed durable store still accepted an in-flight completion"
+        first.run_until_idle(&execution_scope, 1).await.is_err(),
+        "closed durable store still accepted scheduler work"
     );
     drop(first);
     drop(store);
@@ -953,13 +1264,20 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
         objects.clone(),
         registry,
         EngineConfig {
-            instance_id: id("restart-two"),
+            instance_id: id("restart-one"),
             max_concurrency: 1,
+            cancellation_grace: Duration::from_secs(1),
         },
     )
     .unwrap();
     second.acquire_scope(&execution_scope).await.unwrap();
-    second.run_until_idle(&execution_scope, 16).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        second.run_until_idle(&execution_scope, 16),
+    )
+    .await
+    .expect("restart scheduler did not become idle")
+    .unwrap();
     assert_eq!(
         store
             .get_run(&execution_scope, &id("run-restart"))
