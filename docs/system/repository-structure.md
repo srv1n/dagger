@@ -2,10 +2,10 @@
 subject: Repository structure
 keywords: [folders, crate, modules, layout]
 part_of: System overview
-describes: [Cargo.toml, dagger-workflow-core, docs/system, .tusker]
+describes: [Cargo.toml, dagger-workflow-core]
 status: canonical
 created: 2026-08-23
-last_verified: 2026-08-23 @ 94e8bc4543ccf2c8f57c30715071e7c0b9352b57
+last_verified: 2026-08-23 @ f4b8abf6a7c9499b93652d142ccb4b19538baf28
 read_when: "You need to find the owner of code or tests."
 skip_when: "You already know the target module."
 ---
