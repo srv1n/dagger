@@ -20,9 +20,9 @@ The control store keeps definitions, revisions, runs, nodes, attempts, gates, bu
 
 `InMemoryStore` keeps state in one process.
 
-`SqliteWorkflowStore` is available with the `sqlite` feature. Its standalone open path enables WAL mode, full synchronous writes, foreign keys, and a bounded connection pool.
+`SqliteWorkflowStore` is available with the `sqlite` feature. Its standalone open path enables WAL mode, full synchronous writes, foreign keys, a five-second busy timeout, and a bounded connection pool. `from_pool` silently normalizes a caller-owned file database to WAL; it accepts SQLite's unavoidable in-memory journal mode. The store re-enables foreign keys and the five-second busy timeout every time it acquires a connection, so a caller-owned pool cannot silently supply a wrongly configured connection.
 
-Each SQLite command starts an immediate transaction. The command uses the database clock, applies one reducer operation, saves the new projections, and commits. A command with no applied state change rolls back. Some contract and run-limit errors commit a terminal state change and return a typed error.
+Each SQLite command starts an immediate transaction. A BUSY or LOCKED transaction start retries at most six times with capped, jittered 10–640 ms delays; other database errors remain typed failures. The command uses the database clock, applies one reducer operation, saves the new projections, and commits. A command with no applied state change rolls back. Some contract and run-limit errors commit a terminal state change and return a typed error.
 
 The SQLite database stores object metadata and typed references. It does not store object bytes.
 

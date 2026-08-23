@@ -35,7 +35,10 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 6;
 
 pub use schema::SCHEMA_VERSION;
 
@@ -827,11 +830,28 @@ where
     O: ObjectStore,
 {
     /// Initializes the adapter on a caller-owned pool without disturbing host tables.
+    ///
+    /// The store normalizes the database to WAL (except SQLite's in-memory mode), and configures
+    /// foreign keys plus the busy timeout every time it acquires a connection. Callers must not
+    /// change those pragmas while the store owns the pool.
     pub async fn from_pool(
         pool: SqlitePool,
         _clock: Arc<C>,
         objects: Arc<O>,
     ) -> Result<Self, StoreError> {
+        let mut connection = pool
+            .acquire()
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::configure_connection(&mut connection).await?;
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        if !matches!(journal_mode.as_str(), "wal" | "memory") {
+            return Err(StoreError::TransactionFailed);
+        }
+        drop(connection);
         schema::migrate(&pool).await?;
         Ok(Self {
             pool,
@@ -855,7 +875,7 @@ where
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
             .connect_with(options)
@@ -872,7 +892,7 @@ where
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(SQLITE_BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(if url.contains(":memory:") { 1 } else { 5 })
             .connect_with(options)
@@ -903,25 +923,68 @@ where
             .take()
     }
 
-    async fn begin_immediate(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
+    async fn configure_connection(
+        connection: &mut PoolConnection<Sqlite>,
+    ) -> Result<(), StoreError> {
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut **connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        sqlx::query(format!("PRAGMA busy_timeout = {}", SQLITE_BUSY_TIMEOUT.as_millis()).as_str())
+            .execute(&mut **connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        Ok(())
+    }
+
+    fn is_busy(error: &sqlx::Error) -> bool {
+        error
+            .as_database_error()
+            .and_then(|database| database.code())
+            .and_then(|code| code.parse::<i32>().ok())
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
+    }
+
+    fn busy_retry_delay(attempt: usize) -> Duration {
+        let ceiling_ms = 10_u64 << attempt;
+        let jitter_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64
+            % (ceiling_ms + 1);
+        Duration::from_millis(ceiling_ms + jitter_ms)
+    }
+
+    async fn acquire_configured(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
         let mut connection = self
             .pool
             .acquire()
             .await
             .map_err(|_| StoreError::StorageUnavailable)?;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(|_| StoreError::TransactionFailed)?;
+        Self::configure_connection(&mut connection).await?;
         Ok(connection)
     }
 
+    async fn begin_immediate(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
+        for attempt in 0..=SQLITE_BUSY_RETRY_ATTEMPTS {
+            let mut connection = self.acquire_configured().await?;
+            match sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await
+            {
+                Ok(_) => return Ok(connection),
+                Err(error) if Self::is_busy(&error) && attempt < SQLITE_BUSY_RETRY_ATTEMPTS => {
+                    drop(connection);
+                    tokio::time::sleep(Self::busy_retry_delay(attempt)).await;
+                }
+                Err(_) => return Err(StoreError::TransactionFailed),
+            }
+        }
+        unreachable!("bounded retry loop returns on its final attempt")
+    }
+
     async fn begin_read(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
+        let mut connection = self.acquire_configured().await?;
         sqlx::query("BEGIN")
             .execute(&mut *connection)
             .await

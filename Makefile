@@ -1,4 +1,8 @@
-.PHONY: codebasezip
+.PHONY: codebasezip sqlite-write-load
+
+sqlite-write-load:
+	PATH=/private/tmp/rzn-ghl-flock-bin:$$PATH flock /tmp/rzn-build-slot.lock -c 'cargo test -p dagger-workflow-core --features sqlite --test w6_sqlite sqlite_write_path_load -- --ignored --exact --nocapture'
+
 codebasezip:
 	@mkdir -p artifacts
 	@repo="$$(basename "$$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"; \
