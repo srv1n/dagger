@@ -1858,11 +1858,10 @@ async fn sqlite_write_path_load() {
     let metrics = Arc::new(Mutex::new(SqliteWriteLoadMetrics::default()));
     let started = Instant::now();
     let mut writers = Vec::with_capacity(WRITERS);
-    for writer in 0..WRITERS {
+    for (writer, run_id) in run_ids.iter().cloned().enumerate() {
         let store = store.clone();
         let fixture = fixture.clone();
         let permit = permit.clone();
-        let run_id = run_ids[writer].clone();
         let completion_output = completion_output.clone();
         let barrier = barrier.clone();
         let metrics = metrics.clone();
