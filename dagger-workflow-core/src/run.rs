@@ -509,6 +509,8 @@ pub struct WorkflowRunView {
     pub run: WorkflowRun,
     /// Present only for a conforming Running run.
     pub operational: Option<RunOperationalView>,
+    /// Durable external operations retained with this run.
+    pub external_handles: Vec<crate::store::ExternalHandle>,
 }
 
 impl RunState {

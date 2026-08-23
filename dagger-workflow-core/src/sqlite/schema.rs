@@ -7,7 +7,7 @@ use crate::store::StoreError;
 /// Current durable schema version.
 ///
 /// This adapter has one coherent baseline schema.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
     version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
@@ -269,6 +269,23 @@ const MIGRATION_1: &[&str] = &[
         )"#,
 ];
 
+const MIGRATION_2: &[&str] = &[
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_external_handle_rows (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, entity_id TEXT NOT NULL,
+        sub_id TEXT NOT NULL, row_data TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK(version > 0),
+        PRIMARY KEY (tenant_id, namespace, entity_id, sub_id)
+    ) STRICT"#,
+    r#"CREATE TABLE IF NOT EXISTS dagger_workflow_external_handles (
+        tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, run_id TEXT NOT NULL,
+        node_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, kind TEXT NOT NULL,
+        external_id TEXT NOT NULL, metadata_json TEXT NOT NULL, registered_at_ms INTEGER NOT NULL,
+        PRIMARY KEY (tenant_id, namespace, idempotency_key, kind)
+    ) STRICT"#,
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_external_handles_run_scan
+        ON dagger_workflow_external_handles(tenant_id, namespace, run_id, idempotency_key, kind)"#,
+];
+
 /// Applies all pending migrations, committing each version independently.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(MIGRATIONS_TABLE_DDL)
@@ -287,12 +304,18 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     if applied.unwrap_or(0) < 1 {
         apply_version(pool, 1, MIGRATION_1).await?;
     }
-    validate_coherent_v1(pool).await?;
+    if applied.unwrap_or(0) < 2 {
+        apply_version(pool, 2, MIGRATION_2).await?;
+    }
+    validate_coherent_schema(pool).await?;
     Ok(())
 }
 
-async fn validate_coherent_v1(pool: &SqlitePool) -> Result<(), StoreError> {
-    for statement in std::iter::once(MIGRATIONS_TABLE_DDL).chain(MIGRATION_1.iter().copied()) {
+async fn validate_coherent_schema(pool: &SqlitePool) -> Result<(), StoreError> {
+    for statement in std::iter::once(MIGRATIONS_TABLE_DDL)
+        .chain(MIGRATION_1.iter().copied())
+        .chain(MIGRATION_2.iter().copied())
+    {
         let mut words = statement.split_whitespace();
         let object_type = match (words.next(), words.next()) {
             (Some("CREATE"), Some("TABLE")) => "table",
@@ -373,8 +396,16 @@ async fn record_version(
     version: i64,
 ) -> Result<(), StoreError> {
     sqlx::query(
-        "INSERT INTO dagger_workflow_schema_migrations(version, applied_at_ms)
-         VALUES (?, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))",
+        "INSERT INTO dagger_workflow_schema_migrations(version, applied_at_ms, clock_offset_ms)
+         VALUES (
+            ?,
+            CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
+            COALESCE(
+                (SELECT clock_offset_ms FROM dagger_workflow_schema_migrations
+                 ORDER BY version DESC LIMIT 1),
+                0
+            )
+         )",
     )
     .bind(version)
     .execute(&mut **transaction)

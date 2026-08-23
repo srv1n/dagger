@@ -223,6 +223,7 @@ const OBJECT_ROWS: &str = "dagger_workflow_object_rows";
 const EVENT_ROWS: &str = "dagger_workflow_event_rows";
 const EVENT_BATCH_ROWS: &str = "dagger_workflow_event_batch_rows";
 const BUDGET_ROWS: &str = "dagger_workflow_budget_rows";
+const EXTERNAL_HANDLE_ROWS: &str = "dagger_workflow_external_handle_rows";
 const STALE_ROWS: &str = "dagger_workflow_stale_observation_rows";
 const COUNTER_ROWS: &str = "dagger_workflow_scope_counters";
 
@@ -242,6 +243,7 @@ const AUTHORITY_TABLES: &[&str] = &[
     EVENT_ROWS,
     EVENT_BATCH_ROWS,
     BUDGET_ROWS,
+    EXTERNAL_HANDLE_ROWS,
     STALE_ROWS,
     COUNTER_ROWS,
 ];
@@ -256,6 +258,7 @@ const RUN_SCOPED_AUTHORITY_TABLES: &[&str] = &[
     EVENT_ROWS,
     EVENT_BATCH_ROWS,
     BUDGET_ROWS,
+    EXTERNAL_HANDLE_ROWS,
     STALE_ROWS,
 ];
 
@@ -268,6 +271,7 @@ struct AuthorityLoad {
     receipt: Option<(CommandKindKey, String)>,
     object_digests: Vec<Digest>,
     artifact_ref_ids: Vec<Id>,
+    external_idempotency_key: Option<String>,
 }
 
 impl AuthorityLoad {
@@ -309,6 +313,11 @@ impl AuthorityLoad {
 
     fn artifacts(mut self, ids: impl IntoIterator<Item = Id>) -> Self {
         self.artifact_ref_ids.extend(ids);
+        self
+    }
+
+    fn external_handle_key(mut self, idempotency_key: &str) -> Self {
+        self.external_idempotency_key = Some(idempotency_key.to_owned());
         self
     }
 }
@@ -404,6 +413,10 @@ struct ScopeAuthority {
 
 fn encode_row<T: Serialize>(value: &T) -> Result<String, StoreError> {
     serde_jcs::to_string(value).map_err(|_| StoreError::TransactionFailed)
+}
+
+fn external_handle_sub_id(idempotency_key: &str, kind: &str) -> String {
+    format!("{}:{idempotency_key}{kind}", idempotency_key.len())
 }
 
 fn decode_row<T: DeserializeOwned>(value: &str) -> Result<T, StoreError> {
@@ -548,6 +561,14 @@ fn decode_authority_row(
                 .entry((scope.clone(), row.run_id.clone()))
                 .or_default()
                 .push(row);
+        }
+        EXTERNAL_HANDLE_ROWS => {
+            let row: ExternalHandle = decode_row(data)?;
+            scoped(scope, &row.scope, ())?;
+            state.external_handles.insert(
+                (scope.clone(), row.idempotency_key.clone(), row.kind.clone()),
+                row,
+            );
         }
         STALE_ROWS => {
             state.stale_observed.insert((
@@ -753,6 +774,16 @@ fn encode_authority_rows(
                     encode_row(entry)?,
                 );
             }
+        }
+    }
+    for ((row_scope, idempotency_key, kind), row) in &state.external_handles {
+        if row_scope == scope {
+            put(
+                EXTERNAL_HANDLE_ROWS,
+                row.run_id.as_str().to_owned(),
+                external_handle_sub_id(idempotency_key, kind),
+                encode_row(row)?,
+            );
         }
     }
     for (row_scope, run_id, attempt_id) in &state.stale_observed {
@@ -1074,6 +1105,29 @@ where
             )
             .await?;
         }
+        if let Some(idempotency_key) = request.external_idempotency_key.as_ref() {
+            let handles: Vec<(String, String)> = sqlx::query_as(
+                "SELECT run_id, kind FROM dagger_workflow_external_handles
+                 WHERE tenant_id = ? AND namespace = ? AND idempotency_key = ?",
+            )
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(idempotency_key)
+            .fetch_all(&mut **connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+            for (run_id, kind) in handles {
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    EXTERNAL_HANDLE_ROWS,
+                    &run_id,
+                    &external_handle_sub_id(idempotency_key, &kind),
+                )
+                .await?;
+            }
+        }
         object_digests.sort();
         object_digests.dedup();
         for digest in object_digests {
@@ -1094,6 +1148,7 @@ where
             && request.receipt.is_none()
             && request.object_digests.is_empty()
             && request.artifact_ref_ids.is_empty()
+            && request.external_idempotency_key.is_none()
         {
             // Only object_records uses this diagnostic, tenant-wide snapshot.
             for table in AUTHORITY_TABLES {
@@ -1283,6 +1338,25 @@ where
             ))
         };
         for key in &changed {
+            if key.table == EXTERNAL_HANDLE_ROWS {
+                if let Some((data, _)) = before.rows.get(key) {
+                    let handle: ExternalHandle = decode_row(data)?;
+                    sqlx::query(
+                        "DELETE FROM dagger_workflow_external_handles
+                         WHERE tenant_id = ? AND namespace = ? AND run_id = ?
+                           AND idempotency_key = ? AND kind = ?",
+                    )
+                    .bind(scope.tenant_id.as_str())
+                    .bind(scope.namespace.as_str())
+                    .bind(handle.run_id.as_str())
+                    .bind(&handle.idempotency_key)
+                    .bind(&handle.kind)
+                    .execute(&mut **connection)
+                    .await
+                    .map_err(|_| StoreError::TransactionFailed)?;
+                }
+                continue;
+            }
             let (table, entity_column, sub_column) = match key.table {
                 DEFINITION_ROWS => ("dagger_workflow_definitions", "definition_id", None),
                 REVISION_ROWS => {
@@ -1763,6 +1837,36 @@ where
                 .await
                 .map_err(|_| StoreError::TransactionFailed)?;
             }
+        }
+        for handle in state.external_handles.values() {
+            if !touched(
+                EXTERNAL_HANDLE_ROWS,
+                handle.run_id.as_str(),
+                &external_handle_sub_id(&handle.idempotency_key, &handle.kind),
+            ) {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO dagger_workflow_external_handles
+                 (tenant_id, namespace, run_id, node_id, idempotency_key, kind,
+                  external_id, metadata_json, registered_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(handle.scope.tenant_id.as_str())
+            .bind(handle.scope.namespace.as_str())
+            .bind(handle.run_id.as_str())
+            .bind(handle.node_id.as_str())
+            .bind(&handle.idempotency_key)
+            .bind(&handle.kind)
+            .bind(&handle.external_id)
+            .bind(
+                serde_jcs::to_string(&handle.metadata)
+                    .map_err(|_| StoreError::TransactionFailed)?,
+            )
+            .bind(handle.registered_at.0)
+            .execute(&mut **connection)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
         }
         for events in state.events.values() {
             for event in events {
@@ -2698,6 +2802,39 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         record_action_progress(command: RecordActionProgress) -> ();
         AuthorityLoad::run(&command.run_id)
     );
+    sql_command!(
+        register_external_handle(command: RegisterExternalHandle) -> ExternalHandle;
+        AuthorityLoad::run(&command.run_id)
+    );
+    async fn lookup_external_handle(
+        &self,
+        scope: &ExecutionScope,
+        idempotency_key: &str,
+    ) -> Result<Vec<ExternalHandle>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let now = Self::database_now(&mut connection).await?;
+        let mut state = Self::load_state(
+            &mut connection,
+            scope,
+            &AuthorityLoad::default().external_handle_key(idempotency_key),
+        )
+        .await?
+        .state;
+        self.restore_verified_bytes(&mut state, scope);
+        let result = ReducerStore::from_state(Arc::new(DatabaseTimestamp(now)), state)
+            .lookup_external_handle(scope, idempotency_key)
+            .await;
+        match result {
+            Ok(value) => {
+                Self::commit(connection).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                Self::rollback(&mut connection).await;
+                Err(error)
+            }
+        }
+    }
     sql_command!(timeout_attempt(command: TimeoutAttempt) -> NodeAttempt; AuthorityLoad::run(&command.run_id));
     sql_command!(
         recover_abandoned_attempts_for_run(command: RecoverAbandonedAttemptsForRun)

@@ -62,6 +62,19 @@ fn valid_metadata(display_name: &str, description: &str) -> bool {
     !display_name.is_empty() && display_name.len() <= 200 && description.len() <= 4_000
 }
 
+fn valid_external_field(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256
+}
+
+fn valid_external_handle(command: &RegisterExternalHandle) -> bool {
+    valid_external_field(&command.idempotency_key)
+        && valid_external_field(&command.kind)
+        && valid_external_field(&command.external_id)
+        && serde_jcs::to_vec(&command.metadata)
+            .map(|bytes| bytes.len() <= 8 * 1024)
+            .unwrap_or(false)
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct ReducerState {
@@ -103,6 +116,8 @@ pub(crate) struct ReducerState {
     pub(crate) events: BTreeMap<(ExecutionScope, Id), Vec<WorkflowEvent>>,
     #[serde(with = "map_as_sequence")]
     pub(crate) ledger: BTreeMap<(ExecutionScope, Id), Vec<BudgetLedgerEntry>>,
+    #[serde(with = "map_as_sequence")]
+    pub(crate) external_handles: BTreeMap<(ExecutionScope, String, String), ExternalHandle>,
     pub(crate) stale_observed: BTreeSet<(ExecutionScope, Id, Id)>,
     pub(crate) batch_counter: u64,
 }
@@ -4945,7 +4960,11 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             running_fence(&state, scope, &command.run_id, None, now)?;
             let node = state
                 .nodes
-                .get(&(scope.clone(), command.run_id.clone(), command.node_id.clone()))
+                .get(&(
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.node_id.clone(),
+                ))
                 .ok_or(StoreError::NotFound)?;
             if node.active_attempt_id.as_ref() != Some(&command.attempt_id) {
                 return Err(StoreError::AttemptFenced);
@@ -5013,6 +5032,114 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             )?;
             Ok(())
         })
+    }
+
+    async fn register_external_handle(
+        &self,
+        scope: &ExecutionScope,
+        command: RegisterExternalHandle,
+    ) -> Result<ExternalHandle, StoreError> {
+        self.transaction(|mut state, now| {
+            if !valid_external_handle(&command) {
+                return Err(StoreError::InvalidField);
+            }
+            let attempt = state
+                .attempts
+                .get(&(
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.attempt_id.clone(),
+                ))
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if attempt.node_instance_id != command.node_id
+                || attempt.completion_credential_digest != command.completion_credential.digest()
+            {
+                return Err(StoreError::InvalidCompletionCredential);
+            }
+            if attempt.status != AttemptState::Started {
+                return Err(StoreError::AttemptFenced);
+            }
+            completion_fence(&state, scope, &attempt, now)?;
+            running_fence(&state, scope, &command.run_id, None, now)?;
+            let node = state
+                .nodes
+                .get(&(
+                    scope.clone(),
+                    command.run_id.clone(),
+                    command.node_id.clone(),
+                ))
+                .ok_or(StoreError::NotFound)?;
+            if node.active_attempt_id.as_ref() != Some(&command.attempt_id)
+                || attempt.idempotency_key != command.idempotency_key
+            {
+                return Err(StoreError::AttemptFenced);
+            }
+            let key = (
+                scope.clone(),
+                command.idempotency_key.clone(),
+                command.kind.clone(),
+            );
+            if let Some(existing) = state.external_handles.get(&key) {
+                if existing.run_id == command.run_id
+                    && existing.node_id == command.node_id
+                    && existing.external_id == command.external_id
+                    && existing.metadata == command.metadata
+                {
+                    return Ok(existing.clone());
+                }
+                return Err(StoreError::IdempotencyConflict);
+            }
+            let handle = ExternalHandle {
+                scope: scope.clone(),
+                run_id: command.run_id.clone(),
+                node_id: command.node_id.clone(),
+                idempotency_key: command.idempotency_key,
+                kind: command.kind,
+                external_id: command.external_id,
+                metadata: command.metadata,
+                registered_at: now,
+            };
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::ActionProgress,
+                command.attempt_id.as_str().to_owned(),
+                vec![event_spec(
+                    "P03",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::action_external_handle_reported(
+                        &handle.kind,
+                        &handle.external_id,
+                    ),
+                )],
+            )?;
+            state.external_handles.insert(key, handle.clone());
+            Ok(handle)
+        })
+    }
+
+    async fn lookup_external_handle(
+        &self,
+        scope: &ExecutionScope,
+        idempotency_key: &str,
+    ) -> Result<Vec<ExternalHandle>, StoreError> {
+        if !valid_external_field(idempotency_key) {
+            return Err(StoreError::InvalidField);
+        }
+        Ok(self
+            .state
+            .lock()
+            .expect("store lock poisoned")
+            .external_handles
+            .iter()
+            .filter(|((handle_scope, key, _), _)| handle_scope == scope && key == idempotency_key)
+            .map(|(_, handle)| handle.clone())
+            .collect())
     }
 
     async fn timeout_attempt(
@@ -7459,7 +7586,17 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
         } else {
             None
         };
-        Ok(WorkflowRunView { run, operational })
+        let external_handles = state
+            .external_handles
+            .values()
+            .filter(|handle| handle.scope == *scope && handle.run_id == *run_id)
+            .cloned()
+            .collect();
+        Ok(WorkflowRunView {
+            run,
+            operational,
+            external_handles,
+        })
     }
 
     async fn get_node(

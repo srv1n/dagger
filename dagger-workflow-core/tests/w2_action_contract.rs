@@ -3,7 +3,7 @@ use dagger_workflow_core::action::{
     ActionContext, ActionDescriptor, ActionInvocation, ActionOutcome, ActionRegistry, BudgetHandle,
     CancellationSource, CanonicalBoundInput, CompatibilityMismatch, CompletionCredential,
     DiagnosticFact, DiagnosticScalar, DiagnosticsEnvelope, DiagnosticsValidationError,
-    InMemoryActionRegistry, InvocationError, WorkflowAction,
+    ExternalHandleAccess, InMemoryActionRegistry, InvocationError, WorkflowAction,
 };
 use dagger_workflow_core::artifact::{ArtifactKind, ArtifactRef, JsonRef};
 use dagger_workflow_core::definition::ActionPin;
@@ -94,6 +94,7 @@ fn context(
             declared_max_cost_units: CostUnits(10),
         },
         Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
+        ExternalHandleAccess::unavailable(),
     )
 }
 
@@ -404,6 +405,7 @@ fn idempotency_key_is_stable_across_attempt_ids() {
             declared_max_cost_units: CostUnits(1),
         },
         Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
+        ExternalHandleAccess::unavailable(),
     );
     let second = ActionContext::new(
         scope(),
@@ -419,6 +421,7 @@ fn idempotency_key_is_stable_across_attempt_ids() {
             declared_max_cost_units: CostUnits(1),
         },
         Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
+        ExternalHandleAccess::unavailable(),
     );
     assert_eq!(first.idempotency_key, second.idempotency_key);
 }

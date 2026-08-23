@@ -4,7 +4,7 @@ use crate::artifact::{ArtifactRefValue, JsonRef, VerifiedObjectRef};
 use crate::definition::ActionPin;
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
-use crate::store::StoreError;
+use crate::store::{ExternalHandle, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -116,11 +116,22 @@ pub struct BudgetHandle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProgressRecord {
     /// A durable checkpoint object owned outside the workflow event stream.
-    Checkpoint { object_ref: String },
+    Checkpoint {
+        /// Durable checkpoint object reference.
+        object_ref: String,
+    },
     /// A bounded action phase label.
-    Phase { label: String },
+    Phase {
+        /// Bounded phase label.
+        label: String,
+    },
     /// An external operation handle, such as an E2B sandbox ID.
-    ExternalHandle { kind: String, id: String },
+    ExternalHandle {
+        /// External provider or operation kind.
+        kind: String,
+        /// Provider-issued external identity.
+        id: String,
+    },
 }
 
 impl ProgressRecord {
@@ -142,6 +153,58 @@ pub type ProgressReporter = Arc<
         + Send
         + Sync,
 >;
+
+/// Engine-supplied external-operation registry for one action context.
+#[derive(Clone)]
+pub struct ExternalHandleAccess {
+    lookup: Arc<
+        dyn Fn() -> Pin<Box<dyn Future<Output = Result<Vec<ExternalHandle>, StoreError>> + Send>>
+            + Send
+            + Sync,
+    >,
+    register: Arc<
+        dyn Fn(
+                String,
+                String,
+                Value,
+            )
+                -> Pin<Box<dyn Future<Output = Result<ExternalHandle, StoreError>> + Send>>
+            + Send
+            + Sync,
+    >,
+}
+
+impl ExternalHandleAccess {
+    /// Creates the engine-owned access path for one active attempt.
+    pub fn new(
+        lookup: impl Fn() -> Pin<Box<dyn Future<Output = Result<Vec<ExternalHandle>, StoreError>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+        register: impl Fn(
+                String,
+                String,
+                Value,
+            )
+                -> Pin<Box<dyn Future<Output = Result<ExternalHandle, StoreError>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            lookup: Arc::new(lookup),
+            register: Arc::new(register),
+        }
+    }
+
+    /// Creates an inert capability for isolated context-contract tests.
+    pub fn unavailable() -> Self {
+        Self::new(
+            || Box::pin(async { Err(StoreError::IllegalTransition) }),
+            |_, _, _| Box::pin(async { Err(StoreError::IllegalTransition) }),
+        )
+    }
+}
 
 /// The exact context for one action attempt.
 #[derive(Clone)]
@@ -169,6 +232,7 @@ pub struct ActionContext {
     /// Read-only declared budget.
     pub budget: BudgetHandle,
     progress_reporter: ProgressReporter,
+    external_handles: ExternalHandleAccess,
 }
 
 impl ActionContext {
@@ -187,6 +251,7 @@ impl ActionContext {
         cancellation_token: Arc<dyn CancellationToken>,
         budget: BudgetHandle,
         progress_reporter: ProgressReporter,
+        external_handles: ExternalHandleAccess,
     ) -> Self {
         let idempotency_key = crate::ids::idempotency_key(&scope, &run_id, &node_instance_id);
         Self {
@@ -202,6 +267,7 @@ impl ActionContext {
             cancellation_token,
             budget,
             progress_reporter,
+            external_handles,
         }
     }
 
@@ -223,6 +289,7 @@ impl ActionContext {
         cancellation_token: Arc<dyn CancellationToken>,
         budget: BudgetHandle,
         progress_reporter: ProgressReporter,
+        external_handles: ExternalHandleAccess,
     ) -> Self {
         let idempotency_key = crate::ids::map_child_idempotency_key(
             &scope,
@@ -245,12 +312,34 @@ impl ActionContext {
             cancellation_token,
             budget,
             progress_reporter,
+            external_handles,
         }
     }
 
     /// Durably records one bounded progress item for this active attempt.
     pub async fn report_progress(&self, record: ProgressRecord) -> Result<(), StoreError> {
-        (self.progress_reporter)(record).await
+        match record {
+            ProgressRecord::ExternalHandle { kind, id } => self
+                .register_external_handle(kind, id, Value::Null)
+                .await
+                .map(|_| ()),
+            record => (self.progress_reporter)(record).await,
+        }
+    }
+
+    /// Lists durable external operations created by prior attempts with this key.
+    pub async fn lookup_external_handle(&self) -> Result<Vec<ExternalHandle>, StoreError> {
+        (self.external_handles.lookup)().await
+    }
+
+    /// Registers the external operation before its expensive work begins.
+    pub async fn register_external_handle(
+        &self,
+        kind: String,
+        external_id: String,
+        metadata: Value,
+    ) -> Result<ExternalHandle, StoreError> {
+        (self.external_handles.register)(kind, external_id, metadata).await
     }
 }
 

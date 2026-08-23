@@ -14,6 +14,8 @@ use crate::run::{
     WorkflowRunView,
 };
 use crate::scope::ExecutionScope;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 
@@ -299,10 +301,16 @@ pub enum StoreError {
     AttemptFenced,
     /// The configured per-attempt progress-event cap is exhausted.
     #[error("progress event limit exceeded")]
-    ProgressEventLimitExceeded { limit: u16 },
+    ProgressEventLimitExceeded {
+        /// Maximum accepted progress events for this attempt.
+        limit: u16,
+    },
     /// Progress arrived sooner than the durable per-attempt interval permits.
     #[error("progress rate limited")]
-    ProgressRateLimited { retry_after_ms: u64 },
+    ProgressRateLimited {
+        /// Minimum delay before another progress report can be accepted.
+        retry_after_ms: u64,
+    },
     /// Recovery encountered a current-generation attempt.
     #[error("current generation attempt present")]
     CurrentGenerationAttemptPresent,
@@ -597,6 +605,48 @@ pub struct RecordActionProgress {
     pub record: ProgressRecord,
     /// Maximum progress events this attempt may emit.
     pub max_events_per_attempt: u16,
+}
+
+/// A durable external operation associated with one retry-stable action key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalHandle {
+    /// Owning execution scope.
+    pub scope: ExecutionScope,
+    /// Owning run, so retention deletes this row with the run.
+    pub run_id: Id,
+    /// Owning logical node instance.
+    pub node_id: NodeInstanceId,
+    /// Retry-stable external idempotency key.
+    pub idempotency_key: String,
+    /// External provider or operation kind.
+    pub kind: String,
+    /// Provider-issued external identity.
+    pub external_id: String,
+    /// Provider-specific canonical JSON needed to reattach.
+    pub metadata: Value,
+    /// Database-clock registration time.
+    pub registered_at: Timestamp,
+}
+
+/// Parameters for a fenced external-operation registration.
+pub struct RegisterExternalHandle {
+    /// Per-attempt completion capability.
+    pub completion_credential: CompletionCredential,
+    /// Run ID.
+    pub run_id: Id,
+    /// Node instance ID.
+    pub node_id: NodeInstanceId,
+    /// Active attempt ID.
+    pub attempt_id: Id,
+    /// Retry-stable external idempotency key.
+    pub idempotency_key: String,
+    /// External provider or operation kind.
+    pub kind: String,
+    /// Provider-issued external identity.
+    pub external_id: String,
+    /// Provider-specific canonical JSON needed to reattach.
+    pub metadata: Value,
 }
 
 /// Closed complete-attempt command outcomes.
@@ -959,11 +1009,25 @@ pub trait WorkflowStore: Send + Sync {
     ) -> impl Future<Output = Result<CompleteAttemptResult, StoreError>> + Send + 'a;
 
     /// Appends one active-attempt-fenced durable progress event.
-    async fn record_action_progress(
-        &self,
-        scope: &ExecutionScope,
+    fn record_action_progress<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
         command: RecordActionProgress,
-    ) -> Result<(), StoreError>;
+    ) -> impl Future<Output = Result<(), StoreError>> + Send + 'a;
+
+    /// Atomically records an active-attempt-fenced external operation handle.
+    fn register_external_handle<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        command: RegisterExternalHandle,
+    ) -> impl Future<Output = Result<ExternalHandle, StoreError>> + Send + 'a;
+
+    /// Lists the registered handles for one retry-stable external key.
+    fn lookup_external_handle<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        idempotency_key: &'a str,
+    ) -> impl Future<Output = Result<Vec<ExternalHandle>, StoreError>> + Send + 'a;
 
     /// Applies a due database-clock timeout.
     async fn timeout_attempt(

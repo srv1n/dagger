@@ -2,7 +2,7 @@
 
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
-    CancellationToken, ProgressRecord, ProgressReporter,
+    CancellationToken, ExternalHandleAccess, ProgressRecord, ProgressReporter,
 };
 use crate::artifact::{
     ArtifactRef, ArtifactRefValue, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject,
@@ -19,9 +19,9 @@ use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
     CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
     MarkCorruptStorage, OrderedMapItem, PageRequest, RecordActionProgress, RecordChoice,
-    RecoverAbandonedAttemptsForRun, ReleaseRetry, RequestApproval, ResolveTerminalNode,
-    ResumeCompatible, StartRun, StoreError,
-    SuspendIncompatible, TimeoutAttempt, WorkflowStore,
+    RecoverAbandonedAttemptsForRun, RegisterExternalHandle, ReleaseRetry, RequestApproval,
+    ResolveTerminalNode, ResumeCompatible, StartRun, StoreError, SuspendIncompatible,
+    TimeoutAttempt, WorkflowStore,
 };
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -878,6 +878,50 @@ where
                     .await
             })
         });
+        let external_store = self.store.clone();
+        let external_scope = scope.clone();
+        let external_run_id = node.run_id.clone();
+        let external_node_id = node.node_instance_id.clone();
+        let external_attempt_id = attempt_id.clone();
+        let external_credential = completion_credential.clone();
+        let external_idempotency_key = attempt.idempotency_key.clone();
+        let lookup_store = external_store.clone();
+        let lookup_scope = external_scope.clone();
+        let lookup_key = external_idempotency_key.clone();
+        let external_handles = ExternalHandleAccess::new(
+            move || {
+                let store = lookup_store.clone();
+                let scope = lookup_scope.clone();
+                let key = lookup_key.clone();
+                Box::pin(async move { store.lookup_external_handle(&scope, &key).await })
+            },
+            move |kind, external_id, metadata| {
+                let store = external_store.clone();
+                let scope = external_scope.clone();
+                let run_id = external_run_id.clone();
+                let node_id = external_node_id.clone();
+                let attempt_id = external_attempt_id.clone();
+                let completion_credential = external_credential.clone();
+                let idempotency_key = external_idempotency_key.clone();
+                Box::pin(async move {
+                    store
+                        .register_external_handle(
+                            &scope,
+                            RegisterExternalHandle {
+                                completion_credential,
+                                run_id,
+                                node_id,
+                                attempt_id,
+                                idempotency_key,
+                                kind,
+                                external_id,
+                                metadata,
+                            },
+                        )
+                        .await
+                })
+            },
+        );
         let context = ActionContext::new(
             scope.clone(),
             node.run_id,
@@ -892,6 +936,7 @@ where
                 declared_max_cost_units: attempt.declared_max_cost,
             },
             progress_reporter,
+            external_handles,
         );
         let action = self
             .registry
