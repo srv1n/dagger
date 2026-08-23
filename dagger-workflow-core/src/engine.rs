@@ -164,6 +164,14 @@ impl AttemptSupervisor {
             .insert(key, source);
     }
 
+    fn unregister(&self, key: &AttemptKey) {
+        self.active
+            .lock()
+            .expect("supervisor lock poisoned")
+            .remove(key);
+        self.activity.notify_waiters();
+    }
+
     fn finish(&self, key: &AttemptKey, result: Result<(), EngineError>) {
         self.active
             .lock()
@@ -535,7 +543,6 @@ where
             claimed.context.attempt_id.clone(),
         );
         let source = claimed.cancellation.clone();
-        self.supervisor.register(key.clone(), source.clone());
         let supervisor = self.supervisor.clone();
         let store = self.store.clone();
         let object_store = self.object_store.clone();
@@ -820,7 +827,10 @@ where
             .await
             .map_err(|_| EngineError::ObjectWrite)?;
         let attempt_id = self.next_attempt_id(permit.generation())?;
-        let result = self
+        let source = CancellationSource::new();
+        let key = (scope.clone(), node.run_id.clone(), attempt_id.clone());
+        self.supervisor.register(key.clone(), source.clone());
+        let result = match self
             .store
             .claim_node_attempt(
                 scope,
@@ -835,19 +845,33 @@ where
                     binding_derivation_digest: sha(&bound),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.supervisor.unregister(&key);
+                return Err(error.into());
+            }
+        };
         let ClaimNodeAttemptResult::Claimed {
             invocation,
             completion_credential,
         } = result
         else {
+            self.supervisor.unregister(&key);
             return Ok(None);
         };
-        let attempt = self
+        let attempt = match self
             .store
             .get_attempt(scope, &node.run_id, &attempt_id)
-            .await?;
-        let source = CancellationSource::new();
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                self.supervisor.unregister(&key);
+                return Err(error.into());
+            }
+        };
         let progress_store = self.store.clone();
         let progress_scope = scope.clone();
         let progress_run_id = node.run_id.clone();

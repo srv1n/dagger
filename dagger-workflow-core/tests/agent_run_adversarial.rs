@@ -4,8 +4,8 @@
 //! stale-result fencing, and an external-effect retry after a forced store disconnect.
 
 use dagger_workflow_core::action::{
-    ActionContext, ActionDescriptor, ActionOutcome, CompatibilityReport, InMemoryActionRegistry,
-    WorkflowAction,
+    ActionContext, ActionDescriptor, ActionOutcome, ActionRegistry, CompatibilityReport,
+    InMemoryActionRegistry, WorkflowAction,
 };
 use dagger_workflow_core::approval::AuthenticatedPrincipal;
 use dagger_workflow_core::artifact::ObjectStore;
@@ -188,6 +188,85 @@ impl WorkflowAction for SlowAction {
 
 struct FastAction {
     descriptor: ActionDescriptor,
+}
+
+#[derive(Default)]
+struct ResolveGate {
+    state: (Mutex<(bool, bool)>, Condvar),
+}
+
+impl ResolveGate {
+    fn wait_until_blocked(&self) {
+        let (lock, wake) = &self.state;
+        let (state, _) = wake
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |state| {
+                !state.0
+            })
+            .unwrap();
+        assert!(
+            state.0,
+            "action resolution did not reach the claim boundary"
+        );
+    }
+
+    fn release(&self) {
+        let (lock, wake) = &self.state;
+        lock.lock().unwrap().1 = true;
+        wake.notify_all();
+    }
+}
+
+struct BlockingRegistry {
+    actions: InMemoryActionRegistry,
+    gate: Arc<ResolveGate>,
+}
+
+impl ActionRegistry for BlockingRegistry {
+    fn resolve(&self, name: &str) -> Option<Arc<dyn WorkflowAction>> {
+        let (lock, wake) = &self.gate.state;
+        let mut state = lock.lock().unwrap();
+        state.0 = true;
+        wake.notify_all();
+        while !state.1 {
+            state = wake.wait(state).unwrap();
+        }
+        drop(state);
+        self.actions.resolve(name)
+    }
+
+    fn check_pins(
+        &self,
+        pins: &[dagger_workflow_core::definition::ActionPin],
+    ) -> CompatibilityReport {
+        self.actions.check_pins(pins)
+    }
+}
+
+struct CancellationAtStartAction {
+    descriptor: ActionDescriptor,
+    started: Arc<AtomicBool>,
+    observed_cancellation: Arc<AtomicBool>,
+}
+
+impl WorkflowAction for CancellationAtStartAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        context: ActionContext,
+        _: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        let started = self.started.clone();
+        let observed_cancellation = self.observed_cancellation.clone();
+        Box::pin(async move {
+            observed_cancellation
+                .store(context.cancellation_token.is_cancelled(), Ordering::Release);
+            started.store(true, Ordering::Release);
+            ActionOutcome::success(json!({"value": 1}), Vec::new(), CostUnits(1), None).unwrap()
+        })
+    }
 }
 
 struct GateAction {
@@ -404,13 +483,14 @@ fn principal(execution_scope: &ExecutionScope, schema: &Digest) -> Authenticated
     .unwrap()
 }
 
-async fn start<S, O>(
-    engine: &WorkflowEngine<S, O, InMemoryActionRegistry>,
+async fn start<S, O, R>(
+    engine: &WorkflowEngine<S, O, R>,
     execution_scope: &ExecutionScope,
     run_id: &str,
 ) where
     S: WorkflowStore + 'static,
     O: ObjectStore + 'static,
+    R: ActionRegistry,
 {
     engine.start(execution_scope, &id(run_id)).await.unwrap();
 }
@@ -832,6 +912,112 @@ async fn durable_cancellation_drops_a_non_cooperative_action_after_grace() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(cancelled_at.elapsed() >= Duration::from_millis(50));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_between_claim_and_local_registration_reaches_the_action() {
+    let execution_scope = scope("claim-cancel-race");
+    let clock = Arc::new(TestClock::new(Timestamp(8_000)));
+    let store = Arc::new(InMemoryStore::new(clock.clone()));
+    let objects = Arc::new(InMemoryObjectStore::new(clock));
+    let schema = digest(SCHEMA);
+    let owner = principal(&execution_scope, &schema);
+    let started = Arc::new(AtomicBool::new(false));
+    let observed_cancellation = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(ResolveGate::default());
+    let actions = InMemoryActionRegistry::new();
+    actions
+        .register(Arc::new(CancellationAtStartAction {
+            descriptor: descriptor("claim-cancel", &schema),
+            started: started.clone(),
+            observed_cancellation: observed_cancellation.clone(),
+        }))
+        .unwrap();
+    let registry = Arc::new(BlockingRegistry {
+        actions,
+        gate: gate.clone(),
+    });
+    let revision = publish(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        definition("claim-cancel-def", "claim-cancel", &schema, 1),
+    )
+    .await;
+    create_run(
+        &*store,
+        &*objects,
+        &execution_scope,
+        &owner,
+        "claim-cancel-def",
+        &revision,
+        "run-claim-cancel",
+    )
+    .await;
+    let engine = Arc::new(
+        WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("claim-cancel-engine"),
+                max_concurrency: 1,
+                cancellation_grace: Duration::from_millis(50),
+            },
+        )
+        .unwrap(),
+    );
+    engine.acquire_scope(&execution_scope).await.unwrap();
+    start(&engine, &execution_scope, "run-claim-cancel").await;
+    let ticking = {
+        let engine = engine.clone();
+        let execution_scope = execution_scope.clone();
+        tokio::spawn(async move { engine.tick(&execution_scope).await })
+    };
+    let waiting_gate = gate.clone();
+    tokio::task::spawn_blocking(move || waiting_gate.wait_until_blocked())
+        .await
+        .unwrap();
+    let run = store
+        .get_run(&execution_scope, &id("run-claim-cancel"))
+        .await
+        .unwrap()
+        .run;
+    engine
+        .cancel(
+            &execution_scope,
+            dagger_workflow_core::store::CancelRun {
+                run_id: id("run-claim-cancel"),
+                expected_run_version: run.version,
+                expected_pending_gate_versions: Vec::new(),
+                principal: owner,
+                reason_code: "claim-registration-race".to_owned(),
+                idempotency_token: "claim-registration-race".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    gate.release();
+    ticking.await.unwrap().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !started.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "cancelled action did not start");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        observed_cancellation.load(Ordering::Acquire),
+        "action started without the durable cancellation signal"
+    );
+    assert_eq!(
+        store
+            .get_run(&execution_scope, &id("run-claim-cancel"))
+            .await
+            .unwrap()
+            .run
+            .status,
+        RunState::Cancelled
+    );
 }
 
 #[tokio::test(start_paused = true)]
