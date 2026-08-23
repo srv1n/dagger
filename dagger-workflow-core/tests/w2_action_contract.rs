@@ -9,6 +9,7 @@ use dagger_workflow_core::artifact::{ArtifactKind, ArtifactRef, JsonRef};
 use dagger_workflow_core::definition::ActionPin;
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
+use dagger_workflow_core::store::StoreError;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::future::Future;
@@ -92,6 +93,7 @@ fn context(
         BudgetHandle {
             declared_max_cost_units: CostUnits(10),
         },
+        Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
     )
 }
 
@@ -401,6 +403,7 @@ fn idempotency_key_is_stable_across_attempt_ids() {
         BudgetHandle {
             declared_max_cost_units: CostUnits(1),
         },
+        Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
     );
     let second = ActionContext::new(
         scope(),
@@ -415,6 +418,7 @@ fn idempotency_key_is_stable_across_attempt_ids() {
         BudgetHandle {
             declared_max_cost_units: CostUnits(1),
         },
+        Arc::new(|_| Box::pin(async { Err(StoreError::AttemptFenced) })),
     );
     assert_eq!(first.idempotency_key, second.idempotency_key);
 }

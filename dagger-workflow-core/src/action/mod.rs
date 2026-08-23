@@ -4,6 +4,7 @@ use crate::artifact::{ArtifactRefValue, JsonRef, VerifiedObjectRef};
 use crate::definition::ActionPin;
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
+use crate::store::StoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -111,6 +112,37 @@ pub struct BudgetHandle {
     pub declared_max_cost_units: CostUnits,
 }
 
+/// Low-volume durable workflow progress emitted by an active action attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgressRecord {
+    /// A durable checkpoint object owned outside the workflow event stream.
+    Checkpoint { object_ref: String },
+    /// A bounded action phase label.
+    Phase { label: String },
+    /// An external operation handle, such as an E2B sandbox ID.
+    ExternalHandle { kind: String, id: String },
+}
+
+impl ProgressRecord {
+    pub(crate) fn valid(&self) -> bool {
+        fn bounded(value: &str) -> bool {
+            !value.is_empty() && value.len() <= 256
+        }
+        match self {
+            Self::Checkpoint { object_ref } => bounded(object_ref),
+            Self::Phase { label } => bounded(label),
+            Self::ExternalHandle { kind, id } => bounded(kind) && bounded(id),
+        }
+    }
+}
+
+/// Engine-supplied durable progress sink for one action context.
+pub type ProgressReporter = Arc<
+    dyn Fn(ProgressRecord) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The exact context for one action attempt.
 #[derive(Clone)]
 pub struct ActionContext {
@@ -136,6 +168,7 @@ pub struct ActionContext {
     pub cancellation_token: Arc<dyn CancellationToken>,
     /// Read-only declared budget.
     pub budget: BudgetHandle,
+    progress_reporter: ProgressReporter,
 }
 
 impl ActionContext {
@@ -153,6 +186,7 @@ impl ActionContext {
         deadline: Timestamp,
         cancellation_token: Arc<dyn CancellationToken>,
         budget: BudgetHandle,
+        progress_reporter: ProgressReporter,
     ) -> Self {
         let idempotency_key = crate::ids::idempotency_key(&scope, &run_id, &node_instance_id);
         Self {
@@ -167,6 +201,7 @@ impl ActionContext {
             deadline,
             cancellation_token,
             budget,
+            progress_reporter,
         }
     }
 
@@ -187,6 +222,7 @@ impl ActionContext {
         deadline: Timestamp,
         cancellation_token: Arc<dyn CancellationToken>,
         budget: BudgetHandle,
+        progress_reporter: ProgressReporter,
     ) -> Self {
         let idempotency_key = crate::ids::map_child_idempotency_key(
             &scope,
@@ -208,7 +244,13 @@ impl ActionContext {
             deadline,
             cancellation_token,
             budget,
+            progress_reporter,
         }
+    }
+
+    /// Durably records one bounded progress item for this active attempt.
+    pub async fn report_progress(&self, record: ProgressRecord) -> Result<(), StoreError> {
+        (self.progress_reporter)(record).await
     }
 }
 

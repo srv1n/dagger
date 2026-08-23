@@ -1,6 +1,8 @@
 //! Atomic domain-command and scoped read boundary.
 
-use crate::action::{ActionInvocation, ActionOutcome, CompatibilityReport, CompletionCredential};
+use crate::action::{
+    ActionInvocation, ActionOutcome, CompatibilityReport, CompletionCredential, ProgressRecord,
+};
 use crate::approval::{ApprovalDecision, ApprovalGate, AuthenticatedPrincipal};
 use crate::artifact::{ArtifactRef, FailedReadProof, VerifiedObjectRef};
 use crate::definition::{PublishableDefinition, ValidationErrorKind};
@@ -295,6 +297,12 @@ pub enum StoreError {
     /// Attempt or active-node fencing failed.
     #[error("attempt fenced")]
     AttemptFenced,
+    /// The configured per-attempt progress-event cap is exhausted.
+    #[error("progress event limit exceeded")]
+    ProgressEventLimitExceeded { limit: u16 },
+    /// Progress arrived sooner than the durable per-attempt interval permits.
+    #[error("progress rate limited")]
+    ProgressRateLimited { retry_after_ms: u64 },
     /// Recovery encountered a current-generation attempt.
     #[error("current generation attempt present")]
     CurrentGenerationAttemptPresent,
@@ -573,6 +581,22 @@ pub struct CompleteAttempt {
     pub submitted_outcome: ActionOutcome,
     /// Verified objects corresponding to the outcome.
     pub objects: CompletionObjects,
+}
+
+/// Parameters for one credential-authenticated action progress event.
+pub struct RecordActionProgress {
+    /// Per-attempt completion capability.
+    pub completion_credential: CompletionCredential,
+    /// Run ID.
+    pub run_id: Id,
+    /// Node instance ID.
+    pub node_id: NodeInstanceId,
+    /// Attempt ID.
+    pub attempt_id: Id,
+    /// Closed progress record.
+    pub record: ProgressRecord,
+    /// Maximum progress events this attempt may emit.
+    pub max_events_per_attempt: u16,
 }
 
 /// Closed complete-attempt command outcomes.
@@ -933,6 +957,13 @@ pub trait WorkflowStore: Send + Sync {
         scope: &'a ExecutionScope,
         command: CompleteAttempt,
     ) -> impl Future<Output = Result<CompleteAttemptResult, StoreError>> + Send + 'a;
+
+    /// Appends one active-attempt-fenced durable progress event.
+    async fn record_action_progress(
+        &self,
+        scope: &ExecutionScope,
+        command: RecordActionProgress,
+    ) -> Result<(), StoreError>;
 
     /// Applies a due database-clock timeout.
     async fn timeout_attempt(

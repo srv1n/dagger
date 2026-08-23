@@ -2,7 +2,7 @@
 
 use crate::action::{
     ActionInvocation, ActionOutcome, CompletionCredential, DiagnosticsEnvelope,
-    DiagnosticsValidationError,
+    DiagnosticsValidationError, ProgressRecord,
 };
 use crate::approval::{ApprovalDecision, ApprovalGate, ApprovalResolutionSource};
 use crate::artifact::{
@@ -36,6 +36,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 const CLAIM_LIFETIME_MS: i64 = 20_000;
+const PROGRESS_MIN_INTERVAL_MS: i64 = 1_000;
 
 fn digest(bytes: &[u8]) -> Digest {
     let value = Sha256::digest(bytes)
@@ -1604,6 +1605,9 @@ payload_constructors! {
     attempt_cancelled => AttemptCancelled(reason_code: &str, charged_cost_units: &CostUnits);
     attempt_marked_stale => AttemptMarkedStale(active_attempt_id: &Option<Id>, submitted_outcome_category: &str, submitted_payload_digest: &Digest, charged_cost_units: &CostUnits);
     stale_completion_observed => StaleCompletionObserved(immutable_terminal_state: &AttemptState, submitted_outcome_category: &str, submitted_payload_digest: &Digest, database_arrival_at: &Timestamp);
+    action_checkpoint_reported => ActionCheckpointReported(object_ref: &str);
+    action_phase_reported => ActionPhaseReported(label: &str);
+    action_external_handle_reported => ActionExternalHandleReported(kind: &str, id: &str);
     budget_settled => BudgetSettled(ledger_seq: &u64, reservation_amount: &CostUnits, consumed_amount: &CostUnits, released_amount: &str, reason: &BudgetLedgerReason, available_after: &str);
     budget_reservation_refused => BudgetReservationRefused(requested: &CostUnits, consumed: &CostUnits, reserved: &CostUnits, limit: &CostUnits, available: &str, permanently_infeasible: &bool);
     approval_gate_created => ApprovalGateCreated(request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
@@ -1869,6 +1873,9 @@ fn event_payload_fields(
             ],
             &[],
         ),
+        ActionCheckpointReported => (&["object_ref"], &[]),
+        ActionPhaseReported => (&["label"], &[]),
+        ActionExternalHandleReported => (&["kind", "id"], &[]),
         BudgetSettled => (
             &[
                 "ledger_seq",
@@ -5183,6 +5190,107 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             }
         })
     }
+    async fn record_action_progress(
+        &self,
+        scope: &ExecutionScope,
+        command: RecordActionProgress,
+    ) -> Result<(), StoreError> {
+        self.transaction(|mut state, now| {
+            if command.max_events_per_attempt == 0 || !command.record.valid() {
+                return Err(StoreError::InvalidField);
+            }
+            let attempt_key = (
+                scope.clone(),
+                command.run_id.clone(),
+                command.attempt_id.clone(),
+            );
+            let attempt = state
+                .attempts
+                .get(&attempt_key)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if attempt.node_instance_id != command.node_id
+                || attempt.completion_credential_digest != command.completion_credential.digest()
+            {
+                return Err(StoreError::InvalidCompletionCredential);
+            }
+            if attempt.status != AttemptState::Started {
+                return Err(StoreError::AttemptFenced);
+            }
+            completion_fence(&state, scope, &attempt, now)?;
+            running_fence(&state, scope, &command.run_id, None, now)?;
+            let node = state
+                .nodes
+                .get(&(scope.clone(), command.run_id.clone(), command.node_id.clone()))
+                .ok_or(StoreError::NotFound)?;
+            if node.active_attempt_id.as_ref() != Some(&command.attempt_id) {
+                return Err(StoreError::AttemptFenced);
+            }
+            let progress_events = state
+                .events
+                .get(&(scope.clone(), command.run_id.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter(|event| {
+                    event.attempt_id.as_ref() == Some(&command.attempt_id)
+                        && matches!(
+                            event.event_type,
+                            EventType::ActionCheckpointReported
+                                | EventType::ActionPhaseReported
+                                | EventType::ActionExternalHandleReported
+                        )
+                })
+                .collect::<Vec<_>>();
+            if progress_events.len() >= usize::from(command.max_events_per_attempt) {
+                return Err(StoreError::ProgressEventLimitExceeded {
+                    limit: command.max_events_per_attempt,
+                });
+            }
+            if let Some(previous) = progress_events.last() {
+                let elapsed = now.0.saturating_sub(previous.occurred_at.0);
+                if elapsed < PROGRESS_MIN_INTERVAL_MS {
+                    return Err(StoreError::ProgressRateLimited {
+                        retry_after_ms: (PROGRESS_MIN_INTERVAL_MS - elapsed) as u64,
+                    });
+                }
+            }
+            let spec = match command.record {
+                ProgressRecord::Checkpoint { object_ref } => event_spec(
+                    "P01",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::action_checkpoint_reported(&object_ref),
+                ),
+                ProgressRecord::Phase { label } => event_spec(
+                    "P02",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::action_phase_reported(&label),
+                ),
+                ProgressRecord::ExternalHandle { kind, id } => event_spec(
+                    "P03",
+                    Some(&command.node_id),
+                    Some(&command.attempt_id),
+                    None,
+                    event_payload::action_external_handle_reported(&kind, &id),
+                ),
+            };
+            append_batch(
+                &mut state,
+                scope,
+                &command.run_id,
+                now,
+                EventActorKind::ActionProgress,
+                command.attempt_id.as_str().to_owned(),
+                vec![spec],
+            )?;
+            Ok(())
+        })
+    }
+
     async fn timeout_attempt(
         &self,
         scope: &ExecutionScope,

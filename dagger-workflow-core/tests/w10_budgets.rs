@@ -15,7 +15,7 @@
 //! reducers are separate code paths that have drifted before.
 
 use dagger_workflow_core::action::{
-    ActionOutcome, ArtifactOutput, CompatibilityReport, CompletionCredential,
+    ActionOutcome, ArtifactOutput, CompatibilityReport, CompletionCredential, ProgressRecord,
 };
 use dagger_workflow_core::approval::AuthenticatedPrincipal;
 use dagger_workflow_core::artifact::{ObjectStore, VerifiedObjectRef};
@@ -25,7 +25,7 @@ use dagger_workflow_core::definition::{
     TimeoutPolicy, WorkflowDefinition,
 };
 use dagger_workflow_core::engine::TestClock;
-use dagger_workflow_core::event::WorkflowEvent;
+use dagger_workflow_core::event::{EventType, WorkflowEvent};
 use dagger_workflow_core::ids::{
     map_child_id, map_expansion_digest, CostUnits, Digest, Id, MapChildIdentity, NodeInstanceId,
     Timestamp, Version,
@@ -39,6 +39,7 @@ use dagger_workflow_core::store::{
     CompleteAttemptResult, CompletionObjects, CreateDefinition, CreateRun, EventPageRequest,
     ExpandMap, ExpireRunLifetime, OrderedMapItem, PublishRevision, ReleaseRetry,
     ResolveTerminalNode, ResolvedActionSchemas, StartRun, StoreError, WorkflowStore,
+    RecordActionProgress,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -435,6 +436,239 @@ async fn events<S: WorkflowStore>(
         )
         .await
         .unwrap()
+}
+
+async fn report_progress<S: WorkflowStore>(
+    store: &S,
+    fixture: &Fixture,
+    run_id: &str,
+    attempt_id: &str,
+    credential: CompletionCredential,
+    record: ProgressRecord,
+    max_events_per_attempt: u16,
+) -> Result<(), StoreError> {
+    store
+        .record_action_progress(
+            &fixture.scope,
+            RecordActionProgress {
+                completion_credential: credential,
+                run_id: id(run_id),
+                node_id: id("action"),
+                attempt_id: id(attempt_id),
+                record,
+                max_events_per_attempt,
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn action_progress_is_fenced_after_claim_takeover() {
+    async fn body<S: WorkflowStore>(
+        store: &S,
+        objects: &Arc<InMemoryObjectStore<TestClock>>,
+        clock: &Arc<TestClock>,
+        tenant: &str,
+    ) {
+        let fixture = seed_action(store, objects, &format!("progress-fence-{tenant}"), 1, CostUnits(1)).await;
+        store
+            .create_run(
+                &fixture.scope,
+                create_run_command(&fixture, "progress-fence", CostUnits(10), generous_limits()),
+            )
+            .await
+            .unwrap();
+        let first = claim_engine(store, &fixture, "progress-one").await;
+        start(store, &fixture, &first, "progress-fence").await;
+        let credential = credential_of(
+            claim_attempt(
+                store,
+                &fixture,
+                &first,
+                "progress-fence",
+                &id("action"),
+                "progress-attempt-one",
+                &fixture.input,
+            )
+            .await
+            .unwrap(),
+        );
+        clock.advance_ms(20_001).unwrap();
+        claim_engine(store, &fixture, "progress-two").await;
+        assert!(matches!(
+            report_progress(
+                store,
+                &fixture,
+                "progress-fence",
+                "progress-attempt-one",
+                credential,
+                ProgressRecord::Phase { label: "stale".to_owned() },
+                2,
+            )
+            .await,
+            Err(StoreError::AttemptFenced)
+        ));
+    }
+    both_stores!(body);
+}
+
+#[tokio::test]
+async fn action_progress_enforces_the_per_attempt_cap() {
+    async fn body<S: WorkflowStore>(
+        store: &S,
+        objects: &Arc<InMemoryObjectStore<TestClock>>,
+        clock: &Arc<TestClock>,
+        tenant: &str,
+    ) {
+        let fixture = seed_action(store, objects, &format!("progress-cap-{tenant}"), 1, CostUnits(1)).await;
+        store
+            .create_run(
+                &fixture.scope,
+                create_run_command(&fixture, "progress-cap", CostUnits(10), generous_limits()),
+            )
+            .await
+            .unwrap();
+        let claim = claim_engine(store, &fixture, "progress-cap-engine").await;
+        start(store, &fixture, &claim, "progress-cap").await;
+        let credential = credential_of(
+            claim_attempt(
+                store,
+                &fixture,
+                &claim,
+                "progress-cap",
+                &id("action"),
+                "progress-cap-attempt",
+                &fixture.input,
+            )
+            .await
+            .unwrap(),
+        );
+        report_progress(
+            store,
+            &fixture,
+            "progress-cap",
+            "progress-cap-attempt",
+            credential.clone(),
+            ProgressRecord::Checkpoint { object_ref: "checkpoint-1".to_owned() },
+            2,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            report_progress(
+                store,
+                &fixture,
+                "progress-cap",
+                "progress-cap-attempt",
+                credential.clone(),
+                ProgressRecord::Phase { label: "too-fast".to_owned() },
+                2,
+            )
+            .await,
+            Err(StoreError::ProgressRateLimited { .. })
+        ));
+        clock.advance_ms(1_000).unwrap();
+        report_progress(
+            store,
+            &fixture,
+            "progress-cap",
+            "progress-cap-attempt",
+            credential.clone(),
+            ProgressRecord::ExternalHandle { kind: "e2b".to_owned(), id: "sandbox-1".to_owned() },
+            2,
+        )
+        .await
+        .unwrap();
+        clock.advance_ms(1_000).unwrap();
+        assert!(matches!(
+            report_progress(
+                store,
+                &fixture,
+                "progress-cap",
+                "progress-cap-attempt",
+                credential,
+                ProgressRecord::Phase { label: "too-many".to_owned() },
+                2,
+            )
+            .await,
+            Err(StoreError::ProgressEventLimitExceeded { limit: 2 })
+        ));
+        let progress = events(store, &fixture, "progress-cap").await;
+        assert!(progress.iter().any(|event| event.event_type == EventType::ActionCheckpointReported));
+        assert!(progress.iter().any(|event| event.event_type == EventType::ActionExternalHandleReported));
+    }
+    both_stores!(body);
+}
+
+#[tokio::test]
+async fn action_progress_event_limit_terminalizes_the_run() {
+    async fn body<S: WorkflowStore>(
+        store: &S,
+        objects: &Arc<InMemoryObjectStore<TestClock>>,
+        clock: &Arc<TestClock>,
+        tenant: &str,
+    ) {
+        let fixture = seed_action(store, objects, &format!("progress-limit-{tenant}"), 1, CostUnits(1)).await;
+        let mut limits = generous_limits();
+        limits.max_total_events = 16;
+        store
+            .create_run(
+                &fixture.scope,
+                create_run_command(&fixture, "progress-limit", CostUnits(10), limits),
+            )
+            .await
+            .unwrap();
+        let claim = claim_engine(store, &fixture, "progress-limit-engine").await;
+        start(store, &fixture, &claim, "progress-limit").await;
+        let credential = credential_of(
+            claim_attempt(
+                store,
+                &fixture,
+                &claim,
+                "progress-limit",
+                &id("action"),
+                "progress-limit-attempt",
+                &fixture.input,
+            )
+            .await
+            .unwrap(),
+        );
+        report_progress(
+            store,
+            &fixture,
+            "progress-limit",
+            "progress-limit-attempt",
+            credential.clone(),
+            ProgressRecord::Phase { label: "started".to_owned() },
+            64,
+        )
+        .await
+        .unwrap();
+        clock.advance_ms(1_000).unwrap();
+        assert!(matches!(
+            report_progress(
+                store,
+                &fixture,
+                "progress-limit",
+                "progress-limit-attempt",
+                credential,
+                ProgressRecord::Phase { label: "overflow".to_owned() },
+                64,
+            )
+            .await,
+            Err(StoreError::RunLimitApplied { ref code }) if code == "RunEventLimitExceeded"
+        ));
+        assert_eq!(
+            store.get_run(&fixture.scope, &id("progress-limit")).await.unwrap().run.status,
+            RunState::Cancelled
+        );
+        assert!(events(store, &fixture, "progress-limit")
+            .await
+            .iter()
+            .any(|event| event.event_type == EventType::RunCancelled
+                && event.payload["reason_code"] == "RunEventLimitExceeded"));
+    }
+    both_stores!(body);
 }
 
 // ---------------------------------------------------------------------------

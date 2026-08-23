@@ -12,6 +12,8 @@ pub enum EventActorKind {
     Engine,
     /// Credential-authenticated result intake.
     ActionCompletion,
+    /// Action-scoped durable progress writer.
+    ActionProgress,
     /// Authenticated host actor.
     Host,
     /// Engine recovery actor.
@@ -133,6 +135,12 @@ pub enum EventType {
     AttemptMarkedStale,
     /// A10-A17 immutable late observation.
     StaleCompletionObserved,
+    /// P01 action checkpoint reference.
+    ActionCheckpointReported,
+    /// P02 action phase transition.
+    ActionPhaseReported,
+    /// P03 external operation handle announcement.
+    ActionExternalHandleReported,
     /// A02-A09 settlement.
     BudgetSettled,
     /// N27/N60 reservation refusal.

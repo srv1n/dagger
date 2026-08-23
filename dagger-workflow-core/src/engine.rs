@@ -2,7 +2,7 @@
 
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
-    CancellationToken,
+    CancellationToken, ProgressRecord, ProgressReporter,
 };
 use crate::artifact::{
     ArtifactRef, ArtifactRefValue, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject,
@@ -18,8 +18,9 @@ use crate::scope::ExecutionScope;
 use crate::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
     CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
-    MarkCorruptStorage, OrderedMapItem, PageRequest, RecordChoice, RecoverAbandonedAttemptsForRun,
-    ReleaseRetry, RequestApproval, ResolveTerminalNode, ResumeCompatible, StartRun, StoreError,
+    MarkCorruptStorage, OrderedMapItem, PageRequest, RecordActionProgress, RecordChoice,
+    RecoverAbandonedAttemptsForRun, ReleaseRetry, RequestApproval, ResolveTerminalNode,
+    ResumeCompatible, StartRun, StoreError,
     SuspendIncompatible, TimeoutAttempt, WorkflowStore,
 };
 use serde_json::{Map, Value};
@@ -111,6 +112,9 @@ pub enum EngineBuildError {
     /// The configured concurrency is zero.
     #[error("engine concurrency must be positive")]
     InvalidConcurrency,
+    /// The configured action progress cap is zero.
+    #[error("action progress cap must be positive")]
+    InvalidProgressEventCap,
 }
 
 /// Durable workflow scheduler.
@@ -125,6 +129,7 @@ where
     reader: CommittedObjectReader<S, O>,
     registry: Arc<R>,
     config: EngineConfig,
+    max_progress_events_per_attempt: u16,
     permits: Mutex<BTreeMap<ExecutionScope, crate::store::EnginePermit>>,
     supervisor: Arc<AttemptSupervisor>,
 }
@@ -246,9 +251,22 @@ where
             object_store,
             registry,
             config,
+            max_progress_events_per_attempt: 64,
             permits: Mutex::new(BTreeMap::new()),
             supervisor,
         })
+    }
+
+    /// Configures the cap for durable progress events emitted by each attempt.
+    pub fn with_max_progress_events_per_attempt(
+        mut self,
+        max_progress_events_per_attempt: u16,
+    ) -> Result<Self, EngineBuildError> {
+        if max_progress_events_per_attempt == 0 {
+            return Err(EngineBuildError::InvalidProgressEventCap);
+        }
+        self.max_progress_events_per_attempt = max_progress_events_per_attempt;
+        Ok(self)
     }
 
     /// Acquires the singleton scheduler generation for one execution scope.
@@ -830,6 +848,36 @@ where
             .get_attempt(scope, &node.run_id, &attempt_id)
             .await?;
         let source = CancellationSource::new();
+        let progress_store = self.store.clone();
+        let progress_scope = scope.clone();
+        let progress_run_id = node.run_id.clone();
+        let progress_node_id = node.node_instance_id.clone();
+        let progress_attempt_id = attempt_id.clone();
+        let progress_credential = completion_credential.clone();
+        let max_progress_events_per_attempt = self.max_progress_events_per_attempt;
+        let progress_reporter: ProgressReporter = Arc::new(move |record: ProgressRecord| {
+            let store = progress_store.clone();
+            let scope = progress_scope.clone();
+            let run_id = progress_run_id.clone();
+            let node_id = progress_node_id.clone();
+            let attempt_id = progress_attempt_id.clone();
+            let completion_credential = progress_credential.clone();
+            Box::pin(async move {
+                store
+                    .record_action_progress(
+                        &scope,
+                        RecordActionProgress {
+                            completion_credential,
+                            run_id,
+                            node_id,
+                            attempt_id,
+                            record,
+                            max_events_per_attempt: max_progress_events_per_attempt,
+                        },
+                    )
+                    .await
+            })
+        });
         let context = ActionContext::new(
             scope.clone(),
             node.run_id,
@@ -843,6 +891,7 @@ where
             BudgetHandle {
                 declared_max_cost_units: attempt.declared_max_cost,
             },
+            progress_reporter,
         );
         let action = self
             .registry

@@ -2694,6 +2694,10 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
                 .chain(command.objects.diagnostics.iter().map(VerifiedObjectRef::digest))
         )
     );
+    sql_command!(
+        record_action_progress(command: RecordActionProgress) -> ();
+        AuthorityLoad::run(&command.run_id)
+    );
     sql_command!(timeout_attempt(command: TimeoutAttempt) -> NodeAttempt; AuthorityLoad::run(&command.run_id));
     sql_command!(
         recover_abandoned_attempts_for_run(command: RecoverAbandonedAttemptsForRun)
