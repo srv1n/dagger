@@ -1,15 +1,13 @@
 # Reference workflows
 
-These YAML files are workflow-core test fixtures.
+The YAML files in this directory are test fixtures.
 
-- `intel_digest.yaml` covers actions, a Choice, and terminal nodes.
-- `legal_research.yaml` covers the repository legal-research workflow.
+- `intel_digest.yaml` has actions, a Choice, and terminal nodes.
+- `legal_research.yaml` has the legal-research workflow that the integration test runs.
 
 The files contain placeholder action digests. Test code replaces the digests before publication.
 
-Do not use the placeholder digests in a deployed workflow.
-
-Run the fixture checks:
+Do not publish the placeholder values.
 
 ```sh
 cargo test -p dagger-workflow-core --test w1_definition

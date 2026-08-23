@@ -20,7 +20,7 @@ pub enum EventActorKind {
     Clock,
 }
 
-/// The complete closed v0.1 event type set.
+/// The complete closed event type set.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum EventType {
     /// R01 run creation.

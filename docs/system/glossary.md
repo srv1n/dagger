@@ -1,41 +1,39 @@
 ---
 subject: Glossary
 keywords: [terms, definitions, vocabulary]
-part_of: overview
-describes: [src, dagger-workflow-core/src]
+part_of: System overview
+describes: [dagger-workflow-core/src]
 status: canonical
 created: 2026-08-23
-last_verified: "2026-08-23 @ bdd41fa"
-read_when: "You need the meaning of a project term."
-skip_when: "The term is already clear in the owning guide."
+last_verified: 2026-08-23 @ ef3df5d2232f1a7b2365b99287e80f31b7d510ee
+read_when: "You need the meaning of a Dagger term."
+skip_when: "The owning guide already defines the term."
 ---
 
 # Glossary
 
 **Action**: Rust code that receives canonical input and returns one outcome.
 
-**Action pin**: The exact version, schema digests, and compatibility digest for an action.
+**Action pin**: The exact action name, contract version, schema digests, and compatibility digest.
 
-**Artifact reference**: A typed durable reference to immutable object bytes.
+**Artifact reference**: A typed reference to immutable object bytes.
 
-**Canonical JSON**: JSON bytes with one deterministic representation.
+**Canonical JSON**: JSON bytes that have one deterministic representation.
 
-**Control plane**: Durable records that describe workflow state. Object bytes are not control-plane state.
+**Control store**: Storage for workflow state. It does not store object bytes.
 
-**DAG**: A directed graph with no cycle.
+**Engine claim**: The scoped lease that lets one scheduler generation change workflow state.
 
-**Engine claim**: The scoped lease that permits one scheduler generation to change workflow state.
+**Execution scope**: A tenant ID and namespace that isolate durable data.
 
-**Execution scope**: The tenant ID and namespace that isolate workflow-core data.
-
-**Host**: The application that embeds Dagger or workflow core.
+**Host**: The application that embeds Dagger.
 
 **Idempotency key**: A stable key that lets an external action detect a repeated request.
 
-**Object store**: Storage for immutable bytes addressed by a SHA-256 digest.
+**Object store**: Storage for immutable bytes that a SHA-256 digest identifies.
 
-**Revision**: An immutable, validated, and pinned workflow definition.
+**Revision**: An immutable and validated workflow definition with exact pins.
 
-**Run**: One execution of one published revision with immutable input and limits.
+**Run**: One execution of one published revision with fixed input, limits, and budget.
 
-**Tusker**: The repository task and project-knowledge system. It does not execute product code unless a human enables automation.
+**Tusker**: The repository system for tasks, proof, gates, and project knowledge.

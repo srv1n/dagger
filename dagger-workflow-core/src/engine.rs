@@ -1,4 +1,4 @@
-//! Minimal engine construction surface reserved for W3.
+//! Workflow scheduling and lifecycle operations.
 
 use crate::action::{
     ActionContext, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
@@ -110,7 +110,7 @@ pub enum EngineBuildError {
     InvalidConcurrency,
 }
 
-/// Durable workflow scheduler shell implemented by W3.
+/// Durable workflow scheduler.
 #[allow(dead_code)]
 pub struct WorkflowEngine<S, O, R>
 where

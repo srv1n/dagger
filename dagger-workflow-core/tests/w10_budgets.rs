@@ -1,5 +1,5 @@
 #![cfg(feature = "sqlite")]
-//! W10 acceptance specs: RunLimits ceilings, event correlation, and the
+//! Acceptance tests for run-limit ceilings, event correlation, and the
 //! temporary-versus-permanent budget distinction.
 //!
 //! The implemented contract is in `src/run.rs`, `src/budget.rs`,
@@ -86,7 +86,7 @@ struct Fixture {
 ///
 /// The two reducers are independent code paths behind one trait; a ceiling
 /// enforced in only one of them is exactly the partial wiring this file exists
-/// to catch, so no W10 property is accepted from a single store.
+/// to catch, so no property is accepted from a single store.
 macro_rules! both_stores {
     ($body:ident) => {{
         let clock = Arc::new(TestClock::new(CLOCK_ORIGIN));
@@ -252,7 +252,7 @@ async fn seed_action<S: WorkflowStore>(
 }
 
 /// A Map whose children are concurrently claimable. Map children are the only
-/// v0.1 way to hold two live reservations in one run, which is what the
+/// current way to hold two live reservations in one run, which is what the
 /// reservation-pressure branch requires.
 async fn seed_map<S: WorkflowStore>(
     store: &S,

@@ -1,4 +1,4 @@
-//! W11-A integrity propagation and W11-B host boundary acceptance specs.
+//! Acceptance tests for integrity propagation and the host read boundary.
 //!
 //! The implemented contract is in `src/artifact.rs`, `src/committed_read.rs`,
 //! and the store corruption commands. Two properties are proved here:
@@ -70,8 +70,8 @@ enum Fault {
     /// The nth read since arming fails verification; every other read succeeds.
     ///
     /// The corruption is transient on purpose. A caller that discards the first
-    /// proof and reads again observes healthy bytes, which is exactly the
-    /// unrecoverable case erratum 0.1.1 section A.2 forbids.
+    /// proof and reads again observes healthy bytes. The test requires the
+    /// caller to preserve the first proof.
     CorruptOnRead(usize),
 }
 
@@ -337,14 +337,14 @@ async fn create_run<S: WorkflowStore>(
 }
 
 // ---------------------------------------------------------------------------
-// W11-B: host boundary. Erratum 0.1.1 section B.
+// Host read boundary.
 // ---------------------------------------------------------------------------
 
 /// The corruption command is durable before the integrity outcome exists.
 ///
 /// Asserted against the control plane, not against the returned value: at the
 /// first instant the caller can observe `CorruptionApplied`, `get_run` must
-/// already report CorruptStorage. Erratum 0.1.1 sections B.2 and B.3.
+/// already report CorruptStorage.
 #[test]
 fn host_read_commits_corruption_before_reporting_it() {
     block_on(async {
@@ -393,8 +393,7 @@ fn host_read_commits_corruption_before_reporting_it() {
 /// Unavailability mints no proof and mutates nothing at all.
 ///
 /// The whole run entity is compared before and after, so an event append, a
-/// version bump, or a timestamp touch fails this. Erratum 0.1.1 sections A.4
-/// and B.5.
+/// version bump, or a timestamp touch fails this.
 #[test]
 fn host_read_storage_unavailable_leaves_the_run_untouched() {
     block_on(async {
@@ -437,8 +436,7 @@ fn host_read_storage_unavailable_leaves_the_run_untouched() {
 /// A failed corruption command is reported instead of the integrity result.
 ///
 /// Reporting `CorruptionApplied` here would tell the host the run output was
-/// already invalidated while the control plane still says otherwise. Erratum
-/// 0.1.1 section B.2, mark-failure precedence.
+/// already invalidated while the control plane still says otherwise.
 #[test]
 fn mark_failure_takes_precedence_over_the_integrity_result() {
     block_on(async {
@@ -499,7 +497,7 @@ fn mark_failure_takes_precedence_over_the_integrity_result() {
 }
 
 // ---------------------------------------------------------------------------
-// W11-A: integrity propagation through hydration, and the infrastructure-class
+// Integrity propagation through hydration, and the infrastructure-class
 // mark failure. Both need the durable adapter, which is the only implementation
 // that hydrates committed prerequisite objects before opening a transaction.
 // ---------------------------------------------------------------------------
@@ -523,7 +521,7 @@ mod durable {
     ///
     /// The armed digest fails verification once and then reads healthy, so a
     /// re-minted proof is not merely different, it is impossible: a second read
-    /// succeeds. Erratum 0.1.1 sections A.1, A.2 and A.4.
+    /// succeeds.
     #[tokio::test]
     async fn hydration_corruption_delivers_the_first_proof_and_the_exact_ref() {
         let clock = Arc::new(TestClock::new(Timestamp(4_000)));
@@ -582,7 +580,7 @@ mod durable {
     /// same bytes under two different `ArtifactRef`s. Hydration therefore
     /// verifies the digest twice, once per typed use, and the ref it reports is
     /// the use whose own read failed: corrupting the first read and corrupting
-    /// the second read must name different refs. Erratum 0.1.1 section A.2.
+    /// the second read must name different refs.
     #[tokio::test]
     async fn hydration_names_the_typed_use_whose_read_actually_failed() {
         async fn hydrate(
@@ -687,7 +685,7 @@ mod durable {
     /// Unavailable storage during hydration is never corruption.
     ///
     /// It mints no proof, it is not `CommittedObjectCorrupt`, and it authorizes
-    /// no transition. Erratum 0.1.1 sections A.4 and C.1.
+    /// no transition.
     #[tokio::test]
     async fn hydration_storage_unavailability_stays_unavailable() {
         let clock = Arc::new(TestClock::new(Timestamp(6_000)));
@@ -712,7 +710,7 @@ mod durable {
     ///
     /// The natural rejection path is covered on the reference store; this pins
     /// the transaction-failure path, where the command was legal and simply did
-    /// not commit. Erratum 0.1.1 section B.2.
+    /// not commit.
     #[cfg(feature = "conformance")]
     #[tokio::test]
     async fn transaction_failure_on_the_mark_is_not_applied_corruption() {

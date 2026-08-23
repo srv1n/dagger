@@ -1,4 +1,4 @@
-//! Versioned, restartable SQLite schema migrations.
+//! Restartable SQLite schema setup.
 
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
@@ -6,9 +6,7 @@ use crate::store::StoreError;
 
 /// Current durable schema version.
 ///
-/// This pre-release adapter has one coherent baseline. Earlier local W6
-/// migration numbers never represented independently usable schemas and were
-/// deliberately collapsed rather than retained as fictional compatibility.
+/// This adapter has one coherent baseline schema.
 pub const SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (

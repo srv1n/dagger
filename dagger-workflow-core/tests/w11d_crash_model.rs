@@ -1,4 +1,4 @@
-//! W11-D: stateful crash model over the local-filesystem publication protocol.
+//! Stateful crash model for the local file-system publication protocol.
 //!
 //! # What this proves, and what it does not
 //!
@@ -7,8 +7,7 @@
 //! barrier is deleted. This module replaces the real filesystem with a model that tracks
 //! durability, so a deleted barrier becomes a failing test.
 //!
-//! The property under test is the one contract erratum 0.1.1 section C.2 states, not the
-//! "no visible-before-durable window" that section retracts:
+//! The test checks this capability property:
 //!
 //! > No successful publication response and no committable `VerifiedObjectRef` may escape before
 //! > all required durability barriers and post-publication verification have completed.
@@ -23,9 +22,8 @@
 //! persistence rules are an assumption about POSIX filesystems, not a measurement of one; a real
 //! kernel, mount, and device stack can violate them. A process SIGKILL would not close that gap
 //! either -- the page cache and filesystem keep running after the process dies, so unsynced data
-//! can still be written back. Only W11-E (abrupt-crash testing against a block device) qualifies
-//! a named filesystem, and until it exists no filesystem is inside the durability claim
-//! (erratum 0.1.1 section C.3).
+//! can still be written back. Only abrupt-crash testing against a block device can qualify a
+//! named file system. Until that test exists, no named file system is inside the durability claim.
 //!
 //! # Why the negative controls are the deliverable
 //!
@@ -655,7 +653,7 @@ fn open(fs: &ModelFs) -> Result<FsObjectStore<TestClock, ModelFs>, ObjectStoreEr
     FsObjectStore::open_with(ROOT, Arc::new(TestClock::new(Timestamp(1))), fs.clone())
 }
 
-/// A committable reference that reached a caller. Erratum 0.1.1 C.2 binds the store to it.
+/// A committable reference that reached a caller.
 #[derive(Clone, Debug)]
 struct Escaped {
     digest: Digest,
@@ -664,9 +662,9 @@ struct Escaped {
     origin: &'static str,
 }
 
-/// The interleaved reader: a second process that knows the digest and calls `get` while the
-/// publisher is mid-protocol. Erratum 0.1.1 C.2 names this the case a process-local lock cannot
-/// close; `get` must establish the publication barrier itself before minting a reference.
+/// The interleaved reader is a second process that knows the digest and calls `get` while the
+/// publisher is in progress. A process-local lock cannot close this case. `get` must establish
+/// the publication barrier before it mints a reference.
 fn interleaved_reader(fs: &ModelFs, digests: &[Digest], escaped: &Mutex<Vec<Escaped>>) {
     let (crash_at, counting) = {
         let mut model = fs.lock();
@@ -1032,8 +1030,7 @@ fn the_workload_exercises_every_barrier() {
 
 #[test]
 fn no_committable_reference_escapes_before_its_barriers_complete() {
-    // Erratum 0.1.1 section C.2. Every crash point, every permitted persistence outcome, with an
-    // interleaved second-process reader at the crash point.
+    // Check each crash point and each permitted persistence outcome with an interleaved reader.
     let violations = sweep(Policy::HONEST);
     assert!(violations.is_empty(), "{}", summarize(&violations));
 }

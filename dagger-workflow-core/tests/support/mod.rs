@@ -84,7 +84,7 @@ fn repin_action(action: &mut ActionReference, fixtures: &FixtureActions) {
     action.compatible_implementation_requirement = descriptor.implementation_compatibility_digest;
 }
 
-/// Loads the frozen YAML and explicitly replaces only its fixture placeholders with the exact
+/// Loads the reference YAML and explicitly replaces only its fixture placeholders with the exact
 /// contracts advertised by the registered fixture actions. The YAML itself stays immutable.
 pub fn repin_legal_research_reference(fixtures: &FixtureActions) -> PublishableDefinition {
     let path = format!(

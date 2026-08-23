@@ -6,8 +6,8 @@ definition_id: legal_research
 name: Bounded legal research
 description: >
   Bounded legal research with at most two explicitly unrolled search rounds.
-  The frozen v0.1 binding model cannot carry the conditional second-round
-  value through reconvergence; see the companion README friction log.
+  The binding rules cannot carry the conditional second-round value through
+  reconvergence.
 run_input_schema_digest: sha256:1077010822d9814e1013a656eb384b9cd6eb4ad82b83f236d55c436b2c9d8668
 run_output_schema_digest: sha256:53b429dc06ae3d59c1d5a42007d25d0bb1fecb7066244fbe83f97710f2b53088
 entry_node_id: generate_initial_queries
@@ -249,7 +249,7 @@ nodes:
       - target: /second_round_binding_status
         source:
           kind: constant
-          value: unavailable_after_choice_reconvergence_in_v0_1
+          value: unavailable_after_choice_reconvergence
     retry:
       max_attempts: 2
       backoff:

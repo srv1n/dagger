@@ -85,7 +85,7 @@ impl EnginePermit {
 pub struct EngineClaim {
     /// Claim scope.
     pub scope: ExecutionScope,
-    /// Fixed v0.1 control-plane ID.
+    /// Fixed control-plane ID.
     pub control_plane_id: String,
     /// Current engine label.
     pub instance_id: Id,

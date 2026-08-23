@@ -451,7 +451,7 @@ async fn data_with_a_malformed_sidecar_is_unavailable_and_mints_no_proof() {
             assert_eq!(fs::read(&object).unwrap(), b"must stay incomplete");
         }
 
-        // A present-but-malformed sidecar is not authoritative absence. The v0.1 proof
+        // A present-but-malformed sidecar is not authoritative absence. The proof
         // vocabulary is closed, so unreadable metadata gets no proof at all rather than
         // being misreported as Missing and invalidating a succeeded run.
         assert!(matches!(

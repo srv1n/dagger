@@ -193,7 +193,7 @@ pub struct ActionInvocation {
     pub scope: ExecutionScope,
     /// Owning run ID.
     pub run_id: Id,
-    /// Invocation ID, equal to attempt ID in v0.1.
+    /// Invocation ID, equal to the attempt ID.
     pub invocation_id: Id,
     /// Owning node instance.
     pub node_instance_id: NodeInstanceId,

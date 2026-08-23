@@ -611,7 +611,7 @@ pub struct PublicationSchemaDocument {
 
 /// External facts required to turn a locally valid definition into a revision.
 ///
-/// W3/W6 provide durable implementations; tests and authoring tools may use an
+/// Store implementations provide durable resolution; tests and authoring tools may use an
 /// in-memory resolver. No external lookup is performed during stage 1.
 pub trait PublicationResolver {
     /// Resolves a durable supported-subset schema document by its exact digest.
@@ -995,7 +995,7 @@ pub fn normalize_definition(
             &["shorten description"],
         ));
     }
-    // Serde applies both v0.1 defaults; assigning explicitly documents the invariant.
+    // Serde applies both format defaults; assigning explicitly documents the invariant.
     if definition.description.is_empty() {
         definition.description = String::new();
     }

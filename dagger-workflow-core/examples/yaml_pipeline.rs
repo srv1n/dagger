@@ -829,8 +829,8 @@ async fn main() -> DemoResult<()> {
     let nodes = all_nodes(&store, &scope, &run_id).await?;
     let labels = labels_for(&nodes);
     println!(
-        "    {:<16} {:<8} {:<10} {}",
-        "node", "kind", "status", "result digest"
+        "    {:<16} {:<8} {:<10} result digest",
+        "node", "kind", "status"
     );
     for node in &nodes {
         println!(

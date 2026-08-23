@@ -21,12 +21,9 @@ const NONCE_BYTES: usize = 32;
 
 /// The filesystem operations the durable publication protocol performs.
 ///
-/// This exists as a seam because fsync is not observable through `std::fs`: no assertion made
-/// over a real filesystem can fail when a durability barrier is deleted. Contract erratum 0.1.1
-/// section C.2 states the binding property as a capability property -- no committable
-/// `VerifiedObjectRef` may escape before its barriers complete -- and only a model filesystem
-/// that tracks durability separately from namespace visibility can witness it. W11-D
-/// (`tests/w11d_crash_model.rs`) implements that model over this trait.
+/// This seam makes sync barriers observable in tests. A real file-system test cannot detect a
+/// deleted barrier through `std::fs`. The crash-model test tracks durability separately from
+/// namespace visibility and runs the model through this trait.
 ///
 /// The seam covers exactly what the store calls and nothing else; it is not a virtual
 /// filesystem. Entropy (`/dev/urandom`) is deliberately outside it: nonces are identity, not
@@ -65,7 +62,7 @@ pub trait StoreFs: Send + Sync {
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 }
 
-/// The real local filesystem, and the only backend inside the durability claim (erratum C.3).
+/// The real local file system, and the only backend inside the durability claim.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdFs;
 
@@ -752,7 +749,7 @@ fn create_directory_component(
 /// Reads the media sidecar, distinguishing its lookup phase from its read and decode phase.
 ///
 /// Only an absent sidecar is authoritative absence. A sidecar that is present but empty,
-/// oversized, or not UTF-8 is malformed metadata: the v0.1 proof vocabulary is closed and has
+/// oversized, or not UTF-8 is malformed metadata: the proof vocabulary is closed and has
 /// no class for it, so it is reported as an incomplete read rather than squeezed into
 /// `Missing`.
 fn read_media_type(fs: &impl StoreFs, path: &Path) -> Result<String, ReadFailure> {

@@ -1,79 +1,78 @@
 ---
-subject: Workflow core
-keywords: [bounded engine, scheduler, actions, state]
-part_of: overview
-describes: [dagger-workflow-core/src, dagger-workflow-core/examples, dagger-workflow-core/tests]
+subject: Workflow engine
+keywords: [engine, scheduler, actions, state]
+part_of: System overview
+describes: [dagger-workflow-core/src/engine.rs, dagger-workflow-core/src/action, dagger-workflow-core/src/run.rs, dagger-workflow-core/src/store.rs]
 status: canonical
 created: 2026-08-23
-last_verified: "2026-08-23 @ bdd41fa"
-read_when: "You build or review dagger-workflow-core."
-skip_when: "You work on the root dagger package."
+last_verified: 2026-08-23 @ ef3df5d2232f1a7b2365b99287e80f31b7d510ee
+read_when: "You build or review the Dagger engine."
+skip_when: "You only need commands; read Getting started."
 ---
 
-# Workflow core
+# Workflow engine
 
-Workflow core executes a published workflow revision. It keeps data for each customer separate.
+The Dagger engine executes one published workflow revision.
 
-The code calls this boundary an `ExecutionScope`. It contains a tenant ID and a namespace. The store uses the scope with each durable ID.
+The main Rust type is `WorkflowEngine`. The revision type is `WorkflowRevision`.
 
-## Main flow
+Each durable key belongs to one `ExecutionScope`. A scope contains a tenant ID and a namespace.
 
-1. Parse a JSON or YAML definition.
-2. Validate the graph and all fields.
-3. Resolve schemas and action pins.
-4. Publish an immutable revision.
-5. Put the run input in the object store.
-6. Create the run and its static nodes.
-7. Acquire the engine claim for the scope.
-8. Start the run.
-9. Call `tick` until the run stops or waits.
-10. Read the final output through the committed-object reader.
+## Run lifecycle
 
-The examples contain complete host code. Start with `dagger-workflow-core/examples/yaml_pipeline.rs`.
+1. The host creates `WorkflowEngine` with a store, an object store, and an action registry.
+2. The host gets the scheduler claim for one scope.
+3. The host creates a run with immutable input, limits, and budget.
+4. `start` checks the exact action pins and starts the run.
+5. `tick` performs maintenance and advances ready nodes.
+6. `run_until_idle` calls `tick` until one pass makes no change.
+7. The host reads committed output through `CommittedObjectReader`.
+
+`EngineConfig.max_concurrency` limits action calls in one process. It must be greater than zero.
 
 ## Node types
 
 | Node | Behavior |
 | --- | --- |
-| `Action` | Calls a registered implementation. |
-| `Map` | Creates a bounded action child for each array item. |
+| `Action` | Calls one registered action. |
+| `Map` | Creates one bounded action child for each array item. |
 | `Choice` | Selects the first matching case or the required default. |
-| `Approval` | Waits for an authorized decision or an expiry result. |
-| `Succeed` | Commits the one root output. |
+| `Approval` | Waits for an allowed decision or an expiry result. |
+| `Succeed` | Commits the root output. |
 | `Fail` | Commits an explicit domain failure. |
 
-A definition must have exactly one reachable `Succeed` node. It can have more than one `Fail` node.
+A valid definition has exactly one reachable `Succeed` node. It can have more than one `Fail` node.
 
 ## Action contract
 
-An action supplies an `ActionDescriptor`. The descriptor contains its name, contract version, input schema digest, output schema digest, and implementation compatibility digest.
+An `ActionDescriptor` contains these exact pins:
 
-The engine builds canonical input bytes. The action returns one `ActionOutcome`.
+- Action name.
+- Contract version.
+- Input schema digest.
+- Output schema digest.
+- Implementation compatibility digest.
 
-An outcome can succeed, fail for a retryable reason, fail permanently, or report a contract failure. A successful outcome can include artifacts, cost, and diagnostics.
+The engine gives canonical input bytes to `WorkflowAction`.
 
-The engine checks the output before it commits the result.
+The action returns `Success`, `Retryable`, or `Permanent`. A success result can include output, artifacts, cost, and diagnostics.
 
-## Engine claim
+The engine checks size, digest, deadline, registration, and action pins before it commits a result.
 
-One live engine generation owns one scope. `acquire_scope` gets the claim. `heartbeat_scope` renews it. `release_scope` gives it up.
+## Scheduler claim and recovery
 
-The claim prevents two scheduler generations from changing the same scope at the same time.
+Each scope has one live engine claim. The claim and completion credentials fence an old generation. One engine process can hold claims for more than one scope.
 
-## Recovery
+After takeover, the engine finds attempts from an older generation. It marks their outcome as unknown. It then applies the retry rule. It does not treat an unknown action call as success.
 
-The store records attempts, retries, deadlines, approvals, events, and command receipts.
-
-After a takeover, the engine recovers lower-generation attempts. It does not treat an unknown action outcome as success.
-
-The action receives an idempotency key and a completion credential. A late completion must pass the completion fence.
+The action gets a retry-stable idempotency key. An external action can use this key to detect a repeated request.
 
 ## Host duties
 
-The host must supply authenticated principals for approval decisions.
+The host supplies authenticated principals for approval decisions.
 
-The host must keep action pins available for active runs. The engine blocks an incompatible run instead of selecting a different implementation.
+The host keeps pinned action implementations available for active runs. Dagger blocks an incompatible run. It does not select a different implementation.
 
-The host must set run limits and a budget before it creates a run.
+The host sets every run limit and the run budget.
 
-The host must not put raw secrets in workflow definitions, action input, diagnostics, or events.
+The host keeps secrets outside definitions, action input, diagnostics, events, and ordinary artifacts. Dagger does not provide a secret store.

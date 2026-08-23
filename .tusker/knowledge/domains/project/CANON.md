@@ -6,7 +6,7 @@ project: "dagger"
 domain: "project"
 title: "Project Canon"
 status: "current"
-summary: "Current durable truth for the Dagger workspace."
+summary: "Current durable truth for the Dagger workflow engine."
 capsule:
   skip_when: "Skip when you only need Tusker task state or proof."
   use_when: "Use before you change behavior, public APIs, storage, or documentation."
@@ -22,34 +22,33 @@ state_rev: "sha256:c1a60856211def47c9cb7661f2d6b8ce70131370365638dfa7aab8bf22b7c
 
 ## Current truth
 
-- Dagger is one Rust workspace with two separate workflow engines.
-- The root `dagger` package owns DAG Flow, Task Agent, Pub/Sub, and Work Queue.
-- `dagger-workflow-core` owns the bounded workflow engine.
-- The two engines do not share a runtime or data model.
+- Dagger has one Cargo package: `dagger-workflow-core`.
+- This package is the canonical workflow engine.
+- `dagger-workflow-core/src/lib.rs` defines the public module surface.
+- `dagger-workflow-core/schema/workflow-definition-0.1.json` defines the current workflow input shape.
+- The format value `0.1` is a data contract. It is not a Dagger product generation.
 - `docs/system/00-overview.md` is the human documentation entry point.
-- Tusker owns repository task records. Tusker automation is off by default.
+- Tusker owns task records, proof, gates, and project knowledge.
+- Tusker automation is off unless a human enables it.
 
-## Stable interfaces
+## Engine boundary
 
-- Root public exports come from `src/lib.rs`.
-- Workflow-core public modules come from `dagger-workflow-core/src/lib.rs`.
-- Workflow definition format `0.1` uses `dagger-workflow-core/schema/workflow-definition-0.1.json`.
-- CI runs format, Clippy, workspace tests, doc tests, and Rust documentation.
+- `WorkflowEngine` changes workflow state through `WorkflowStore` commands.
+- `ActionRegistry` owns executable action implementations and exact pins.
+- `WorkflowStore` owns control state.
+- `ObjectStore` owns immutable bytes.
+- `ExecutionScope` isolates every tenant and namespace.
+- The host owns identity, secrets, process startup, and deployment policy.
 
-## Constraints
+## Storage boundary
 
-- Select the target engine before you change code.
-- Do not claim that workflow core replaces the root runtime.
-- Keep each workflow-core durable key inside one tenant and namespace scope.
-- Keep secrets outside definitions, events, diagnostics, and ordinary artifacts.
-- Use Simplified Technical English in human documentation.
+- `InMemoryStore` and `InMemoryObjectStore` are process-local.
+- `SqliteWorkflowStore` is the optional durable control store.
+- `FsObjectStore` is the local file-system object store.
+- The repository has no cloud object-store backend and no distributed control store.
+
+## Required checks
+
+- Run format, Clippy, workspace tests, doc tests, and Rust documentation checks after a code change.
 - Run `tusker docs map` and `tusker validate --vault ./.tusker --json` after a documentation change.
-
-## Deprecated or stale
-
-- The deleted architecture plans and status reviews are available only in Git history.
-
-## Open questions
-
-- The Cargo manifests do not contain complete publishing and license metadata.
-- The repository does not contain a migration adapter between the two engines.
+- Use Simplified Technical English in human documentation.

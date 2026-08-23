@@ -1,28 +1,37 @@
 ---
 subject: Workflow definitions
 keywords: [yaml, json, schema, nodes, bindings]
-part_of: Workflow core
+part_of: Workflow engine
 describes: [dagger-workflow-core/src/definition, dagger-workflow-core/schema, docs/reference_workflows]
 status: canonical
 created: 2026-08-23
-last_verified: "2026-08-23 @ bdd41fa"
-read_when: "You write or validate a workflow-core definition."
-skip_when: "You need scheduler state; read Workflow core."
+last_verified: 2026-08-23 @ ef3df5d2232f1a7b2365b99287e80f31b7d510ee
+read_when: "You write or validate a Dagger definition."
+skip_when: "You need scheduler state; read Workflow engine."
 ---
 
 # Workflow definitions
 
-Workflow core accepts JSON and YAML. Both formats describe the same workflow data.
+Dagger accepts JSON and YAML. Both inputs create the same workflow data.
 
-The code stores the data in the `WorkflowDefinition` type.
+The Rust type is `WorkflowDefinition`.
 
-The format version is `0.1`.
+The required `definition_format_version` value is `0.1`. This value identifies the data format. It is not a Dagger product generation.
 
 The machine-readable schema is `dagger-workflow-core/schema/workflow-definition-0.1.json`.
 
-## Required root fields
+## Publication stages
 
-A definition contains these fields:
+Publication has two stages.
+
+1. `validate_definition` checks syntax, IDs, fields, limits, graph edges, reachability, bindings, and terminal paths.
+2. `resolve_publication` resolves exact schemas, literal artifacts, and action pins. The host then calls `WorkflowStore::publish_revision` with the immutable revision.
+
+Parsing a file is not publication. The host must supply the resolver data for stage 2.
+
+## Root fields
+
+A definition has these root fields:
 
 - `definition_format_version`.
 - `definition_id`.
@@ -33,9 +42,21 @@ A definition contains these fields:
 - `entry_node_id`.
 - `nodes`.
 
-The parser rejects an unknown structural field. The semantic validator also checks graph rules that JSON Schema cannot check.
+The parser rejects unknown structural fields and duplicate keys. The YAML parser also rejects merge keys and more than one document.
 
-## Bind data
+## Graph rules
+
+The validator requires these rules:
+
+- Node IDs are unique.
+- Each edge names an existing node.
+- The graph has no cycle.
+- Each required node is reachable from the entry node.
+- Exactly one reachable node is `Succeed`.
+- Every reachable path ends at `Succeed` or `Fail`.
+- A binding can read only allowed upstream data.
+
+## Bindings
 
 An ordinary binding can read from these sources:
 
@@ -46,57 +67,34 @@ An ordinary binding can read from these sources:
 
 A Map child can also read the current item and its zero-based index.
 
-Use RFC 6901 JSON pointers. The validator rejects overlapping target pointers and invalid upstream references.
+Bindings use RFC 6901 JSON pointers. The validator rejects overlapping target pointers.
 
-## Pin actions
+## Definition limits
 
-Each `Action` and `Map` action has five pin fields. The engine requires an exact match before it starts or resumes work.
+| Item | Enforced limit |
+| --- | --- |
+| Canonical definition bytes | At most 4 MiB. |
+| Nodes | At most 1,024. |
+| Map items | At most 10,000. |
+| Map concurrency | At most 1,024 and not more than the item count. |
+| Choice cases | At most 100. |
+| Approval allowlist entries | At most 256 principal IDs and 256 role IDs. |
+| `retry.max_attempts` | From 1 through 100. |
+| Action timeout | From 1 ms through 86,400,000 ms. |
 
-The example YAML files contain zero digests as authoring placeholders. Example code replaces them before publication. Do not use zero digests in a deployed definition.
+The parser also limits YAML depth, aliases, anchors, scalar bytes, events, and expansions. See the constants in `dagger-workflow-core/src/definition/mod.rs` for the exact parser ceilings.
 
-## Minimal shape
+## Action pins
 
-```yaml
-definition_format_version: "0.1"
-definition_id: sample
-name: Sample
-run_input_schema_digest: sha256:<64 lowercase hex characters>
-run_output_schema_digest: sha256:<64 lowercase hex characters>
-entry_node_id: work
-nodes:
-  - id: work
-    kind: Action
-    action:
-      name: sample.work
-      contract_version: "1"
-      input_schema_digest: sha256:<64 lowercase hex characters>
-      output_schema_digest: sha256:<64 lowercase hex characters>
-      compatible_implementation_requirement: sha256:<64 lowercase hex characters>
-    bindings: []
-    retry:
-      max_attempts: 1
-      backoff:
-        kind: fixed
-        delay_ms: 0
-    timeout:
-      timeout_ms: 10000
-    declared_max_cost_units: "1"
-    next: [done]
-  - id: done
-    kind: Succeed
-    output:
-      kind: node_output
-      node_id: work
-      pointer: ""
-```
+Each `Action` and Map action has five exact pin fields. The engine requires an exact registry match before it starts or resumes the run.
 
-Replace each placeholder digest with a real SHA-256 digest before publication.
+The example YAML files use zero digests as authoring placeholders. Example code replaces these values before publication. Do not publish a definition with placeholder digests.
 
 ## Reference definitions
 
-Use these files as parser and validation fixtures:
+Tests load these files:
 
 - `docs/reference_workflows/intel_digest.yaml`.
 - `docs/reference_workflows/legal_research.yaml`.
 
-These files are test inputs. Do not change them as prose-only edits.
+Treat these files as executable fixtures. Run their tests after a change.

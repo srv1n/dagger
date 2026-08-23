@@ -36,3 +36,6 @@ CLAUDE.md
 
 # ChatGPT handoff code bundles
 artifacts/
+
+# Tusker generated local state
+.tusker/_system/

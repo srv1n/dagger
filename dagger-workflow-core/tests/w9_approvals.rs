@@ -1,5 +1,5 @@
 #![cfg(feature = "sqlite")]
-//! W9 acceptance specs: durable approval gates.
+//! Acceptance tests for durable approval gates.
 //!
 //! The implemented contract is in `src/approval.rs`, `src/run.rs`, and the
 //! `WorkflowStore` approval commands. The host rules are in
@@ -884,7 +884,7 @@ async fn approved_output_is_the_exact_canonical_envelope() {
 ///
 /// This one property cannot use `both_stores!`, because the two stores keep
 /// time differently and the difference is exactly what the fixture measures.
-/// The in-memory reducer reads a frozen `TestClock`, so the boundary can be
+/// The in-memory reducer reads a fixed `TestClock`, so the boundary can be
 /// probed at one millisecond -- tight enough to catch a `>` written where
 /// the rule is `DB-now >= expires_at`. The SQLite store's authoritative
 /// time is real Unix time plus a durable offset column, so a one-millisecond

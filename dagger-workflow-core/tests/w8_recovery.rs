@@ -1,9 +1,8 @@
 #![cfg(feature = "sqlite")]
 
-//! W8 crash-recovery fixtures. Every fixture kills the process seam the same way the plan
-//! requires: the SQLite pool is closed and dropped, the object store handle is dropped, and
-//! everything after the kill runs against a FRESH store instance (and, where the scheduler is
-//! involved, a fresh `WorkflowEngine`) opened on the same durable files. Nothing survives in
+//! Crash-recovery fixtures. Each fixture closes and drops the SQLite pool and the object-store
+//! handle. Everything after the stop uses a fresh store instance. Scheduler tests also use a
+//! fresh `WorkflowEngine` on the same durable files. Nothing survives in
 //! process memory, so every post-crash assertion is a statement about the ledger.
 //!
 //!
@@ -714,7 +713,7 @@ async fn a_kill_between_object_put_and_commit_reuses_the_versioned_idempotency_k
     )
     .await;
     // The action's output object is durably published; the SQLite commit that would reference it
-    // never happens. This is the exact W7 commit-order window.
+    // never happens. This is the exact commit-order window.
     let orphan = deployment
         .put(&started.objects, &json!({"value": 4242}))
         .await;

@@ -2,12 +2,21 @@
 name = "dagger-workflow-core"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.82"
 
 [features]
 default = []
 conformance = []
 sqlite = ["dep:sqlx"]
+
+[lints.clippy]
+if_same_then_else = "allow"
+large_enum_variant = "allow"
+needless_borrow = "allow"
+needless_return = "allow"
+result_large_err = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
 
 [dependencies]
 serde = { version = "1.0.197", features = ["derive"] }

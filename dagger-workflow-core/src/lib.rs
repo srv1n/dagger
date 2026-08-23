@@ -1,6 +1,6 @@
-//! Public specification skeleton for the frozen dagger workflow core v0.1 contract.
+//! Public API for the Dagger workflow engine.
 //!
-//! This crate owns the shared API that W1 and W2 implement against.
+//! This crate owns workflow definitions, execution, state, and storage boundaries.
 
 #![deny(missing_docs)]
 #![allow(async_fn_in_trait)]

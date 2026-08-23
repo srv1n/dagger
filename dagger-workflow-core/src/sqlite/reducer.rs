@@ -1120,9 +1120,9 @@ fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
                     .any(|name| !object.contains_key(name))
             })
             || object.iter().any(|(name, field)| {
-                properties.get(name).map_or(true, |field_schema| {
-                    !schema_accepts(root, field_schema, field)
-                })
+                properties
+                    .get(name)
+                    .is_none_or(|field_schema| !schema_accepts(root, field_schema, field))
             })
         {
             return false;
@@ -2104,7 +2104,7 @@ fn frontier_reduce(
         let edge = state.edges.get_mut(key).expect("key captured");
         if edge.from_node_id == *source_node && edge.state == EdgeState::Dormant {
             frontier_changed = true;
-            let selected = selected_edge.map_or(true, |selected| selected == &edge.edge_id);
+            let selected = selected_edge.is_none_or(|selected| selected == &edge.edge_id);
             edge.state = if selected {
                 EdgeState::Satisfied
             } else {

@@ -2481,7 +2481,7 @@ async fn revision_definition_id_mismatch_rejected<A: ConformanceAdapter>(
 /// Section 1.5 fixes the ranking algorithm and makes the persisted rank the
 /// recovery-order key read by sections 3.4 and 4. A host-chosen rank would make
 /// deterministic bulk recovery ordering host-dependent, which is precisely the
-/// property the W8 recovery fixtures certify.
+/// property that the recovery fixtures certify.
 async fn revision_topological_ranks_mismatch_rejected<A: ConformanceAdapter>(
     adapter: &A,
     scope: &ExecutionScope,
