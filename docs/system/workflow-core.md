@@ -90,6 +90,10 @@ errors; nothing is silently dropped. A report is accepted only while its credent
 Started, active, and owned by the current engine generation. Event-cap exhaustion follows the
 normal `RunEventLimitExceeded` terminalization path.
 
+Each store applies rate limiting and attempt fencing with its authoritative clock. `InMemoryStore`
+uses its injected `Clock`. `SqliteWorkflowStore` uses SQLite time inside the command transaction,
+including the durable test offset, so every process observes one clock for leases and progress.
+
 ## Scheduler claim and recovery
 
 Each scope has one live engine claim. The claim and completion credentials fence an old generation. One engine process can hold claims for more than one scope.

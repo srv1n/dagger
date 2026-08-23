@@ -1968,6 +1968,12 @@ fn append_batch(
             .ok_or(StoreError::ArithmeticOverflow)?
     };
     if required > run.limits.max_total_events {
+        // The transaction discards this staged mutation after using it to identify
+        // which run must consume its reserved terminal event.
+        set_run_mutated(
+            state.runs.get_mut(&run_key).ok_or(StoreError::NotFound)?,
+            now,
+        )?;
         return Err(StoreError::RunLimitApplied {
             code: "RunEventLimitExceeded".to_owned(),
         });

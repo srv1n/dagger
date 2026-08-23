@@ -566,7 +566,7 @@ async fn pool_injection_preserves_host_tables_and_applies_schema() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(table_count, 34);
+    assert_eq!(table_count, 36);
 }
 
 #[tokio::test]
@@ -589,7 +589,7 @@ async fn standalone_open_reopens_a_converged_migration() {
     .fetch_all(reopened.pool())
     .await
     .unwrap();
-    assert_eq!(versions, vec![1]);
+    assert_eq!(versions, vec![1, 2]);
 }
 
 #[tokio::test]

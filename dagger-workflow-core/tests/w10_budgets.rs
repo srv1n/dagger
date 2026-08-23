@@ -104,6 +104,49 @@ macro_rules! both_stores {
     }};
 }
 
+/// Runs a clock-sensitive fixture against each store's authoritative clock.
+macro_rules! both_timed_stores {
+    ($body:ident) => {{
+        let clock = Arc::new(TestClock::new(CLOCK_ORIGIN));
+        let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+        let store = InMemoryStore::new(clock.clone());
+        {
+            let ticker = clock.clone();
+            $body(
+                &store,
+                &objects,
+                move |ms| {
+                    let ticker = ticker.clone();
+                    async move {
+                        ticker.advance_ms(ms).unwrap();
+                    }
+                },
+                "memory",
+            )
+            .await;
+        }
+
+        let clock = Arc::new(TestClock::new(CLOCK_ORIGIN));
+        let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+        let store =
+            SqliteWorkflowStore::open_url("sqlite::memory:", clock.clone(), objects.clone())
+                .await
+                .unwrap();
+        {
+            let ticker = &store;
+            $body(
+                &store,
+                &objects,
+                move |ms| async move {
+                    ticker.advance_database_clock_ms(ms).await.unwrap();
+                },
+                "sqlite",
+            )
+            .await;
+        }
+    }};
+}
+
 async fn publish<S: WorkflowStore>(
     store: &S,
     objects: &Arc<InMemoryObjectStore<TestClock>>,
@@ -463,12 +506,16 @@ async fn report_progress<S: WorkflowStore>(
 
 #[tokio::test]
 async fn action_progress_is_fenced_after_claim_takeover() {
-    async fn body<S: WorkflowStore>(
+    async fn body<S, A, F>(
         store: &S,
         objects: &Arc<InMemoryObjectStore<TestClock>>,
-        clock: &Arc<TestClock>,
+        advance: A,
         tenant: &str,
-    ) {
+    ) where
+        S: WorkflowStore,
+        A: Fn(i64) -> F,
+        F: std::future::Future<Output = ()>,
+    {
         let fixture = seed_action(
             store,
             objects,
@@ -499,7 +546,7 @@ async fn action_progress_is_fenced_after_claim_takeover() {
             .await
             .unwrap(),
         );
-        clock.advance_ms(20_001).unwrap();
+        advance(20_001).await;
         claim_engine(store, &fixture, "progress-two").await;
         assert!(matches!(
             report_progress(
@@ -517,17 +564,21 @@ async fn action_progress_is_fenced_after_claim_takeover() {
             Err(StoreError::AttemptFenced)
         ));
     }
-    both_stores!(body);
+    both_timed_stores!(body);
 }
 
 #[tokio::test]
 async fn action_progress_enforces_the_per_attempt_cap() {
-    async fn body<S: WorkflowStore>(
+    async fn body<S, A, F>(
         store: &S,
         objects: &Arc<InMemoryObjectStore<TestClock>>,
-        clock: &Arc<TestClock>,
+        advance: A,
         tenant: &str,
-    ) {
+    ) where
+        S: WorkflowStore,
+        A: Fn(i64) -> F,
+        F: std::future::Future<Output = ()>,
+    {
         let fixture = seed_action(
             store,
             objects,
@@ -586,7 +637,7 @@ async fn action_progress_enforces_the_per_attempt_cap() {
             .await,
             Err(StoreError::ProgressRateLimited { .. })
         ));
-        clock.advance_ms(1_000).unwrap();
+        advance(1_000).await;
         report_progress(
             store,
             &fixture,
@@ -601,7 +652,7 @@ async fn action_progress_enforces_the_per_attempt_cap() {
         )
         .await
         .unwrap();
-        clock.advance_ms(1_000).unwrap();
+        advance(1_000).await;
         assert!(matches!(
             report_progress(
                 store,
@@ -625,17 +676,21 @@ async fn action_progress_enforces_the_per_attempt_cap() {
             .iter()
             .any(|event| event.event_type == EventType::ActionExternalHandleReported));
     }
-    both_stores!(body);
+    both_timed_stores!(body);
 }
 
 #[tokio::test]
 async fn action_progress_event_limit_terminalizes_the_run() {
-    async fn body<S: WorkflowStore>(
+    async fn body<S, A, F>(
         store: &S,
         objects: &Arc<InMemoryObjectStore<TestClock>>,
-        clock: &Arc<TestClock>,
+        advance: A,
         tenant: &str,
-    ) {
+    ) where
+        S: WorkflowStore,
+        A: Fn(i64) -> F,
+        F: std::future::Future<Output = ()>,
+    {
         let fixture = seed_action(
             store,
             objects,
@@ -681,7 +736,7 @@ async fn action_progress_event_limit_terminalizes_the_run() {
         )
         .await
         .unwrap();
-        clock.advance_ms(1_000).unwrap();
+        advance(1_000).await;
         assert!(matches!(
             report_progress(
                 store,
@@ -702,7 +757,8 @@ async fn action_progress_event_limit_terminalizes_the_run() {
                 .unwrap()
                 .run
                 .status,
-            RunState::Cancelled
+            RunState::Cancelled,
+            "{tenant}"
         );
         assert!(events(store, &fixture, "progress-limit")
             .await
@@ -710,7 +766,7 @@ async fn action_progress_event_limit_terminalizes_the_run() {
             .any(|event| event.event_type == EventType::RunCancelled
                 && event.payload["reason_code"] == "RunEventLimitExceeded"));
     }
-    both_stores!(body);
+    both_timed_stores!(body);
 }
 
 // ---------------------------------------------------------------------------
