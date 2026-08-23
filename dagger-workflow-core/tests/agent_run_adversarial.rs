@@ -23,14 +23,13 @@ use dagger_workflow_core::sqlite::SqliteWorkflowStore;
 use dagger_workflow_core::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
     CompletionObjects, CreateDefinition, CreateRun, ExpectedGateVersion, PublishRevision,
-    RecoverAbandonedAttemptsForRun, ReleaseRetry, ResolvedActionSchemas, StartRun, StoreError,
-    WorkflowStore,
+    RecoverAbandonedAttemptsForRun, RegisterExternalHandle, ReleaseRetry, ResolvedActionSchemas,
+    StartRun, StoreError, WorkflowStore,
 };
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
@@ -991,6 +990,11 @@ async fn stale_completion_is_fenced_after_takeover() {
         } => completion_credential,
         _ => panic!("first attempt was not claimed"),
     };
+    let stale_key = store
+        .get_attempt(&execution_scope, &id("run-fence"), &id("attempt-one"))
+        .await
+        .unwrap()
+        .idempotency_key;
     store
         .advance_database_clock_ms(CLAIM_LIFETIME_MS + 1)
         .await
@@ -999,6 +1003,24 @@ async fn stale_completion_is_fenced_after_takeover() {
         .acquire_engine_claim(&execution_scope, id("fence-two"))
         .await
         .unwrap();
+    assert!(matches!(
+        store
+            .register_external_handle(
+                &execution_scope,
+                RegisterExternalHandle {
+                    completion_credential: stale.clone(),
+                    run_id: id("run-fence"),
+                    node_id: id("work"),
+                    attempt_id: id("attempt-one"),
+                    idempotency_key: stale_key,
+                    kind: "marker".to_owned(),
+                    external_id: "sandbox-stale".to_owned(),
+                    metadata: json!({}),
+                },
+            )
+            .await,
+        Err(StoreError::AttemptFenced)
+    ));
     let pre_recovery = store
         .complete_attempt(
             &execution_scope,
@@ -1119,11 +1141,22 @@ async fn stale_completion_is_fenced_after_takeover() {
     eprintln!("STALE_COMPLETION_FENCE result=StaleRecorded active_attempt=attempt-two");
 }
 
-#[derive(Default)]
 struct MarkerLog {
-    entries: Mutex<Vec<(String, String)>>,
+    entries: Mutex<Vec<(String, String, String)>>,
     first_started: AtomicBool,
-    gate: (Mutex<bool>, Condvar),
+    reattached: AtomicUsize,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for MarkerLog {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            first_started: AtomicBool::new(false),
+            reattached: AtomicUsize::new(0),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
 }
 
 struct MarkerAction {
@@ -1145,26 +1178,41 @@ impl WorkflowAction for MarkerAction {
         let attempt = context.attempt_id.as_str().to_owned();
         let log = self.log.clone();
         Box::pin(async move {
-            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-            if let Err(error) = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&marker)
+            let handle = match context
+                .lookup_external_handle()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|handle| handle.kind == "marker")
             {
-                assert_eq!(
-                    error.kind(),
-                    ErrorKind::AlreadyExists,
-                    "marker write failed: {error}"
-                );
-            }
-            log.entries.lock().unwrap().push((key, attempt));
+                Some(handle) => {
+                    log.reattached.fetch_add(1, Ordering::AcqRel);
+                    handle
+                }
+                None => {
+                    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+                    std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&marker)
+                        .unwrap();
+                    context
+                        .register_external_handle(
+                            "marker".to_owned(),
+                            format!("sandbox-{key}"),
+                            json!({"marker": key.clone()}),
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+            log.entries
+                .lock()
+                .unwrap()
+                .push((key, attempt, handle.external_id));
             if context.attempt_number == 1 {
                 log.first_started.store(true, Ordering::Release);
-                let (lock, wake) = &log.gate;
-                let mut released = lock.lock().unwrap();
-                while !*released {
-                    released = wake.wait(released).unwrap();
-                }
+                log.release.acquire().await.unwrap().forget();
             }
             ActionOutcome::success(json!({"value":1}), Vec::new(), CostUnits(1), None).unwrap()
         })
@@ -1240,11 +1288,7 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
         .await
         .unwrap();
     store.pool().close().await;
-    {
-        let (lock, wake) = &log.gate;
-        *lock.lock().unwrap() = true;
-        wake.notify_all();
-    }
+    log.release.add_permits(1);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         first.run_until_idle(&execution_scope, 1).await.is_err(),
@@ -1291,6 +1335,17 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].0, entries[1].0);
     assert_ne!(entries[0].1, entries[1].1);
+    assert_eq!(entries[0].2, entries[1].2);
+    assert_eq!(log.reattached.load(Ordering::Acquire), 1);
+    let inspection = store
+        .get_run(&execution_scope, &id("run-restart"))
+        .await
+        .unwrap();
+    assert_eq!(inspection.external_handles.len(), 1);
+    assert_eq!(
+        inspection.external_handles[0].metadata["marker"],
+        entries[0].0
+    );
     assert_eq!(
         std::fs::read_dir(&marker_dir).unwrap().count(),
         1,

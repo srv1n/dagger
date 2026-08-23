@@ -79,9 +79,9 @@ The engine checks size, digest, deadline, registration, and action pins before i
 
 ## Action progress for embedders
 
-Actions may `await context.report_progress(...)` for low-frequency durable checkpoints,
-phase labels, and external handles. Each record is appended to the ordinary run event stream
-as an action-attempt-correlated event; it is not a harness trace channel.
+Actions may `await context.report_progress(...)` for low-frequency durable checkpoints and
+phase labels. Each record is appended to the ordinary run event stream as an
+action-attempt-correlated event; it is not a harness trace channel.
 
 The engine permits 64 progress records per attempt by default. An embedder can set a different
 positive cap with `WorkflowEngine::with_max_progress_events_per_attempt` before sharing the
@@ -96,7 +96,13 @@ Each scope has one live engine claim. The claim and completion credentials fence
 
 After takeover, the engine finds attempts from an older generation. It marks their outcome as unknown. It then applies the retry rule. It does not treat an unknown action call as success.
 
-The action gets a retry-stable idempotency key. An external action can use this key to detect a repeated request.
+The action gets a retry-stable idempotency key. For paid or otherwise expensive external work,
+use the durable registry in this order: `lookup_external_handle()`; reattach when a matching
+kind exists or create the provider operation when absent; immediately
+`register_external_handle(kind, external_id, metadata)`; then execute. Registration is
+active-attempt-fenced and idempotent per `(idempotency_key, kind)`, emits the existing P03
+external-handle progress event, and is visible in `get_run(...).external_handles`. Registry rows
+are run-scoped and follow run retention.
 
 ## Host duties
 
