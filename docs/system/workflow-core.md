@@ -30,6 +30,24 @@ Each durable key belongs to one `ExecutionScope`. A scope contains a tenant ID a
 
 `EngineConfig.max_concurrency` limits action calls in one process. It must be greater than zero.
 
+## Long-running action executor design
+
+`tick` claims ready attempts only while the engine-wide semaphore has capacity. It starts each
+claimed action as a Tokio task on the host runtime and returns without waiting for the action.
+Each task publishes and commits its own result as soon as it finishes. `run_until_idle` waits for
+supervisor activity before it decides that the current frontier is idle.
+
+The supervisor heartbeats a scope while that scope has an action in flight. Attempt IDs contain
+the durable engine generation and random bytes. A completion is valid only while its attempt's
+engine generation still owns the live scope claim. A takeover therefore rejects an old
+generation's completion before recovery changes the old attempt state.
+
+Cancellation has two layers. An action can poll `is_cancelled` or await `cancelled`. The
+supervisor also polls durable run state, so cancellation from another process reaches a local
+task. After `EngineConfig.cancellation_grace`, the supervisor drops a non-cooperative action
+future. Dropping the future is the engine guarantee. The action's drop or abort path must stop
+subprocesses, sandboxes, requests, and other external resources.
+
 ## Node types
 
 | Node | Behavior |

@@ -31,6 +31,8 @@ The host must set all run limits. Dagger does not supply production defaults.
 The store validates these values when it creates the run. The values do not change during the run.
 
 Set `EngineConfig.max_concurrency` to a value greater than zero. This value limits action calls in one process.
+Set `EngineConfig.cancellation_grace` to the time an action may use for cooperative external
+cleanup before the supervisor drops its future.
 
 ## Budget
 
