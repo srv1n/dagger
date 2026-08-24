@@ -1,0 +1,205 @@
+# Arithmetic pipeline, defined entirely in YAML and parsed at runtime by
+# dagger_workflow_core::definition::parse_yaml_definition.
+#
+# Shape of the graph:
+#
+#   load_batch ---> sum_batch ----\
+#              \                   ---> combine ---> score_each (Map) ---> done
+#               --> range_batch --/
+#
+# load_batch fans out to two independent branches that the scheduler may run in
+# the same pass. combine is a join: it has two incoming edges and stays Pending
+# until both are satisfied. score_each then fans out again, one child action
+# instance per number, and its result is the ordered array of child outputs,
+# which becomes the run's output artifact.
+#
+# Every sha256:000... below is a placeholder. Schema digests are content
+# addresses of the actual JSON Schema documents, so the example computes them
+# from the registered action implementations and rewrites these pins before
+# validation. See the header comment in yaml_pipeline.rs.
+
+definition_format_version: "0.1"
+definition_id: arithmetic_pipeline
+name: Arithmetic pipeline
+description: Fan out over a batch of numbers, join the branch results, then map over the batch.
+run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+entry_node_id: load_batch
+
+nodes:
+  # Entry node. Reads the batch out of the immutable run input and is the
+  # single fan-out point of the graph.
+  - id: load_batch
+    kind: Action
+    action:
+      name: math.load_batch
+      contract_version: placeholder
+      input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      compatible_implementation_requirement: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    bindings:
+      - target: /numbers
+        source:
+          kind: run_input
+          pointer: /numbers
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 10000
+    declared_max_cost_units: "1"
+    next: [sum_batch, range_batch]
+
+  # First branch. Independent of range_batch.
+  - id: sum_batch
+    kind: Action
+    action:
+      name: math.sum
+      contract_version: placeholder
+      input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      compatible_implementation_requirement: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    bindings:
+      - target: /numbers
+        source:
+          kind: node_output
+          node_id: load_batch
+          pointer: /numbers
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 10000
+    declared_max_cost_units: "1"
+    next: [combine]
+
+  # Second branch. No edge to or from sum_batch, so the two are unordered with
+  # respect to each other and may run concurrently.
+  - id: range_batch
+    kind: Action
+    action:
+      name: math.range
+      contract_version: placeholder
+      input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      compatible_implementation_requirement: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    bindings:
+      - target: /numbers
+        source:
+          kind: node_output
+          node_id: load_batch
+          pointer: /numbers
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 10000
+    declared_max_cost_units: "1"
+    next: [combine]
+
+  # The join. Two incoming edges, so it is created Pending and only becomes
+  # Ready once both branches have succeeded. Its bindings read from both
+  # branches, from their shared ancestor, and from the immutable run input.
+  - id: combine
+    kind: Action
+    action:
+      name: math.combine
+      contract_version: placeholder
+      input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      compatible_implementation_requirement: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    bindings:
+      - target: /numbers
+        source:
+          kind: node_output
+          node_id: load_batch
+          pointer: /numbers
+      - target: /sum
+        source:
+          kind: node_output
+          node_id: sum_batch
+          pointer: /sum
+      - target: /min
+        source:
+          kind: node_output
+          node_id: range_batch
+          pointer: /min
+      - target: /max
+        source:
+          kind: node_output
+          node_id: range_batch
+          pointer: /max
+      - target: /bonus
+        source:
+          kind: run_input
+          pointer: /bonus
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 10000
+    declared_max_cost_units: "1"
+    next: [score_each]
+
+  # Bounded fan-out. One child action instance per item of the source array,
+  # capped by max_items and executed at most max_concurrency at a time. Each
+  # child also reads the joined totals, so the Map depends on the join. The Map
+  # node's own result is the ordered array of its children's outputs.
+  - id: score_each
+    kind: Map
+    items:
+      kind: node_output
+      node_id: combine
+      pointer: /numbers
+    max_items: 16
+    max_concurrency: 4
+    action:
+      name: math.score
+      contract_version: placeholder
+      input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      compatible_implementation_requirement: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    bindings:
+      - target: /value
+        source:
+          kind: map_item
+          pointer: ""
+      - target: /index
+        source:
+          kind: map_index
+      - target: /sum
+        source:
+          kind: node_output
+          node_id: combine
+          pointer: /sum
+      - target: /bonus
+        source:
+          kind: node_output
+          node_id: combine
+          pointer: /bonus
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 10000
+    declared_max_cost_units: "1"
+    next: [done]
+
+  # The single reachable successful terminal. Its output source becomes the
+  # run's root output artifact: here, the Map aggregate.
+  - id: done
+    kind: Succeed
+    output:
+      kind: node_output
+      node_id: score_each
+      pointer: ""

@@ -16,16 +16,12 @@ run() {
 echo -e "${BLUE}Dagger Test Suite${NC}"
 echo "======================================"
 
-rm -rf test_*_db examples/*/target
-
 run cargo fmt --all -- --check
 run cargo clippy --workspace --all-targets --all-features -- -D warnings
 run cargo check --workspace --all-targets --all-features
 run cargo test --workspace --all-features
 run cargo test --doc --workspace --all-features
 run cargo doc --workspace --all-features --no-deps
-
-rm -rf test_*_db
 
 echo -e "\n======================================"
 echo -e "${GREEN}All checks passed.${NC}"

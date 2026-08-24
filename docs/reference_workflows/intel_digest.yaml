@@ -1,0 +1,300 @@
+# Reference fixture only. Every sha256 value below is a placeholder derived
+# from its fixture schema or action name; publication must resolve it to the
+# matching durable SchemaDocument or compatible mock implementation.
+definition_format_version: "0.1"
+definition_id: intel_digest
+name: Scheduled intelligence digest
+description: >
+  Host-triggered intelligence digest with three concurrent feed fetches,
+  bounded item summarization, durable approval, and idempotent publication.
+run_input_schema_digest: sha256:dc968dc5e2ae5072810badf3b7af82b6d8c9f3a37304fcecabeb24bdce8217bf
+run_output_schema_digest: sha256:805b96108600d8df07fca448beebeec615c53ce75b389fe3e53f3c801ad56604
+entry_node_id: prepare_trigger
+nodes:
+  - id: prepare_trigger
+    kind: Action
+    action:
+      name: intel.prepare_trigger
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:df3f4358224430896c0c586a4318a9b2f61a7ea19dc1da603f9c58e21ac27e71
+      output_schema_digest: sha256:e83d8d58fb85307ace1281473382679599821498f7d309186567dc53ab2619c7
+      compatible_implementation_requirement: sha256:5cb31041d9d9b064750e46e55af753dfe66b8f4d0f93b958f833d3de9bd43dee
+    bindings:
+      - target: /trigger
+        source:
+          kind: run_input
+          pointer: /trigger
+    retry:
+      max_attempts: 1
+      backoff:
+        kind: fixed
+        delay_ms: 0
+    timeout:
+      timeout_ms: 5000
+    declared_max_cost_units: "1"
+    next:
+      - fetch_feed_alpha
+      - fetch_feed_beta
+      - fetch_feed_gamma
+
+  - id: fetch_feed_alpha
+    kind: Action
+    action:
+      name: intel.fetch_feed_alpha
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:321be8e36078ac114796c045dc9cb7e1370b5ab5d2e8e17ad171bfa53aeb55f0
+      output_schema_digest: sha256:4f2fb3f67fea71df9ac8b60701571918652fae12dfc0c9c83d4b73213c66e46a
+      compatible_implementation_requirement: sha256:8bc103b3deef24abff19c0b93b3b9bc8a9e96eef2b125ba25fc0fbf25ba2e894
+    bindings:
+      - target: /feed_name
+        source:
+          kind: constant
+          value: alpha
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - normalize_and_deduplicate
+
+  - id: fetch_feed_beta
+    kind: Action
+    action:
+      name: intel.fetch_feed_beta
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:ea5ed02f2356642155acc2aa0b4ab1969611c2f2fb848e9112fd94052abdf899
+      output_schema_digest: sha256:f1d946eefb81a842272fd1b32e5d836bc184cb6baf13b5177b585b43e1faa869
+      compatible_implementation_requirement: sha256:8115e3d40f049ac1dc564982b56864d40aa95a87d67da81f0f779ec5e318b5e4
+    bindings:
+      - target: /feed_name
+        source:
+          kind: constant
+          value: beta
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 3
+      backoff:
+        kind: exponential
+        initial_delay_ms: 1000
+        multiplier: 2
+        max_delay_ms: 10000
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - normalize_and_deduplicate
+
+  - id: fetch_feed_gamma
+    kind: Action
+    action:
+      name: intel.fetch_feed_gamma
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:3cbdc2475f330fe9e95ee786bb5be568345a5d6851c53f9f002bc5a5bf571fbe
+      output_schema_digest: sha256:fee9585a3c46b4eb2a97e70bfa27b6525bb678466467590ca4d5b58ab91a81b7
+      compatible_implementation_requirement: sha256:ea0b1f00ddd4d02b48f8124ce775ea39e9f31f0e9a91d4bec75563276bdbd694
+    bindings:
+      - target: /feed_name
+        source:
+          kind: constant
+          value: gamma
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - normalize_and_deduplicate
+
+  - id: normalize_and_deduplicate
+    kind: Action
+    action:
+      name: intel.normalize_deduplicate
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:5dca8a93bad15b0ff375dfdbf69220d47392d4b4293b5891ed247cae62190d48
+      output_schema_digest: sha256:eb89ec93828031dd1e35a7c26709fa26259e94a938289e09b052cd4c40b04122
+      compatible_implementation_requirement: sha256:1c7d3a6ca1da137418d66371b975a9e6faa8736372443ded20e3d75884d0a18d
+    bindings:
+      - target: /feeds/alpha
+        source:
+          kind: node_output
+          node_id: fetch_feed_alpha
+          pointer: /items
+      - target: /feeds/beta
+        source:
+          kind: node_output
+          node_id: fetch_feed_beta
+          pointer: /items
+      - target: /feeds/gamma
+        source:
+          kind: node_output
+          node_id: fetch_feed_gamma
+          pointer: /items
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - summarize_retained_items
+
+  - id: summarize_retained_items
+    kind: Map
+    items:
+      kind: node_output
+      node_id: normalize_and_deduplicate
+      pointer: /retained_items
+    max_items: 100
+    max_concurrency: 8
+    action:
+      name: intel.summarize_item
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:0e4179be6ee95e0196086105c8c1d2aab6c3651c96bd89a1c3bd4091f664ed72
+      output_schema_digest: sha256:724249a3ba6d9715a64e4349cff18dfd9eb25a2c26f8f92a2f1a5baef0d8f507
+      compatible_implementation_requirement: sha256:8d5a71c71525c0234277ed5b022d6c37ce893a451da7f79f2717f5a28500d775
+    bindings:
+      - target: /item
+        source:
+          kind: map_item
+          pointer: ""
+      - target: /item_index
+        source:
+          kind: map_index
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 500
+    timeout:
+      timeout_ms: 20000
+    declared_max_cost_units: "10"
+    next:
+      - compile_report
+
+  - id: compile_report
+    kind: Action
+    action:
+      name: intel.compile_report
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:cf5fe2cca1a41716cb6507c5ff33befcac7112968acfc118c3be0957b4d07484
+      output_schema_digest: sha256:396398d2274f07996681f349918e3a3e3d65438dfd4e13420a8b7e7de3bea042
+      compatible_implementation_requirement: sha256:ea797456ff0d131e6ae2f72fa5e869758f86e9359a1d85a683dfb10f71bdcba8
+    bindings:
+      - target: /deduplication_stats
+        source:
+          kind: node_output
+          node_id: normalize_and_deduplicate
+          pointer: /stats
+      - target: /summaries
+        source:
+          kind: node_output
+          node_id: summarize_retained_items
+          pointer: ""
+      - target: /trigger
+        source:
+          kind: node_output
+          node_id: prepare_trigger
+          pointer: /trigger
+    retry:
+      max_attempts: 2
+      backoff:
+        kind: fixed
+        delay_ms: 1000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - approve_report
+
+  - id: approve_report
+    kind: Approval
+    request:
+      kind: node_output
+      node_id: compile_report
+      pointer: /approval_request
+    gate:
+      expires_after_ms: 86400000
+      on_expiry: reject
+      authorization:
+        allowed_principal_ids:
+          - fixture.digest.owner
+        allowed_role_ids:
+          - fixture.intelligence.approver
+    next:
+      - publish_report
+
+  - id: publish_report
+    kind: Action
+    action:
+      name: intel.publish
+      contract_version: fixture-0.1
+      input_schema_digest: sha256:1b9bad32216bad8102664509094a930f69aeabdb013ee6243a0b0973d7153827
+      output_schema_digest: sha256:a2214dbea0c8fafbcb0a52123cba01777a7da6b55e7d6ea44f4ae000ba5381b8
+      compatible_implementation_requirement: sha256:72233845958290f2565789337c83867938a20c0ddc4808e08a440bd942cf9d93
+    bindings:
+      - target: /approval
+        source:
+          kind: node_output
+          node_id: approve_report
+          pointer: ""
+      - target: /channel
+        source:
+          kind: constant
+          value: fixture-intelligence-digest
+      - target: /report
+        source:
+          kind: node_output
+          node_id: compile_report
+          pointer: /report
+    retry:
+      max_attempts: 3
+      backoff:
+        kind: exponential
+        initial_delay_ms: 1000
+        multiplier: 2
+        max_delay_ms: 10000
+    timeout:
+      timeout_ms: 30000
+    declared_max_cost_units: "20"
+    next:
+      - digest_succeeded
+
+  - id: digest_succeeded
+    kind: Succeed
+    output:
+      kind: node_output
+      node_id: publish_report
+      pointer: /published_artifact_ref

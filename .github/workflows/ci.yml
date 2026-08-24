@@ -12,6 +12,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: make agent-run-conformance
       - run: cargo test --workspace --all-features
       - run: cargo test --doc --workspace --all-features
       - run: cargo doc --workspace --all-features --no-deps

@@ -1,174 +1,59 @@
 # Dagger
 
-Multi-paradigm workflow orchestration library for Rust. Execute YAML-defined DAGs, manage dynamic task graphs, or build event-driven systems with SQLite persistence and parallel execution.
+Dagger is a Rust library for bounded workflow execution.
 
-## Installation
+This repository has one Cargo package: `dagger-workflow-core`. This package is the canonical Dagger engine.
 
-```toml
-[dependencies]
-dagger = { path = "path/to/dagger" }
-tokio = { version = "1.36", features = ["full"] }
-serde_json = "1.0"
-anyhow = "1.0"
-sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "sqlite"] }
+The engine provides these parts:
+
+- Strict JSON and YAML workflow definitions.
+- Immutable workflow revisions.
+- Action, Map, Choice, Approval, Succeed, and Fail nodes.
+- Tenant and namespace isolation.
+- Run budgets and fixed run limits.
+- Durable attempts, retries, approvals, events, and recovery.
+- In-memory stores for tests and local process use.
+- SQLite control state with the `sqlite` feature.
+- In-memory or local file-system object storage.
+
+## Check the code
+
+You need Rust 1.82 or later.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo test --doc --workspace --all-features
+cargo doc --workspace --all-features --no-deps
 ```
 
-## Quick Start
+## Run an example
 
-```rust
-use dagger::{action, coord::ActionRegistry, Cache, DagExecutor};
-use serde_json::json;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize (macro-registered actions are loaded here)
-    let registry = ActionRegistry::new();
-    let mut executor = DagExecutor::new(None, registry, "sqlite::memory:").await?;
-    
-    // Load workflow
-    executor.load_yaml_file("workflow.yaml").await?;
-    
-    // Execute
-    let cache = Cache::new();
-    let (_tx, rx) = tokio::sync::oneshot::channel();
-    let report = executor.execute_static_dag("pipeline", &cache, rx).await?;
-    
-    println!("Completed: {}", report.overall_success);
-    Ok(())
-}
-
-#[action(name = "process")]
-async fn process_data(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-    Ok(json!({ "status": "ok", "input": input }))
-}
+```sh
+cargo run -p dagger-workflow-core --example yaml_pipeline
+cargo run -p dagger-workflow-core --example guardrails
+cargo run -p dagger-workflow-core --example multi_tenant
+cargo run -p dagger-workflow-core --features sqlite --example durable_demo
 ```
 
-## Three Execution Paradigms
+## Read the documentation
 
-### 1. DAG Flow
-Static workflows defined in YAML with automatic dependency resolution and parallel execution.
+Start with the [system overview](docs/system/00-overview.md).
 
-```yaml
-name: pipeline
-nodes:
-  - id: fetch
-    action: fetch_data
-  - id: process
-    action: process_data
-    dependencies: [fetch]
+- [Getting started](docs/system/getting-started.md) gives build and example commands.
+- [Workflow engine](docs/system/workflow-core.md) explains execution.
+- [Workflow definitions](docs/system/workflow-definitions.md) explains the input format.
+- [Storage and durability](docs/system/storage-and-durability.md) explains the stores.
+- [Operations and limits](docs/system/operations-and-limits.md) lists host duties and hard limits.
+- [Testing and development](docs/system/testing-and-development.md) lists the required checks.
+
+## Task tracking
+
+This repository uses Tusker for tasks, proof, gates, and project knowledge. Automation is off unless a human enables it.
+
+```sh
+tusker list
+tusker show <TASK-ID> --capsule
+tusker validate --vault ./.tusker --json
 ```
-
-### 2. Task Agent
-Dynamic task graphs with runtime dependency creation and agent-based execution.
-
-```rust
-#[dagger::task_agent]
-async fn analyze(task: Task) -> anyhow::Result<serde_json::Value> {
-    // Create subtasks dynamically based on input
-    Ok(json!({ "status": "processing" }))
-}
-```
-
-### 3. Pub/Sub
-Event-driven communication between decoupled agents.
-
-```rust
-#[dagger::pubsub_agent(subscribe = "events", publish = "results")]
-async fn handler(msg: Message) -> anyhow::Result<()> {
-    // Process and publish
-    Ok(())
-}
-```
-
-## Key Features
-
-- **Parallel Execution**: Automatic parallelization of independent nodes
-- **SQLite Persistence**: ACID-compliant storage with compression
-- **Embedded Durable Tasks**: Task Agent storage can share a caller-provided app SQLite pool or run standalone for tests and examples
-- **Send-Compatible**: Works with Tauri and cross-thread async contexts
-- **Retry Logic**: Configurable retry strategies with exponential backoff
-- **Visual Debugging**: Export execution graphs as DOT files
-
-## Architecture
-
-The library uses a Coordinator pattern for parallel execution without borrow checker issues:
-
-- **Workers**: Execute nodes in parallel without mutable access to executor
-- **Coordinator**: Single point for state mutations
-- **Message Passing**: Event-driven communication via channels
-
-Storage uses SQLite with zstd compression for 3-10x size reduction.
-
-## Examples
-
-Working examples in `examples/`:
-- `dag_flow_basic.rs` - YAML workflow execution with `#[action]` (`examples/fixtures/basic_pipeline.yaml`)
-- `dag_flow_pipeline.rs` - End-to-end order processing pipeline (`examples/fixtures/order_pipeline.yaml`)
-- `dag_flow_cli.rs` - CLI runner for multiple YAML DAGs (`examples/fixtures/pipeline*.yaml`)
-- `dag_flow_dot.rs` - Generate DOT graph for visualization (Graphviz)
-- `task_agent_basic.rs` - Task Agent mode with `#[task_agent]`
-- `pubsub_basic.rs` - Pub/Sub mode with `#[pubsub_agent]`
-- `dynamic_nodes_demo.rs` - Dynamic DAG growth
-- `coordinator_demo.rs` - Coordinator-based execution
-
-Run with:
-```bash
-cargo run --example dag_flow_basic
-```
-
-Sample outputs and notes on nondeterminism: `examples/README.md`.
-
-## Documentation
-
-- [Architecture](docs/ARCHITECTURE.md) - System design and components
-- [DAG Flow Guide](docs/DAG_FLOW_COMPLETE_GUIDE.md) - YAML workflows
-- [Task Agent Guide](docs/TASK_AGENT_ARCHITECTURE.md) - Dynamic tasks
-- [Pub/Sub Guide](docs/PUBSUB_ARCHITECTURE.md) - Event-driven agents
-- [Upgrading / Adoption Notes](docs/UPGRADING.md) - Downstream migration checklist
-
-## Embedded Task Storage
-
-Task Agent mode now persists into namespaced `dagger_*` tables:
-
-- `dagger_jobs`
-- `dagger_tasks`
-- `dagger_task_dependencies`
-- `dagger_task_outputs`
-- `dagger_task_events`
-- `dagger_shared_state`
-
-Use path-based storage for standalone tests or demos:
-
-```rust
-let system = dagger::TaskSystemBuilder::new()
-    .with_storage_path("tasks.db")
-    .build(std::sync::Arc::new(dagger::AgentRegistry::new()))
-    .await?;
-```
-
-Use pool-based storage when the host app wants Dagger embedded inside its own SQLite database:
-
-```rust
-let pool = sqlx::SqlitePool::connect("sqlite:app.db").await?;
-let system = dagger::TaskSystemBuilder::new()
-    .with_sqlite_pool(pool)
-    .build(std::sync::Arc::new(dagger::AgentRegistry::new()))
-    .await?;
-```
-
-The embedded schema matches the host-side RZN migration contract: millisecond timestamps, `input_blob` / `output_blob`, `output_summary`, relational dependency edges, ordered output rows with `seq`, and lifecycle events with `from_status` / `to_status`.
-
-Task storage now distinguishes engine/runtime fields from host/public fields:
-
-- Engine/runtime: execution status, retries, dependency edges, payload input/output
-- Host/public: `public_id`, `thread_id`, `subject`, `description`, `owner`, metadata JSON, and source metadata
-
-Host integrations can query durable tasks by public id, thread, parent/child hierarchy, and dependency graph, and can list ordered output and lifecycle event history.
-
-## Recent Changes
-
-This snapshot standardizes on macro-based registration for all three modes. If you are upgrading from earlier versions, read the adoption notes in `docs/UPGRADING.md`.
-
-## License
-
-MIT

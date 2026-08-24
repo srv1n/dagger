@@ -1,0 +1,532 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dagger.dev/schemas/workflow-definition-0.1.json",
+  "title": "dagger-workflow-core definition 0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "definition_format_version",
+    "definition_id",
+    "name",
+    "run_input_schema_digest",
+    "run_output_schema_digest",
+    "entry_node_id",
+    "nodes"
+  ],
+  "properties": {
+    "definition_format_version": { "const": "0.1" },
+    "definition_id": { "$ref": "#/$defs/id" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "description": { "type": "string", "maxLength": 4000, "default": "" },
+    "run_input_schema_digest": { "$ref": "#/$defs/digest" },
+    "run_output_schema_digest": { "$ref": "#/$defs/digest" },
+    "entry_node_id": { "$ref": "#/$defs/id" },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/node" }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/id" }
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "u64_decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$",
+      "x-dagger-maximum-decimal": "18446744073709551615"
+    },
+    "source_pointer": {
+      "type": "string",
+      "pattern": "^(|(?:/(?:[^~/]|~[01])*)+)$"
+    },
+    "target_pointer": {
+      "type": "string",
+      "pattern": "^/(?:[^~/]|~[01])*(?:/(?:[^~/]|~[01])*)*$"
+    },
+    "json_scalar": {
+      "type": ["string", "number", "integer", "boolean", "null"]
+    },
+    "action_pin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "contract_version",
+        "input_schema_digest",
+        "output_schema_digest",
+        "compatible_implementation_requirement"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"
+        },
+        "contract_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$"
+        },
+        "input_schema_digest": { "$ref": "#/$defs/digest" },
+        "output_schema_digest": { "$ref": "#/$defs/digest" },
+        "compatible_implementation_requirement": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "timeout_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout_ms"],
+      "properties": {
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        }
+      }
+    },
+    "retry_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "backoff"],
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "backoff": {
+          "oneOf": [
+            { "$ref": "#/$defs/fixed_backoff" },
+            { "$ref": "#/$defs/exponential_backoff" }
+          ]
+        }
+      }
+    },
+    "fixed_backoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "delay_ms"],
+      "properties": {
+        "kind": { "const": "fixed" },
+        "delay_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400000
+        }
+      }
+    },
+    "exponential_backoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "initial_delay_ms", "multiplier", "max_delay_ms"],
+      "properties": {
+        "kind": { "const": "exponential" },
+        "initial_delay_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        },
+        "multiplier": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 16
+        },
+        "max_delay_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400000
+        }
+      }
+    },
+    "artifact_locator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "artifact_ref_id", "digest", "media_type"],
+          "properties": {
+            "kind": { "const": "literal" },
+            "artifact_ref_id": { "$ref": "#/$defs/id" },
+            "digest": { "$ref": "#/$defs/digest" },
+            "media_type": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pointer"],
+          "properties": {
+            "kind": { "const": "run_input" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "node_id", "pointer"],
+          "properties": {
+            "kind": { "const": "node_output" },
+            "node_id": { "$ref": "#/$defs/id" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        }
+      ]
+    },
+    "binding_source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "constant" },
+            "value": true
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pointer"],
+          "properties": {
+            "kind": { "const": "run_input" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "node_id", "pointer"],
+          "properties": {
+            "kind": { "const": "node_output" },
+            "node_id": { "$ref": "#/$defs/id" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "source"],
+          "properties": {
+            "kind": { "const": "artifact_ref" },
+            "source": { "$ref": "#/$defs/artifact_locator" }
+          }
+        }
+      ]
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "source"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target_pointer" },
+        "source": { "$ref": "#/$defs/binding_source" }
+      }
+    },
+    "value_source": {
+      "oneOf": [
+        { "$ref": "#/$defs/binding_source" }
+      ]
+    },
+    "map_binding_source": {
+      "oneOf": [
+        { "$ref": "#/$defs/binding_source" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "pointer"],
+          "properties": {
+            "kind": { "const": "map_item" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "map_index" }
+          }
+        }
+      ]
+    },
+    "map_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "source"],
+      "properties": {
+        "target": { "$ref": "#/$defs/target_pointer" },
+        "source": { "$ref": "#/$defs/map_binding_source" }
+      }
+    },
+    "choice_case": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["equals", "next"],
+          "properties": {
+            "equals": { "$ref": "#/$defs/json_scalar" },
+            "next": { "$ref": "#/$defs/id" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["in", "next"],
+          "properties": {
+            "in": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/json_scalar" }
+            },
+            "next": { "$ref": "#/$defs/id" }
+          }
+        }
+      ]
+    },
+    "action_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "action",
+        "bindings",
+        "retry",
+        "timeout",
+        "declared_max_cost_units",
+        "next"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Action" },
+        "action": { "$ref": "#/$defs/action_pin" },
+        "bindings": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/binding" }
+        },
+        "retry": { "$ref": "#/$defs/retry_policy" },
+        "timeout": { "$ref": "#/$defs/timeout_policy" },
+        "declared_max_cost_units": { "$ref": "#/$defs/u64_decimal" },
+        "next": { "$ref": "#/$defs/targets" }
+      }
+    },
+    "choice_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "input", "selector", "cases", "default"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Choice" },
+        "input": { "$ref": "#/$defs/value_source" },
+        "selector": { "$ref": "#/$defs/source_pointer" },
+        "cases": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": { "$ref": "#/$defs/choice_case" }
+        },
+        "default": { "$ref": "#/$defs/id" }
+      }
+    },
+    "map_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "items",
+        "max_items",
+        "max_concurrency",
+        "action",
+        "bindings",
+        "retry",
+        "timeout",
+        "declared_max_cost_units",
+        "next"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Map" },
+        "items": { "$ref": "#/$defs/value_source" },
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "action": { "$ref": "#/$defs/action_pin" },
+        "bindings": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/map_binding" }
+        },
+        "retry": { "$ref": "#/$defs/retry_policy" },
+        "timeout": { "$ref": "#/$defs/timeout_policy" },
+        "declared_max_cost_units": { "$ref": "#/$defs/u64_decimal" },
+        "next": { "$ref": "#/$defs/targets" }
+      }
+    },
+    "approval_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "request", "gate", "next"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Approval" },
+        "request": { "$ref": "#/$defs/value_source" },
+        "gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["expires_after_ms", "authorization"],
+          "properties": {
+            "expires_after_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 31536000000
+            },
+            "on_expiry": {
+              "type": "string",
+              "enum": ["approve", "reject"],
+              "default": "reject"
+            },
+            "authorization": {
+              "$ref": "#/$defs/decision_authorization_policy"
+            }
+          }
+        },
+        "next": { "$ref": "#/$defs/targets" }
+      }
+    },
+    "decision_authorization_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_principal_ids", "allowed_role_ids"],
+      "properties": {
+        "allowed_principal_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "allowed_role_ids": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        }
+      },
+      "anyOf": [
+        {
+          "properties": {
+            "allowed_principal_ids": { "minItems": 1 }
+          }
+        },
+        {
+          "properties": {
+            "allowed_role_ids": { "minItems": 1 }
+          }
+        }
+      ]
+    },
+    "succeed_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "output"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Succeed" },
+        "output": { "$ref": "#/$defs/value_source" }
+      }
+    },
+    "fail_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "code", "message"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "const": "Fail" },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
+      }
+    },
+    "node": {
+      "oneOf": [
+        { "$ref": "#/$defs/action_node" },
+        { "$ref": "#/$defs/map_node" },
+        { "$ref": "#/$defs/choice_node" },
+        { "$ref": "#/$defs/approval_node" },
+        { "$ref": "#/$defs/succeed_node" },
+        { "$ref": "#/$defs/fail_node" }
+      ]
+    }
+  },
+  "x-dagger-semantic-constraints": [
+    "Apply all schema defaults before canonical hashing.",
+    "Node IDs are unique and entry_node_id names exactly one node.",
+    "All next/default/case targets exist and each Choice target is unique.",
+    "The control graph and binding dependency graph are acyclic.",
+    "Every node is reachable from entry_node_id.",
+    "Every maximal active path ends in Succeed or Fail.",
+    "Exactly one Succeed node exists and is reachable from entry_node_id; multiple Fail nodes are allowed.",
+    "Every Choice declares a default target; fail-closed default behavior uses an explicit Fail node.",
+    "Action, Map action, and root run schema digests resolve to durable supported-subset SchemaDocument objects.",
+    "Action input schemas are JSON objects and explicit bindings cover every required leaf exactly once.",
+    "Binding targets are unique and non-overlapping; source types assign without coercion.",
+    "Every node_output source is a dominating strict ancestor on every activating path.",
+    "Every literal artifact identity/digest/media tuple resolves to one verified ArtifactRef and ObjectRecord in the definition scope.",
+    "Choice case scalar values do not overlap under exact JSON equality.",
+    "Map max_concurrency is less than or equal to max_items.",
+    "Retry exponential max_delay_ms is greater than or equal to initial_delay_ms.",
+    "All decimal u64 values parse without overflow.",
+    "Canonical definition size is at most 4 MiB; unknown structural fields are rejected; the schema has no raw-credential field; host-authored constants and text remain subject to host semantic secret hygiene.",
+    "Every approval authorization policy has at least one principal or role.",
+    "No catch, error edge, cycle, loop, tolerance threshold, or unbounded Map extension is accepted."
+  ]
+}
