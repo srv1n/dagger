@@ -1,10 +1,10 @@
 .PHONY: agent-run-conformance codebasezip sqlite-write-load
 
 agent-run-conformance:
-	PATH=/private/tmp/rzn-ghl-flock-bin:$$PATH flock /tmp/rzn-build-slot.lock -c 'cargo test -p dagger-workflow-core --all-features --test agent_run_adversarial'
+	cargo test -p dagger-workflow-core --all-features --test agent_run_adversarial
 
 sqlite-write-load:
-	PATH=/private/tmp/rzn-ghl-flock-bin:$$PATH flock /tmp/rzn-build-slot.lock -c 'cargo test -p dagger-workflow-core --features sqlite --test w6_sqlite sqlite_write_path_load -- --ignored --exact --nocapture'
+	cargo test -p dagger-workflow-core --features sqlite --test w6_sqlite sqlite_write_path_load -- --ignored --exact --nocapture
 
 codebasezip:
 	@mkdir -p artifacts
