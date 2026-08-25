@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 69;
+pub const CASE_COUNT: usize = 70;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -106,6 +106,7 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "action_output_aggregate_limit_boundary_accepted",
     "action_output_schema_enforced",
     "schema_pattern_validation_enforced",
+    "empty_schema_accepts_any_instance",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -2358,6 +2359,84 @@ async fn schema_pattern_validation_enforced<A: ConformanceAdapter>(
         })
     ) {
         return Err(failure(case, "non-matching pattern input was accepted"));
+    }
+    Ok(())
+}
+
+/// The empty schema is publishable and accepts every JSON instance kind.
+async fn empty_schema_accepts_any_instance<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 70;
+    let schema = adapter
+        .objects()
+        .put(scope, b"{}", "application/json")
+        .await
+        .map_err(|_| failure(case, "empty schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "empty-schema-conformance".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "principal construction failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("conformance-definition"),
+                display_name: "conformance".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "definition creation failed"))?;
+    let (canonical, outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &schema).await?;
+    outcome.map_err(|_| failure(case, "empty schema revision publication failed"))?;
+    for (index, value) in [
+        Value::Null,
+        Value::Bool(true),
+        Value::String("value".to_owned()),
+        json!(1),
+        json!(1.5),
+        json!([1, "two"]),
+        json!({"nested": true}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input = adapter
+            .objects()
+            .put(
+                scope,
+                &serde_jcs::to_vec(&value)
+                    .map_err(|_| failure(case, "instance encoding failed"))?,
+                "application/json",
+            )
+            .await
+            .map_err(|_| failure(case, "instance publication failed"))?;
+        adapter
+            .store()
+            .create_run(
+                scope,
+                CreateRun {
+                    run_id: id(&format!("empty-schema-run-{index}")),
+                    definition_id: id("conformance-definition"),
+                    revision_hash: canonical.digest().clone(),
+                    input,
+                    budget_limit: CostUnits(10),
+                    limits: terminal_output_limits(10_000, 100_000),
+                    principal: principal.clone(),
+                    idempotency_token: format!("empty-schema-token-{index}"),
+                },
+            )
+            .await
+            .map_err(|_| failure(case, "empty schema rejected a JSON instance"))?;
     }
     Ok(())
 }
@@ -4973,6 +5052,10 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "schema_pattern_validation_enforced",
         schema_pattern_validation_enforced
+    );
+    run_fixture!(
+        "empty_schema_accepts_any_instance",
+        empty_schema_accepts_any_instance
     );
     results
 }

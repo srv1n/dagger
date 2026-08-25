@@ -533,6 +533,9 @@ fn validate_schema_node(
     {
         return Err(StoreError::SchemaSubsetUnsupported);
     }
+    if object.is_empty() {
+        return Ok(());
+    }
     if let Some(reference) = object.get("$ref") {
         if object.len() != 1 {
             return Err(StoreError::SchemaSubsetUnsupported);

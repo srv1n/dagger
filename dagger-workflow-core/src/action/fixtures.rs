@@ -135,44 +135,11 @@ pub fn descriptor(name: &str) -> ActionDescriptor {
 
 /// Returns the single schema every deterministic fixture pin points at.
 ///
-/// The schema is closed by construction (`additionalProperties: false` plus a declared
-/// property set), so this cannot be `{}`. It is therefore the exact union of
-/// the fields the three store-side validators actually see for the legal
-/// research reference workflow:
-///
-/// - `legal_question` is the run input submitted at `create_run`;
-/// - `query`, `sources` and `excerpts` are the `legal.search` output, which
-///   is the action of both Map nodes and so is validated per child result;
-/// - `artifact_ref_id`, `digest`, `size_bytes` and `media_type` are the
-///   `report_artifact_ref` the Succeed node publishes as the run output.
-///
-/// Plain Action outputs are not schema-validated, so nothing else belongs here.
-/// Keys stay in lexicographic order because the digest is over RFC 8785 bytes.
+/// These fixtures exercise orchestration rather than value shapes, so they use
+/// the official opaque marker instead of maintaining one speculative union of
+/// every reference action's input and output fields.
 pub fn fixture_schema() -> Value {
-    json!({
-        "additionalProperties": false,
-        "properties": {
-            "artifact_ref_id": {"type": "string"},
-            "digest": {"type": "string"},
-            "excerpts": {"items": {"type": "string"}, "type": "array"},
-            "legal_question": {"type": "string"},
-            "media_type": {"type": "string"},
-            "query": {"type": "string"},
-            "size_bytes": {"type": "string"},
-            "sources": {
-                "items": {
-                    "additionalProperties": false,
-                    "properties": {
-                        "excerpt": {"type": "string"},
-                        "source_id": {"type": "string"}
-                    },
-                    "type": "object"
-                },
-                "type": "array"
-            }
-        },
-        "type": "object"
-    })
+    json!({})
 }
 
 /// Returns the digest of [`fixture_schema`]'s canonical bytes.

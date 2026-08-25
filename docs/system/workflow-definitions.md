@@ -90,6 +90,10 @@ Each `Action` and Map action has five exact pin fields. The engine requires an e
 
 The example YAML files use zero digests as authoring placeholders. Example code replaces these values before publication. Do not publish a definition with placeholder digests.
 
+## Opaque schema values
+
+Use the empty schema object `{}` as the official opaque marker. It accepts any JSON value. It means Dagger does not statically check the value's shape at that schema node.
+
 ## Reference definitions
 
 Tests load these files:
