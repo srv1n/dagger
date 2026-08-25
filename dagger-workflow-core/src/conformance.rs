@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 68;
+pub const CASE_COUNT: usize = 69;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -105,6 +105,7 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "action_output_aggregate_limit_enforced",
     "action_output_aggregate_limit_boundary_accepted",
     "action_output_schema_enforced",
+    "schema_pattern_validation_enforced",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -2249,6 +2250,114 @@ async fn pinned_root_schema_subset_enforced<A: ConformanceAdapter>(
         Err(StoreError::NotFound)
     ) {
         return Err(failure(44, "rejected run creation left a run row"));
+    }
+    Ok(())
+}
+
+/// Regex patterns compile at publication and enforce their real match semantics.
+async fn schema_pattern_validation_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 69;
+    let schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"pattern":"^[a-z]+$","type":"string"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "pattern schema publication failed"))?;
+    let invalid_schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{"pattern":"*","type":"string"}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "invalid pattern schema publication failed"))?;
+    let principal = AuthenticatedPrincipal::mint(
+        scope.clone(),
+        "pattern-conformance".to_owned(),
+        Vec::new(),
+        schema.digest().clone(),
+    )
+    .map_err(|_| failure(case, "principal construction failed"))?;
+    adapter
+        .store()
+        .create_definition(
+            scope,
+            CreateDefinition {
+                definition_id: id("conformance-definition"),
+                display_name: "conformance".to_owned(),
+                description: String::new(),
+                principal: principal.clone(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "definition creation failed"))?;
+    let (_, invalid_outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &invalid_schema)
+            .await?;
+    if !matches!(invalid_outcome, Err(StoreError::SchemaSubsetUnsupported)) {
+        return Err(failure(case, "invalid regex pattern was published"));
+    }
+    let (canonical, outcome) =
+        publish_with_root_input_schema(adapter, scope, &principal, &schema, &schema).await?;
+    outcome.map_err(|_| failure(case, "valid pattern revision publication failed"))?;
+    let matching = adapter
+        .objects()
+        .put(scope, br#"{"value":"abc"}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "matching input publication failed"))?;
+    adapter
+        .store()
+        .create_run(
+            scope,
+            CreateRun {
+                run_id: id("pattern-match-run"),
+                definition_id: id("conformance-definition"),
+                revision_hash: canonical.digest().clone(),
+                input: matching,
+                budget_limit: CostUnits(10),
+                limits: terminal_output_limits(10_000, 100_000),
+                principal: principal.clone(),
+                idempotency_token: "pattern-match-token".to_owned(),
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "matching pattern input was rejected"))?;
+    let non_matching = adapter
+        .objects()
+        .put(scope, br#"{"value":"abc123"}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "non-matching input publication failed"))?;
+    if !matches!(
+        adapter
+            .store()
+            .create_run(
+                scope,
+                CreateRun {
+                    run_id: id("pattern-miss-run"),
+                    definition_id: id("conformance-definition"),
+                    revision_hash: canonical.digest().clone(),
+                    input: non_matching,
+                    budget_limit: CostUnits(10),
+                    limits: terminal_output_limits(10_000, 100_000),
+                    principal,
+                    idempotency_token: "pattern-miss-token".to_owned(),
+                },
+            )
+            .await,
+        Err(StoreError::ContractValidation {
+            kind: ValidationErrorKind::SchemaSubsetUnsupported,
+            ..
+        })
+    ) {
+        return Err(failure(case, "non-matching pattern input was accepted"));
     }
     Ok(())
 }
@@ -4860,6 +4969,10 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "action_output_schema_enforced",
         action_output_schema_enforced
+    );
+    run_fixture!(
+        "schema_pattern_validation_enforced",
+        schema_pattern_validation_enforced
     );
     results
 }

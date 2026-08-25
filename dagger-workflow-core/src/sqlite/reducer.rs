@@ -669,15 +669,7 @@ fn validate_schema_node(
             .as_str()
             .filter(|pattern| pattern.len() <= 1024)
             .ok_or(StoreError::SchemaSubsetUnsupported)?;
-        if pattern.contains("(?")
-            || pattern
-                .as_bytes()
-                .windows(2)
-                .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_digit())
-            || !pattern_is_syntactically_balanced(pattern)
-        {
-            return Err(StoreError::SchemaSubsetUnsupported);
-        }
+        compile_schema_pattern(pattern)?;
     }
     if !types.contains("number")
         && !types.contains("integer")
@@ -696,27 +688,19 @@ fn validate_schema_node(
     Ok(())
 }
 
-fn pattern_is_syntactically_balanced(pattern: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut escaped = false;
-    for character in pattern.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        match character {
-            '[' | '(' | '{' => stack.push(character),
-            ']' if stack.pop() != Some('[') => return false,
-            ')' if stack.pop() != Some('(') => return false,
-            '}' if stack.pop() != Some('{') => return false,
-            _ => {}
-        }
+fn compile_schema_pattern(pattern: &str) -> Result<regex_lite::Regex, StoreError> {
+    if pattern.contains("(?")
+        || pattern
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_digit())
+    {
+        return Err(StoreError::SchemaSubsetUnsupported);
     }
-    !escaped && stack.is_empty()
+    regex_lite::RegexBuilder::new(pattern)
+        .size_limit(1024 * 1024)
+        .build()
+        .map_err(|_| StoreError::SchemaSubsetUnsupported)
 }
 
 fn valid_schema_type(name: &str) -> bool {
@@ -1148,29 +1132,7 @@ fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
 }
 
 fn supported_pattern_matches(pattern: &str, value: &str) -> bool {
-    let anchored_start = pattern.starts_with('^');
-    let anchored_end = pattern.ends_with('$') && !pattern.ends_with("\\$");
-    let body = pattern
-        .strip_prefix('^')
-        .unwrap_or(pattern)
-        .strip_suffix('$')
-        .unwrap_or_else(|| pattern.strip_prefix('^').unwrap_or(pattern));
-    if body.bytes().any(|byte| {
-        matches!(
-            byte,
-            b'[' | b'(' | b'{' | b'*' | b'+' | b'?' | b'|' | b'\\' | b'.'
-        )
-    }) {
-        // Publication already validated the Rust-regex syntax. The transaction-local
-        // adapter fails closed for patterns outside its literal fast path.
-        return false;
-    }
-    match (anchored_start, anchored_end) {
-        (true, true) => value == body,
-        (true, false) => value.starts_with(body),
-        (false, true) => value.ends_with(body),
-        (false, false) => value.contains(body),
-    }
+    compile_schema_pattern(pattern).is_ok_and(|pattern| pattern.is_match(value))
 }
 
 fn validate_limits(limits: &crate::run::RunLimits) -> bool {
