@@ -2859,7 +2859,11 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             command.objects.output.iter().map(VerifiedObjectRef::digest)
                 .chain(command.objects.artifacts.iter().map(VerifiedObjectRef::digest))
                 .chain(command.objects.diagnostics.iter().map(VerifiedObjectRef::digest))
-        )
+        );
+        |store, workflow_scope| store.hydrate_run_action_schemas(
+            workflow_scope,
+            &command.run_id,
+        ).await?
     );
     sql_command!(
         record_action_progress(command: RecordActionProgress) -> ();

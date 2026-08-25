@@ -86,7 +86,9 @@ impl WorkflowAction for MapAction {
 /// requires `type` on every node and a closed field set on every object schema.
 /// A bare `{}` was accepted here only while the in-memory store skipped
 /// publication-time subset validation, which was the E5 defect.
-const SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;
+const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"item":{"additionalProperties":false,"properties":{"same":{"type":"boolean"}},"type":["integer","object","string"]}},"required":["item"],"type":"object"}"#;
+
+const RUN_INPUT_SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;
 
 /// The Succeed node here is bound to the Map, so its output is the ordered
 /// aggregate of the children (), which is an ARRAY and
@@ -94,7 +96,7 @@ const SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;
 /// against the pinned root output schema per N16, so the root output needs its
 /// own document. `items` is the union of the map items these fixtures echo back:
 /// integers, strings, and `{"same": bool}` objects.
-const ROOT_OUTPUT_SCHEMA: &[u8] = br#"{"items":{"additionalProperties":false,"properties":{"same":{"type":"boolean"}},"type":["integer","object","string"]},"type":"array"}"#;
+const ROOT_OUTPUT_SCHEMA: &[u8] = br#"{"items":{"additionalProperties":false,"properties":{"item":{"additionalProperties":false,"properties":{"same":{"type":"boolean"}},"type":["integer","object","string"]}},"required":["item"],"type":"object"},"type":"array"}"#;
 
 fn descriptor() -> ActionDescriptor {
     ActionDescriptor {
@@ -113,7 +115,7 @@ fn definition(definition_id: &str, items: Value, max_items: u32) -> WorkflowDefi
         definition_id: id(definition_id),
         name: definition_id.to_owned(),
         description: String::new(),
-        run_input_schema_digest: hash(SCHEMA),
+        run_input_schema_digest: hash(RUN_INPUT_SCHEMA),
         run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
         entry_node_id: id("map"),
         nodes: vec![
@@ -164,6 +166,10 @@ async fn publish_and_create(
 ) {
     let schema = objects
         .put(execution_scope, SCHEMA, "application/json")
+        .await
+        .unwrap();
+    let run_input_schema = objects
+        .put(execution_scope, RUN_INPUT_SCHEMA, "application/json")
         .await
         .unwrap();
     let root_output_schema = objects
@@ -231,7 +237,7 @@ async fn publish_and_create(
                 definition_id: workflow.definition_id.clone(),
                 expected_definition_version: dagger_workflow_core::ids::Version(1),
                 canonical_definition: canonical.clone(),
-                run_input_schema: schema.clone(),
+                run_input_schema,
                 run_output_schema: root_output_schema,
                 resolved_action_schema_objects: action_schemas,
                 parsed_revision: PublishableDefinition {

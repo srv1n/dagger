@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 67;
+pub const CASE_COUNT: usize = 68;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -104,6 +104,7 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "action_artifacts_per_attempt_limit_boundary_accepted",
     "action_output_aggregate_limit_enforced",
     "action_output_aggregate_limit_boundary_accepted",
+    "action_output_schema_enforced",
 ];
 
 /// Supplies one isolated store pair and control over its database clock.
@@ -3121,6 +3122,50 @@ async fn assert_action_output_contract_failure<A: ConformanceAdapter>(
     Ok(())
 }
 
+/// A successful Action output violating its own pinned schema is rejected.
+async fn action_output_schema_enforced<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 68;
+    let (_, credential, run) = prepare_action_attempt_conformance(
+        adapter,
+        scope,
+        case,
+        terminal_output_limits(100_000, 1_000_000),
+    )
+    .await?;
+    let output = adapter
+        .objects()
+        .put(scope, br#"{"value":"one"}"#, "application/json")
+        .await
+        .map_err(|_| failure(case, "off-schema output publication failed"))?;
+    let completed = offer_action_output(
+        adapter,
+        scope,
+        credential,
+        ActionOutcome::success(json!({"value": "one"}), Vec::new(), CostUnits(1), None)
+            .map_err(|_| failure(case, "completion outcome invalid"))?,
+        output,
+        Vec::new(),
+    )
+    .await
+    .map_err(|_| failure(case, "attempt completion rejected instead of applied"))?;
+    if !matches!(completed, CompleteAttemptResult::TerminalRun(_)) {
+        return Err(failure(case, "off-schema action output was committed"));
+    }
+    assert_action_output_contract_failure(
+        adapter,
+        scope,
+        case,
+        NodeFailureKind::ActionOutputSchemaMismatch,
+        RunFailureKind::ActionOutputSchemaMismatch,
+        run.aggregate_object_bytes,
+    )
+    .await
+}
+
 /// An action output over `max_inline_json_bytes_per_value` is rejected.
 ///
 /// Section 1.4 applies the value ceiling "before binding, invocation, event-inline
@@ -4811,6 +4856,10 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "action_output_aggregate_limit_boundary_accepted",
         action_output_aggregate_limit_boundary_accepted
+    );
+    run_fixture!(
+        "action_output_schema_enforced",
+        action_output_schema_enforced
     );
     results
 }

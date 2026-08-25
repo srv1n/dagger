@@ -352,11 +352,11 @@ pub trait ObjectStore: Send + Sync {
     ) -> impl Future<Output = Result<VerifiedObjectRef, ObjectStoreError>> + Send + 'a;
 
     /// Reads and verifies committed bytes or mints a failed-read proof.
-    async fn get(
-        &self,
-        scope: &ExecutionScope,
-        digest: &Digest,
-    ) -> Result<VerifiedObject, ObjectReadError>;
+    fn get<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        digest: &'a Digest,
+    ) -> impl Future<Output = Result<VerifiedObject, ObjectReadError>> + Send + 'a;
 
     /// Publishes a prepared object without replacement.
     async fn publish_if_absent(

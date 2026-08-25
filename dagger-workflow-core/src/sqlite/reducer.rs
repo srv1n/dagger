@@ -4310,6 +4310,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             // is recorded here and applied with the cost-protocol branch below, after the
             // section 3.4 deadline check, because a due completion is A06/A14 regardless.
             let mut limit_failure = None;
+            let mut schema_failure = None;
             if let ActionOutcome::Success { artifacts, .. } = &command.submitted_outcome {
                 let output = command
                     .objects
@@ -4329,7 +4330,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 let run = state
                     .runs
                     .get(&(scope.clone(), command.run_id.clone()))
-                    .expect("run");
+                    .ok_or(StoreError::CorruptControlPlane)?;
                 let artifact_bytes =
                     command
                         .objects
@@ -4366,6 +4367,43 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     > run.limits.max_aggregate_object_bytes_per_run
                 {
                     limit_failure = Some(NodeFailureKind::AggregateObjectLimitExceeded);
+                }
+                if limit_failure.is_none() {
+                    let revision = state
+                        .revisions
+                        .get(&(
+                            scope.clone(),
+                            run.definition_id.clone(),
+                            run.revision_hash.clone(),
+                        ))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let reference_location = if node.parent_map_instance_id.is_some() {
+                        format!("{}/map_action", node.definition_node_id.as_str())
+                    } else {
+                        node.definition_node_id.as_str().to_owned()
+                    };
+                    let schema_digest = &revision
+                        .action_pins
+                        .iter()
+                        .find(|pin| pin.reference_location == reference_location)
+                        .ok_or(StoreError::CorruptControlPlane)?
+                        .output_schema_ref
+                        .0
+                        .digest;
+                    let schema_bytes = state
+                        .verified_object_bytes
+                        .get(&(scope.clone(), schema_digest.clone()))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    let schema: Value = serde_json::from_slice(schema_bytes)
+                        .map_err(|_| StoreError::CorruptControlPlane)?;
+                    let output_bytes = state
+                        .verified_object_bytes
+                        .get(&(scope.clone(), output.digest().clone()))
+                        .ok_or(StoreError::CorruptControlPlane)?;
+                    schema_failure = serde_json::from_slice::<Value>(output_bytes)
+                        .map(|value| !schema_accepts(&schema, &schema, &value))
+                        .unwrap_or(true)
+                        .then_some(NodeFailureKind::ActionOutputSchemaMismatch);
                 }
             }
             if now >= attempt.deadline_at {
@@ -4464,7 +4502,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             let contract_kind = if contract_cost_failure {
                 Some(NodeFailureKind::ActionCostProtocolViolation)
             } else {
-                limit_failure
+                limit_failure.or(schema_failure)
             };
             if let Some(contract_kind) = contract_kind {
                 let run_kind = run_failure(contract_kind);
