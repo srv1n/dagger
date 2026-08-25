@@ -53,10 +53,8 @@ fn hash(bytes: &[u8]) -> Digest {
 }
 
 /// The fixture schema every w3 definition pins for its run input, run output and
-/// action pins. Section 14.3 requires a `type` keyword on every node and a closed
-/// field set on every object schema, so the bare `{}` these fixtures used is not a
-/// legal schema; it only passed while the in-memory store skipped publication-time
-/// subset validation, which was the E5 defect. The property set is exactly the
+/// action pins. Section 14.3 requires a closed field set on every typed object
+/// schema; `{}` is reserved as the opaque marker. The property set is exactly the
 /// union of what these fixtures feed through the two values the store actually
 /// validates: the run input at create_run and each Map child result at
 /// complete_map. None of these tests are about schema content, so scaffolding one

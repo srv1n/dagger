@@ -2370,6 +2370,15 @@ async fn empty_schema_accepts_any_instance<A: ConformanceAdapter>(
     _scope_b: &ExecutionScope,
 ) -> Result<(), ConformanceFailure> {
     let case = 70;
+    let action_schema = adapter
+        .objects()
+        .put(
+            scope,
+            br#"{"additionalProperties":false,"properties":{"value":{}},"required":["value"],"type":"object"}"#,
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "property opaque schema publication failed"))?;
     let schema = adapter
         .objects()
         .put(scope, b"{}", "application/json")
@@ -2379,7 +2388,7 @@ async fn empty_schema_accepts_any_instance<A: ConformanceAdapter>(
         scope.clone(),
         "empty-schema-conformance".to_owned(),
         Vec::new(),
-        schema.digest().clone(),
+        action_schema.digest().clone(),
     )
     .map_err(|_| failure(case, "principal construction failed"))?;
     adapter
@@ -2396,7 +2405,7 @@ async fn empty_schema_accepts_any_instance<A: ConformanceAdapter>(
         .await
         .map_err(|_| failure(case, "definition creation failed"))?;
     let (canonical, outcome) =
-        publish_with_root_input_schema(adapter, scope, &principal, &schema, &schema).await?;
+        publish_with_root_input_schema(adapter, scope, &principal, &action_schema, &schema).await?;
     outcome.map_err(|_| failure(case, "empty schema revision publication failed"))?;
     for (index, value) in [
         Value::Null,

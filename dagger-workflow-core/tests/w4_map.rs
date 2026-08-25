@@ -82,10 +82,9 @@ impl WorkflowAction for MapAction {
     }
 }
 
-/// The narrowest schema the supported subset accepts for an object: section 14.3
-/// requires `type` on every node and a closed field set on every object schema.
-/// A bare `{}` was accepted here only while the in-memory store skipped
-/// publication-time subset validation, which was the E5 defect.
+/// The narrowest typed object schema the supported subset accepts: section 14.3
+/// requires a closed field set on every object schema. `{}` is the separate opaque
+/// marker for accepting any JSON value.
 const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"item":{"additionalProperties":false,"properties":{"same":{"type":"boolean"}},"type":["integer","object","string"]}},"required":["item"],"type":"object"}"#;
 
 const RUN_INPUT_SCHEMA: &[u8] = br#"{"additionalProperties":false,"type":"object"}"#;

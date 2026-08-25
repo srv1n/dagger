@@ -506,6 +506,10 @@ fn validate_schema_node(
     let object = schema
         .as_object()
         .ok_or(StoreError::SchemaSubsetUnsupported)?;
+    // `{}` is the documented opaque marker: it accepts any JSON value at this node.
+    if object.is_empty() {
+        return Ok(());
+    }
     const ALLOWED: &[&str] = &[
         "$schema",
         "$defs",
@@ -532,9 +536,6 @@ fn validate_schema_node(
         || (!root && (object.contains_key("$schema") || object.contains_key("$defs")))
     {
         return Err(StoreError::SchemaSubsetUnsupported);
-    }
-    if object.is_empty() {
-        return Ok(());
     }
     if let Some(reference) = object.get("$ref") {
         if object.len() != 1 {
