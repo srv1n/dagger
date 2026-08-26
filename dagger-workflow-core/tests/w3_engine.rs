@@ -57,9 +57,10 @@ fn hash(bytes: &[u8]) -> Digest {
 /// schema; `{}` is reserved as the opaque marker. The property set is exactly the
 /// union of what these fixtures feed through the two values the store actually
 /// validates: the run input at create_run and each Map child result at
-/// complete_map. None of these tests are about schema content, so scaffolding one
-/// shared document keeps a single digest across every pin site.
-const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"approval":{"type":"string"},"artifact":{"additionalProperties":false,"properties":{"artifact_ref_id":{"type":"string"},"digest":{"type":"string"},"media_type":{"type":"string"},"size_bytes":{"type":"string"}},"type":"object"},"index":{"type":"integer"},"item":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"type":["integer","object"]},"scope":{"type":"string"},"value":{"type":"integer"}},"type":"object"}"#;
+/// complete_map, plus the deep-binding conformance input. None of these tests are
+/// about schema content, so scaffolding one shared document keeps a single digest
+/// across every pin site.
+const SCHEMA: &[u8] = br#"{"additionalProperties":false,"properties":{"approval":{"type":"string"},"artifact":{"additionalProperties":false,"properties":{"artifact_ref_id":{"type":"string"},"digest":{"type":"string"},"media_type":{"type":"string"},"size_bytes":{"type":"string"}},"type":"object"},"data":{"additionalProperties":false,"properties":{"date":{"type":"string"},"summaries":{"type":"integer"}},"type":"object"},"index":{"type":"integer"},"item":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"type":["integer","object"]},"scope":{"type":"string"},"value":{"type":"integer"}},"type":"object"}"#;
 
 /// The fixture schema every `prepare_definition` revision pins for its RUN OUTPUT.
 /// Transition N16 and section 5.3 make the Succeed output subject to the pinned
@@ -374,6 +375,117 @@ impl WorkflowAction for RetryOnce {
             }
         })
     }
+}
+
+#[test]
+fn deep_binding_targets_publish_and_execute_as_nested_input() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(1_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = ActionDescriptor {
+            name: "fixture.deep-bindings".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
+            implementation_compatibility_digest: hash(b"deep-bindings-implementation"),
+        };
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("deep-bindings-definition"),
+            name: "deep bindings".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
+            entry_node_id: id("work"),
+            nodes: vec![
+                NodeDefinition::Action {
+                    id: id("work"),
+                    action: ActionReference {
+                        name: descriptor.name.clone(),
+                        contract_version: descriptor.contract_version.clone(),
+                        input_schema_digest: descriptor.input_schema_digest.clone(),
+                        output_schema_digest: descriptor.output_schema_digest.clone(),
+                        compatible_implementation_requirement: descriptor
+                            .implementation_compatibility_digest
+                            .clone(),
+                    },
+                    bindings: vec![
+                        Binding {
+                            target: "/data/date".to_owned(),
+                            source: BindingSource::Constant {
+                                value: json!("2026-08-26"),
+                            },
+                        },
+                        Binding {
+                            target: "/data/summaries".to_owned(),
+                            source: BindingSource::Constant { value: json!(2) },
+                        },
+                    ],
+                    retry: RetryPolicy {
+                        max_attempts: 1,
+                        backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                    },
+                    timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                    declared_max_cost_units: CostUnits(1),
+                    next: vec![id("done")],
+                },
+                NodeDefinition::Succeed {
+                    id: id("done"),
+                    output: BindingSource::Constant { value: json!({}) },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "deep-bindings-run",
+            10_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(RetryOnce {
+                descriptor,
+                fail: AtomicBool::new(false),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects.clone(),
+            registry,
+            EngineConfig {
+                instance_id: id("deep-bindings-engine"),
+                max_concurrency: 1,
+                cancellation_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("deep-bindings-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        let node = store
+            .get_node(&execution_scope, &id("deep-bindings-run"), &id("work"))
+            .await
+            .unwrap();
+        let output = objects
+            .get(
+                &execution_scope,
+                &node.result_ref.expect("action result").0.digest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.bytes).unwrap(),
+            json!({"data": {"date": "2026-08-26", "summaries": 2}})
+        );
+    });
 }
 
 struct SerialProbe {

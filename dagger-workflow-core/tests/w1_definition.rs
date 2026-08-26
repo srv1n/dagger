@@ -1,7 +1,7 @@
 use dagger_workflow_core::definition::{
     canonical_definition_json, parse_json_definition, parse_yaml_definition, resolve_publication,
-    revision_hash, validate_definition, PublicationResolver, PublicationSchemaDocument,
-    ValidationErrorKind,
+    revision_hash, validate_definition, DefinitionValidationError, PublicationResolver,
+    PublicationSchemaDocument, ValidationErrorKind,
 };
 use dagger_workflow_core::ids::Digest;
 use std::collections::BTreeMap;
@@ -76,6 +76,152 @@ impl PublicationResolver for FakeResolver {
     ) -> bool {
         true
     }
+}
+
+fn resolve_action_bindings(
+    action_input_schema: serde_json::Value,
+    bindings: serde_json::Value,
+) -> Result<(), Vec<DefinitionValidationError>> {
+    let run_input_schema = serde_json::json!({
+        "additionalProperties": false,
+        "properties": {
+            "date": {"type": "string"},
+            "summaries": {"type": "integer"}
+        },
+        "type": "object"
+    });
+    let output_schema = serde_json::json!({});
+    let run_input_digest = revision_hash(&serde_jcs::to_vec(&run_input_schema).unwrap());
+    let action_input_digest = revision_hash(&serde_jcs::to_vec(&action_input_schema).unwrap());
+    let output_digest = revision_hash(&serde_jcs::to_vec(&output_schema).unwrap());
+    let definition = parse_json_definition(
+        &serde_json::json!({
+            "definition_format_version": "0.1",
+            "definition_id": "deep-bindings",
+            "name": "deep bindings",
+            "run_input_schema_digest": run_input_digest,
+            "run_output_schema_digest": output_digest,
+            "entry_node_id": "work",
+            "nodes": [
+                {
+                    "id": "work",
+                    "kind": "Action",
+                    "action": {
+                        "name": "example.action",
+                        "contract_version": "v1",
+                        "input_schema_digest": action_input_digest,
+                        "output_schema_digest": output_digest,
+                        "compatible_implementation_requirement": DIGEST
+                    },
+                    "bindings": bindings,
+                    "retry": {"max_attempts": 1, "backoff": {"kind": "fixed", "delay_ms": 0}},
+                    "timeout": {"timeout_ms": 1},
+                    "declared_max_cost_units": "0",
+                    "next": ["done"]
+                },
+                {"id": "done", "kind": "Succeed", "output": {"kind": "constant", "value": null}}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let unresolved = validate_definition(&definition)?;
+    let schemas = BTreeMap::from([
+        (run_input_digest, run_input_schema),
+        (action_input_digest, action_input_schema),
+        (output_digest, output_schema),
+    ]);
+    resolve_publication(unresolved, &FakeResolver { schemas }).map(|_| ())
+}
+
+fn deep_bindings() -> serde_json::Value {
+    serde_json::json!([
+        {"target": "/data/date", "source": {"kind": "run_input", "pointer": "/date"}},
+        {"target": "/data/summaries", "source": {"kind": "run_input", "pointer": "/summaries"}}
+    ])
+}
+
+#[test]
+fn publication_accepts_deep_bindings_below_required_opaque_input() {
+    let schema = serde_json::json!({
+        "additionalProperties": false,
+        "properties": {"data": {}},
+        "required": ["data"],
+        "type": "object"
+    });
+    resolve_action_bindings(schema, deep_bindings()).unwrap();
+}
+
+#[test]
+fn publication_type_checks_deep_bindings_below_typed_input() {
+    let schema = |date_type| {
+        serde_json::json!({
+            "additionalProperties": false,
+            "properties": {
+                "data": {
+                    "additionalProperties": false,
+                    "properties": {
+                        "date": {"type": date_type},
+                        "summaries": {"type": "integer"}
+                    },
+                    "required": ["date", "summaries"],
+                    "type": "object"
+                }
+            },
+            "required": ["data"],
+            "type": "object"
+        })
+    };
+    resolve_action_bindings(schema("string"), deep_bindings()).unwrap();
+    let errors = resolve_action_bindings(schema("integer"), deep_bindings()).unwrap_err();
+    assert!(errors
+        .iter()
+        .any(|error| error.kind == ValidationErrorKind::BindingTypeMismatch));
+}
+
+#[test]
+fn publication_rejects_unresolvable_binding_target_with_nearest_ancestor() {
+    let schema = serde_json::json!({
+        "additionalProperties": false,
+        "properties": {"data": {"type": "string"}},
+        "type": "object"
+    });
+    let errors = resolve_action_bindings(
+        schema,
+        serde_json::json!([
+            {"target": "/dta/date", "source": {"kind": "run_input", "pointer": "/date"}}
+        ]),
+    )
+    .unwrap_err();
+    let error = errors
+        .iter()
+        .find(|error| error.kind == ValidationErrorKind::BindingTargetInvalid)
+        .unwrap();
+    assert!(error.message.contains("work"));
+    assert!(error.message.contains("/dta/date"));
+    assert!(error.message.contains("<root>"));
+}
+
+#[test]
+fn validation_rejects_overlapping_binding_targets_and_names_both() {
+    let errors = resolve_action_bindings(
+        serde_json::json!({
+            "additionalProperties": false,
+            "properties": {"data": {}},
+            "type": "object"
+        }),
+        serde_json::json!([
+            {"target": "/data", "source": {"kind": "run_input", "pointer": "/date"}},
+            {"target": "/data/date", "source": {"kind": "run_input", "pointer": "/date"}}
+        ]),
+    )
+    .unwrap_err();
+    let error = errors
+        .iter()
+        .find(|error| error.kind == ValidationErrorKind::BindingTargetInvalid)
+        .unwrap();
+    assert!(error.message.contains("/data`"));
+    assert!(error.message.contains("/data/date`"));
 }
 
 #[test]

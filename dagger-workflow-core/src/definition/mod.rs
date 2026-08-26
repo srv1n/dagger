@@ -844,8 +844,13 @@ fn validate_publication_bindings(
             .flatten()
             .filter_map(Value::as_str);
         for leaf in required {
-            let target = format!("/{leaf}");
-            if !bindings.iter().any(|(bound, _, _)| *bound == target) {
+            let target = format!("/{}", leaf.replace('~', "~0").replace('/', "~1"));
+            if !bindings.iter().any(|(bound, _, _)| {
+                *bound == target
+                    || bound
+                        .strip_prefix(&target)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }) {
                 errors.push(error(
                     ValidationErrorKind::BindingTargetInvalid,
                     format!("/nodes/{}/bindings", node_id(node).as_str()),
@@ -855,8 +860,22 @@ fn validate_publication_bindings(
             }
         }
         for (target, constant, source) in bindings {
-            let Some(target_schema) = schema_at_pointer(input_schema, target) else {
-                continue;
+            let target_schema = match schema_at_binding_target(input_schema, target) {
+                Ok(Some(schema)) => schema,
+                Ok(None) => continue,
+                Err(ancestor) => {
+                    errors.push(error(
+                        ValidationErrorKind::BindingTargetInvalid,
+                        format!("/nodes/{}/bindings", node_id(node).as_str()),
+                        format!(
+                            "node `{}` binding target `{target}` cannot be resolved; nearest resolvable ancestor is `{}`",
+                            node_id(node).as_str(),
+                            if ancestor.is_empty() { "<root>" } else { &ancestor }
+                        ),
+                        &["bind a target present in the action input schema"],
+                    ));
+                    continue;
+                }
             };
             if let Some(value) = constant {
                 if !json_value_matches_schema(value, target_schema) {
@@ -959,6 +978,35 @@ fn schema_at_pointer<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> 
                 .get(&segment)
                 .or_else(|| current.get("items"))
         })
+}
+
+fn schema_at_binding_target<'a>(
+    schema: &'a Value,
+    pointer: &str,
+) -> Result<Option<&'a Value>, String> {
+    let mut current = schema;
+    let mut ancestor = String::new();
+    for segment in pointer.strip_prefix('/').unwrap_or(pointer).split('/') {
+        if current.as_object().is_some_and(serde_json::Map::is_empty) {
+            return Ok(None);
+        }
+        let decoded = segment.replace("~1", "/").replace("~0", "~");
+        let Some(next) = current
+            .get("properties")
+            .and_then(|properties| properties.get(&decoded))
+            .or_else(|| current.get("items"))
+        else {
+            return Err(ancestor);
+        };
+        current = next;
+        ancestor.push('/');
+        ancestor.push_str(segment);
+    }
+    if current.as_object().is_some_and(serde_json::Map::is_empty) {
+        Ok(None)
+    } else {
+        Ok(Some(current))
+    }
 }
 
 fn json_value_matches_schema(value: &Value, schema: &Value) -> bool {
@@ -1485,7 +1533,7 @@ fn validate_binding_targets<'a>(
             errors.push(error(
                 ValidationErrorKind::BindingTargetInvalid,
                 format!("/nodes/{}/bindings", id.0),
-                "binding targets must be unique and must not overlap",
+                format!("binding targets `{}` and `{}` overlap", pair[0], pair[1]),
                 &["bind only one leaf per target"],
             ));
         }
