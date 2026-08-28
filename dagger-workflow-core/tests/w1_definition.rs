@@ -22,6 +22,27 @@ fn invalid_kind(input: &str) -> ValidationErrorKind {
 }
 
 #[test]
+fn closed_skip_aggregate_and_object_sources_parse_and_validate() {
+    let definition = parse_json_definition(&format!(
+        r#"{{"definition_format_version":"0.1","definition_id":"closed-sources","name":"closed sources","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"map","kind":"Map","items":{{"kind":"constant","value":[1]}},"max_items":1,"max_concurrency":1,"action":{{"name":"example.action","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[{{"target":"/item","source":{{"kind":"map_item","pointer":""}}}}],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["choose"]}},{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"target":{{"kind":"skip"}}}}],"default":{{"kind":"node","next":"done"}}}},{{"id":"done","kind":"Succeed","output":{{"kind":"object","fields":{{"values":{{"kind":"map_aggregate","node_id":"map","pointer":""}},"names":{{"kind":"array","items":[{{"kind":"constant","value":"map"}}]}}}}}}}}]}}"#
+    ))
+    .unwrap();
+    validate_definition(&definition).unwrap();
+}
+
+#[test]
+fn map_aggregate_requires_an_authored_map_node() {
+    let input = valid().replace(
+        r#"{"kind":"constant","value":null}"#,
+        r#"{"kind":"map_aggregate","node_id":"work","pointer":""}"#,
+    );
+    assert_eq!(
+        invalid_kind(&input),
+        ValidationErrorKind::BindingSourceInvalid
+    );
+}
+
+#[test]
 fn reference_workflows_parse_and_validate() {
     for fixture in ["legal_research.yaml", "intel_digest.yaml"] {
         let path = format!(
@@ -330,7 +351,7 @@ fn invalid_definition_table_is_actionable() {
 fn friction_1_reconverged_node_output_is_rejected() {
     // 1: a post-Choice reconvergence consumer cannot use a branch-only output.
     let reconvergence = format!(
-        r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"next":"branch"}}],"default":"join"}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
+        r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"target":{{"kind":"node","next":"branch"}}}}],"default":{{"kind":"node","next":"join"}}}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
     );
     assert_eq!(
         invalid_kind(&reconvergence),

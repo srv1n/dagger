@@ -388,6 +388,11 @@ pub enum ChoiceSelection {
         /// Selected deterministic edge ID.
         edge_id: Id,
     },
+    /// A matching case or default intentionally activated no target.
+    Skipped {
+        /// Matching case index, or None for the default outcome.
+        case_index: Option<u32>,
+    },
 }
 
 /// One immutable attempt row.

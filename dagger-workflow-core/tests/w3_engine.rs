@@ -17,7 +17,7 @@ use dagger_workflow_core::definition::{
 use dagger_workflow_core::engine::{EngineConfig, EngineError, TestClock, WorkflowEngine};
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
-use dagger_workflow_core::run::{AttemptState, RunLimits, RunState};
+use dagger_workflow_core::run::{AttemptState, NodeState, RunLimits, RunState};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CreateDefinition, CreateRun, DecideApproval,
@@ -367,6 +367,34 @@ struct CountingAction {
     output: Value,
 }
 
+struct PermanentAction {
+    descriptor: ActionDescriptor,
+    calls: Arc<AtomicUsize>,
+}
+
+impl WorkflowAction for PermanentAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _context: ActionContext,
+        _canonical_bound_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            ActionOutcome::permanent(
+                "fixture.permanent".to_owned(),
+                "expected permanent failure".to_owned(),
+                None,
+                CostUnits(1),
+            )
+            .unwrap()
+        })
+    }
+}
+
 impl WorkflowAction for CountingAction {
     fn descriptor(&self) -> &ActionDescriptor {
         &self.descriptor
@@ -458,9 +486,17 @@ fn multiple_root_actions_execute_once_and_join() {
                 ),
                 NodeDefinition::Succeed {
                     id: id("done"),
-                    output: BindingSource::NodeOutput {
-                        node_id: id("join"),
-                        pointer: String::new(),
+                    output: BindingSource::Array {
+                        items: vec![
+                            BindingSource::NodeOutput {
+                                node_id: id("alfa"),
+                                pointer: String::new(),
+                            },
+                            BindingSource::NodeOutput {
+                                node_id: id("zulu"),
+                                pointer: String::new(),
+                            },
+                        ],
                     },
                 },
             ],
@@ -514,6 +550,162 @@ fn multiple_root_actions_execute_once_and_join() {
         assert_eq!(
             store
                 .get_run(&execution_scope, &id("multiple-root-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Succeeded
+        );
+    });
+}
+
+#[test]
+fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(800)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = |name: &str| ActionDescriptor {
+            name: name.to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
+            implementation_compatibility_digest: hash(format!("{name}-impl").as_bytes()),
+        };
+        let reference = |descriptor: &ActionDescriptor| ActionReference {
+            name: descriptor.name.clone(),
+            contract_version: descriptor.contract_version.clone(),
+            input_schema_digest: descriptor.input_schema_digest.clone(),
+            output_schema_digest: descriptor.output_schema_digest.clone(),
+            compatible_implementation_requirement: descriptor
+                .implementation_compatibility_digest
+                .clone(),
+        };
+        let action =
+            |node: &str, descriptor: &ActionDescriptor, bindings: Vec<Binding>, next: Vec<Id>| {
+                NodeDefinition::Action {
+                    id: id(node),
+                    action: reference(descriptor),
+                    bindings,
+                    retry: RetryPolicy {
+                        max_attempts: 1,
+                        backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                    },
+                    timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                    declared_max_cost_units: CostUnits(1),
+                    next,
+                }
+            };
+        let failed = descriptor("fixture.permanent-failed");
+        let independent = descriptor("fixture.permanent-independent");
+        let blocked = descriptor("fixture.permanent-blocked");
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("permanent-failure-definition"),
+            name: "permanent failure keeps independent roots live".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
+            nodes: vec![
+                action("failed", &failed, Vec::new(), vec![id("blocked")]),
+                action(
+                    "blocked",
+                    &blocked,
+                    vec![Binding {
+                        target: "/data".to_owned(),
+                        source: BindingSource::NodeOutput {
+                            node_id: id("failed"),
+                            pointer: String::new(),
+                        },
+                    }],
+                    vec![id("done")],
+                ),
+                action("independent", &independent, Vec::new(), vec![id("done")]),
+                NodeDefinition::Succeed {
+                    id: id("done"),
+                    output: BindingSource::NodeOutput {
+                        node_id: id("independent"),
+                        pointer: String::new(),
+                    },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "permanent-failure-run",
+            10_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let independent_calls = Arc::new(AtomicUsize::new(0));
+        let blocked_calls = Arc::new(AtomicUsize::new(0));
+        registry
+            .register(Arc::new(PermanentAction {
+                descriptor: failed,
+                calls: failed_calls.clone(),
+            }))
+            .unwrap();
+        for (descriptor, calls) in [
+            (independent, independent_calls.clone()),
+            (blocked, blocked_calls.clone()),
+        ] {
+            registry
+                .register(Arc::new(CountingAction {
+                    descriptor,
+                    calls,
+                    output: json!({}),
+                }))
+                .unwrap();
+        }
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("permanent-failure-engine"),
+                max_concurrency: 2,
+                cancellation_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("permanent-failure-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+
+        assert_eq!(failed_calls.load(Ordering::Acquire), 1);
+        assert_eq!(independent_calls.load(Ordering::Acquire), 1);
+        assert_eq!(blocked_calls.load(Ordering::Acquire), 0);
+        assert_eq!(
+            store
+                .get_node(
+                    &execution_scope,
+                    &id("permanent-failure-run"),
+                    &id("blocked")
+                )
+                .await
+                .unwrap()
+                .status,
+            NodeState::Skipped
+        );
+        assert_eq!(
+            store
+                .get_node(&execution_scope, &id("permanent-failure-run"), &id("done"))
+                .await
+                .unwrap()
+                .status,
+            NodeState::Succeeded
+        );
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("permanent-failure-run"))
                 .await
                 .unwrap()
                 .run
@@ -1928,7 +2120,7 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
                 },
                 NodeDefinition::Succeed {
                     id: id("succeed"),
-                    output: BindingSource::NodeOutput {
+                    output: BindingSource::MapAggregate {
                         node_id: id("map"),
                         pointer: String::new(),
                     },

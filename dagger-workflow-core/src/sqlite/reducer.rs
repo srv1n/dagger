@@ -852,15 +852,22 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
             let mut result = cases
                 .iter()
                 .enumerate()
-                .map(|(index, case)| {
+                .filter_map(|(index, case)| {
                     let target = match case {
-                        crate::definition::ChoiceCase::Equals { next, .. }
-                        | crate::definition::ChoiceCase::In { next, .. } => next.clone(),
+                        crate::definition::ChoiceCase::Equals { target, .. }
+                        | crate::definition::ChoiceCase::In { target, .. } => target,
                     };
-                    (format!("case/{index}"), target, Some(index as u32))
+                    match target {
+                        crate::definition::ChoiceTarget::Node { next } => {
+                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                        }
+                        crate::definition::ChoiceTarget::Skip => None,
+                    }
                 })
                 .collect::<Vec<_>>();
-            result.push(("default".to_owned(), default.clone(), None));
+            if let crate::definition::ChoiceTarget::Node { next } = default {
+                result.push(("default".to_owned(), next.clone(), None));
+            }
             result
         }
         NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
@@ -1286,7 +1293,7 @@ payload_constructors! {
     map_expanded => MapExpanded(map_input_digest: &Digest, expansion_digest: &Digest, child_count: &Option<u32>, max_concurrency: &u32);
     map_zero_items_succeeded => MapZeroItemsSucceeded(map_input_digest: &Digest, expansion_digest: &Digest, aggregate_digest: &Digest);
     map_succeeded => MapSucceeded(child_count: &Option<u32>, aggregate_digest: &Digest);
-    choice_selected => ChoiceSelected(choice_input_digest: &Digest, selector_value_digest: &Digest, selection_kind: &str, case_index: &Option<u32>, edge_id: &Id);
+    choice_selected => ChoiceSelected(choice_input_digest: &Digest, selector_value_digest: &Digest, selection_kind: &str, case_index: &Option<u32>, edge_id: &Option<&Id>);
     approval_requested => ApprovalRequested(gate_id: &Id, request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
     approval_approved => ApprovalApproved(gate_id: &Id, decision_payload_digest: &Option<&Digest>, approval_output_digest: &Digest, resolution_source: &str);
     approval_rejected => ApprovalRejected(gate_id: &Id, decision_payload_digest: &Option<&Digest>, resolution_source: &str);
@@ -2095,6 +2102,7 @@ fn frontier_reduce(
     scope: &ExecutionScope,
     run_id: &Id,
     source_node: &Id,
+    source_succeeded: bool,
     selected_edge: Option<&Id>,
     now: Timestamp,
     specs: &mut Vec<EventSpec>,
@@ -2111,8 +2119,9 @@ fn frontier_reduce(
         let edge = state.edges.get_mut(key).expect("key captured");
         if edge.from_node_id == *source_node && edge.state == EdgeState::Dormant {
             frontier_changed = true;
-            let selected = edge.kind == EdgeKind::Dependency
-                || selected_edge.is_none_or(|selected| selected == &edge.edge_id);
+            let selected = source_succeeded
+                && (edge.kind == EdgeKind::Dependency
+                    || selected_edge.is_none_or(|selected| selected == &edge.edge_id));
             edge.state = if selected {
                 EdgeState::Satisfied
             } else {
@@ -2135,7 +2144,11 @@ fn frontier_reduce(
                     &(&edge.edge_id),
                     &(&edge.from_node_id),
                     &(&edge.to_node_id),
-                    &("choice_unselected"),
+                    &(if source_succeeded {
+                        "choice_unselected"
+                    } else {
+                        "source_failed"
+                    }),
                 )
             };
             specs.push(event_spec(
@@ -2257,6 +2270,63 @@ fn frontier_reduce(
     if frontier_changed {
         bump_frontier_epoch(state, scope, run_id)?;
     }
+    finalize_failed_run_if_output_unavailable(state, scope, run_id, now, specs)?;
+    Ok(())
+}
+
+/// Marks the run failed only after every branch is terminal and its declared
+/// success output cannot exist. A permanent Action failure itself only removes
+/// its dependent frontier; unrelated roots keep running.
+fn finalize_failed_run_if_output_unavailable(
+    state: &mut ReducerState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    now: Timestamp,
+    specs: &mut Vec<EventSpec>,
+) -> Result<(), StoreError> {
+    let run_key = (scope.clone(), run_id.clone());
+    if state
+        .runs
+        .get(&run_key)
+        .ok_or(StoreError::NotFound)?
+        .status
+        .is_terminal()
+    {
+        return Ok(());
+    }
+    let nodes = state
+        .nodes
+        .values()
+        .filter(|node| node.scope == *scope && node.run_id == *run_id)
+        .collect::<Vec<_>>();
+    if nodes.iter().any(|node| !node.status.is_terminal())
+        || nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Succeed && node.status == NodeState::Succeeded)
+    {
+        return Ok(());
+    }
+    let Some(failure_kind) = nodes
+        .iter()
+        .filter(|node| node.status == NodeState::Failed)
+        .filter_map(|node| node.failure_kind)
+        .find(|kind| *kind == NodeFailureKind::ActionPermanent)
+    else {
+        return Ok(());
+    };
+    let run_kind = run_failure(failure_kind);
+    let run = state.runs.get_mut(&run_key).expect("run exists");
+    run.status = RunState::Failed;
+    run.failure_kind = Some(run_kind);
+    run.finished_at = Some(now);
+    set_run_mutated(run, now)?;
+    specs.push(event_spec(
+        "R07",
+        None,
+        None,
+        None,
+        event_payload::run_failed(&(run_kind), &(Option::<&Digest>::None)),
+    ));
     Ok(())
 }
 
@@ -4714,6 +4784,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         scope,
                         &command.run_id,
                         &command.node_id,
+                        true,
                         None,
                         now,
                         &mut specs,
@@ -4887,85 +4958,54 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     let child_failure_kind = node.failure_kind.expect("permanent failure kind");
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
-                    if let Some(parent_map_instance_id) = parent_map_instance_id {
-                        let parent_key = (
-                            scope.clone(),
-                            command.run_id.clone(),
-                            parent_map_instance_id.clone(),
-                        );
-                        let mut parent = state
-                            .nodes
-                            .get(&parent_key)
-                            .cloned()
-                            .ok_or(StoreError::CorruptControlPlane)?;
-                        if parent.status != NodeState::WaitingChildren {
-                            return Err(StoreError::CorruptControlPlane);
-                        }
-                        parent.status = NodeState::Failed;
-                        parent.failure_kind = Some(NodeFailureKind::MapChildFailed);
-                        set_node_mutated(&mut parent, now)?;
-                        state.nodes.insert(parent_key, parent);
-                        specs.push(event_spec(
-                            "N42",
-                            Some(&parent_map_instance_id),
-                            None,
-                            None,
-                            event_payload::map_failed_fast(
-                                &(command.node_id),
-                                &(child_failure_kind),
-                            ),
-                        ));
-                        let run = terminalize_run(
-                            &mut state,
-                            scope,
-                            &command.run_id,
-                            RunState::Failed,
-                            Some(RunFailureKind::MapChildFailed),
-                            "MapChildFailed",
-                            now,
-                            &mut specs,
-                        )?;
-                        specs.push(event_spec(
-                            "R07",
-                            None,
-                            None,
-                            None,
-                            event_payload::run_failed(
-                                &(RunFailureKind::MapChildFailed),
-                                &(Option::<&Digest>::None),
-                            ),
-                        ));
-                        append_batch(
-                            &mut state,
-                            scope,
-                            &command.run_id,
-                            now,
-                            EventActorKind::ActionCompletion,
-                            "completion".to_owned(),
-                            specs,
-                        )?;
-                        return Ok(CompleteAttemptResult::TerminalRun(run));
-                    }
-                    let run = terminalize_run(
+                    let failed_frontier =
+                        if let Some(parent_map_instance_id) = parent_map_instance_id {
+                            let parent_key = (
+                                scope.clone(),
+                                command.run_id.clone(),
+                                parent_map_instance_id.clone(),
+                            );
+                            let mut parent = state
+                                .nodes
+                                .get(&parent_key)
+                                .cloned()
+                                .ok_or(StoreError::CorruptControlPlane)?;
+                            if parent.status != NodeState::WaitingChildren {
+                                return Err(StoreError::CorruptControlPlane);
+                            }
+                            parent.status = NodeState::Failed;
+                            parent.failure_kind = Some(NodeFailureKind::MapChildFailed);
+                            set_node_mutated(&mut parent, now)?;
+                            state.nodes.insert(parent_key, parent);
+                            specs.push(event_spec(
+                                "N42",
+                                Some(&parent_map_instance_id),
+                                None,
+                                None,
+                                event_payload::map_failed_fast(
+                                    &(command.node_id),
+                                    &(child_failure_kind),
+                                ),
+                            ));
+                            parent_map_instance_id
+                        } else {
+                            command.node_id.clone()
+                        };
+                    frontier_reduce(
                         &mut state,
                         scope,
                         &command.run_id,
-                        RunState::Failed,
-                        Some(RunFailureKind::ActionPermanent),
-                        "ActionPermanent",
+                        &failed_frontier,
+                        false,
+                        None,
                         now,
                         &mut specs,
                     )?;
-                    specs.push(event_spec(
-                        "R07",
-                        None,
-                        None,
-                        None,
-                        event_payload::run_failed(
-                            &(RunFailureKind::ActionPermanent),
-                            &(Option::<&Digest>::None),
-                        ),
-                    ));
+                    let run = state
+                        .runs
+                        .get(&(scope.clone(), command.run_id.clone()))
+                        .expect("run")
+                        .clone();
                     append_batch(
                         &mut state,
                         scope,
@@ -4975,7 +5015,11 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         "completion".to_owned(),
                         specs,
                     )?;
-                    Ok(CompleteAttemptResult::TerminalRun(run))
+                    if run.status.is_terminal() {
+                        Ok(CompleteAttemptResult::TerminalRun(run))
+                    } else {
+                        Ok(CompleteAttemptResult::Applied(attempt))
+                    }
                 }
             }
         })
@@ -5613,51 +5657,62 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             let mut expected = None;
             for (index, case) in cases.iter().enumerate() {
                 let (values, target) = match case {
-                    crate::definition::ChoiceCase::Equals { equals, next } => {
-                        (std::slice::from_ref(equals), next)
+                    crate::definition::ChoiceCase::Equals { equals, target } => {
+                        (std::slice::from_ref(equals), target)
                     }
-                    crate::definition::ChoiceCase::In { r#in, next } => (r#in.as_slice(), next),
+                    crate::definition::ChoiceCase::In { r#in, target } => (r#in.as_slice(), target),
                 };
                 if values.iter().any(|value| {
                     serde_jcs::to_vec(value)
                         .map(|bytes| digest(&bytes) == command.evaluated_selector_digest)
                         .unwrap_or(false)
                 }) {
-                    expected = Some(ChoiceSelection::Case {
-                        case_index: index as u32,
-                        edge_id: edge_id(
-                            &state
-                                .runs
-                                .get(&(scope.clone(), command.run_id.clone()))
-                                .expect("run")
-                                .revision_hash,
-                            &node.definition_node_id,
-                            &format!("case/{index}"),
-                            target,
-                        ),
+                    expected = Some(match target {
+                        crate::definition::ChoiceTarget::Node { next } => ChoiceSelection::Case {
+                            case_index: index as u32,
+                            edge_id: edge_id(
+                                &state
+                                    .runs
+                                    .get(&(scope.clone(), command.run_id.clone()))
+                                    .expect("run")
+                                    .revision_hash,
+                                &node.definition_node_id,
+                                &format!("case/{index}"),
+                                next,
+                            ),
+                        },
+                        crate::definition::ChoiceTarget::Skip => ChoiceSelection::Skipped {
+                            case_index: Some(index as u32),
+                        },
                     });
                     break;
                 }
             }
-            let expected = expected.unwrap_or_else(|| ChoiceSelection::Default {
-                edge_id: edge_id(
-                    &state
-                        .runs
-                        .get(&(scope.clone(), command.run_id.clone()))
-                        .expect("run")
-                        .revision_hash,
-                    &node.definition_node_id,
-                    "default",
-                    default,
-                ),
+            let expected = expected.unwrap_or_else(|| match default {
+                crate::definition::ChoiceTarget::Node { next } => ChoiceSelection::Default {
+                    edge_id: edge_id(
+                        &state
+                            .runs
+                            .get(&(scope.clone(), command.run_id.clone()))
+                            .expect("run")
+                            .revision_hash,
+                        &node.definition_node_id,
+                        "default",
+                        next,
+                    ),
+                },
+                crate::definition::ChoiceTarget::Skip => {
+                    ChoiceSelection::Skipped { case_index: None }
+                }
             });
             if command.selection != expected {
                 return Err(StoreError::InvalidField);
             }
             let selected = match &command.selection {
                 ChoiceSelection::Case { edge_id, .. } | ChoiceSelection::Default { edge_id } => {
-                    edge_id.clone()
+                    Some(edge_id.clone())
                 }
+                ChoiceSelection::Skipped { .. } => None,
             };
             let outgoing_ids = state
                 .edges
@@ -5669,7 +5724,10 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 })
                 .map(|edge| edge.edge_id.clone())
                 .collect::<BTreeSet<_>>();
-            if !outgoing_ids.contains(&selected) {
+            if selected
+                .as_ref()
+                .is_some_and(|edge_id| !outgoing_ids.contains(edge_id))
+            {
                 return Err(StoreError::InvalidField);
             }
             node.status = NodeState::Succeeded;
@@ -5693,14 +5751,21 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     &(&command.evaluated_selector_digest),
                     &("case"),
                     &(Some(*case_index)),
-                    &(&selected),
+                    &(selected.as_ref()),
                 ),
                 ChoiceSelection::Default { .. } => event_payload::choice_selected(
                     &(command.input.digest()),
                     &(&command.evaluated_selector_digest),
                     &("default"),
                     &(Option::<u32>::None),
-                    &(&selected),
+                    &(selected.as_ref()),
+                ),
+                ChoiceSelection::Skipped { case_index } => event_payload::choice_selected(
+                    &(command.input.digest()),
+                    &(&command.evaluated_selector_digest),
+                    &("skip"),
+                    &(case_index),
+                    &(Option::<&Id>::None),
                 ),
             };
             let mut specs = vec![event_spec(
@@ -5715,7 +5780,8 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 scope,
                 &command.run_id,
                 &command.node_id,
-                Some(&selected),
+                true,
+                selected.as_ref(),
                 now,
                 &mut specs,
             )?;
@@ -5961,6 +6027,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     scope,
                     &command.run_id,
                     &command.map_node_id,
+                    true,
                     None,
                     now,
                     &mut specs,
@@ -6243,6 +6310,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 scope,
                 &command.run_id,
                 &command.map_node_id,
+                true,
                 None,
                 now,
                 &mut specs,
@@ -6593,6 +6661,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         scope,
                         &command.run_id,
                         &node_id,
+                        true,
                         None,
                         now,
                         &mut specs,
@@ -6794,6 +6863,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         scope,
                         &command.run_id,
                         &node_id,
+                        true,
                         None,
                         now,
                         &mut specs,

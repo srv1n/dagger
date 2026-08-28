@@ -218,6 +218,43 @@
           "additionalProperties": false,
           "required": ["kind", "node_id", "pointer"],
           "properties": {
+            "kind": { "const": "map_aggregate" },
+            "node_id": { "$ref": "#/$defs/id" },
+            "pointer": { "$ref": "#/$defs/source_pointer" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "fields"],
+          "properties": {
+            "kind": { "const": "object" },
+            "fields": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 64,
+              "additionalProperties": { "$ref": "#/$defs/binding_source" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "items"],
+          "properties": {
+            "kind": { "const": "array" },
+            "items": {
+              "type": "array",
+              "maxItems": 1024,
+              "items": { "$ref": "#/$defs/binding_source" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "node_id", "pointer"],
+          "properties": {
             "kind": { "const": "node_output" },
             "node_id": { "$ref": "#/$defs/id" },
             "pointer": { "$ref": "#/$defs/source_pointer" }
@@ -284,16 +321,16 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["equals", "next"],
+          "required": ["equals", "target"],
           "properties": {
             "equals": { "$ref": "#/$defs/json_scalar" },
-            "next": { "$ref": "#/$defs/id" }
+            "target": { "$ref": "#/$defs/choice_target" }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["in", "next"],
+          "required": ["in", "target"],
           "properties": {
             "in": {
               "type": "array",
@@ -302,8 +339,27 @@
               "uniqueItems": true,
               "items": { "$ref": "#/$defs/json_scalar" }
             },
+            "target": { "$ref": "#/$defs/choice_target" }
+          }
+        }
+      ]
+    },
+    "choice_target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "next"],
+          "properties": {
+            "kind": { "const": "node" },
             "next": { "$ref": "#/$defs/id" }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": { "kind": { "const": "skip" } }
         }
       ]
     },
@@ -350,7 +406,7 @@
           "maxItems": 100,
           "items": { "$ref": "#/$defs/choice_case" }
         },
-        "default": { "$ref": "#/$defs/id" }
+        "default": { "$ref": "#/$defs/choice_target" }
       }
     },
     "map_node": {
@@ -509,12 +565,12 @@
   "x-dagger-semantic-constraints": [
     "Apply all schema defaults before canonical hashing.",
     "Node IDs are unique; roots are the lexical set with no incoming output-reference or control-activation edge.",
-    "All next/default/case targets exist and each Choice target is unique.",
+    "All node next/default/case targets exist and each Choice node target is unique.",
     "The control graph and binding dependency graph are acyclic.",
     "Every node is reachable from the derived root set.",
     "Every maximal active path ends in Succeed or Fail.",
     "Exactly one Succeed node exists and is reachable from the derived root set; multiple Fail nodes are allowed.",
-    "Every Choice declares a default target; fail-closed default behavior uses an explicit Fail node.",
+    "Every Choice declares a default node or skip outcome.",
     "Action, Map action, and root run schema digests resolve to durable supported-subset SchemaDocument objects.",
     "Action input schemas are JSON objects and explicit bindings cover every required leaf exactly once.",
     "Binding targets are unique and non-overlapping; source types assign without coercion.",

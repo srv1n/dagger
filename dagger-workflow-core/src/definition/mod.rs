@@ -83,8 +83,8 @@ pub enum NodeDefinition {
         selector: String,
         /// Ordered non-empty cases.
         cases: Vec<ChoiceCase>,
-        /// Required default target.
-        default: Id,
+        /// Required default outcome.
+        default: ChoiceTarget,
     },
     /// A durable human approval node.
     Approval {
@@ -251,6 +251,23 @@ pub enum BindingSource {
         /// Source RFC 6901 pointer.
         pointer: String,
     },
+    /// The ordered projection of one pointer from every child output of a Map.
+    MapAggregate {
+        /// Static upstream Map node identifier.
+        node_id: Id,
+        /// Source RFC 6901 pointer inside each child output.
+        pointer: String,
+    },
+    /// A deterministic JSON object assembled from named closed sources.
+    Object {
+        /// Named object fields in canonical lexical order.
+        fields: BTreeMap<String, BindingSource>,
+    },
+    /// A deterministic JSON array assembled from closed sources in authored order.
+    Array {
+        /// Ordered array items.
+        items: Vec<BindingSource>,
+    },
     /// A typed ArtifactRef locator.
     ArtifactRef {
         /// Closed artifact locator.
@@ -278,6 +295,23 @@ pub enum MapBindingSource {
         node_id: Id,
         /// Source RFC 6901 pointer.
         pointer: String,
+    },
+    /// The ordered projection of one pointer from every child output of a Map.
+    MapAggregate {
+        /// Static upstream Map node identifier.
+        node_id: Id,
+        /// Source RFC 6901 pointer inside each child output.
+        pointer: String,
+    },
+    /// A deterministic JSON object assembled from named closed sources.
+    Object {
+        /// Named object fields in canonical lexical order.
+        fields: BTreeMap<String, BindingSource>,
+    },
+    /// A deterministic JSON array assembled from closed sources in authored order.
+    Array {
+        /// Ordered array items.
+        items: Vec<BindingSource>,
     },
     /// A typed ArtifactRef locator.
     ArtifactRef {
@@ -328,16 +362,29 @@ pub enum ChoiceCase {
     Equals {
         /// Scalar to compare exactly.
         equals: Value,
-        /// Singular case target.
-        next: Id,
+        /// Case outcome.
+        target: ChoiceTarget,
     },
     /// Exact membership in a non-empty scalar set.
     In {
         /// Canonical-unique scalar candidates.
         r#in: Vec<Value>,
-        /// Singular case target.
+        /// Case outcome.
+        target: ChoiceTarget,
+    },
+}
+
+/// One closed Choice outcome.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ChoiceTarget {
+    /// Activate one authored control target.
+    Node {
+        /// Singular target node.
         next: Id,
     },
+    /// Activate no target and deterministically skip every dormant Choice edge.
+    Skip,
 }
 
 /// Immutable durable gate configuration.
@@ -729,41 +776,67 @@ fn require_publication_schema(
     }
 }
 
-fn validate_publication_artifacts(
-    node: &NodeDefinition,
+fn validate_publication_source(
+    id: &Id,
+    source: &BindingSource,
     resolver: &dyn PublicationResolver,
     errors: &mut Vec<DefinitionValidationError>,
 ) {
-    let id = node_id(node);
-    let mut check_source = |source: &BindingSource| {
-        if let BindingSource::ArtifactRef {
+    match source {
+        BindingSource::ArtifactRef {
             source:
                 ArtifactLocator::Literal {
                     artifact_ref_id,
                     digest,
                     media_type,
                 },
-        } = source
-        {
-            if !resolver.artifact_exists(artifact_ref_id, digest, media_type) {
-                errors.push(error(
-                    ValidationErrorKind::ArtifactLocatorInvalid,
-                    format!("/nodes/{}/source", id.as_str()),
-                    "literal ArtifactRef does not resolve under the publication scope",
-                    &["register the exact ArtifactRef"],
-                ));
+        } if !resolver.artifact_exists(artifact_ref_id, digest, media_type) => {
+            errors.push(error(
+                ValidationErrorKind::ArtifactLocatorInvalid,
+                format!("/nodes/{}/source", id.as_str()),
+                "literal ArtifactRef does not resolve under the publication scope",
+                &["register the exact ArtifactRef"],
+            ));
+        }
+        BindingSource::Object { fields } => {
+            for field in fields.values() {
+                validate_publication_source(id, field, resolver, errors);
             }
         }
-    };
+        BindingSource::Array { items } => {
+            for item in items {
+                validate_publication_source(id, item, resolver, errors);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_publication_artifacts(
+    node: &NodeDefinition,
+    resolver: &dyn PublicationResolver,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
+    let id = node_id(node);
     match node {
         NodeDefinition::Action { bindings, .. } => bindings
             .iter()
-            .for_each(|binding| check_source(&binding.source)),
+            .for_each(|binding| validate_publication_source(id, &binding.source, resolver, errors)),
         NodeDefinition::Map {
             items, bindings, ..
         } => {
-            check_source(items);
+            validate_publication_source(id, items, resolver, errors);
             for binding in bindings {
+                if let MapBindingSource::Object { fields } = &binding.source {
+                    for field in fields.values() {
+                        validate_publication_source(id, field, resolver, errors);
+                    }
+                }
+                if let MapBindingSource::Array { items } = &binding.source {
+                    for item in items {
+                        validate_publication_source(id, item, resolver, errors);
+                    }
+                }
                 if let MapBindingSource::ArtifactRef {
                     source:
                         ArtifactLocator::Literal {
@@ -786,7 +859,9 @@ fn validate_publication_artifacts(
         }
         NodeDefinition::Choice { input, .. }
         | NodeDefinition::Approval { request: input, .. }
-        | NodeDefinition::Succeed { output: input, .. } => check_source(input),
+        | NodeDefinition::Succeed { output: input, .. } => {
+            validate_publication_source(id, input, resolver, errors)
+        }
         NodeDefinition::Fail { .. } => {}
     }
 }
@@ -946,6 +1021,51 @@ fn binding_source_schema(
                 _ => return None,
             };
             schema_at_pointer(&source_schema, pointer).cloned()
+        }
+        BindingSource::MapAggregate {
+            node_id: source_node_id,
+            pointer,
+        } => {
+            let NodeDefinition::Map { action, .. } = definition
+                .nodes
+                .iter()
+                .find(|candidate| node_id(candidate) == source_node_id)?
+            else {
+                return None;
+            };
+            let mut aggregate = serde_json::Map::new();
+            aggregate.insert("type".to_string(), Value::String("array".to_string()));
+            aggregate.insert(
+                "items".to_string(),
+                schema_at_pointer(schemas.get(&action.output_schema_digest)?, pointer)?.clone(),
+            );
+            Some(Value::Object(aggregate))
+        }
+        BindingSource::Object { fields } => {
+            let mut properties = serde_json::Map::new();
+            for (name, source) in fields {
+                properties.insert(
+                    name.clone(),
+                    binding_source_schema(definition, schemas, source)
+                        .unwrap_or_else(|| serde_json::json!({})),
+                );
+            }
+            let mut object = serde_json::Map::new();
+            object.insert("type".to_string(), Value::String("object".to_string()));
+            object.insert("properties".to_string(), Value::Object(properties));
+            Some(Value::Object(object))
+        }
+        BindingSource::Array { items } => {
+            let item_schemas = items
+                .iter()
+                .map(|item| binding_source_schema(definition, schemas, item))
+                .collect::<Option<Vec<_>>>()?;
+            let item_schema = item_schemas
+                .first()
+                .filter(|first| item_schemas.iter().all(|item| item == *first))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(serde_json::json!({"type":"array","items":item_schema}))
         }
         BindingSource::Constant { .. } | BindingSource::ArtifactRef { .. } => None,
     }
@@ -1181,15 +1301,30 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id)> {
         NodeDefinition::Choice { cases, default, .. } => cases
             .iter()
             .enumerate()
-            .map(|(index, case)| (format!("case/{index}"), case_target(case).clone()))
-            .chain(std::iter::once(("default".to_owned(), default.clone())))
+            .filter_map(|(index, case)| {
+                choice_target(case_target(case))
+                    .cloned()
+                    .map(|target| (format!("case/{index}"), target))
+            })
+            .chain(
+                choice_target(default)
+                    .cloned()
+                    .map(|target| ("default".to_owned(), target)),
+            )
             .collect(),
         NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
     }
 }
-fn case_target(case: &ChoiceCase) -> &Id {
+fn case_target(case: &ChoiceCase) -> &ChoiceTarget {
     match case {
-        ChoiceCase::Equals { next, .. } | ChoiceCase::In { next, .. } => next,
+        ChoiceCase::Equals { target, .. } | ChoiceCase::In { target, .. } => target,
+    }
+}
+
+fn choice_target(target: &ChoiceTarget) -> Option<&Id> {
+    match target {
+        ChoiceTarget::Node { next } => Some(next),
+        ChoiceTarget::Skip => None,
     }
 }
 
@@ -1336,7 +1471,7 @@ fn validate_node(
                     &["add a case"],
                 ));
             }
-            if !ids.contains_key(default) {
+            if choice_target(default).is_some_and(|target| !ids.contains_key(target)) {
                 errors.push(error(
                     ValidationErrorKind::MissingNode,
                     format!("/nodes/{}/default", id.0),
@@ -1345,15 +1480,28 @@ fn validate_node(
                 ));
             }
             let mut targets = BTreeSet::new();
-            targets.insert(default.clone());
+            if let Some(target) = choice_target(default) {
+                targets.insert(target.clone());
+            }
             let mut values = BTreeSet::new();
             for case in cases {
-                if !targets.insert(case_target(case).clone()) {
+                if let Some(target) = choice_target(case_target(case)) {
+                    if !targets.insert(target.clone()) {
+                        errors.push(error(
+                            ValidationErrorKind::ChoiceCaseInvalid,
+                            format!("/nodes/{}/cases", id.0),
+                            "Choice case and default targets must be unique",
+                            &["use distinct targets"],
+                        ));
+                    }
+                }
+                if choice_target(case_target(case)).is_some_and(|target| !ids.contains_key(target))
+                {
                     errors.push(error(
-                        ValidationErrorKind::ChoiceCaseInvalid,
+                        ValidationErrorKind::MissingNode,
                         format!("/nodes/{}/cases", id.0),
-                        "Choice case and default targets must be unique",
-                        &["use distinct targets"],
+                        "Choice case must target an existing node",
+                        &["use an existing node id or skip"],
                     ));
                 }
                 let candidates: Vec<&Value> = match case {
@@ -1551,7 +1699,60 @@ fn validate_source(
     map_allowed: bool,
     errors: &mut Vec<DefinitionValidationError>,
 ) {
-    match source { BindingSource::RunInput { pointer } => validate_pointer(id, pointer, errors), BindingSource::NodeOutput { pointer, .. } => validate_pointer(id, pointer, errors), BindingSource::ArtifactRef { source } => match source { ArtifactLocator::Literal { artifact_ref_id, digest, media_type } if valid_id(&artifact_ref_id.0) && valid_digest(&digest.0) && !media_type.is_empty() && media_type.len() <= 200 => {}, ArtifactLocator::RunInput { pointer } | ArtifactLocator::NodeOutput { pointer, .. } if valid_source_pointer(pointer) => {}, _ => errors.push(error(ValidationErrorKind::ArtifactLocatorInvalid, format!("/nodes/{}/source", id.0), "artifact locator requires an exact identity/digest/media tuple or valid source pointer", &["use a complete literal locator"])), }, BindingSource::Constant { .. } => {} }
+    match source {
+        BindingSource::RunInput { pointer }
+        | BindingSource::NodeOutput { pointer, .. }
+        | BindingSource::MapAggregate { pointer, .. } => validate_pointer(id, pointer, errors),
+        BindingSource::Object { fields } => {
+            if fields.is_empty()
+                || fields.len() > 64
+                || fields.keys().any(|name| name.is_empty() || name.len() > 200)
+            {
+                errors.push(error(
+                    ValidationErrorKind::InvalidField,
+                    format!("/nodes/{}/source/fields", id.0),
+                    "object source requires 1–64 non-empty field names of at most 200 bytes",
+                    &["use a small named field map"],
+                ));
+            }
+            for field in fields.values() {
+                validate_source(id, field, map_allowed, errors);
+            }
+        }
+        BindingSource::Array { items } => {
+            if items.len() > 1_024 {
+                errors.push(error(
+                    ValidationErrorKind::InvalidField,
+                    format!("/nodes/{}/source/items", id.0),
+                    "array source permits at most 1,024 items",
+                    &["split the value before binding"],
+                ));
+            }
+            for item in items {
+                validate_source(id, item, map_allowed, errors);
+            }
+        }
+        BindingSource::ArtifactRef { source } => match source {
+            ArtifactLocator::Literal {
+                artifact_ref_id,
+                digest,
+                media_type,
+            } if valid_id(&artifact_ref_id.0)
+                && valid_digest(&digest.0)
+                && !media_type.is_empty()
+                && media_type.len() <= 200 => {}
+            ArtifactLocator::RunInput { pointer }
+            | ArtifactLocator::NodeOutput { pointer, .. }
+                if valid_source_pointer(pointer) => {}
+            _ => errors.push(error(
+                ValidationErrorKind::ArtifactLocatorInvalid,
+                format!("/nodes/{}/source", id.0),
+                "artifact locator requires an exact identity/digest/media tuple or valid source pointer",
+                &["use a complete literal locator"],
+            )),
+        },
+        BindingSource::Constant { .. } => {}
+    }
     let _ = map_allowed;
 }
 fn validate_map_source(
@@ -1563,7 +1764,24 @@ fn validate_map_source(
         MapBindingSource::Constant { .. } | MapBindingSource::MapIndex => {}
         MapBindingSource::RunInput { pointer }
         | MapBindingSource::NodeOutput { pointer, .. }
+        | MapBindingSource::MapAggregate { pointer, .. }
         | MapBindingSource::MapItem { pointer } => validate_pointer(id, pointer, errors),
+        MapBindingSource::Object { fields } => validate_source(
+            id,
+            &BindingSource::Object {
+                fields: fields.clone(),
+            },
+            true,
+            errors,
+        ),
+        MapBindingSource::Array { items } => validate_source(
+            id,
+            &BindingSource::Array {
+                items: items.clone(),
+            },
+            true,
+            errors,
+        ),
         MapBindingSource::ArtifactRef { source } => validate_source(
             id,
             &BindingSource::ArtifactRef {
@@ -1591,26 +1809,51 @@ fn validate_bindings(
 ) {
     for node in &definition.nodes {
         let consumer = node_id(node);
-        let sources: Vec<Option<&Id>> = match node {
+        let ordinary_sources = match node {
             NodeDefinition::Action { bindings, .. } => bindings
                 .iter()
-                .map(|binding| source_node(&binding.source))
+                .map(|binding| &binding.source)
+                .collect::<Vec<_>>(),
+            NodeDefinition::Map { items, .. }
+            | NodeDefinition::Choice { input: items, .. }
+            | NodeDefinition::Approval { request: items, .. }
+            | NodeDefinition::Succeed { output: items, .. } => vec![items],
+            NodeDefinition::Fail { .. } => Vec::new(),
+        };
+        for source in ordinary_sources {
+            validate_map_aggregate_source(definition, consumer, source, errors);
+        }
+        if let NodeDefinition::Map { bindings, .. } = node {
+            for binding in bindings {
+                validate_map_binding_aggregate_source(
+                    definition,
+                    consumer,
+                    &binding.source,
+                    errors,
+                );
+            }
+        }
+        let sources: Vec<&Id> = match node {
+            NodeDefinition::Action { bindings, .. } => bindings
+                .iter()
+                .flat_map(|binding| source_nodes(&binding.source))
                 .collect(),
             NodeDefinition::Map {
                 items, bindings, ..
-            } => std::iter::once(source_node(items))
+            } => source_nodes(items)
+                .into_iter()
                 .chain(
                     bindings
                         .iter()
-                        .map(|binding| map_source_node(&binding.source)),
+                        .flat_map(|binding| map_source_nodes(&binding.source)),
                 )
                 .collect(),
             NodeDefinition::Choice { input, .. }
             | NodeDefinition::Approval { request: input, .. }
-            | NodeDefinition::Succeed { output: input, .. } => vec![source_node(input)],
+            | NodeDefinition::Succeed { output: input, .. } => source_nodes(input),
             NodeDefinition::Fail { .. } => vec![],
         };
-        for source_id in sources.into_iter().flatten() {
+        for source_id in sources {
             let strict_ancestor =
                 source_id != consumer && graph_reaches(edges, source_id, consumer, None);
             let choice_bypass = definition.nodes.iter().any(|candidate| {
@@ -1624,22 +1867,98 @@ fn validate_bindings(
         }
     }
 }
-fn map_source_node(source: &MapBindingSource) -> Option<&Id> {
+
+fn validate_map_aggregate_source(
+    definition: &WorkflowDefinition,
+    consumer: &Id,
+    source: &BindingSource,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
     match source {
-        MapBindingSource::NodeOutput { node_id, .. } => Some(node_id),
-        MapBindingSource::ArtifactRef {
-            source: ArtifactLocator::NodeOutput { node_id, .. },
-        } => Some(node_id),
-        _ => None,
+        BindingSource::MapAggregate {
+            node_id: map_node_id,
+            ..
+        } if !matches!(
+            definition
+                .nodes
+                .iter()
+                .find(|candidate| node_id(candidate) == map_node_id),
+            Some(NodeDefinition::Map { .. })
+        ) =>
+        {
+            errors.push(error(
+                ValidationErrorKind::BindingSourceInvalid,
+                format!("/nodes/{}/source", consumer.0),
+                "map_aggregate must name an authored Map node",
+                &["use a Map node id"],
+            ));
+        }
+        BindingSource::Object { fields } => {
+            for field in fields.values() {
+                validate_map_aggregate_source(definition, consumer, field, errors);
+            }
+        }
+        BindingSource::Array { items } => {
+            for item in items {
+                validate_map_aggregate_source(definition, consumer, item, errors);
+            }
+        }
+        _ => {}
     }
 }
-fn source_node(source: &BindingSource) -> Option<&Id> {
+
+fn validate_map_binding_aggregate_source(
+    definition: &WorkflowDefinition,
+    consumer: &Id,
+    source: &MapBindingSource,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
     match source {
-        BindingSource::NodeOutput { node_id, .. } => Some(node_id),
+        MapBindingSource::MapAggregate { node_id, pointer } => validate_map_aggregate_source(
+            definition,
+            consumer,
+            &BindingSource::MapAggregate {
+                node_id: node_id.clone(),
+                pointer: pointer.clone(),
+            },
+            errors,
+        ),
+        MapBindingSource::Object { fields } => {
+            for field in fields.values() {
+                validate_map_aggregate_source(definition, consumer, field, errors);
+            }
+        }
+        MapBindingSource::Array { items } => {
+            for item in items {
+                validate_map_aggregate_source(definition, consumer, item, errors);
+            }
+        }
+        _ => {}
+    }
+}
+fn map_source_nodes(source: &MapBindingSource) -> Vec<&Id> {
+    match source {
+        MapBindingSource::NodeOutput { node_id, .. }
+        | MapBindingSource::MapAggregate { node_id, .. } => vec![node_id],
+        MapBindingSource::Object { fields } => fields.values().flat_map(source_nodes).collect(),
+        MapBindingSource::Array { items } => items.iter().flat_map(source_nodes).collect(),
+        MapBindingSource::ArtifactRef {
+            source: ArtifactLocator::NodeOutput { node_id, .. },
+        } => vec![node_id],
+        _ => Vec::new(),
+    }
+}
+fn source_nodes(source: &BindingSource) -> Vec<&Id> {
+    match source {
+        BindingSource::NodeOutput { node_id, .. } | BindingSource::MapAggregate { node_id, .. } => {
+            vec![node_id]
+        }
         BindingSource::ArtifactRef {
             source: ArtifactLocator::NodeOutput { node_id, .. },
-        } => Some(node_id),
-        _ => None,
+        } => vec![node_id],
+        BindingSource::Object { fields } => fields.values().flat_map(source_nodes).collect(),
+        BindingSource::Array { items } => items.iter().flat_map(source_nodes).collect(),
+        _ => Vec::new(),
     }
 }
 fn reference_edges(definition: &WorkflowDefinition) -> BTreeMap<Id, Vec<(String, Id)>> {
@@ -1650,26 +1969,27 @@ fn reference_edges(definition: &WorkflowDefinition) -> BTreeMap<Id, Vec<(String,
         .collect::<BTreeMap<_, _>>();
     for node in &definition.nodes {
         let consumer = node_id(node);
-        let sources: Vec<Option<&Id>> = match node {
+        let sources: Vec<&Id> = match node {
             NodeDefinition::Action { bindings, .. } => bindings
                 .iter()
-                .map(|binding| source_node(&binding.source))
+                .flat_map(|binding| source_nodes(&binding.source))
                 .collect(),
             NodeDefinition::Map {
                 items, bindings, ..
-            } => std::iter::once(source_node(items))
+            } => source_nodes(items)
+                .into_iter()
                 .chain(
                     bindings
                         .iter()
-                        .map(|binding| map_source_node(&binding.source)),
+                        .flat_map(|binding| map_source_nodes(&binding.source)),
                 )
                 .collect(),
             NodeDefinition::Choice { input, .. }
             | NodeDefinition::Approval { request: input, .. }
-            | NodeDefinition::Succeed { output: input, .. } => vec![source_node(input)],
+            | NodeDefinition::Succeed { output: input, .. } => source_nodes(input),
             NodeDefinition::Fail { .. } => Vec::new(),
         };
-        for (index, source) in sources.into_iter().flatten().enumerate() {
+        for (index, source) in sources.into_iter().enumerate() {
             if let Some(outgoing) = edges.get_mut(source) {
                 outgoing.push((
                     format!("reference/{}/{index}", consumer.0),

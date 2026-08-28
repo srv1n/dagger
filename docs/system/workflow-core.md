@@ -59,12 +59,16 @@ subprocesses, sandboxes, requests, and other external resources.
 | --- | --- |
 | `Action` | Calls one registered action. |
 | `Map` | Creates one bounded action child for each array item. |
-| `Choice` | Selects the first matching case or the required default. |
+| `Choice` | Selects the first matching case or the required default. A case/default may target a node or explicitly skip. |
 | `Approval` | Waits for an allowed decision or an expiry result. |
 | `Succeed` | Commits the root output. |
 | `Fail` | Commits an explicit domain failure. |
 
 A valid definition has exactly one reachable `Succeed` node. It can have more than one `Fail` node.
+
+A permanent Action failure skips nodes that need its output. It does not stop an independent
+branch. If another branch reaches `Succeed`, the run succeeds; otherwise the run fails after no
+success output remains possible.
 
 ## Action contract
 

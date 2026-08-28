@@ -17,7 +17,7 @@ use dagger_workflow_core::ids::{
     TopologicalRank, Version,
 };
 use dagger_workflow_core::memory::InMemoryObjectStore;
-use dagger_workflow_core::run::RunLimits;
+use dagger_workflow_core::run::{NodeState, RunLimits, RunState};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::{
     SqliteWorkflowStore, SCHEDULER_COMPATIBILITY_SCAN_SQL, SCHEDULER_DEADLINES_SCAN_SQL,
@@ -416,6 +416,113 @@ fn create_run_command(fixture: &ActionFixture, run_id: &str) -> CreateRun {
         principal: fixture.principal.clone(),
         idempotency_token: format!("create-{run_id}-token-long-enough"),
     }
+}
+
+#[tokio::test]
+async fn permanent_action_failure_skips_missing_output_dependent_in_sqlite() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = SqliteWorkflowStore::open_url("sqlite::memory:", clock, objects.clone())
+        .await
+        .unwrap();
+    let fixture = seed_action_definition(&store, &objects, "permanent-skip").await;
+    let run_id = Id::new("permanent-skip-run").unwrap();
+    store
+        .create_run(
+            &fixture.scope,
+            create_run_command(&fixture, run_id.as_str()),
+        )
+        .await
+        .unwrap();
+    let engine_claim = store
+        .acquire_engine_claim(&fixture.scope, Id::new("permanent-skip-engine").unwrap())
+        .await
+        .unwrap();
+    store
+        .start_run(
+            &fixture.scope,
+            StartRun {
+                permit: engine_claim.permit.clone(),
+                run_id: run_id.clone(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: fixture.evidence_digest.clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let action_id = Id::new("action").unwrap();
+    let action = store
+        .get_node(&fixture.scope, &run_id, &action_id)
+        .await
+        .unwrap();
+    let completion_credential = match store
+        .claim_node_attempt(
+            &fixture.scope,
+            ClaimNodeAttempt {
+                permit: engine_claim.permit,
+                run_id: run_id.clone(),
+                node_id: action_id.clone(),
+                expected_node_version: action.version,
+                attempt_id: Id::new("permanent-skip-attempt").unwrap(),
+                worker_id: Id::new("permanent-skip-worker").unwrap(),
+                bound_input: fixture.input.clone(),
+                binding_derivation_digest: fixture.evidence_digest.clone(),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => panic!("expected claim"),
+    };
+    let result = store
+        .complete_attempt(
+            &fixture.scope,
+            CompleteAttempt {
+                completion_credential,
+                run_id: run_id.clone(),
+                node_id: action_id,
+                attempt_id: Id::new("permanent-skip-attempt").unwrap(),
+                submitted_outcome: ActionOutcome::permanent(
+                    "fixture.permanent".to_owned(),
+                    "expected permanent failure".to_owned(),
+                    None,
+                    CostUnits(1),
+                )
+                .unwrap(),
+                objects: CompletionObjects {
+                    output: None,
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, CompleteAttemptResult::TerminalRun(_)));
+    assert_eq!(
+        store
+            .get_run(&fixture.scope, &run_id)
+            .await
+            .unwrap()
+            .run
+            .status,
+        RunState::Failed
+    );
+    assert_eq!(
+        store
+            .get_node(&fixture.scope, &run_id, &Id::new("succeed").unwrap())
+            .await
+            .unwrap()
+            .status,
+        NodeState::Skipped
+    );
 }
 
 async fn raw_scope_snapshot(

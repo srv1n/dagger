@@ -9,8 +9,8 @@ use crate::artifact::{
 };
 use crate::committed_read::{CommittedObjectReader, CommittedReadOutcome};
 use crate::definition::{
-    ArtifactLocator, Binding, BindingSource, ChoiceCase, MapBinding, MapBindingSource,
-    NodeDefinition, WorkflowDefinition,
+    ArtifactLocator, Binding, BindingSource, ChoiceCase, ChoiceTarget, MapBinding,
+    MapBindingSource, NodeDefinition, WorkflowDefinition,
 };
 use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChildIdentity};
 use crate::run::{NodeKind, NodeRun};
@@ -1038,6 +1038,37 @@ where
                     )
                     .await?
                 }
+                MapBindingSource::MapAggregate { node_id, pointer } => {
+                    self.resolve_source(
+                        scope,
+                        run,
+                        &BindingSource::MapAggregate {
+                            node_id: node_id.clone(),
+                            pointer: pointer.clone(),
+                        },
+                    )
+                    .await?
+                }
+                MapBindingSource::Object { fields } => {
+                    self.resolve_source(
+                        scope,
+                        run,
+                        &BindingSource::Object {
+                            fields: fields.clone(),
+                        },
+                    )
+                    .await?
+                }
+                MapBindingSource::Array { items } => {
+                    self.resolve_source(
+                        scope,
+                        run,
+                        &BindingSource::Array {
+                            items: items.clone(),
+                        },
+                    )
+                    .await?
+                }
                 MapBindingSource::MapItem { pointer } => {
                     if pointer.is_empty() {
                         item.clone()
@@ -1076,6 +1107,43 @@ where
                     .read_committed(scope, &run.run_id, &output.0, None)
                     .await?;
                 select_json(&object.bytes, pointer)
+            }
+            BindingSource::MapAggregate { node_id, pointer } => {
+                let node = self.store.get_node(scope, &run.run_id, node_id).await?;
+                if node.kind != NodeKind::Map {
+                    return Err(EngineError::Binding);
+                }
+                let output = node.result_ref.ok_or(EngineError::Binding)?;
+                let object = self
+                    .read_committed(scope, &run.run_id, &output.0, None)
+                    .await?;
+                let values = serde_json::from_slice::<Value>(&object.bytes)
+                    .map_err(|_| EngineError::Binding)?
+                    .as_array()
+                    .cloned()
+                    .ok_or(EngineError::Binding)?;
+                values
+                    .iter()
+                    .map(|value| value.pointer(pointer).cloned().ok_or(EngineError::Binding))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(Value::Array)
+            }
+            BindingSource::Object { fields } => {
+                let mut object = Map::new();
+                for (name, field) in fields {
+                    object.insert(
+                        name.clone(),
+                        Box::pin(self.resolve_source(scope, run, field)).await?,
+                    );
+                }
+                Ok(Value::Object(object))
+            }
+            BindingSource::Array { items } => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(Box::pin(self.resolve_source(scope, run, item)).await?);
+                }
+                Ok(Value::Array(values))
             }
             BindingSource::ArtifactRef { source } => {
                 self.resolve_artifact_locator(scope, run, source).await
@@ -1155,31 +1223,39 @@ where
         let mut selected = None;
         for (index, case) in cases.iter().enumerate() {
             let (matches, target) = match case {
-                ChoiceCase::Equals { equals, next } => (selector_value == equals, next),
-                ChoiceCase::In { r#in, next } => {
-                    (r#in.iter().any(|value| value == selector_value), next)
+                ChoiceCase::Equals { equals, target } => (selector_value == equals, target),
+                ChoiceCase::In { r#in, target } => {
+                    (r#in.iter().any(|value| value == selector_value), target)
                 }
             };
             if matches {
-                selected = Some(crate::run::ChoiceSelection::Case {
-                    case_index: index as u32,
-                    edge_id: edge_id(
-                        &run.revision_hash,
-                        &node.definition_node_id,
-                        &format!("case/{index}"),
-                        target,
-                    ),
+                selected = Some(match target {
+                    ChoiceTarget::Node { next } => crate::run::ChoiceSelection::Case {
+                        case_index: index as u32,
+                        edge_id: edge_id(
+                            &run.revision_hash,
+                            &node.definition_node_id,
+                            &format!("case/{index}"),
+                            next,
+                        ),
+                    },
+                    ChoiceTarget::Skip => crate::run::ChoiceSelection::Skipped {
+                        case_index: Some(index as u32),
+                    },
                 });
                 break;
             }
         }
-        let selection = selected.unwrap_or_else(|| crate::run::ChoiceSelection::Default {
-            edge_id: edge_id(
-                &run.revision_hash,
-                &node.definition_node_id,
-                "default",
-                default,
-            ),
+        let selection = selected.unwrap_or_else(|| match default {
+            ChoiceTarget::Node { next } => crate::run::ChoiceSelection::Default {
+                edge_id: edge_id(
+                    &run.revision_hash,
+                    &node.definition_node_id,
+                    "default",
+                    next,
+                ),
+            },
+            ChoiceTarget::Skip => crate::run::ChoiceSelection::Skipped { case_index: None },
         });
         let object = self
             .object_store

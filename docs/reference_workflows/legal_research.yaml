@@ -117,8 +117,12 @@ nodes:
     selector: /needs_second_round
     cases:
       - equals: true
-        next: generate_followup_queries
-    default: synthesize_report
+        target:
+          kind: node
+          next: generate_followup_queries
+    default:
+      kind: node
+      next: synthesize_report
 
   - id: generate_followup_queries
     kind: Action

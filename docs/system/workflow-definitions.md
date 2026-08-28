@@ -71,6 +71,8 @@ An ordinary binding can read from these sources:
 - A constant JSON value.
 - The immutable run input.
 - A successful upstream node output.
+- One selected field from every successful child output of a named Map.
+- A deterministic object or array assembled from other closed sources.
 - A typed artifact reference.
 
 A Map child can also read the current item and its zero-based index.
