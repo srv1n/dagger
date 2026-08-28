@@ -18,7 +18,7 @@ use dagger_workflow_core::engine::{EngineConfig, EngineError, TestClock, Workflo
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
 use dagger_workflow_core::run::{
-    AttemptState, NodeState, RunFailureKind, RunLimits, RunState, SkipReason,
+    AttemptState, NodeFailureKind, NodeState, RunFailureKind, RunLimits, RunState, SkipReason,
 };
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::store::{
@@ -562,7 +562,7 @@ fn multiple_root_actions_execute_once_and_join() {
 }
 
 #[test]
-fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
+fn permanent_action_failure_can_succeed_with_run_input_output() {
     block_on(async {
         let execution_scope = scope();
         let clock = Arc::new(TestClock::new(Timestamp(800)));
@@ -600,12 +600,11 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
                 }
             };
         let failed = descriptor("fixture.permanent-failed");
-        let independent = descriptor("fixture.permanent-independent");
         let blocked = descriptor("fixture.permanent-blocked");
         let definition = WorkflowDefinition {
             definition_format_version: "0.1".to_owned(),
             definition_id: id("permanent-failure-definition"),
-            name: "permanent failure keeps independent roots live".to_owned(),
+            name: "permanent failure with run input output".to_owned(),
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
@@ -623,12 +622,15 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
                     }],
                     vec![id("done")],
                 ),
-                action("independent", &independent, Vec::new(), vec![id("done")]),
                 NodeDefinition::Succeed {
                     id: id("done"),
-                    output: BindingSource::NodeOutput {
-                        node_id: id("independent"),
-                        pointer: String::new(),
+                    output: BindingSource::Object {
+                        fields: BTreeMap::from([(
+                            "source".to_owned(),
+                            BindingSource::RunInput {
+                                pointer: "/approval".to_owned(),
+                            },
+                        )]),
                     },
                 },
             ],
@@ -644,7 +646,6 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
         .await;
         let registry = Arc::new(InMemoryActionRegistry::new());
         let failed_calls = Arc::new(AtomicUsize::new(0));
-        let independent_calls = Arc::new(AtomicUsize::new(0));
         let blocked_calls = Arc::new(AtomicUsize::new(0));
         registry
             .register(Arc::new(PermanentAction {
@@ -652,25 +653,20 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
                 calls: failed_calls.clone(),
             }))
             .unwrap();
-        for (descriptor, calls) in [
-            (independent, independent_calls.clone()),
-            (blocked, blocked_calls.clone()),
-        ] {
-            registry
-                .register(Arc::new(CountingAction {
-                    descriptor,
-                    calls,
-                    output: json!({}),
-                }))
-                .unwrap();
-        }
+        registry
+            .register(Arc::new(CountingAction {
+                descriptor: blocked,
+                calls: blocked_calls.clone(),
+                output: json!({}),
+            }))
+            .unwrap();
         let engine = WorkflowEngine::new(
             store.clone(),
-            objects,
+            objects.clone(),
             registry,
             EngineConfig {
                 instance_id: id("permanent-failure-engine"),
-                max_concurrency: 2,
+                max_concurrency: 1,
                 cancellation_grace: Duration::from_secs(1),
             },
         )
@@ -683,8 +679,17 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
         engine.run_until_idle(&execution_scope, 8).await.unwrap();
 
         assert_eq!(failed_calls.load(Ordering::Acquire), 1);
-        assert_eq!(independent_calls.load(Ordering::Acquire), 1);
         assert_eq!(blocked_calls.load(Ordering::Acquire), 0);
+        let failed = store
+            .get_node(
+                &execution_scope,
+                &id("permanent-failure-run"),
+                &id("failed"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status, NodeState::Failed);
+        assert_eq!(failed.failure_kind, Some(NodeFailureKind::ActionPermanent));
         assert_eq!(
             store
                 .get_node(
@@ -713,6 +718,21 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
                 .run
                 .status,
             RunState::Succeeded
+        );
+        let output = store
+            .get_run(&execution_scope, &id("permanent-failure-run"))
+            .await
+            .unwrap()
+            .run
+            .output_ref
+            .expect("succeed output is durable");
+        let object = objects
+            .get(&execution_scope, &output.0.digest)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&object.bytes).unwrap(),
+            json!({"source":"release"})
         );
     });
 }

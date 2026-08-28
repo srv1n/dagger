@@ -2219,16 +2219,10 @@ fn frontier_reduce(
             || controls
                 .iter()
                 .any(|edge| edge.state == EdgeState::Satisfied);
-        let controls_all_condition_false = !controls.is_empty()
-            && controls.iter().all(|edge| {
-                edge.state == EdgeState::Skipped
-                    && edge.skip_reason == Some(SkipReason::ConditionFalse)
-            });
         let terminal_output_ready = state.nodes.get(&key).expect("pending node exists").kind
             == NodeKind::Succeed
             && dependencies_satisfied
             && !control_activated
-            && controls_all_condition_false
             && state
                 .nodes
                 .values()
