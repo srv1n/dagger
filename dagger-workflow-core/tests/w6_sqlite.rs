@@ -108,7 +108,6 @@ async fn seed_action_definition(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: Id::new("action").unwrap(),
         nodes: vec![
             NodeDefinition::Action {
                 id: Id::new("action").unwrap(),
@@ -214,7 +213,6 @@ async fn publish_revision_reuses_existing_schema_artifact_refs() {
         description: "reuses the first revision schemas".to_owned(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: Id::new("action").unwrap(),
         nodes: vec![
             NodeDefinition::Action {
                 id: Id::new("action").unwrap(),
@@ -331,7 +329,6 @@ async fn seed_approval_definition(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: Id::new("approval").unwrap(),
         nodes: vec![
             NodeDefinition::Approval {
                 id: Id::new("approval").unwrap(),
@@ -960,7 +957,6 @@ async fn complete_map_rehydrates_pinned_output_schema_after_restart() {
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: Id::new("map").unwrap(),
         nodes: vec![
             NodeDefinition::Map {
                 id: Id::new("map").unwrap(),
@@ -1329,7 +1325,6 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: Id::new("action").unwrap(),
         nodes: vec![
             NodeDefinition::Action {
                 id: Id::new("action").unwrap(),

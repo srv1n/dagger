@@ -16,8 +16,8 @@ canonical_files:
   - "INDEX.md"
   - "CANON.md"
 created_at: "2026-08-23T12:08:23Z"
-updated_at: "2026-08-23T12:36:03Z"
-state_rev: "sha256:0ed8210081ecdc15fff8f58b93fb375bcee63c3a9e0738ede402b02a1359f0d2"
+updated_at: "2026-08-28T14:50:58Z"
+state_rev: "sha256:82155c77439f3ac254e005f1be810ab58a0eeaf120db6572a06f07ea03deaa54"
 ---
 
 # Project

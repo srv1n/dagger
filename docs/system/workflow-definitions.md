@@ -39,7 +39,6 @@ A definition has these root fields:
 - Optional `description`.
 - `run_input_schema_digest`.
 - `run_output_schema_digest`.
-- `entry_node_id`.
 - `nodes`.
 
 The parser rejects unknown structural fields and duplicate keys. The YAML parser also rejects merge keys and more than one document.
@@ -51,10 +50,19 @@ The validator requires these rules:
 - Node IDs are unique.
 - Each edge names an existing node.
 - The graph has no cycle.
-- Each required node is reachable from the entry node.
+- A `node_output` source creates one dependency edge from its named node.
+- Constant and run-input sources do not create dependency edges.
+- Literal and run-input artifact references do not create dependency edges.
+- The root set contains every node with no incoming output-reference edge and no incoming
+  control-activation edge.
+- Each required node is reachable from the derived root set.
 - Exactly one reachable node is `Succeed`.
 - Every reachable path ends at `Succeed` or `Fail`.
 - A binding can read only allowed upstream data.
+
+The definition does not contain `entry_node_id` or `depends_on`. Dagger keeps every authored
+root. It does not add a start node. Canonical topological ranks use lexical Kahn order over the
+output-reference edges, so source file order does not change readiness order.
 
 ## Bindings
 

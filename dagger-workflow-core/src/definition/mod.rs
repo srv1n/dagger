@@ -25,8 +25,6 @@ pub struct WorkflowDefinition {
     pub run_input_schema_digest: Digest,
     /// Pinned root output schema digest.
     pub run_output_schema_digest: Digest,
-    /// Unique entry node identifier.
-    pub entry_node_id: Id,
     /// Closed list of definition nodes.
     pub nodes: Vec<NodeDefinition>,
 }
@@ -494,21 +492,13 @@ pub fn validate_definition(
             }
         }
     }
-    if !ids.contains_key(&normalized.entry_node_id) {
-        errors.push(error(
-            ValidationErrorKind::MissingNode,
-            "/entry_node_id",
-            "entry_node_id must name one declared node",
-            &["use an existing node id"],
-        ));
-    }
-    let edges: BTreeMap<Id, Vec<(String, Id)>> = normalized
+    let control_edges: BTreeMap<Id, Vec<(String, Id)>> = normalized
         .nodes
         .iter()
         .map(|node| (node_id(node).clone(), outgoing(node)))
         .collect();
     for node in &normalized.nodes {
-        for (label, target) in edges.get(node_id(node)).into_iter().flatten() {
+        for (label, target) in control_edges.get(node_id(node)).into_iter().flatten() {
             if !ids.contains_key(target) {
                 errors.push(error(
                     ValidationErrorKind::MissingNode,
@@ -523,20 +513,25 @@ pub fn validate_definition(
     if !errors.is_empty() {
         return Err(errors);
     }
-    let ranks = match ranks_from_edges(&normalized, &edges) {
+    if let Err(error) = ranks_from_edges(&normalized, &control_edges) {
+        errors.push(error);
+    }
+    let reference_edges = reference_edges(&normalized);
+    let ranks = match ranks_from_edges(&normalized, &reference_edges) {
         Ok(ranks) => ranks,
         Err(error) => {
             errors.push(error);
             BTreeMap::new()
         }
     };
-    let reachable = reachable(&normalized.entry_node_id, &edges);
+    let root_node_ids = roots_from_edges(&normalized, &reference_edges);
+    let reachable = reachable_from(&root_node_ids, &control_edges);
     for node in &normalized.nodes {
         if !reachable.contains(node_id(node)) {
             errors.push(error(
                 ValidationErrorKind::UnreachableNode,
                 format!("/nodes/{}/id", node_id(node).0),
-                "every node must be reachable from entry_node_id",
+                "every node must be reachable from the derived root set",
                 &[
                     "add an incoming edge from the reachable graph",
                     "remove the node",
@@ -576,10 +571,11 @@ pub fn validate_definition(
             ));
         }
     }
-    validate_bindings(&normalized, &edges, &mut errors);
+    validate_bindings(&normalized, &control_edges, &mut errors);
     if errors.is_empty() {
         Ok(UnresolvedDefinition {
             definition: normalized,
+            root_node_ids,
             topological_ranks: ranks,
         })
     } else {
@@ -596,6 +592,8 @@ pub fn validate_definition(
 pub struct UnresolvedDefinition {
     /// Normalized typed definition.
     pub definition: WorkflowDefinition,
+    /// Lexically ordered nodes with no incoming output reference.
+    pub root_node_ids: Vec<Id>,
     /// Canonical Kahn ranks keyed by node ID.
     pub topological_ranks: BTreeMap<Id, TopologicalRank>,
 }
@@ -1088,12 +1086,20 @@ pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
 pub fn canonical_topological_ranks(
     definition: &WorkflowDefinition,
 ) -> Result<BTreeMap<Id, TopologicalRank>, DefinitionValidationError> {
-    let edges = definition
-        .nodes
-        .iter()
-        .map(|node| (node_id(node).clone(), outgoing(node)))
-        .collect();
+    let edges = reference_edges(definition);
     ranks_from_edges(definition, &edges)
+}
+
+/// Returns the lexically ordered nodes with no incoming output reference.
+pub fn canonical_root_node_ids(definition: &WorkflowDefinition) -> Vec<Id> {
+    let edges = reference_edges(definition);
+    roots_from_edges(definition, &edges)
+}
+
+pub(crate) fn reference_outgoing(
+    definition: &WorkflowDefinition,
+) -> BTreeMap<Id, Vec<(String, Id)>> {
+    reference_edges(definition)
 }
 
 mod yaml {
@@ -1636,6 +1642,64 @@ fn source_node(source: &BindingSource) -> Option<&Id> {
         _ => None,
     }
 }
+fn reference_edges(definition: &WorkflowDefinition) -> BTreeMap<Id, Vec<(String, Id)>> {
+    let mut edges = definition
+        .nodes
+        .iter()
+        .map(|node| (node_id(node).clone(), Vec::new()))
+        .collect::<BTreeMap<_, _>>();
+    for node in &definition.nodes {
+        let consumer = node_id(node);
+        let sources: Vec<Option<&Id>> = match node {
+            NodeDefinition::Action { bindings, .. } => bindings
+                .iter()
+                .map(|binding| source_node(&binding.source))
+                .collect(),
+            NodeDefinition::Map {
+                items, bindings, ..
+            } => std::iter::once(source_node(items))
+                .chain(
+                    bindings
+                        .iter()
+                        .map(|binding| map_source_node(&binding.source)),
+                )
+                .collect(),
+            NodeDefinition::Choice { input, .. }
+            | NodeDefinition::Approval { request: input, .. }
+            | NodeDefinition::Succeed { output: input, .. } => vec![source_node(input)],
+            NodeDefinition::Fail { .. } => Vec::new(),
+        };
+        for (index, source) in sources.into_iter().flatten().enumerate() {
+            if let Some(outgoing) = edges.get_mut(source) {
+                outgoing.push((
+                    format!("reference/{}/{index}", consumer.0),
+                    consumer.clone(),
+                ));
+            }
+        }
+    }
+    edges
+}
+fn roots_from_edges(
+    definition: &WorkflowDefinition,
+    edges: &BTreeMap<Id, Vec<(String, Id)>>,
+) -> Vec<Id> {
+    let mut incoming = BTreeSet::new();
+    for targets in edges.values() {
+        incoming.extend(targets.iter().map(|(_, target)| target.clone()));
+    }
+    for node in &definition.nodes {
+        incoming.extend(outgoing(node).into_iter().map(|(_, target)| target));
+    }
+    definition
+        .nodes
+        .iter()
+        .map(|node| node_id(node).clone())
+        .filter(|id| !incoming.contains(id))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
 fn ranks_from_edges(
     definition: &WorkflowDefinition,
     edges: &BTreeMap<Id, Vec<(String, Id)>>,
@@ -1683,9 +1747,9 @@ fn ranks_from_edges(
         Ok(ranks)
     }
 }
-fn reachable(entry: &Id, edges: &BTreeMap<Id, Vec<(String, Id)>>) -> BTreeSet<Id> {
+fn reachable_from(entries: &[Id], edges: &BTreeMap<Id, Vec<(String, Id)>>) -> BTreeSet<Id> {
     let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([entry.clone()]);
+    let mut queue = VecDeque::from(entries.to_vec());
     while let Some(id) = queue.pop_front() {
         if seen.insert(id.clone()) {
             if let Some(targets) = edges.get(&id) {
@@ -1821,5 +1885,164 @@ impl<'de> Deserialize<'de> for NoDuplicateJson {
             }
         }
         deserializer.deserialize_any(JsonVisitor).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn id(value: &str) -> Id {
+        Id::new(value).unwrap()
+    }
+
+    fn digest() -> Digest {
+        Digest::new(format!("sha256:{}", "0".repeat(64))).unwrap()
+    }
+
+    fn action(id_value: &str, bindings: Vec<Binding>, next: Vec<&str>) -> NodeDefinition {
+        NodeDefinition::Action {
+            id: id(id_value),
+            action: ActionReference {
+                name: format!("test.{id_value}"),
+                contract_version: "v1".to_owned(),
+                input_schema_digest: digest(),
+                output_schema_digest: digest(),
+                compatible_implementation_requirement: digest(),
+            },
+            bindings,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+            },
+            timeout: TimeoutPolicy { timeout_ms: 1 },
+            declared_max_cost_units: CostUnits(0),
+            next: next.into_iter().map(id).collect(),
+        }
+    }
+
+    fn multiple_root_definition(order: [&str; 2]) -> WorkflowDefinition {
+        let mut roots = order
+            .into_iter()
+            .map(|root| action(root, Vec::new(), vec!["join"]))
+            .collect::<Vec<_>>();
+        roots.push(action(
+            "join",
+            vec![
+                Binding {
+                    target: "/alfa".to_owned(),
+                    source: BindingSource::NodeOutput {
+                        node_id: id("alfa"),
+                        pointer: String::new(),
+                    },
+                },
+                Binding {
+                    target: "/zulu".to_owned(),
+                    source: BindingSource::NodeOutput {
+                        node_id: id("zulu"),
+                        pointer: String::new(),
+                    },
+                },
+            ],
+            vec!["done"],
+        ));
+        roots.push(NodeDefinition::Succeed {
+            id: id("done"),
+            output: BindingSource::NodeOutput {
+                node_id: id("join"),
+                pointer: String::new(),
+            },
+        });
+        WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("multiple-roots"),
+            name: "Multiple roots".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: digest(),
+            run_output_schema_digest: digest(),
+            nodes: roots,
+        }
+    }
+
+    #[test]
+    fn multiple_root() {
+        let definition = multiple_root_definition(["zulu", "alfa"]);
+        let json = serde_json::to_string(&definition).unwrap();
+        assert!(!json.contains("entry_node_id"));
+        let parsed = parse_json_definition(&json).unwrap();
+        let unresolved = validate_definition(&parsed).unwrap();
+        assert_eq!(unresolved.root_node_ids, vec![id("alfa"), id("zulu")]);
+        assert_eq!(unresolved.definition.nodes.len(), 4);
+        assert!(!definition_json_schema().contains("entry_node_id"));
+    }
+
+    #[test]
+    fn root_set_determinism() {
+        let left = validate_definition(&multiple_root_definition(["alfa", "zulu"])).unwrap();
+        let right = validate_definition(&multiple_root_definition(["zulu", "alfa"])).unwrap();
+        assert_eq!(left.root_node_ids, right.root_node_ids);
+        assert_eq!(left.topological_ranks, right.topological_ranks);
+        assert!(left.topological_ranks[&id("alfa")] < left.topological_ranks[&id("zulu")]);
+        assert!(left.topological_ranks[&id("zulu")] < left.topological_ranks[&id("join")]);
+    }
+
+    #[test]
+    fn multiple_root_invalid() {
+        let mut unknown = multiple_root_definition(["alfa", "zulu"]);
+        if let NodeDefinition::Action { bindings, .. } = &mut unknown.nodes[2] {
+            bindings[0].source = BindingSource::NodeOutput {
+                node_id: id("missing"),
+                pointer: String::new(),
+            };
+        }
+        assert!(validate_definition(&unknown)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == ValidationErrorKind::BindingSourceInvalid));
+
+        let mut cycle = multiple_root_definition(["alfa", "zulu"]);
+        if let NodeDefinition::Succeed { output, .. } = &mut cycle.nodes[3] {
+            *output = BindingSource::NodeOutput {
+                node_id: id("done"),
+                pointer: String::new(),
+            };
+        }
+        assert!(validate_definition(&cycle)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == ValidationErrorKind::BindingSourceInvalid));
+
+        let mut overlap = multiple_root_definition(["alfa", "zulu"]);
+        if let NodeDefinition::Action { bindings, .. } = &mut overlap.nodes[2] {
+            bindings[1].target = "/alfa/value".to_owned();
+        }
+        assert!(validate_definition(&overlap)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == ValidationErrorKind::BindingTargetInvalid));
+
+        let mut control_cycle = multiple_root_definition(["alfa", "zulu"]);
+        if let NodeDefinition::Action { next, .. } = &mut control_cycle.nodes[2] {
+            next.push(id("alfa"));
+        }
+        assert!(validate_definition(&control_cycle)
+            .unwrap_err()
+            .iter()
+            .any(|error| error.kind == ValidationErrorKind::Cycle));
+
+        let fake_root = serde_json::to_string(&multiple_root_definition(["alfa", "zulu"]))
+            .unwrap()
+            .replace("\"nodes\"", "\"entry_node_id\":\"alfa\",\"nodes\"");
+        assert_eq!(
+            parse_json_definition(&fake_root).unwrap_err().kind,
+            ValidationErrorKind::UnknownField
+        );
+        assert_eq!(
+            json!(canonical_root_node_ids(&multiple_root_definition([
+                "alfa", "zulu"
+            ]))),
+            json!(["alfa", "zulu"])
+        );
     }
 }

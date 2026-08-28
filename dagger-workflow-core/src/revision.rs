@@ -27,8 +27,8 @@ pub struct WorkflowRevision {
     pub run_input_schema_digest: Digest,
     /// Root output schema digest.
     pub run_output_schema_digest: Digest,
-    /// Entry node ID.
-    pub entry_node_id: Id,
+    /// Lexically ordered nodes with no incoming output reference.
+    pub root_node_ids: Vec<Id>,
     /// Definition node count.
     pub node_count: u32,
     /// Canonical Kahn ranks.

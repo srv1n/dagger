@@ -79,7 +79,6 @@ name: Monthly usage rollup
 description: Normalize a tenant's metered units, then total them.
 run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-entry_node_id: normalize
 nodes:
   - id: normalize
     kind: Action

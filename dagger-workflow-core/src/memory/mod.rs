@@ -20,8 +20,8 @@ use crate::ids::{
 };
 use crate::revision::WorkflowRevision;
 use crate::run::{
-    AttemptErrorClass, AttemptState, BlockedFromState, ChoiceSelection, EdgeFact, EdgeState,
-    NodeAttempt, NodeFailureKind, NodeKind, NodeRun, NodeState, RunFailureKind,
+    AttemptErrorClass, AttemptState, BlockedFromState, ChoiceSelection, EdgeFact, EdgeKind,
+    EdgeState, NodeAttempt, NodeFailureKind, NodeKind, NodeRun, NodeState, RunFailureKind,
     RunOperationalCounts, RunOperationalView, RunState, WorkflowRun, WorkflowRunView,
 };
 use crate::scope::ExecutionScope;
@@ -2377,7 +2377,8 @@ fn frontier_reduce(
         let edge = state.edges.get_mut(key).expect("key captured");
         if edge.from_node_id == *source_node && edge.state == EdgeState::Dormant {
             frontier_changed = true;
-            let selected = selected_edge.is_none_or(|selected| selected == &edge.edge_id);
+            let selected = edge.kind == EdgeKind::Dependency
+                || selected_edge.is_none_or(|selected| selected == &edge.edge_id);
             edge.state = if selected {
                 EdgeState::Satisfied
             } else {
@@ -2451,7 +2452,19 @@ fn frontier_reduce(
             let node = state.nodes.get_mut(&key).expect("pending node exists");
             node.incoming_satisfied = satisfied;
             node.incoming_skipped = skipped;
-            if satisfied > 0 {
+            let dependencies_satisfied = incoming
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Dependency)
+                .all(|edge| edge.state == EdgeState::Satisfied);
+            let controls = incoming
+                .iter()
+                .filter(|edge| edge.kind == EdgeKind::Control)
+                .collect::<Vec<_>>();
+            let control_activated = controls.is_empty()
+                || controls
+                    .iter()
+                    .any(|edge| edge.state == EdgeState::Satisfied);
+            if dependencies_satisfied && control_activated {
                 node.status = NodeState::Ready;
                 set_node_mutated(node, now)?;
                 specs.push(event_spec(
@@ -3117,7 +3130,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .definition
                     .run_output_schema_digest
                     .clone(),
-                entry_node_id: canonical_revision.definition.entry_node_id.clone(),
+                root_node_ids: crate::definition::canonical_root_node_ids(
+                    &canonical_revision.definition,
+                ),
                 node_count: u32::try_from(canonical_revision.definition.nodes.len())
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
                 node_topological_ranks: canonical_revision.topological_ranks.clone(),
@@ -3457,6 +3472,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             from_node_id: source.clone(),
                             to_node_id: target,
                             choice_case_index: case_index,
+                            kind: EdgeKind::Control,
                             state: EdgeState::Dormant,
                             resolved_at: None,
                             version: Version(1),
@@ -3464,11 +3480,36 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     );
                 }
             }
+            for (source, targets) in crate::definition::reference_outgoing(&parsed.definition) {
+                for (label, target) in targets {
+                    let count = incoming.entry(target.clone()).or_default();
+                    *count = count.checked_add(1).ok_or(StoreError::ArithmeticOverflow)?;
+                    let id = edge_id(&revision.revision_hash, &source, &label, &target);
+                    state.edges.insert(
+                        (scope.clone(), command.run_id.clone(), id.clone()),
+                        EdgeFact {
+                            scope: scope.clone(),
+                            run_id: command.run_id.clone(),
+                            edge_id: id,
+                            from_node_id: source.clone(),
+                            to_node_id: target,
+                            choice_case_index: None,
+                            kind: EdgeKind::Dependency,
+                            state: EdgeState::Dormant,
+                            resolved_at: None,
+                            version: Version(1),
+                        },
+                    );
+                }
+            }
+            let root_node_ids = crate::definition::canonical_root_node_ids(&parsed.definition)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
             let mut ordered_nodes = parsed.definition.nodes.iter().collect::<Vec<_>>();
             ordered_nodes.sort_by_key(|node| node_id(node));
             for definition_node in ordered_nodes {
                 let id = node_id(definition_node).clone();
-                let ready = id == parsed.definition.entry_node_id;
+                let ready = root_node_ids.contains(&id);
                 let count = incoming.get(&id).copied().unwrap_or_default();
                 let node = NodeRun {
                     scope: scope.clone(),

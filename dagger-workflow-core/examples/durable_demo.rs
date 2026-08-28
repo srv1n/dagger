@@ -39,7 +39,6 @@ name: Durable relevance report
 description: Deterministic keyword extraction, scoring, branching, and report composition.
 run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-entry_node_id: extract_keywords
 nodes:
   - id: extract_keywords
     kind: Action

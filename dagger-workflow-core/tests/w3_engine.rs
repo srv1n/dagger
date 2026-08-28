@@ -10,9 +10,9 @@ use dagger_workflow_core::artifact::{
     ObjectReadError, ObjectStore, ObjectStoreError, VerifiedObject, VerifiedObjectRef,
 };
 use dagger_workflow_core::definition::{
-    ActionReference, ApprovalGateConfig, ArtifactLocator, BackoffPolicy, Binding, BindingSource,
-    MapBinding, MapBindingSource, NodeDefinition, PublishableDefinition, RetryPolicy,
-    TimeoutPolicy, WorkflowDefinition,
+    canonical_topological_ranks, ActionReference, ApprovalGateConfig, ArtifactLocator,
+    BackoffPolicy, Binding, BindingSource, MapBinding, MapBindingSource, NodeDefinition,
+    PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
 };
 use dagger_workflow_core::engine::{EngineConfig, EngineError, TestClock, WorkflowEngine};
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
@@ -141,22 +141,7 @@ async fn prepare_definition(
         )
         .await
         .unwrap();
-    let ranks = definition
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(index, node)| {
-            let node_id = match node {
-                NodeDefinition::Action { id, .. }
-                | NodeDefinition::Map { id, .. }
-                | NodeDefinition::Choice { id, .. }
-                | NodeDefinition::Approval { id, .. }
-                | NodeDefinition::Succeed { id, .. }
-                | NodeDefinition::Fail { id, .. } => id.clone(),
-            };
-            (node_id, TopologicalRank(index as u32))
-        })
-        .collect();
+    let ranks = canonical_topological_ranks(&definition).unwrap();
     let resolved_action_schema_objects = definition
         .nodes
         .iter()
@@ -253,7 +238,6 @@ fn memory_create_run_rejects_input_outside_pinned_root_schema_without_a_run() {
             description: String::new(),
             run_input_schema_digest: schema.digest().clone(),
             run_output_schema_digest: schema.digest().clone(),
-            entry_node_id: id("succeed"),
             nodes: vec![NodeDefinition::Succeed {
                 id: id("succeed"),
                 output: BindingSource::RunInput {
@@ -377,6 +361,168 @@ impl WorkflowAction for RetryOnce {
     }
 }
 
+struct CountingAction {
+    descriptor: ActionDescriptor,
+    calls: Arc<AtomicUsize>,
+    output: Value,
+}
+
+impl WorkflowAction for CountingAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        _context: ActionContext,
+        _canonical_bound_input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async move {
+            ActionOutcome::success(self.output.clone(), Vec::new(), CostUnits(1), None).unwrap()
+        })
+    }
+}
+
+#[test]
+fn multiple_root_actions_execute_once_and_join() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(750)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = |name: &str| ActionDescriptor {
+            name: name.to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
+            implementation_compatibility_digest: hash(format!("{name}-impl").as_bytes()),
+        };
+        let reference = |descriptor: &ActionDescriptor| ActionReference {
+            name: descriptor.name.clone(),
+            contract_version: descriptor.contract_version.clone(),
+            input_schema_digest: descriptor.input_schema_digest.clone(),
+            output_schema_digest: descriptor.output_schema_digest.clone(),
+            compatible_implementation_requirement: descriptor
+                .implementation_compatibility_digest
+                .clone(),
+        };
+        let alfa = descriptor("fixture.multi-root-alfa");
+        let zulu = descriptor("fixture.multi-root-zulu");
+        let join = descriptor("fixture.multi-root-join");
+        let action = |node: &str,
+                      descriptor: &ActionDescriptor,
+                      bindings: Vec<Binding>,
+                      next: Vec<Id>| NodeDefinition::Action {
+            id: id(node),
+            action: reference(descriptor),
+            bindings,
+            retry: RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+            },
+            timeout: TimeoutPolicy { timeout_ms: 1_000 },
+            declared_max_cost_units: CostUnits(1),
+            next,
+        };
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("multiple-root-engine"),
+            name: "multiple root engine".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
+            nodes: vec![
+                action("zulu", &zulu, Vec::new(), vec![id("join")]),
+                action("alfa", &alfa, Vec::new(), vec![id("join")]),
+                action(
+                    "join",
+                    &join,
+                    vec![
+                        Binding {
+                            target: "/data".to_owned(),
+                            source: BindingSource::NodeOutput {
+                                node_id: id("alfa"),
+                                pointer: String::new(),
+                            },
+                        },
+                        Binding {
+                            target: "/artifact".to_owned(),
+                            source: BindingSource::NodeOutput {
+                                node_id: id("zulu"),
+                                pointer: String::new(),
+                            },
+                        },
+                    ],
+                    vec![id("done")],
+                ),
+                NodeDefinition::Succeed {
+                    id: id("done"),
+                    output: BindingSource::NodeOutput {
+                        node_id: id("join"),
+                        pointer: String::new(),
+                    },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "multiple-root-run",
+            10_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        let alfa_calls = Arc::new(AtomicUsize::new(0));
+        let zulu_calls = Arc::new(AtomicUsize::new(0));
+        let join_calls = Arc::new(AtomicUsize::new(0));
+        for (descriptor, calls) in [
+            (alfa, alfa_calls.clone()),
+            (zulu, zulu_calls.clone()),
+            (join, join_calls.clone()),
+        ] {
+            registry
+                .register(Arc::new(CountingAction {
+                    descriptor,
+                    calls,
+                    output: json!({}),
+                }))
+                .unwrap();
+        }
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("multiple-root-engine-instance"),
+                max_concurrency: 2,
+                cancellation_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("multiple-root-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        assert_eq!(alfa_calls.load(Ordering::Acquire), 1);
+        assert_eq!(zulu_calls.load(Ordering::Acquire), 1);
+        assert_eq!(join_calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("multiple-root-run"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Succeeded
+        );
+    });
+}
+
 #[test]
 fn deep_binding_targets_publish_and_execute_as_nested_input() {
     block_on(async {
@@ -398,7 +544,6 @@ fn deep_binding_targets_publish_and_execute_as_nested_input() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("work"),
             nodes: vec![
                 NodeDefinition::Action {
                     id: id("work"),
@@ -708,7 +853,6 @@ fn map_workflow(
         description: String::new(),
         run_input_schema_digest: hash(SCHEMA),
         run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-        entry_node_id: id("map"),
         nodes: vec![
             NodeDefinition::Map {
                 id: id("map"),
@@ -783,7 +927,6 @@ fn two_map_workflow(definition_id: &str, descriptor: &ActionDescriptor) -> Workf
         description: String::new(),
         run_input_schema_digest: hash(SCHEMA),
         run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-        entry_node_id: id("fanout"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("fanout"),
@@ -827,7 +970,6 @@ async fn prepare_scoped_run(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("action"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("action"),
@@ -1116,7 +1258,6 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
             description: String::new(),
             run_input_schema_digest: schema.digest().clone(),
             run_output_schema_digest: schema.digest().clone(),
-            entry_node_id: id("action"),
             nodes: vec![
                 NodeDefinition::Action {
                     id: id("action"),
@@ -1502,7 +1643,6 @@ fn approval_expiry_advances_downstream_frontier_through_engine_ticks() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
                     id: id("approval"),
@@ -1610,7 +1750,6 @@ fn approval_decision_winning_between_due_scan_and_expiry_is_benign() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
                     id: id("approval"),
@@ -1750,7 +1889,6 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("map"),
             nodes: vec![
                 NodeDefinition::Map {
                     id: id("map"),
@@ -2002,7 +2140,6 @@ fn map_child_accepts_literal_artifact_ref_binding() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("succeed"),
             nodes: vec![NodeDefinition::Succeed {
                 id: id("succeed"),
                 output: BindingSource::Constant { value: json!({}) },
@@ -2430,7 +2567,6 @@ fn run_lifetime_expiry_terminalizes_through_engine_ticks() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
                     id: id("approval"),
@@ -2531,7 +2667,6 @@ fn blocked_run_fence_precedes_exact_approval_replay() {
             description: String::new(),
             run_input_schema_digest: hash(SCHEMA),
             run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-            entry_node_id: id("approval"),
             nodes: vec![
                 NodeDefinition::Approval {
                     id: id("approval"),

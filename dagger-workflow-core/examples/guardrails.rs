@@ -91,7 +91,6 @@ name: Guardrail probe
 description: One Action node and one Succeed terminal, exercising a single refusal path.
 run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-entry_node_id: work
 nodes:
   - id: work
     kind: Action
@@ -133,7 +132,6 @@ name: Guardrail map probe
 description: One Action node, one Map fan-out, and one Succeed terminal.
 run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-entry_node_id: work
 nodes:
   - id: work
     kind: Action

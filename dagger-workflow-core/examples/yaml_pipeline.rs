@@ -725,7 +725,15 @@ async fn main() -> DemoResult<()> {
     let mut definition = parse_yaml_definition(WORKFLOW_YAML)?;
     println!("  definition_id: {}", definition.definition_id.as_str());
     println!("  name: {}", definition.name);
-    println!("  entry node: {}", definition.entry_node_id.as_str());
+    let roots = dagger_workflow_core::definition::canonical_root_node_ids(&definition);
+    println!(
+        "  root nodes: {}",
+        roots
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("  nodes: {}", definition.nodes.len());
     describe_nodes(&definition);
     println!("  graph: load_batch fans out to sum_batch and range_batch; combine joins");

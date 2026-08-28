@@ -10,9 +10,9 @@ use crate::definition::{ActionPin, PublishableDefinition, WorkflowDefinition};
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp, TopologicalRank, Version};
 use crate::revision::WorkflowRevision;
 use crate::run::{
-    AttemptErrorClass, AttemptState, BlockedFromState, ChoiceSelection, EdgeFact, EdgeState,
-    GateState, NodeAttempt, NodeFailureKind, NodeKind, NodeRun, RunFailureKind, RunLimits,
-    RunState, WorkflowRun,
+    AttemptErrorClass, AttemptState, BlockedFromState, ChoiceSelection, EdgeFact, EdgeKind,
+    EdgeState, GateState, NodeAttempt, NodeFailureKind, NodeKind, NodeRun, RunFailureKind,
+    RunLimits, RunState, WorkflowRun,
 };
 use crate::scope::ExecutionScope;
 use crate::store::{
@@ -123,7 +123,7 @@ serde_public_struct!(workflow_revision, WorkflowRevision, {
     run_output_schema_ref: JsonRef,
     run_input_schema_digest: Digest,
     run_output_schema_digest: Digest,
-    entry_node_id: Id,
+    root_node_ids: Vec<Id>,
     node_count: u32,
     node_topological_ranks: BTreeMap<Id, TopologicalRank>,
     action_pins: Vec<ActionPin>,
@@ -216,6 +216,7 @@ serde_public_struct!(edge_fact, EdgeFact, {
     from_node_id: NodeInstanceId,
     to_node_id: NodeInstanceId,
     choice_case_index: Option<u32>,
+    kind: EdgeKind,
     state: EdgeState,
     resolved_at: Option<Timestamp>,
     version: Version,

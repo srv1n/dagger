@@ -10,7 +10,7 @@ const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 fn valid() -> String {
     format!(
-        r#"{{"definition_format_version":"0.1","definition_id":"example","name":"Example","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","entry_node_id":"work","nodes":[{{"id":"work","kind":"Action","action":{{"name":"example.action","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["done"]}},{{"id":"done","kind":"Succeed","output":{{"kind":"constant","value":null}}}}]}}"#
+        r#"{{"definition_format_version":"0.1","definition_id":"example","name":"Example","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"work","kind":"Action","action":{{"name":"example.action","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["done"]}},{{"id":"done","kind":"Succeed","output":{{"kind":"constant","value":null}}}}]}}"#
     )
 }
 
@@ -101,7 +101,6 @@ fn resolve_action_bindings(
             "name": "deep bindings",
             "run_input_schema_digest": run_input_digest,
             "run_output_schema_digest": output_digest,
-            "entry_node_id": "work",
             "nodes": [
                 {
                     "id": "work",
@@ -282,7 +281,6 @@ definition_id: example
 name: Example
 run_input_schema_digest: &digest {DIGEST}
 run_output_schema_digest: *digest
-entry_node_id: work
 nodes:
   - kind: Action
     id: work
@@ -332,7 +330,7 @@ fn invalid_definition_table_is_actionable() {
 fn friction_1_reconverged_node_output_is_rejected() {
     // 1: a post-Choice reconvergence consumer cannot use a branch-only output.
     let reconvergence = format!(
-        r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","entry_node_id":"choose","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"next":"branch"}}],"default":"join"}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
+        r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"next":"branch"}}],"default":"join"}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
     );
     assert_eq!(
         invalid_kind(&reconvergence),
@@ -349,10 +347,7 @@ fn rejected_extension(document: String, field: &str) {
 #[test]
 fn friction_2_virtual_start_is_not_a_definition_node() {
     rejected_extension(
-        valid().replace(
-            "\"entry_node_id\"",
-            "\"start\":{\"kind\":\"Start\"},\"entry_node_id\"",
-        ),
+        valid().replace("\"nodes\"", "\"start\":{\"kind\":\"Start\"},\"nodes\""),
         "start",
     );
 }
@@ -374,8 +369,8 @@ fn friction_4_map_cannot_embed_a_subworkflow() {
 fn friction_6_schedule_trigger_is_host_owned() {
     rejected_extension(
         valid().replace(
-            "\"entry_node_id\"",
-            "\"trigger\":{\"cron\":\"* * * * *\"},\"entry_node_id\"",
+            "\"nodes\"",
+            "\"trigger\":{\"cron\":\"* * * * *\"},\"nodes\"",
         ),
         "trigger",
     );

@@ -18,12 +18,17 @@ The main Rust type is `WorkflowEngine`. The revision type is `WorkflowRevision`.
 
 Each durable key belongs to one `ExecutionScope`. A scope contains a tenant ID and a namespace.
 
+`WorkflowRevision.root_node_ids` stores the lexical root set derived at publication. A root has
+no incoming `node_output` reference and no incoming control activation. The engine creates those
+authored nodes as ready. It creates no synthetic start node. Output-reference edges and lexical
+Kahn ranks keep joins deterministic across start, tick, resume, and recovery.
+
 ## Run lifecycle
 
 1. The host creates `WorkflowEngine` with a store, an object store, and an action registry.
 2. The host gets the scheduler claim for one scope.
 3. The host creates a run with immutable input, limits, and budget.
-4. `start` checks the exact action pins and starts the run.
+4. `start` checks the exact action pins and starts every derived root once.
 5. `tick` performs maintenance and advances ready nodes.
 6. `run_until_idle` calls `tick` until one pass makes no change.
 7. The host reads committed output through `CommittedObjectReader`.

@@ -319,7 +319,6 @@ async fn run_original_case<A: ConformanceAdapter>(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("action"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("action"),
@@ -487,7 +486,7 @@ async fn run_original_case<A: ConformanceAdapter>(
         .store()
         .get_node(scope_a, &id("conformance-run"), &id("action"))
         .await
-        .map_err(|_| failure(23, "entry node read failed"))?;
+        .map_err(|_| failure(23, "root node read failed"))?;
     if case == 24 {
         if !matches!(
             adapter
@@ -941,7 +940,6 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("approval"),
         nodes: vec![
             NodeDefinition::Approval {
                 id: id("approval"),
@@ -1019,8 +1017,8 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                 parsed_revision: PublishableDefinition {
                     definition,
                     topological_ranks: BTreeMap::from([
-                        (id("approval"), TopologicalRank(0)),
-                        (id("action"), TopologicalRank(1)),
+                        (id("action"), TopologicalRank(0)),
+                        (id("approval"), TopologicalRank(1)),
                         (id("succeed"), TopologicalRank(2)),
                     ]),
                 },
@@ -1256,7 +1254,6 @@ async fn prepare_map_conformance_with_limits<A: ConformanceAdapter>(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("map"),
         nodes: vec![
             NodeDefinition::Map {
                 id: id("map"),
@@ -2052,7 +2049,6 @@ fn publishable_definition(
         description: String::new(),
         run_input_schema_digest: root_input_schema.digest().clone(),
         run_output_schema_digest: action_schema.digest().clone(),
-        entry_node_id: id("action"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("action"),
@@ -2596,7 +2592,7 @@ async fn revision_non_canonical_bytes_rejected<A: ConformanceAdapter>(
 /// Both stacks reject a typed definition that does not canonicalize to the bytes.
 ///
 /// Section 5.2 makes the canonical document authoritative, so a store that stored
-/// the caller's struct would persist an entry node, node set, and ranks that the
+/// the caller's struct would persist a root set, node set, and ranks that the
 /// `revision_hash` does not cover. Section 1.5 then makes those unverified values
 /// the recovery-order key used by sections 3.4 and 4.
 async fn revision_typed_definition_mismatch_rejected<A: ConformanceAdapter>(
@@ -2831,7 +2827,7 @@ async fn prepare_action_attempt_conformance<A: ConformanceAdapter>(
         .store()
         .get_node(scope, &id("conformance-run"), &id("action"))
         .await
-        .map_err(|_| failure(case, "entry node read failed"))?;
+        .map_err(|_| failure(case, "root node read failed"))?;
     let claimed = adapter
         .store()
         .claim_node_attempt(
@@ -4716,7 +4712,6 @@ async fn prepare_approval_conformance<A: ConformanceAdapter>(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("approval"),
         nodes: vec![
             NodeDefinition::Approval {
                 id: id("approval"),

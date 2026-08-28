@@ -24,7 +24,6 @@ name: Arithmetic pipeline
 description: Fan out over a batch of numbers, join the branch results, then map over the batch.
 run_input_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 run_output_schema_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
-entry_node_id: load_batch
 
 nodes:
   # Entry node. Reads the batch out of the immutable run input and is the

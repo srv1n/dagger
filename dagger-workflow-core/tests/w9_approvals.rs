@@ -195,7 +195,6 @@ async fn seed<S: WorkflowStore>(
         description: String::new(),
         run_input_schema_digest: schema.digest().clone(),
         run_output_schema_digest: schema.digest().clone(),
-        entry_node_id: id("approval"),
         nodes: vec![
             NodeDefinition::Approval {
                 id: id("approval"),

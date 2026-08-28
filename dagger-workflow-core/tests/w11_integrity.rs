@@ -173,7 +173,6 @@ fn definition(definition_id: &Id, schema: &Digest) -> WorkflowDefinition {
         description: String::new(),
         run_input_schema_digest: schema.clone(),
         run_output_schema_digest: schema.clone(),
-        entry_node_id: id("action"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("action"),

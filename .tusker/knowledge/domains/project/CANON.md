@@ -14,8 +14,8 @@ capsule:
 source_of_truth:
   - "knowledge/domains/project/CANON.md"
 created_at: "2026-08-23T12:08:23Z"
-updated_at: "2026-08-23T12:36:03Z"
-state_rev: "sha256:c1a60856211def47c9cb7661f2d6b8ce70131370365638dfa7aab8bf22b7c29d"
+updated_at: "2026-08-28T14:50:58Z"
+state_rev: "sha256:771bd3601378b0338821268604f72ca36ed7df2e5788e877c3cd612d03b514f7"
 ---
 
 # Project Canon

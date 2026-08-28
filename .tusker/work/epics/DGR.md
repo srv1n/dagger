@@ -15,8 +15,8 @@ next_task_number: 1
 next_gate_number: 1
 next_decision_number: 1
 created_at: "2026-08-28T14:04:36Z"
-updated_at: "2026-08-28T14:08:01Z"
-state_rev: "sha256:96e96875fe9264d372fbc6920e5989f0f7a0cb3a91f8cd6daf0bf95313ae16a3"
+updated_at: "2026-08-28T14:51:06Z"
+state_rev: "sha256:dd78f775ac206f1210fc9769b6812d3a5603f71fa33a8a0f7e43fe82bb0a9262"
 capsule:
   skip_when: "Skip when you need a specific task contract, proof row, gate, or attempt."
   use_when: "Use to triage this workstream's scope, active tasks, and durable direction."
@@ -58,7 +58,7 @@ are downstream host concerns.
 
 | Task | Status | Next owner | Next action |
 |---|---|---|---|
-| [[DGR-T-0001]] | backlog | agent | Execute the task contract and satisfy proof mode. |
+| [[DGR-T-0001]] | ready | agent | Execute the task contract and satisfy proof mode. |
 
 ## Recently completed
 

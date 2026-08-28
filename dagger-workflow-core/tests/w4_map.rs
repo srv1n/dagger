@@ -116,7 +116,6 @@ fn definition(definition_id: &str, items: Value, max_items: u32) -> WorkflowDefi
         description: String::new(),
         run_input_schema_digest: hash(RUN_INPUT_SCHEMA),
         run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
-        entry_node_id: id("map"),
         nodes: vec![
             NodeDefinition::Map {
                 id: id("map"),

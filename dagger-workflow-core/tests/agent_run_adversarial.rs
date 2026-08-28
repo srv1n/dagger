@@ -83,7 +83,6 @@ fn definition(
         description: String::new(),
         run_input_schema_digest: schema.clone(),
         run_output_schema_digest: schema.clone(),
-        entry_node_id: id("work"),
         nodes: vec![
             NodeDefinition::Action {
                 id: id("work"),

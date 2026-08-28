@@ -131,6 +131,15 @@ pub enum EdgeState {
     Skipped,
 }
 
+/// The closed edge purpose vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EdgeKind {
+    /// Authored control-flow activation.
+    Control,
+    /// An output-reference dependency.
+    Dependency,
+}
+
 /// The closed node kind vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -447,6 +456,8 @@ pub struct EdgeFact {
     pub to_node_id: NodeInstanceId,
     /// Optional Choice case index.
     pub choice_case_index: Option<u32>,
+    /// Whether this edge activates control flow or satisfies a data dependency.
+    pub kind: EdgeKind,
     /// Durable edge state.
     pub state: EdgeState,
     /// Terminal resolution timestamp.

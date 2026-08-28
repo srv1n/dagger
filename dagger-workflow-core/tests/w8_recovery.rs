@@ -75,7 +75,7 @@ fn id(value: &str) -> Id {
 /// The one closed schema every fixture node reads and writes, so schema conformance is never
 /// what a recovery assertion is actually measuring.
 fn schema_bytes() -> Vec<u8> {
-    br#"{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"}"#.to_vec()
+    br#"{"additionalProperties":false,"properties":{"left":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"},"right":{"additionalProperties":false,"properties":{"value":{"type":"integer"}},"required":["value"],"type":"object"},"value":{"type":"integer"}},"required":["value"],"type":"object"}"#.to_vec()
 }
 
 fn action_reference(name: &str, schema: &Digest) -> ActionReference {
@@ -431,7 +431,6 @@ fn chain_definition(schema: &Digest) -> WorkflowDefinition {
         description: String::new(),
         run_input_schema_digest: schema.clone(),
         run_output_schema_digest: schema.clone(),
-        entry_node_id: id("alfa"),
         nodes: vec![
             action_node(
                 "alfa",
@@ -465,6 +464,168 @@ fn chain_definition(schema: &Digest) -> WorkflowDefinition {
             },
         ],
     }
+}
+
+fn multiple_root_definition(schema: &Digest) -> WorkflowDefinition {
+    WorkflowDefinition {
+        definition_format_version: "0.1".to_owned(),
+        definition_id: id("multiple-root-recovery"),
+        name: "multiple root recovery".to_owned(),
+        description: String::new(),
+        run_input_schema_digest: schema.clone(),
+        run_output_schema_digest: schema.clone(),
+        nodes: vec![
+            action_node(
+                "zulu",
+                "w8.zulu-root",
+                schema,
+                BindingSource::RunInput {
+                    pointer: "/value".to_owned(),
+                },
+                2,
+                1,
+                &["join"],
+            ),
+            action_node(
+                "alfa",
+                "w8.alfa-root",
+                schema,
+                BindingSource::RunInput {
+                    pointer: "/value".to_owned(),
+                },
+                2,
+                1,
+                &["join"],
+            ),
+            NodeDefinition::Action {
+                id: id("join"),
+                action: action_reference("w8.join", schema),
+                bindings: vec![
+                    Binding {
+                        target: "/value".to_owned(),
+                        source: BindingSource::RunInput {
+                            pointer: "/value".to_owned(),
+                        },
+                    },
+                    Binding {
+                        target: "/left".to_owned(),
+                        source: BindingSource::NodeOutput {
+                            node_id: id("alfa"),
+                            pointer: String::new(),
+                        },
+                    },
+                    Binding {
+                        target: "/right".to_owned(),
+                        source: BindingSource::NodeOutput {
+                            node_id: id("zulu"),
+                            pointer: String::new(),
+                        },
+                    },
+                ],
+                retry: RetryPolicy {
+                    max_attempts: 2,
+                    backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                },
+                timeout: TimeoutPolicy { timeout_ms: 60_000 },
+                declared_max_cost_units: CostUnits(1),
+                next: vec![id("done")],
+            },
+            NodeDefinition::Succeed {
+                id: id("done"),
+                output: BindingSource::NodeOutput {
+                    node_id: id("join"),
+                    pointer: String::new(),
+                },
+            },
+        ],
+    }
+}
+
+#[tokio::test]
+async fn multiple_root_ready_set_survives_reopen_and_executes_once() {
+    let deployment = Deployment::new("multiple-root-recovery");
+    let definition = multiple_root_definition(&deployment.schema);
+    let definition_id = definition.definition_id.clone();
+    let (store, objects) = deployment.open().await;
+    let revision_hash = deployment
+        .publish(&store, &objects, definition, &["zulu", "alfa", "join"])
+        .await;
+    deployment
+        .create_run(
+            &store,
+            &objects,
+            &definition_id,
+            &revision_hash,
+            "multiple-root-recovery-run",
+            10,
+        )
+        .await;
+    let acquired = store
+        .acquire_engine_claim(&deployment.scope, id("multiple-root-first-engine"))
+        .await
+        .unwrap();
+    store
+        .start_run(
+            &deployment.scope,
+            StartRun {
+                permit: acquired.permit.clone(),
+                run_id: id("multiple-root-recovery-run"),
+                compatibility_evidence: deployment.evidence(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ready_node_ids(&store, &deployment.scope).await,
+        vec!["alfa", "zulu"]
+    );
+    store
+        .release_engine_claim(&deployment.scope, &acquired.permit)
+        .await
+        .unwrap();
+    store.pool().close().await;
+    drop(store);
+    drop(objects);
+
+    let (store, objects) = deployment.open().await;
+    assert_eq!(
+        ready_node_ids(&store, &deployment.scope).await,
+        vec!["alfa", "zulu"]
+    );
+    let log = InvocationLog::default();
+    let action_registry = registry(
+        &["w8.zulu-root", "w8.alfa-root", "w8.join"],
+        &deployment.schema,
+        &log,
+    );
+    let engine = engine(
+        store.clone(),
+        objects,
+        action_registry,
+        "multiple-root-recovery-engine",
+    );
+    engine.acquire_scope(&deployment.scope).await.unwrap();
+    engine.run_until_idle(&deployment.scope, 8).await.unwrap();
+    let invocations = log.0.lock().unwrap();
+    for node in ["alfa", "zulu", "join"] {
+        assert_eq!(
+            invocations
+                .iter()
+                .filter(|(invoked, _, _)| invoked == node)
+                .count(),
+            1,
+            "{node} must execute exactly once"
+        );
+    }
+    assert_eq!(
+        store
+            .get_run(&deployment.scope, &id("multiple-root-recovery-run"))
+            .await
+            .unwrap()
+            .run
+            .status,
+        RunState::Succeeded
+    );
 }
 
 /// Fixture 1 and fixture 2. The frontier a restarted scheduler resumes from is derived only from
@@ -1103,7 +1264,6 @@ fn map_definition(schema: &Digest) -> WorkflowDefinition {
         description: String::new(),
         run_input_schema_digest: schema.clone(),
         run_output_schema_digest: schema.clone(),
-        entry_node_id: id("fanout"),
         nodes: vec![
             NodeDefinition::Map {
                 id: id("fanout"),
@@ -1364,7 +1524,6 @@ fn fanout_definition(schema: &Digest) -> WorkflowDefinition {
         description: String::new(),
         run_input_schema_digest: schema.clone(),
         run_output_schema_digest: schema.clone(),
-        entry_node_id: id("root"),
         nodes: vec![
             action_node(
                 "root",

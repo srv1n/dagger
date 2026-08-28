@@ -9,7 +9,6 @@ description: >
   bounded item summarization, durable approval, and idempotent publication.
 run_input_schema_digest: sha256:dc968dc5e2ae5072810badf3b7af82b6d8c9f3a37304fcecabeb24bdce8217bf
 run_output_schema_digest: sha256:805b96108600d8df07fca448beebeec615c53ce75b389fe3e53f3c801ad56604
-entry_node_id: prepare_trigger
 nodes:
   - id: prepare_trigger
     kind: Action
