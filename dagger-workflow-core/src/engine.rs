@@ -1239,8 +1239,14 @@ where
                             next,
                         ),
                     },
-                    ChoiceTarget::Skip => crate::run::ChoiceSelection::Skipped {
+                    ChoiceTarget::Skip { next } => crate::run::ChoiceSelection::Skipped {
                         case_index: Some(index as u32),
+                        edge_id: edge_id(
+                            &run.revision_hash,
+                            &node.definition_node_id,
+                            &format!("case/{index}"),
+                            next,
+                        ),
                     },
                 });
                 break;
@@ -1255,7 +1261,15 @@ where
                     next,
                 ),
             },
-            ChoiceTarget::Skip => crate::run::ChoiceSelection::Skipped { case_index: None },
+            ChoiceTarget::Skip { next } => crate::run::ChoiceSelection::Skipped {
+                case_index: None,
+                edge_id: edge_id(
+                    &run.revision_hash,
+                    &node.definition_node_id,
+                    "default",
+                    next,
+                ),
+            },
         });
         let object = self
             .object_store

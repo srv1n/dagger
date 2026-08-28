@@ -131,6 +131,16 @@ pub enum EdgeState {
     Skipped,
 }
 
+/// Why an edge or node was skipped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// A Choice selected a different branch.
+    ConditionFalse,
+    /// An upstream dependency could not produce its output.
+    SkippedUpstreamFailed,
+}
+
 /// The closed edge purpose vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EdgeKind {
@@ -202,6 +212,8 @@ macro_rules! failure_kind {
             ApprovalPayloadInvalid,
             /// Action reported cost beyond its declaration.
             ActionCostProtocolViolation,
+            /// No path produced the required root output.
+            SuccessOutputUnavailable,
         }
     };
 }
@@ -352,6 +364,8 @@ pub struct NodeRun {
     pub incoming_satisfied: u32,
     /// Skipped incoming edge count.
     pub incoming_skipped: u32,
+    /// Why this node was skipped, when it is skipped.
+    pub skip_reason: Option<SkipReason>,
     /// Committed Choice input.
     pub choice_input_ref: Option<JsonRef>,
     /// Committed Choice selection.
@@ -388,10 +402,12 @@ pub enum ChoiceSelection {
         /// Selected deterministic edge ID.
         edge_id: Id,
     },
-    /// A matching case or default intentionally activated no target.
+    /// A matching case or default intentionally skipped its guarded target.
     Skipped {
         /// Matching case index, or None for the default outcome.
         case_index: Option<u32>,
+        /// Deterministic edge to skip.
+        edge_id: Id,
     },
 }
 
@@ -465,6 +481,8 @@ pub struct EdgeFact {
     pub kind: EdgeKind,
     /// Durable edge state.
     pub state: EdgeState,
+    /// Why this edge was skipped, when it is skipped.
+    pub skip_reason: Option<SkipReason>,
     /// Terminal resolution timestamp.
     pub resolved_at: Option<Timestamp>,
     /// Edge CAS version.

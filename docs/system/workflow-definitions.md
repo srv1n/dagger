@@ -50,7 +50,8 @@ The validator requires these rules:
 - Node IDs are unique.
 - Each edge names an existing node.
 - The graph has no cycle.
-- A `node_output` source creates one dependency edge from its named node.
+- A `node_output` source creates one dependency edge from its named node. That edge makes the
+  consumer reachable and ready when its source output exists; it does not need a duplicate `next`.
 - Constant and run-input sources do not create dependency edges.
 - Literal and run-input artifact references do not create dependency edges.
 - The root set contains every node with no incoming output-reference edge and no incoming
@@ -78,6 +79,8 @@ An ordinary binding can read from these sources:
 A Map child can also read the current item and its zero-based index.
 
 Bindings use RFC 6901 JSON pointers. The validator rejects overlapping target pointers.
+
+A Choice outcome names one guarded node. `kind: node` activates it; `kind: skip` marks it skipped.
 
 ## Definition limits
 

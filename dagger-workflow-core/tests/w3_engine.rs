@@ -11,13 +11,15 @@ use dagger_workflow_core::artifact::{
 };
 use dagger_workflow_core::definition::{
     canonical_topological_ranks, ActionReference, ApprovalGateConfig, ArtifactLocator,
-    BackoffPolicy, Binding, BindingSource, MapBinding, MapBindingSource, NodeDefinition,
-    PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
+    BackoffPolicy, Binding, BindingSource, ChoiceCase, ChoiceTarget, MapBinding, MapBindingSource,
+    NodeDefinition, PublishableDefinition, RetryPolicy, TimeoutPolicy, WorkflowDefinition,
 };
 use dagger_workflow_core::engine::{EngineConfig, EngineError, TestClock, WorkflowEngine};
 use dagger_workflow_core::ids::{CostUnits, Digest, Id, Timestamp, TopologicalRank};
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
-use dagger_workflow_core::run::{AttemptState, NodeState, RunLimits, RunState};
+use dagger_workflow_core::run::{
+    AttemptState, NodeState, RunFailureKind, RunLimits, RunState, SkipReason,
+};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::store::{
     ClaimNodeAttempt, ClaimNodeAttemptResult, CreateDefinition, CreateRun, DecideApproval,
@@ -711,6 +713,133 @@ fn permanent_action_failure_skips_dependents_but_runs_independent_root() {
                 .run
                 .status,
             RunState::Succeeded
+        );
+    });
+}
+
+#[test]
+fn choice_skip_records_condition_false_and_fails_when_no_succeed_can_run() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(810)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = ActionDescriptor {
+            name: "fixture.choice-skip".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
+            implementation_compatibility_digest: hash(b"choice-skip-impl"),
+        };
+        let action = |node: &str, next: Vec<Id>| NodeDefinition::Action {
+            id: id(node),
+            action: ActionReference {
+                name: descriptor.name.clone(),
+                contract_version: descriptor.contract_version.clone(),
+                input_schema_digest: descriptor.input_schema_digest.clone(),
+                output_schema_digest: descriptor.output_schema_digest.clone(),
+                compatible_implementation_requirement: descriptor
+                    .implementation_compatibility_digest
+                    .clone(),
+            },
+            bindings: Vec::new(),
+            retry: RetryPolicy {
+                max_attempts: 1,
+                backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+            },
+            timeout: TimeoutPolicy { timeout_ms: 1_000 },
+            declared_max_cost_units: CostUnits(1),
+            next,
+        };
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("choice-skip-definition"),
+            name: "choice skip".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
+            nodes: vec![
+                NodeDefinition::Choice {
+                    id: id("choose"),
+                    input: BindingSource::Constant { value: json!(true) },
+                    selector: String::new(),
+                    cases: vec![ChoiceCase::Equals {
+                        equals: json!(true),
+                        target: ChoiceTarget::Skip {
+                            next: id("blocked"),
+                        },
+                    }],
+                    default: ChoiceTarget::Node {
+                        next: id("fallback"),
+                    },
+                },
+                action("blocked", vec![id("done")]),
+                action("fallback", vec![id("done")]),
+                NodeDefinition::Succeed {
+                    id: id("done"),
+                    output: BindingSource::Constant { value: json!(null) },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "choice-skip-run",
+            10_000,
+        )
+        .await;
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(CountingAction {
+                descriptor,
+                calls: Arc::new(AtomicUsize::new(0)),
+                output: json!({}),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects,
+            registry,
+            EngineConfig {
+                instance_id: id("choice-skip-engine"),
+                max_concurrency: 1,
+                cancellation_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("choice-skip-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        let blocked = store
+            .get_node(&execution_scope, &id("choice-skip-run"), &id("blocked"))
+            .await
+            .unwrap();
+        let done = store
+            .get_node(&execution_scope, &id("choice-skip-run"), &id("done"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (blocked.status, blocked.skip_reason),
+            (NodeState::Skipped, Some(SkipReason::ConditionFalse))
+        );
+        assert_eq!(
+            (done.status, done.skip_reason),
+            (NodeState::Skipped, Some(SkipReason::SkippedUpstreamFailed))
+        );
+        let run = store
+            .get_run(&execution_scope, &id("choice-skip-run"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Failed);
+        assert_eq!(
+            run.failure_kind,
+            Some(RunFailureKind::SuccessOutputUnavailable)
         );
     });
 }

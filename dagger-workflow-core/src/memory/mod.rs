@@ -22,7 +22,7 @@ use crate::revision::WorkflowRevision;
 use crate::run::{
     AttemptErrorClass, AttemptState, BlockedFromState, ChoiceSelection, EdgeFact, EdgeKind,
     EdgeState, NodeAttempt, NodeFailureKind, NodeKind, NodeRun, NodeState, RunFailureKind,
-    RunOperationalCounts, RunOperationalView, RunState, WorkflowRun, WorkflowRunView,
+    RunOperationalCounts, RunOperationalView, RunState, SkipReason, WorkflowRun, WorkflowRunView,
 };
 use crate::scope::ExecutionScope;
 use crate::store::*;
@@ -851,13 +851,17 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
                         crate::definition::ChoiceTarget::Node { next } => {
                             Some((format!("case/{index}"), next.clone(), Some(index as u32)))
                         }
-                        crate::definition::ChoiceTarget::Skip => None,
+                        crate::definition::ChoiceTarget::Skip { next } => {
+                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                        }
                     }
                 })
                 .collect::<Vec<_>>();
-            if let crate::definition::ChoiceTarget::Node { next } = default {
-                result.push(("default".to_owned(), next.clone(), None));
-            }
+            let next = match default {
+                crate::definition::ChoiceTarget::Node { next }
+                | crate::definition::ChoiceTarget::Skip { next } => next,
+            };
+            result.push(("default".to_owned(), next.clone(), None));
             result
         }
         NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
@@ -1574,7 +1578,7 @@ payload_constructors! {
     node_retries_exhausted => NodeRetriesExhausted(attempt_id: &Id, attempt_number: &u32, max_attempts: &u32, cause: &str);
     node_budget_waiting => NodeBudgetWaiting(requested: &CostUnits, available: &str, consumed: &CostUnits, reserved: &CostUnits, limit: &CostUnits);
     node_budget_exhausted => NodeBudgetExhausted(requested: &CostUnits, available: &str, limit_minus_consumed: &str);
-    node_skipped => NodeSkipped(incoming_skipped: &u32, incoming_total: &u32);
+    node_skipped => NodeSkipped(incoming_skipped: &u32, incoming_total: &u32, reason: &SkipReason);
     node_cancelled => NodeCancelled(prior_status: &NodeState, terminal_run_status: &RunState, reason_code: &str);
     map_failed_fast => MapFailedFast(failed_child_id: &Id, child_failure_kind: &NodeFailureKind);
     map_contract_failed => MapContractFailed(failure_kind: &NodeFailureKind, failed_child_id: &Option<Id>);
@@ -1602,7 +1606,7 @@ payload_constructors! {
     approval_gate_expired_rejected => ApprovalGateExpiredRejected(expires_at: &Timestamp, database_now: &Timestamp);
     approval_gate_cancelled => ApprovalGateCancelled(terminal_run_status: &RunState, reason_code: &str);
     edge_satisfied => EdgeSatisfied(edge_id: &Id, from_node_id: &Id, to_node_id: &Id);
-    edge_skipped => EdgeSkipped(edge_id: &Id, from_node_id: &Id, to_node_id: &Id, cause: &str);
+    edge_skipped => EdgeSkipped(edge_id: &Id, from_node_id: &Id, to_node_id: &Id, reason: &SkipReason);
 }
 
 fn event_spec(
@@ -1803,7 +1807,7 @@ fn event_payload_fields(
             &[],
         ),
         NodeBudgetExhausted => (&["requested", "available", "limit_minus_consumed"], &[]),
-        NodeSkipped => (&["incoming_skipped", "incoming_total"], &[]),
+        NodeSkipped => (&["incoming_skipped", "incoming_total", "reason"], &[]),
         NodeCancelled => (&["prior_status", "terminal_run_status", "reason_code"], &[]),
         MapFailedFast => (&["failed_child_id", "child_failure_kind"], &[]),
         MapContractFailed => (&["failure_kind"], &["failed_child_id"]),
@@ -1911,7 +1915,7 @@ fn event_payload_fields(
         ApprovalGateExpiredRejected => (&["expires_at", "database_now"], &[]),
         ApprovalGateCancelled => (&["terminal_run_status", "reason_code"], &[]),
         EdgeSatisfied => (&["edge_id", "from_node_id", "to_node_id"], &[]),
-        EdgeSkipped => (&["edge_id", "from_node_id", "to_node_id", "cause"], &[]),
+        EdgeSkipped => (&["edge_id", "from_node_id", "to_node_id", "reason"], &[]),
     }
 }
 
@@ -2369,30 +2373,45 @@ fn frontier_reduce(
     run_id: &Id,
     source_node: &Id,
     source_succeeded: bool,
+    activate_selected_control: bool,
     selected_edge: Option<&Id>,
     now: Timestamp,
     specs: &mut Vec<EventSpec>,
 ) -> Result<(), StoreError> {
     let mut frontier_changed = false;
-    let mut edge_keys = state
-        .edges
-        .keys()
-        .filter(|(edge_scope, edge_run, _)| edge_scope == scope && edge_run == run_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    edge_keys.sort_by(|left, right| left.2.cmp(&right.2));
-    for key in &edge_keys {
+    let mut outgoing = BTreeMap::<Id, Vec<(ExecutionScope, Id, Id)>>::new();
+    let mut incoming = BTreeMap::<Id, Vec<(ExecutionScope, Id, Id)>>::new();
+    for (key, edge) in &state.edges {
+        if edge.scope == *scope && edge.run_id == *run_id {
+            outgoing
+                .entry(edge.from_node_id.clone())
+                .or_default()
+                .push(key.clone());
+            incoming
+                .entry(edge.to_node_id.clone())
+                .or_default()
+                .push(key.clone());
+        }
+    }
+    let mut affected = BTreeSet::new();
+    for key in outgoing.get(source_node).into_iter().flatten() {
         let edge = state.edges.get_mut(key).expect("key captured");
-        if edge.from_node_id == *source_node && edge.state == EdgeState::Dormant {
+        if edge.state == EdgeState::Dormant {
             frontier_changed = true;
             let selected = source_succeeded
                 && (edge.kind == EdgeKind::Dependency
-                    || selected_edge.is_none_or(|selected| selected == &edge.edge_id));
+                    || (activate_selected_control
+                        && selected_edge.is_none_or(|selected| selected == &edge.edge_id)));
             edge.state = if selected {
                 EdgeState::Satisfied
             } else {
                 EdgeState::Skipped
             };
+            edge.skip_reason = (!selected).then_some(if source_succeeded {
+                SkipReason::ConditionFalse
+            } else {
+                SkipReason::SkippedUpstreamFailed
+            });
             edge.resolved_at = Some(now);
             edge.version.0 = edge
                 .version
@@ -2410,11 +2429,7 @@ fn frontier_reduce(
                     &(&edge.edge_id),
                     &(&edge.from_node_id),
                     &(&edge.to_node_id),
-                    &(if source_succeeded {
-                        "choice_unselected"
-                    } else {
-                        "source_failed"
-                    }),
+                    &(edge.skip_reason.expect("skipped edge has reason")),
                 )
             };
             specs.push(event_spec(
@@ -2424,114 +2439,117 @@ fn frontier_reduce(
                 None,
                 payload,
             ));
+            affected.insert(edge.to_node_id.clone());
         }
     }
 
-    loop {
-        let pending_ids = state
-            .nodes
-            .iter()
-            .filter(|((node_scope, node_run, _), node)| {
-                node_scope == scope && node_run == run_id && node.status == NodeState::Pending
-            })
-            .map(|(key, _)| key.2.clone())
+    while let Some(pending_id) = affected.iter().next().cloned() {
+        affected.remove(&pending_id);
+        let key = (scope.clone(), run_id.clone(), pending_id.clone());
+        if state.nodes.get(&key).expect("node exists").status != NodeState::Pending {
+            continue;
+        }
+        let incoming_edges = incoming
+            .get(&pending_id)
+            .into_iter()
+            .flatten()
+            .map(|key| state.edges.get(key).expect("edge exists").clone())
             .collect::<Vec<_>>();
-        let mut changed = false;
-        for pending_id in pending_ids {
-            let incoming = state
-                .edges
-                .values()
-                .filter(|edge| {
-                    edge.scope == *scope && edge.run_id == *run_id && edge.to_node_id == pending_id
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            if incoming.iter().any(|edge| edge.state == EdgeState::Dormant) {
-                continue;
-            }
-            let satisfied = u32::try_from(
-                incoming
-                    .iter()
-                    .filter(|edge| edge.state == EdgeState::Satisfied)
-                    .count(),
-            )
-            .map_err(|_| StoreError::ArithmeticOverflow)?;
-            let incoming_count =
-                u32::try_from(incoming.len()).map_err(|_| StoreError::ArithmeticOverflow)?;
-            let skipped = incoming_count
-                .checked_sub(satisfied)
-                .ok_or(StoreError::ArithmeticOverflow)?;
-            let key = (scope.clone(), run_id.clone(), pending_id.clone());
-            let node = state.nodes.get_mut(&key).expect("pending node exists");
-            node.incoming_satisfied = satisfied;
-            node.incoming_skipped = skipped;
-            let dependencies_satisfied = incoming
+        if incoming_edges
+            .iter()
+            .any(|edge| edge.state == EdgeState::Dormant)
+        {
+            continue;
+        }
+        let satisfied = u32::try_from(
+            incoming_edges
                 .iter()
-                .filter(|edge| edge.kind == EdgeKind::Dependency)
-                .all(|edge| edge.state == EdgeState::Satisfied);
-            let controls = incoming
+                .filter(|edge| edge.state == EdgeState::Satisfied)
+                .count(),
+        )
+        .map_err(|_| StoreError::ArithmeticOverflow)?;
+        let incoming_count =
+            u32::try_from(incoming_edges.len()).map_err(|_| StoreError::ArithmeticOverflow)?;
+        let skipped = incoming_count
+            .checked_sub(satisfied)
+            .ok_or(StoreError::ArithmeticOverflow)?;
+        let node = state.nodes.get_mut(&key).expect("pending node exists");
+        node.incoming_satisfied = satisfied;
+        node.incoming_skipped = skipped;
+        let dependencies_satisfied = incoming_edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Dependency)
+            .all(|edge| edge.state == EdgeState::Satisfied);
+        let controls = incoming_edges
+            .iter()
+            .filter(|edge| edge.kind == EdgeKind::Control)
+            .collect::<Vec<_>>();
+        let control_activated = controls.is_empty()
+            || controls
                 .iter()
-                .filter(|edge| edge.kind == EdgeKind::Control)
-                .collect::<Vec<_>>();
-            let control_activated = controls.is_empty()
-                || controls
+                .any(|edge| edge.state == EdgeState::Satisfied);
+        if dependencies_satisfied && control_activated {
+            node.status = NodeState::Ready;
+            set_node_mutated(node, now)?;
+            specs.push(event_spec(
+                "N03",
+                Some(&pending_id),
+                None,
+                None,
+                event_payload::node_became_ready(&(satisfied), &(skipped), &(node.incoming_total)),
+            ));
+        } else {
+            node.status = NodeState::Skipped;
+            node.skip_reason = Some(
+                if incoming_edges
                     .iter()
-                    .any(|edge| edge.state == EdgeState::Satisfied);
-            if dependencies_satisfied && control_activated {
-                node.status = NodeState::Ready;
-                set_node_mutated(node, now)?;
-                specs.push(event_spec(
-                    "N03",
-                    Some(&pending_id),
-                    None,
-                    None,
-                    event_payload::node_became_ready(
-                        &(satisfied),
-                        &(skipped),
-                        &(node.incoming_total),
-                    ),
-                ));
-            } else {
-                node.status = NodeState::Skipped;
-                set_node_mutated(node, now)?;
-                specs.push(event_spec(
-                    "N28",
-                    Some(&pending_id),
-                    None,
-                    None,
-                    event_payload::node_skipped(&(skipped), &(node.incoming_total)),
-                ));
-                for edge_key in &edge_keys {
-                    let edge = state.edges.get_mut(edge_key).expect("edge exists");
-                    if edge.from_node_id == pending_id && edge.state == EdgeState::Dormant {
-                        edge.state = EdgeState::Skipped;
-                        edge.resolved_at = Some(now);
-                        edge.version.0 = edge
-                            .version
-                            .0
-                            .checked_add(1)
-                            .ok_or(StoreError::ArithmeticOverflow)?;
-                        specs.push(event_spec(
-                            "E02",
-                            Some(&pending_id),
-                            None,
-                            None,
-                            event_payload::edge_skipped(
-                                &(edge.edge_id),
-                                &(edge.from_node_id),
-                                &(edge.to_node_id),
-                                &("source_skipped"),
-                            ),
-                        ));
-                    }
+                    .any(|edge| edge.skip_reason == Some(SkipReason::SkippedUpstreamFailed))
+                {
+                    SkipReason::SkippedUpstreamFailed
+                } else {
+                    SkipReason::ConditionFalse
+                },
+            );
+            set_node_mutated(node, now)?;
+            specs.push(event_spec(
+                "N28",
+                Some(&pending_id),
+                None,
+                None,
+                event_payload::node_skipped(
+                    &(skipped),
+                    &(node.incoming_total),
+                    &(node.skip_reason.expect("skipped node has reason")),
+                ),
+            ));
+            for edge_key in outgoing.get(&pending_id).into_iter().flatten() {
+                let edge = state.edges.get_mut(edge_key).expect("edge exists");
+                if edge.state == EdgeState::Dormant {
+                    edge.state = EdgeState::Skipped;
+                    edge.skip_reason = Some(SkipReason::SkippedUpstreamFailed);
+                    edge.resolved_at = Some(now);
+                    edge.version.0 = edge
+                        .version
+                        .0
+                        .checked_add(1)
+                        .ok_or(StoreError::ArithmeticOverflow)?;
+                    specs.push(event_spec(
+                        "E02",
+                        Some(&pending_id),
+                        None,
+                        None,
+                        event_payload::edge_skipped(
+                            &(edge.edge_id),
+                            &(edge.from_node_id),
+                            &(edge.to_node_id),
+                            &(SkipReason::SkippedUpstreamFailed),
+                        ),
+                    ));
+                    affected.insert(edge.to_node_id.clone());
                 }
             }
-            changed = true;
-            frontier_changed = true;
         }
-        if !changed {
-            break;
-        }
+        frontier_changed = true;
     }
     if frontier_changed {
         bump_frontier_epoch(state, scope, run_id)?;
@@ -2572,15 +2590,13 @@ fn finalize_failed_run_if_output_unavailable(
     {
         return Ok(());
     }
-    let Some(failure_kind) = nodes
+    let run_kind = nodes
         .iter()
         .filter(|node| node.status == NodeState::Failed)
         .filter_map(|node| node.failure_kind)
-        .find(|kind| *kind == NodeFailureKind::ActionPermanent)
-    else {
-        return Ok(());
-    };
-    let run_kind = run_failure(failure_kind);
+        .map(run_failure)
+        .next()
+        .unwrap_or(RunFailureKind::SuccessOutputUnavailable);
     let run = state.runs.get_mut(&run_key).expect("run exists");
     run.status = RunState::Failed;
     run.failure_kind = Some(run_kind);
@@ -3544,6 +3560,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             choice_case_index: case_index,
                             kind: EdgeKind::Control,
                             state: EdgeState::Dormant,
+                            skip_reason: None,
                             resolved_at: None,
                             version: Version(1),
                         },
@@ -3566,6 +3583,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             choice_case_index: None,
                             kind: EdgeKind::Dependency,
                             state: EdgeState::Dormant,
+                            skip_reason: None,
                             resolved_at: None,
                             version: Version(1),
                         },
@@ -3610,6 +3628,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     incoming_total: count,
                     incoming_satisfied: 0,
                     incoming_skipped: 0,
+                    skip_reason: None,
                     choice_input_ref: None,
                     choice_selected_case: None,
                     map_input_ref: None,
@@ -5058,6 +5077,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         &command.run_id,
                         &command.node_id,
                         true,
+                        true,
                         None,
                         now,
                         &mut specs,
@@ -5269,6 +5289,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         scope,
                         &command.run_id,
                         &failed_frontier,
+                        false,
                         false,
                         None,
                         now,
@@ -5954,9 +5975,21 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                                 next,
                             ),
                         },
-                        crate::definition::ChoiceTarget::Skip => ChoiceSelection::Skipped {
-                            case_index: Some(index as u32),
-                        },
+                        crate::definition::ChoiceTarget::Skip { next } => {
+                            ChoiceSelection::Skipped {
+                                case_index: Some(index as u32),
+                                edge_id: edge_id(
+                                    &state
+                                        .runs
+                                        .get(&(scope.clone(), command.run_id.clone()))
+                                        .expect("run")
+                                        .revision_hash,
+                                    &node.definition_node_id,
+                                    &format!("case/{index}"),
+                                    next,
+                                ),
+                            }
+                        }
                     });
                     break;
                 }
@@ -5974,9 +6007,19 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         next,
                     ),
                 },
-                crate::definition::ChoiceTarget::Skip => {
-                    ChoiceSelection::Skipped { case_index: None }
-                }
+                crate::definition::ChoiceTarget::Skip { next } => ChoiceSelection::Skipped {
+                    case_index: None,
+                    edge_id: edge_id(
+                        &state
+                            .runs
+                            .get(&(scope.clone(), command.run_id.clone()))
+                            .expect("run")
+                            .revision_hash,
+                        &node.definition_node_id,
+                        "default",
+                        next,
+                    ),
+                },
             });
             if command.selection != expected {
                 return Err(StoreError::InvalidField);
@@ -5985,7 +6028,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 ChoiceSelection::Case { edge_id, .. } | ChoiceSelection::Default { edge_id } => {
                     Some(edge_id.clone())
                 }
-                ChoiceSelection::Skipped { .. } => None,
+                ChoiceSelection::Skipped { edge_id, .. } => Some(edge_id.clone()),
             };
             let outgoing_ids = state
                 .edges
@@ -6033,12 +6076,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     &(Option::<u32>::None),
                     &(selected.as_ref()),
                 ),
-                ChoiceSelection::Skipped { case_index } => event_payload::choice_selected(
+                ChoiceSelection::Skipped { case_index, .. } => event_payload::choice_selected(
                     &(command.input.digest()),
                     &(&command.evaluated_selector_digest),
                     &("skip"),
                     &(case_index),
-                    &(Option::<&Id>::None),
+                    &(selected.as_ref()),
                 ),
             };
             let mut specs = vec![event_spec(
@@ -6048,13 +6091,18 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 None,
                 choice_payload,
             )];
+            let selected_control = match &command.selection {
+                ChoiceSelection::Skipped { .. } => None,
+                ChoiceSelection::Case { .. } | ChoiceSelection::Default { .. } => selected.as_ref(),
+            };
             frontier_reduce(
                 &mut state,
                 scope,
                 &command.run_id,
                 &command.node_id,
                 true,
-                selected.as_ref(),
+                !matches!(command.selection, ChoiceSelection::Skipped { .. }),
+                selected_control,
                 now,
                 &mut specs,
             )?;
@@ -6301,6 +6349,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     &command.run_id,
                     &command.map_node_id,
                     true,
+                    true,
                     None,
                     now,
                     &mut specs,
@@ -6336,6 +6385,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         incoming_total: 0,
                         incoming_satisfied: 0,
                         incoming_skipped: 0,
+                        skip_reason: None,
                         choice_input_ref: None,
                         choice_selected_case: None,
                         map_input_ref: None,
@@ -6583,6 +6633,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 scope,
                 &command.run_id,
                 &command.map_node_id,
+                true,
                 true,
                 None,
                 now,
@@ -6935,6 +6986,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         &command.run_id,
                         &node_id,
                         true,
+                        true,
                         None,
                         now,
                         &mut specs,
@@ -7136,6 +7188,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         scope,
                         &command.run_id,
                         &node_id,
+                        true,
                         true,
                         None,
                         now,
@@ -8653,6 +8706,7 @@ fn run_failure(kind: NodeFailureKind) -> RunFailureKind {
         NodeFailureKind::MapBoundExceeded => RunFailureKind::MapBoundExceeded,
         NodeFailureKind::ApprovalPayloadInvalid => RunFailureKind::ApprovalPayloadInvalid,
         NodeFailureKind::ActionCostProtocolViolation => RunFailureKind::ActionCostProtocolViolation,
+        NodeFailureKind::SuccessOutputUnavailable => RunFailureKind::SuccessOutputUnavailable,
     }
 }
 

@@ -17,7 +17,7 @@ use dagger_workflow_core::ids::{
     TopologicalRank, Version,
 };
 use dagger_workflow_core::memory::InMemoryObjectStore;
-use dagger_workflow_core::run::{NodeState, RunLimits, RunState};
+use dagger_workflow_core::run::{NodeState, RunLimits, RunState, SkipReason};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::{
     SqliteWorkflowStore, SCHEDULER_COMPATIBILITY_SCAN_SQL, SCHEDULER_DEADLINES_SCAN_SQL,
@@ -515,14 +515,12 @@ async fn permanent_action_failure_skips_missing_output_dependent_in_sqlite() {
             .status,
         RunState::Failed
     );
-    assert_eq!(
-        store
-            .get_node(&fixture.scope, &run_id, &Id::new("succeed").unwrap())
-            .await
-            .unwrap()
-            .status,
-        NodeState::Skipped
-    );
+    let succeed = store
+        .get_node(&fixture.scope, &run_id, &Id::new("succeed").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(succeed.status, NodeState::Skipped);
+    assert_eq!(succeed.skip_reason, Some(SkipReason::SkippedUpstreamFailed));
 }
 
 async fn raw_scope_snapshot(

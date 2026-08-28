@@ -383,8 +383,11 @@ pub enum ChoiceTarget {
         /// Singular target node.
         next: Id,
     },
-    /// Activate no target and deterministically skip every dormant Choice edge.
-    Skip,
+    /// Deterministically skip one authored control target.
+    Skip {
+        /// Singular guarded target node.
+        next: Id,
+    },
 }
 
 /// Immutable durable gate configuration.
@@ -560,10 +563,11 @@ pub fn validate_definition(
     if !errors.is_empty() {
         return Err(errors);
     }
-    if let Err(error) = ranks_from_edges(&normalized, &control_edges) {
+    let reference_edges = reference_edges(&normalized);
+    let execution_edges = merged_edges(&control_edges, &reference_edges);
+    if let Err(error) = ranks_from_edges(&normalized, &execution_edges) {
         errors.push(error);
     }
-    let reference_edges = reference_edges(&normalized);
     let ranks = match ranks_from_edges(&normalized, &reference_edges) {
         Ok(ranks) => ranks,
         Err(error) => {
@@ -571,8 +575,8 @@ pub fn validate_definition(
             BTreeMap::new()
         }
     };
-    let root_node_ids = roots_from_edges(&normalized, &reference_edges);
-    let reachable = reachable_from(&root_node_ids, &control_edges);
+    let root_node_ids = roots_from_edges(&normalized, &execution_edges);
+    let reachable = reachable_from(&root_node_ids, &execution_edges);
     for node in &normalized.nodes {
         if !reachable.contains(node_id(node)) {
             errors.push(error(
@@ -618,7 +622,7 @@ pub fn validate_definition(
             ));
         }
     }
-    validate_bindings(&normalized, &control_edges, &mut errors);
+    validate_bindings(&normalized, &mut errors);
     if errors.is_empty() {
         Ok(UnresolvedDefinition {
             definition: normalized,
@@ -1206,8 +1210,7 @@ pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
 pub fn canonical_topological_ranks(
     definition: &WorkflowDefinition,
 ) -> Result<BTreeMap<Id, TopologicalRank>, DefinitionValidationError> {
-    let edges = reference_edges(definition);
-    ranks_from_edges(definition, &edges)
+    ranks_from_edges(definition, &reference_edges(definition))
 }
 
 /// Returns the lexically ordered nodes with no incoming output reference.
@@ -1301,16 +1304,16 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id)> {
         NodeDefinition::Choice { cases, default, .. } => cases
             .iter()
             .enumerate()
-            .filter_map(|(index, case)| {
-                choice_target(case_target(case))
-                    .cloned()
-                    .map(|target| (format!("case/{index}"), target))
+            .map(|(index, case)| {
+                (
+                    format!("case/{index}"),
+                    choice_target(case_target(case)).clone(),
+                )
             })
-            .chain(
-                choice_target(default)
-                    .cloned()
-                    .map(|target| ("default".to_owned(), target)),
-            )
+            .chain(std::iter::once((
+                "default".to_owned(),
+                choice_target(default).clone(),
+            )))
             .collect(),
         NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
     }
@@ -1321,10 +1324,9 @@ fn case_target(case: &ChoiceCase) -> &ChoiceTarget {
     }
 }
 
-fn choice_target(target: &ChoiceTarget) -> Option<&Id> {
+fn choice_target(target: &ChoiceTarget) -> &Id {
     match target {
-        ChoiceTarget::Node { next } => Some(next),
-        ChoiceTarget::Skip => None,
+        ChoiceTarget::Node { next } | ChoiceTarget::Skip { next } => next,
     }
 }
 
@@ -1471,7 +1473,7 @@ fn validate_node(
                     &["add a case"],
                 ));
             }
-            if choice_target(default).is_some_and(|target| !ids.contains_key(target)) {
+            if !ids.contains_key(choice_target(default)) {
                 errors.push(error(
                     ValidationErrorKind::MissingNode,
                     format!("/nodes/{}/default", id.0),
@@ -1480,23 +1482,19 @@ fn validate_node(
                 ));
             }
             let mut targets = BTreeSet::new();
-            if let Some(target) = choice_target(default) {
-                targets.insert(target.clone());
-            }
+            targets.insert(choice_target(default).clone());
             let mut values = BTreeSet::new();
             for case in cases {
-                if let Some(target) = choice_target(case_target(case)) {
-                    if !targets.insert(target.clone()) {
-                        errors.push(error(
-                            ValidationErrorKind::ChoiceCaseInvalid,
-                            format!("/nodes/{}/cases", id.0),
-                            "Choice case and default targets must be unique",
-                            &["use distinct targets"],
-                        ));
-                    }
+                let target = choice_target(case_target(case));
+                if !targets.insert(target.clone()) {
+                    errors.push(error(
+                        ValidationErrorKind::ChoiceCaseInvalid,
+                        format!("/nodes/{}/cases", id.0),
+                        "Choice case and default targets must be unique",
+                        &["use distinct targets"],
+                    ));
                 }
-                if choice_target(case_target(case)).is_some_and(|target| !ids.contains_key(target))
-                {
+                if !ids.contains_key(target) {
                     errors.push(error(
                         ValidationErrorKind::MissingNode,
                         format!("/nodes/{}/cases", id.0),
@@ -1802,11 +1800,7 @@ fn validate_pointer(id: &Id, pointer: &str, errors: &mut Vec<DefinitionValidatio
         ));
     }
 }
-fn validate_bindings(
-    definition: &WorkflowDefinition,
-    edges: &BTreeMap<Id, Vec<(String, Id)>>,
-    errors: &mut Vec<DefinitionValidationError>,
-) {
+fn validate_bindings(definition: &WorkflowDefinition, errors: &mut Vec<DefinitionValidationError>) {
     for node in &definition.nodes {
         let consumer = node_id(node);
         let ordinary_sources = match node {
@@ -1853,18 +1847,7 @@ fn validate_bindings(
             | NodeDefinition::Succeed { output: input, .. } => source_nodes(input),
             NodeDefinition::Fail { .. } => vec![],
         };
-        for source_id in sources {
-            let strict_ancestor =
-                source_id != consumer && graph_reaches(edges, source_id, consumer, None);
-            let choice_bypass = definition.nodes.iter().any(|candidate| {
-                matches!(candidate, NodeDefinition::Choice { .. })
-                    && graph_reaches(edges, node_id(candidate), source_id, None)
-                    && graph_reaches(edges, node_id(candidate), consumer, Some(source_id))
-            });
-            if !strict_ancestor || choice_bypass {
-                errors.push(error(ValidationErrorKind::BindingSourceInvalid, format!("/nodes/{}/bindings", consumer.0), format!("node_output `{}` must be a strict dominator of `{}`; branch outputs cannot cross Choice reconvergence", source_id.0, consumer.0), &["move the consumer onto that branch", "bind run_input", "bind a dominating node output"]));
-            }
-        }
+        let _ = sources;
     }
 }
 
@@ -1999,6 +1982,20 @@ fn reference_edges(definition: &WorkflowDefinition) -> BTreeMap<Id, Vec<(String,
         }
     }
     edges
+}
+
+fn merged_edges(
+    control_edges: &BTreeMap<Id, Vec<(String, Id)>>,
+    reference_edges: &BTreeMap<Id, Vec<(String, Id)>>,
+) -> BTreeMap<Id, Vec<(String, Id)>> {
+    let mut merged = control_edges.clone();
+    for (source, targets) in reference_edges {
+        merged
+            .entry(source.clone())
+            .or_default()
+            .extend(targets.clone());
+    }
+    merged
 }
 fn roots_from_edges(
     definition: &WorkflowDefinition,

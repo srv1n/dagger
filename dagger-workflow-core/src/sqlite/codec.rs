@@ -198,6 +198,7 @@ serde_public_struct!(node_run, NodeRun, {
     incoming_total: u32,
     incoming_satisfied: u32,
     incoming_skipped: u32,
+    skip_reason: Option<crate::run::SkipReason>,
     choice_input_ref: Option<JsonRef>,
     choice_selected_case: Option<ChoiceSelection>,
     map_input_ref: Option<JsonRef>,
@@ -218,6 +219,7 @@ serde_public_struct!(edge_fact, EdgeFact, {
     choice_case_index: Option<u32>,
     kind: EdgeKind,
     state: EdgeState,
+    skip_reason: Option<crate::run::SkipReason>,
     resolved_at: Option<Timestamp>,
     version: Version,
 });

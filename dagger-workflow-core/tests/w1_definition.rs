@@ -24,7 +24,7 @@ fn invalid_kind(input: &str) -> ValidationErrorKind {
 #[test]
 fn closed_skip_aggregate_and_object_sources_parse_and_validate() {
     let definition = parse_json_definition(&format!(
-        r#"{{"definition_format_version":"0.1","definition_id":"closed-sources","name":"closed sources","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"map","kind":"Map","items":{{"kind":"constant","value":[1]}},"max_items":1,"max_concurrency":1,"action":{{"name":"example.action","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[{{"target":"/item","source":{{"kind":"map_item","pointer":""}}}}],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["choose"]}},{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"target":{{"kind":"skip"}}}}],"default":{{"kind":"node","next":"done"}}}},{{"id":"done","kind":"Succeed","output":{{"kind":"object","fields":{{"values":{{"kind":"map_aggregate","node_id":"map","pointer":""}},"names":{{"kind":"array","items":[{{"kind":"constant","value":"map"}}]}}}}}}}}]}}"#
+        r#"{{"definition_format_version":"0.1","definition_id":"closed-sources","name":"closed sources","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"map","kind":"Map","items":{{"kind":"constant","value":[1]}},"max_items":1,"max_concurrency":1,"action":{{"name":"example.action","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[{{"target":"/item","source":{{"kind":"map_item","pointer":""}}}}],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["done"]}},{{"id":"done","kind":"Succeed","output":{{"kind":"object","fields":{{"values":{{"kind":"map_aggregate","node_id":"map","pointer":""}},"names":{{"kind":"array","items":[{{"kind":"constant","value":"map"}}]}}}}}}}}]}}"#
     ))
     .unwrap();
     validate_definition(&definition).unwrap();
@@ -348,15 +348,17 @@ fn invalid_definition_table_is_actionable() {
 }
 
 #[test]
-fn friction_1_reconverged_node_output_is_rejected() {
-    // 1: a post-Choice reconvergence consumer cannot use a branch-only output.
+fn dependency_edges_make_reconverged_node_outputs_ready_without_duplicate_control_edges() {
     let reconvergence = format!(
         r#"{{"definition_format_version":"0.1","definition_id":"x","name":"x","run_input_schema_digest":"{DIGEST}","run_output_schema_digest":"{DIGEST}","nodes":[{{"id":"choose","kind":"Choice","input":{{"kind":"constant","value":true}},"selector":"","cases":[{{"equals":true,"target":{{"kind":"node","next":"branch"}}}}],"default":{{"kind":"node","next":"join"}}}},{{"id":"branch","kind":"Action","action":{{"name":"x","contract_version":"v1","input_schema_digest":"{DIGEST}","output_schema_digest":"{DIGEST}","compatible_implementation_requirement":"{DIGEST}"}},"bindings":[],"retry":{{"max_attempts":1,"backoff":{{"kind":"fixed","delay_ms":0}}}},"timeout":{{"timeout_ms":1}},"declared_max_cost_units":"0","next":["join"]}},{{"id":"join","kind":"Succeed","output":{{"kind":"node_output","node_id":"branch","pointer":""}}}}]}}"#
     );
-    assert_eq!(
-        invalid_kind(&reconvergence),
-        ValidationErrorKind::BindingSourceInvalid
+    validate_definition(&parse_json_definition(&reconvergence).unwrap()).unwrap();
+
+    let skipped = reconvergence.replace(
+        r#""kind":"node","next":"branch""#,
+        r#""kind":"skip","next":"branch""#,
     );
+    validate_definition(&parse_json_definition(&skipped).unwrap()).unwrap();
 }
 
 fn rejected_extension(document: String, field: &str) {

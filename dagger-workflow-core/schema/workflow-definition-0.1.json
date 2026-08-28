@@ -358,8 +358,11 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind"],
-          "properties": { "kind": { "const": "skip" } }
+          "required": ["kind", "next"],
+          "properties": {
+            "kind": { "const": "skip" },
+            "next": { "$ref": "#/$defs/id" }
+          }
         }
       ]
     },
@@ -574,7 +577,7 @@
     "Action, Map action, and root run schema digests resolve to durable supported-subset SchemaDocument objects.",
     "Action input schemas are JSON objects and explicit bindings cover every required leaf exactly once.",
     "Binding targets are unique and non-overlapping; source types assign without coercion.",
-    "Every node_output source is a dominating strict ancestor on every activating path.",
+    "Control and binding dependency edges form one acyclic reachable execution graph; a binding reference does not need a duplicate control edge.",
     "Every literal artifact identity/digest/media tuple resolves to one verified ArtifactRef and ObjectRecord in the definition scope.",
     "Choice case scalar values do not overlap under exact JSON equality.",
     "Map max_concurrency is less than or equal to max_items.",
