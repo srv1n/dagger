@@ -359,6 +359,12 @@ fn dependency_edges_make_reconverged_node_outputs_ready_without_duplicate_contro
         r#""kind":"skip","next":"branch""#,
     );
     validate_definition(&parse_json_definition(&skipped).unwrap()).unwrap();
+
+    let same_guarded_target = reconvergence.replace(
+        r#""default":{"kind":"node","next":"join"}"#,
+        r#""default":{"kind":"skip","next":"branch"}"#,
+    );
+    validate_definition(&parse_json_definition(&same_guarded_target).unwrap()).unwrap();
 }
 
 fn rejected_extension(document: String, field: &str) {

@@ -2522,11 +2522,12 @@ fn frontier_reduce(
                     &(node.skip_reason.expect("skipped node has reason")),
                 ),
             ));
+            let skip_reason = node.skip_reason.expect("skipped node has reason");
             for edge_key in outgoing.get(&pending_id).into_iter().flatten() {
                 let edge = state.edges.get_mut(edge_key).expect("edge exists");
                 if edge.state == EdgeState::Dormant {
                     edge.state = EdgeState::Skipped;
-                    edge.skip_reason = Some(SkipReason::SkippedUpstreamFailed);
+                    edge.skip_reason = Some(skip_reason);
                     edge.resolved_at = Some(now);
                     edge.version.0 = edge
                         .version
@@ -2542,7 +2543,7 @@ fn frontier_reduce(
                             &(edge.edge_id),
                             &(edge.from_node_id),
                             &(edge.to_node_id),
-                            &(SkipReason::SkippedUpstreamFailed),
+                            &(skip_reason),
                         ),
                     ));
                     affected.insert(edge.to_node_id.clone());

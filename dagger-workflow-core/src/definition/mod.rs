@@ -1482,11 +1482,15 @@ fn validate_node(
                 ));
             }
             let mut targets = BTreeSet::new();
-            targets.insert(choice_target(default).clone());
+            targets.insert((
+                matches!(default, ChoiceTarget::Node { .. }),
+                choice_target(default).clone(),
+            ));
             let mut values = BTreeSet::new();
             for case in cases {
-                let target = choice_target(case_target(case));
-                if !targets.insert(target.clone()) {
+                let outcome = case_target(case);
+                let target = choice_target(outcome);
+                if !targets.insert((matches!(outcome, ChoiceTarget::Node { .. }), target.clone())) {
                     errors.push(error(
                         ValidationErrorKind::ChoiceCaseInvalid,
                         format!("/nodes/{}/cases", id.0),

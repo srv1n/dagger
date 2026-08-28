@@ -773,7 +773,16 @@ fn choice_skip_records_condition_false_and_fails_when_no_succeed_can_run() {
                         next: id("fallback"),
                     },
                 },
-                action("blocked", vec![id("done")]),
+                NodeDefinition::Choice {
+                    id: id("blocked"),
+                    input: BindingSource::Constant { value: json!(true) },
+                    selector: String::new(),
+                    cases: vec![ChoiceCase::Equals {
+                        equals: json!(true),
+                        target: ChoiceTarget::Node { next: id("done") },
+                    }],
+                    default: ChoiceTarget::Skip { next: id("done") },
+                },
                 action("fallback", vec![id("done")]),
                 NodeDefinition::Succeed {
                     id: id("done"),
@@ -829,7 +838,7 @@ fn choice_skip_records_condition_false_and_fails_when_no_succeed_can_run() {
         );
         assert_eq!(
             (done.status, done.skip_reason),
-            (NodeState::Skipped, Some(SkipReason::SkippedUpstreamFailed))
+            (NodeState::Skipped, Some(SkipReason::ConditionFalse))
         );
         let run = store
             .get_run(&execution_scope, &id("choice-skip-run"))
