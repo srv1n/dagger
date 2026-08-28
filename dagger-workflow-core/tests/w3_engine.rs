@@ -786,7 +786,10 @@ fn choice_skip_records_condition_false_and_fails_when_no_succeed_can_run() {
                 action("fallback", vec![id("done")]),
                 NodeDefinition::Succeed {
                     id: id("done"),
-                    output: BindingSource::Constant { value: json!(null) },
+                    output: BindingSource::NodeOutput {
+                        node_id: id("blocked"),
+                        pointer: String::new(),
+                    },
                 },
             ],
         };
@@ -849,6 +852,144 @@ fn choice_skip_records_condition_false_and_fails_when_no_succeed_can_run() {
         assert_eq!(
             run.failure_kind,
             Some(RunFailureKind::SuccessOutputUnavailable)
+        );
+    });
+}
+
+#[test]
+fn choice_skipped_action_can_succeed_from_run_input_after_frontier_settles() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(820)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let descriptor = ActionDescriptor {
+            name: "fixture.choice-skipped-action".to_owned(),
+            contract_version: "1".to_owned(),
+            input_schema_digest: hash(SCHEMA),
+            output_schema_digest: hash(SCHEMA),
+            implementation_compatibility_digest: hash(b"choice-skipped-action-impl"),
+        };
+        let definition = WorkflowDefinition {
+            definition_format_version: "0.1".to_owned(),
+            definition_id: id("choice-skip-input-definition"),
+            name: "choice skip input output".to_owned(),
+            description: String::new(),
+            run_input_schema_digest: hash(SCHEMA),
+            run_output_schema_digest: hash(ROOT_OUTPUT_SCHEMA),
+            nodes: vec![
+                NodeDefinition::Choice {
+                    id: id("choose"),
+                    input: BindingSource::Constant {
+                        value: json!(false),
+                    },
+                    selector: String::new(),
+                    cases: vec![ChoiceCase::Equals {
+                        equals: json!(true),
+                        target: ChoiceTarget::Node {
+                            next: id("guarded"),
+                        },
+                    }],
+                    default: ChoiceTarget::Skip {
+                        next: id("guarded"),
+                    },
+                },
+                NodeDefinition::Action {
+                    id: id("guarded"),
+                    action: ActionReference {
+                        name: descriptor.name.clone(),
+                        contract_version: descriptor.contract_version.clone(),
+                        input_schema_digest: descriptor.input_schema_digest.clone(),
+                        output_schema_digest: descriptor.output_schema_digest.clone(),
+                        compatible_implementation_requirement: descriptor
+                            .implementation_compatibility_digest
+                            .clone(),
+                    },
+                    bindings: Vec::new(),
+                    retry: RetryPolicy {
+                        max_attempts: 1,
+                        backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+                    },
+                    timeout: TimeoutPolicy { timeout_ms: 1_000 },
+                    declared_max_cost_units: CostUnits(1),
+                    next: vec![id("done")],
+                },
+                NodeDefinition::Succeed {
+                    id: id("done"),
+                    output: BindingSource::Object {
+                        fields: BTreeMap::from([(
+                            "source".to_owned(),
+                            BindingSource::RunInput {
+                                pointer: "/approval".to_owned(),
+                            },
+                        )]),
+                    },
+                },
+            ],
+        };
+        prepare_definition(
+            &store,
+            &objects,
+            &execution_scope,
+            definition,
+            "choice-skip-input-run",
+            10_000,
+        )
+        .await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(CountingAction {
+                descriptor,
+                calls: calls.clone(),
+                output: json!({}),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects.clone(),
+            registry,
+            EngineConfig {
+                instance_id: id("choice-skip-input-engine"),
+                max_concurrency: 1,
+                cancellation_grace: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("choice-skip-input-run"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+
+        let guarded = store
+            .get_node(
+                &execution_scope,
+                &id("choice-skip-input-run"),
+                &id("guarded"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (guarded.status, guarded.skip_reason),
+            (NodeState::Skipped, Some(SkipReason::ConditionFalse))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let run = store
+            .get_run(&execution_scope, &id("choice-skip-input-run"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Succeeded);
+        let output = run.output_ref.expect("succeed output is durable");
+        let object = objects
+            .get(&execution_scope, &output.0.digest)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&object.bytes).unwrap(),
+            json!({"source":"release"})
         );
     });
 }

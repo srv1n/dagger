@@ -2473,9 +2473,6 @@ fn frontier_reduce(
         let skipped = incoming_count
             .checked_sub(satisfied)
             .ok_or(StoreError::ArithmeticOverflow)?;
-        let node = state.nodes.get_mut(&key).expect("pending node exists");
-        node.incoming_satisfied = satisfied;
-        node.incoming_skipped = skipped;
         let dependencies_satisfied = incoming_edges
             .iter()
             .filter(|edge| edge.kind == EdgeKind::Dependency)
@@ -2488,7 +2485,29 @@ fn frontier_reduce(
             || controls
                 .iter()
                 .any(|edge| edge.state == EdgeState::Satisfied);
-        if dependencies_satisfied && control_activated {
+        let controls_all_condition_false = !controls.is_empty()
+            && controls.iter().all(|edge| {
+                edge.state == EdgeState::Skipped
+                    && edge.skip_reason == Some(SkipReason::ConditionFalse)
+            });
+        let terminal_output_ready = state.nodes.get(&key).expect("pending node exists").kind
+            == NodeKind::Succeed
+            && dependencies_satisfied
+            && !control_activated
+            && controls_all_condition_false
+            && state
+                .nodes
+                .values()
+                .filter(|candidate| {
+                    candidate.scope == *scope
+                        && candidate.run_id == *run_id
+                        && candidate.node_instance_id != pending_id
+                })
+                .all(|candidate| candidate.status.is_terminal());
+        let node = state.nodes.get_mut(&key).expect("pending node exists");
+        node.incoming_satisfied = satisfied;
+        node.incoming_skipped = skipped;
+        if dependencies_satisfied && (control_activated || terminal_output_ready) {
             node.status = NodeState::Ready;
             set_node_mutated(node, now)?;
             specs.push(event_spec(
