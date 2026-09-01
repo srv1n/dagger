@@ -67,6 +67,63 @@ async fn open_file_store(
         .unwrap()
 }
 
+async fn start_and_claim_action(
+    store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
+    fixture: &ActionFixture,
+    permit: &dagger_workflow_core::store::EnginePermit,
+    run_id: &str,
+    attempt_id: &str,
+) -> dagger_workflow_core::action::CompletionCredential {
+    let run_id = Id::new(run_id).unwrap();
+    store
+        .create_run(&fixture.scope, create_run_command(fixture, run_id.as_str()))
+        .await
+        .unwrap();
+    store
+        .start_run(
+            &fixture.scope,
+            StartRun {
+                permit: permit.clone(),
+                run_id: run_id.clone(),
+                compatibility_evidence: CompatibilityReport {
+                    evidence_digest: fixture.evidence_digest.clone(),
+                    incompatible_reference_locations: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    let node_id = Id::new("action").unwrap();
+    let node = store
+        .get_node(&fixture.scope, &run_id, &node_id)
+        .await
+        .unwrap();
+    match store
+        .claim_node_attempt(
+            &fixture.scope,
+            ClaimNodeAttempt {
+                permit: permit.clone(),
+                run_id,
+                node_id,
+                expected_node_version: node.version,
+                attempt_id: Id::new(attempt_id).unwrap(),
+                worker_id: Id::new("failure-message-worker").unwrap(),
+                bound_input: fixture.input.clone(),
+                binding_derivation_digest: fixture.evidence_digest.clone(),
+            },
+        )
+        .await
+        .unwrap()
+    {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => panic!("action attempt was not claimed"),
+    }
+}
+
 async fn seed_action_definition(
     store: &SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>,
     objects: &Arc<InMemoryObjectStore<TestClock>>,
@@ -700,6 +757,14 @@ async fn standalone_open_reopens_a_converged_migration() {
     let first = SqliteWorkflowStore::open(&path, first_clock, objects.clone())
         .await
         .unwrap();
+    sqlx::query("DELETE FROM dagger_workflow_schema_migrations WHERE version = 3")
+        .execute(first.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE dagger_workflow_attempts DROP COLUMN error_message")
+        .execute(first.pool())
+        .await
+        .unwrap();
     first.pool().close().await;
     let reopened_clock = Arc::new(TestClock::new(Timestamp(20)));
     let reopened = SqliteWorkflowStore::open(&path, reopened_clock, objects)
@@ -711,7 +776,184 @@ async fn standalone_open_reopens_a_converged_migration() {
     .fetch_all(reopened.pool())
     .await
     .unwrap();
-    assert_eq!(versions, vec![1, 2]);
+    assert_eq!(versions, vec![1, 2, 3]);
+    let error_message_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts')
+         WHERE name = 'error_message'",
+    )
+    .fetch_one(reopened.pool())
+    .await
+    .unwrap();
+    assert_eq!(error_message_columns, 1);
+}
+
+#[tokio::test]
+async fn failure_messages_round_trip_through_attempt_projection_and_restart() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("attempt-error-messages.sqlite");
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = open_file_store(&path, clock.clone(), objects.clone()).await;
+    let fixture = seed_action_definition(&store, &objects, "attempt-error-messages").await;
+    let engine = store
+        .acquire_engine_claim(&fixture.scope, Id::new("failure-message-engine").unwrap())
+        .await
+        .unwrap();
+
+    let retry_credential = start_and_claim_action(
+        &store,
+        &fixture,
+        &engine.permit,
+        "retry-message-run",
+        "retry-message-attempt",
+    )
+    .await;
+    assert_eq!(
+        store
+            .get_attempt(
+                &fixture.scope,
+                &Id::new("retry-message-run").unwrap(),
+                &Id::new("retry-message-attempt").unwrap(),
+            )
+            .await
+            .unwrap()
+            .error_message,
+        None
+    );
+    let absent_message: Option<String> = sqlx::query_scalar(
+        "SELECT error_message FROM dagger_workflow_attempts
+         WHERE tenant_id = ? AND namespace = ? AND run_id = ? AND attempt_id = ?",
+    )
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .bind("retry-message-run")
+    .bind("retry-message-attempt")
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(absent_message, None);
+    store
+        .complete_attempt(
+            &fixture.scope,
+            CompleteAttempt {
+                completion_credential: retry_credential,
+                run_id: Id::new("retry-message-run").unwrap(),
+                node_id: Id::new("action").unwrap(),
+                attempt_id: Id::new("retry-message-attempt").unwrap(),
+                submitted_outcome: ActionOutcome::retryable(
+                    "fixture.retryable".to_owned(),
+                    "retry this action".to_owned(),
+                    None,
+                    CostUnits(1),
+                )
+                .unwrap(),
+                objects: CompletionObjects {
+                    output: None,
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let permanent_credential = start_and_claim_action(
+        &store,
+        &fixture,
+        &engine.permit,
+        "permanent-message-run",
+        "permanent-message-attempt",
+    )
+    .await;
+    let long_message = "x".repeat(2_001);
+    store
+        .complete_attempt(
+            &fixture.scope,
+            CompleteAttempt {
+                completion_credential: permanent_credential,
+                run_id: Id::new("permanent-message-run").unwrap(),
+                node_id: Id::new("action").unwrap(),
+                attempt_id: Id::new("permanent-message-attempt").unwrap(),
+                submitted_outcome: ActionOutcome::Permanent {
+                    code: "fixture.permanent".to_owned(),
+                    message: long_message,
+                    diagnostics: None,
+                    actual_cost_units: CostUnits(1),
+                },
+                objects: CompletionObjects {
+                    output: None,
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+    let retry = store
+        .get_attempt(
+            &fixture.scope,
+            &Id::new("retry-message-run").unwrap(),
+            &Id::new("retry-message-attempt").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.error_message.as_deref(), Some("retry this action"));
+    let permanent = store
+        .get_attempt(
+            &fixture.scope,
+            &Id::new("permanent-message-run").unwrap(),
+            &Id::new("permanent-message-attempt").unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        permanent.error_message.as_ref().map(String::len),
+        Some(2_000)
+    );
+    let projected_message: Option<String> = sqlx::query_scalar(
+        "SELECT error_message FROM dagger_workflow_attempts
+         WHERE tenant_id = ? AND namespace = ? AND run_id = ? AND attempt_id = ?",
+    )
+    .bind(fixture.scope.tenant_id.as_str())
+    .bind(fixture.scope.namespace.as_str())
+    .bind("permanent-message-run")
+    .bind("permanent-message-attempt")
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(projected_message.as_ref().map(String::len), Some(2_000));
+
+    store.pool().close().await;
+    drop(store);
+    let reopened = open_file_store(&path, clock, objects).await;
+    assert_eq!(
+        reopened
+            .get_attempt(
+                &fixture.scope,
+                &Id::new("retry-message-run").unwrap(),
+                &Id::new("retry-message-attempt").unwrap(),
+            )
+            .await
+            .unwrap()
+            .error_message
+            .as_deref(),
+        Some("retry this action")
+    );
+    assert_eq!(
+        reopened
+            .get_attempt(
+                &fixture.scope,
+                &Id::new("permanent-message-run").unwrap(),
+                &Id::new("permanent-message-attempt").unwrap(),
+            )
+            .await
+            .unwrap()
+            .error_message
+            .as_ref()
+            .map(String::len),
+        Some(2_000)
+    );
 }
 
 #[tokio::test]

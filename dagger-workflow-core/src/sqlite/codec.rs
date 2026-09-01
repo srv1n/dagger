@@ -247,6 +247,7 @@ serde_public_struct!(node_attempt, NodeAttempt, {
     artifact_refs: Vec<ArtifactRef>,
     error_class: Option<AttemptErrorClass>,
     error_code: Option<String>,
+    error_message: Option<String>,
     diagnostics_ref: Option<JsonRef>,
 });
 

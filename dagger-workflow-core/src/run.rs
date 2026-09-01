@@ -458,6 +458,8 @@ pub struct NodeAttempt {
     pub error_class: Option<AttemptErrorClass>,
     /// Namespaced action error code.
     pub error_code: Option<String>,
+    /// Application-provided failure message, defensively bounded for durable storage.
+    pub error_message: Option<String>,
     /// Optional diagnostics ref.
     pub diagnostics_ref: Option<JsonRef>,
 }

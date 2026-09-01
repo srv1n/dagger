@@ -1757,8 +1757,8 @@ where
                  (tenant_id, namespace, run_id, attempt_id, node_id, attempt_number,
                   status, engine_generation, completion_credential_digest,
                   reservation_units, started_at_ms, deadline_at_ms, finished_at_ms,
-                  output_digest, diagnostics_digest, version)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                  output_digest, diagnostics_digest, error_message, version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             )
             .bind(attempt.scope.tenant_id.as_str())
             .bind(attempt.scope.namespace.as_str())
@@ -1785,6 +1785,7 @@ where
                     .as_ref()
                     .map(|reference| reference.0.digest.as_str()),
             )
+            .bind(attempt.error_message.as_deref())
             .execute(&mut **connection)
             .await
             .map_err(|_| StoreError::TransactionFailed)?;

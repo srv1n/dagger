@@ -7,7 +7,7 @@ use crate::store::StoreError;
 /// Current durable schema version.
 ///
 /// This adapter has one coherent baseline schema.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
     version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
@@ -188,7 +188,7 @@ const MIGRATION_1: &[&str] = &[
         engine_generation INTEGER NOT NULL, completion_credential_digest TEXT NOT NULL,
         reservation_units INTEGER NOT NULL, started_at_ms INTEGER NOT NULL, deadline_at_ms INTEGER NOT NULL,
         finished_at_ms INTEGER, output_digest TEXT, diagnostics_digest TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0),
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0), error_message TEXT,
         PRIMARY KEY (tenant_id, namespace, run_id, attempt_id),
         UNIQUE (tenant_id, namespace, run_id, node_id, attempt_number)
     ) STRICT"#,
@@ -286,6 +286,31 @@ const MIGRATION_2: &[&str] = &[
         ON dagger_workflow_external_handles(tenant_id, namespace, run_id, idempotency_key, kind)"#,
 ];
 
+async fn apply_attempt_error_message_migration(pool: &SqlitePool) -> Result<(), StoreError> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+    let column_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts')
+         WHERE name = 'error_message'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| StoreError::StorageUnavailable)?;
+    if column_exists == 0 {
+        sqlx::query("ALTER TABLE dagger_workflow_attempts ADD COLUMN error_message TEXT")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
+    }
+    record_version(&mut transaction, 3).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StoreError::TransactionFailed)
+}
+
 /// Applies all pending migrations, committing each version independently.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     sqlx::query(MIGRATIONS_TABLE_DDL)
@@ -306,6 +331,9 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     if applied.unwrap_or(0) < 2 {
         apply_version(pool, 2, MIGRATION_2).await?;
+    }
+    if applied.unwrap_or(0) < 3 {
+        apply_attempt_error_message_migration(pool).await?;
     }
     validate_coherent_schema(pool).await?;
     Ok(())

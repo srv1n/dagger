@@ -465,6 +465,8 @@ pub enum ActionOutcome {
     },
 }
 
+const MAX_ERROR_MESSAGE_CHARS: usize = 2_000;
+
 /// Rejection from the closed diagnostics persistence boundary.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum DiagnosticsValidationError {
@@ -569,6 +571,18 @@ impl DiagnosticsEnvelope {
 }
 
 impl ActionOutcome {
+    /// Applies the store's defensive persistence ceiling without changing the
+    /// application-provided message prefix.
+    pub(crate) fn truncate_error_message(&mut self) {
+        let message = match self {
+            Self::Retryable { message, .. } | Self::Permanent { message, .. } => message,
+            Self::Success { .. } => return,
+        };
+        if let Some((index, _)) = message.char_indices().nth(MAX_ERROR_MESSAGE_CHARS) {
+            message.truncate(index);
+        }
+    }
+
     /// Builds a validated success outcome.
     pub fn success(
         output: Value,
@@ -639,7 +653,7 @@ impl ActionOutcome {
                 if !valid_action_code(code) {
                     return Err(ActionOutcomeValidationError::InvalidErrorCode);
                 }
-                if message.is_empty() || message.len() > 2_000 {
+                if message.is_empty() || message.chars().count() > MAX_ERROR_MESSAGE_CHARS {
                     return Err(ActionOutcomeValidationError::InvalidMessage);
                 }
                 validate_optional_diagnostics(diagnostics)
@@ -655,7 +669,7 @@ pub enum ActionOutcomeValidationError {
     #[error("action error code must be a bounded namespace-qualified identifier")]
     InvalidErrorCode,
     /// An action error message is empty or too large to persist safely.
-    #[error("action error message must contain 1 through 2000 bytes")]
+    #[error("action error message must contain 1 through 2000 characters")]
     InvalidMessage,
     /// Diagnostics did not cross the persistence-safe boundary.
     #[error(transparent)]

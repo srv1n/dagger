@@ -4410,6 +4410,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 artifact_refs: Vec::new(),
                 error_class: None,
                 error_code: None,
+                error_message: None,
                 diagnostics_ref: None,
             };
             node.status = NodeState::Running;
@@ -4544,6 +4545,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         command: CompleteAttempt,
     ) -> Result<CompleteAttemptResult, StoreError> {
         self.transaction(|mut state, now| {
+            let mut command = command;
+            command.submitted_outcome.truncate_error_message();
             command
                 .submitted_outcome
                 .validate()
@@ -5107,10 +5110,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     )?;
                     Ok(CompleteAttemptResult::Applied(attempt))
                 }
-                ActionOutcome::Retryable { code, .. } => {
+                ActionOutcome::Retryable { code, message, .. } => {
                     attempt.status = AttemptState::RetryableFailed;
                     attempt.error_class = Some(AttemptErrorClass::Retryable);
                     attempt.error_code = Some(code.clone());
+                    attempt.error_message = Some(message.clone());
                     attempt.finished_at = Some(now);
                     let definition = state
                         .run_definitions
@@ -5223,10 +5227,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         Ok(CompleteAttemptResult::RetryScheduled(returned))
                     }
                 }
-                ActionOutcome::Permanent { code, .. } => {
+                ActionOutcome::Permanent { code, message, .. } => {
                     attempt.status = AttemptState::PermanentFailed;
                     attempt.error_class = Some(AttemptErrorClass::Permanent);
                     attempt.error_code = Some(code.clone());
+                    attempt.error_message = Some(message.clone());
                     attempt.finished_at = Some(now);
                     node.status = NodeState::Failed;
                     node.active_attempt_id = None;
