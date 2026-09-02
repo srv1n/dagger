@@ -749,6 +749,35 @@ async fn pool_injection_preserves_host_tables_and_applies_schema() {
 }
 
 #[tokio::test]
+async fn failed_command_returns_a_clean_connection_to_the_pool() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE dagger_workflow_schema_migrations")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        store.advance_database_clock_ms(1).await,
+        Err(StoreError::TransactionFailed)
+    ));
+    store
+        .pool()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .unwrap()
+        .rollback()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn standalone_open_reopens_a_converged_migration() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("workflow.sqlite");

@@ -29,7 +29,7 @@ use reducer::{
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Sqlite, SqlitePool};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -965,16 +965,12 @@ where
         Ok(connection)
     }
 
-    async fn begin_immediate(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
+    async fn begin_immediate(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
         for attempt in 0..=SQLITE_BUSY_RETRY_ATTEMPTS {
-            let mut connection = self.acquire_configured().await?;
-            match sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
-                .await
-            {
-                Ok(_) => return Ok(connection),
+            let connection = self.acquire_configured().await?;
+            match Transaction::begin(connection, Some("BEGIN IMMEDIATE".into())).await {
+                Ok(transaction) => return Ok(transaction),
                 Err(error) if Self::is_busy(&error) && attempt < SQLITE_BUSY_RETRY_ATTEMPTS => {
-                    drop(connection);
                     tokio::time::sleep(Self::busy_retry_delay(attempt)).await;
                 }
                 Err(_) => return Err(StoreError::TransactionFailed),
@@ -983,17 +979,14 @@ where
         unreachable!("bounded retry loop returns on its final attempt")
     }
 
-    async fn begin_read(&self) -> Result<PoolConnection<Sqlite>, StoreError> {
-        let mut connection = self.acquire_configured().await?;
-        sqlx::query("BEGIN")
-            .execute(&mut *connection)
+    async fn begin_read(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
+        Transaction::begin(self.acquire_configured().await?, Some("BEGIN".into()))
             .await
-            .map_err(|_| StoreError::TransactionFailed)?;
-        Ok(connection)
+            .map_err(|_| StoreError::TransactionFailed)
     }
 
     async fn database_now(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
     ) -> Result<Timestamp, StoreError> {
         let now_ms: i64 = sqlx::query_scalar(
             "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
@@ -1009,7 +1002,7 @@ where
     }
 
     async fn load_authority_table(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         table: &'static str,
         run_filter: Option<&Id>,
@@ -1044,7 +1037,7 @@ where
     }
 
     async fn load_state(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         request: &AuthorityLoad,
     ) -> Result<LoadedAuthority, StoreError> {
@@ -1249,7 +1242,7 @@ where
     }
 
     async fn load_authority_point(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         loaded: &mut LoadedAuthority,
         table: &'static str,
@@ -1277,7 +1270,7 @@ where
     }
 
     async fn load_engine_claim_state(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
     ) -> Result<LoadedAuthority, StoreError> {
         let mut loaded = LoadedAuthority {
@@ -1297,7 +1290,7 @@ where
     }
 
     async fn persist_authority(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         before: &LoadedAuthority,
         state: &ReducerState,
@@ -1380,7 +1373,7 @@ where
     }
 
     async fn persist_projections(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         before: &LoadedAuthority,
         state: &ReducerState,
@@ -2053,7 +2046,7 @@ where
     }
 
     async fn persist_engine_claim_projection(
-        connection: &mut PoolConnection<Sqlite>,
+        connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         state: &ReducerState,
     ) -> Result<(), StoreError> {
@@ -2093,16 +2086,15 @@ where
         Ok(())
     }
 
-    async fn commit(mut connection: PoolConnection<Sqlite>) -> Result<(), StoreError> {
-        sqlx::query("COMMIT")
-            .execute(&mut *connection)
+    async fn commit(connection: Transaction<'static, Sqlite>) -> Result<(), StoreError> {
+        connection
+            .commit()
             .await
-            .map_err(|_| StoreError::TransactionFailed)?;
-        Ok(())
+            .map_err(|_| StoreError::TransactionFailed)
     }
 
-    async fn rollback(connection: &mut PoolConnection<Sqlite>) {
-        let _ = sqlx::query("ROLLBACK").execute(&mut **connection).await;
+    async fn rollback(connection: Transaction<'static, Sqlite>) {
+        let _ = connection.rollback().await;
     }
 
     async fn hydrate_revision_schemas(
@@ -2575,7 +2567,7 @@ where
         .await
         .map_err(|_| StoreError::TransactionFailed)?;
         if result.rows_affected() != 1 {
-            Self::rollback(&mut connection).await;
+            Self::rollback(connection).await;
             return Err(StoreError::ArithmeticOverflow);
         }
         Self::commit(connection).await
@@ -2598,7 +2590,7 @@ macro_rules! sql_command {
             let now = match Self::database_now(&mut connection).await {
                 Ok(value) => value,
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     return Err(error);
                 }
             };
@@ -2606,7 +2598,7 @@ macro_rules! sql_command {
             let loaded = match Self::load_state(&mut connection, scope, &authority_load).await {
                 Ok(value) => value,
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     return Err(error);
                 }
             };
@@ -2626,7 +2618,7 @@ macro_rules! sql_command {
                         )
                         .await
                     {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(error);
                     }
                     if let Err(error) = Self::persist_authority(
@@ -2636,14 +2628,14 @@ macro_rules! sql_command {
                         &state,
                     )
                     .await {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(error);
                     }
                     #[cfg(feature = "conformance")]
                     let commit_fault = self.take_commit_fault();
                     #[cfg(feature = "conformance")]
                     if commit_fault == Some(SqliteCommitFault::BeforeCommit) {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(StoreError::TransactionFailed);
                     }
                     Self::commit(connection).await?;
@@ -2672,20 +2664,20 @@ macro_rules! sql_command {
                     if let Err(persist_error) =
                         Self::persist_projections(&mut connection, scope, &loaded, &state).await
                     {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(persist_error);
                     }
                     if let Err(persist_error) =
                         Self::persist_authority(&mut connection, scope, &loaded, &state).await
                     {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(persist_error);
                     }
                     Self::commit(connection).await?;
                     Err(error)
                 }
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     Err(error)
                 }
             }
@@ -2704,14 +2696,14 @@ macro_rules! sql_engine_command {
             let now = match Self::database_now(&mut connection).await {
                 Ok(value) => value,
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     return Err(error);
                 }
             };
             let loaded = match Self::load_engine_claim_state(&mut connection, scope).await {
                 Ok(value) => value,
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     return Err(error);
                 }
             };
@@ -2725,20 +2717,20 @@ macro_rules! sql_engine_command {
                     if let Err(error) =
                         Self::persist_engine_claim_projection(&mut connection, scope, &state).await
                     {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(error);
                     }
                     if let Err(error) =
                         Self::persist_authority(&mut connection, scope, &loaded, &state).await
                     {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(error);
                     }
                     #[cfg(feature = "conformance")]
                     let commit_fault = self.take_commit_fault();
                     #[cfg(feature = "conformance")]
                     if commit_fault == Some(SqliteCommitFault::BeforeCommit) {
-                        Self::rollback(&mut connection).await;
+                        Self::rollback(connection).await;
                         return Err(StoreError::TransactionFailed);
                     }
                     Self::commit(connection).await?;
@@ -2749,7 +2741,7 @@ macro_rules! sql_engine_command {
                     Ok(value)
                 }
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     Err(error)
                 }
             }
@@ -2782,7 +2774,7 @@ macro_rules! sql_read {
                     Ok(value)
                 }
                 Err(error) => {
-                    Self::rollback(&mut connection).await;
+                    Self::rollback(connection).await;
                     Err(error)
                 }
             }
@@ -2898,7 +2890,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
                 Ok(value)
             }
             Err(error) => {
-                Self::rollback(&mut connection).await;
+                Self::rollback(connection).await;
                 Err(error)
             }
         }
@@ -3006,7 +2998,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
                 Ok(value)
             }
             Err(error) => {
-                Self::rollback(&mut connection).await;
+                Self::rollback(connection).await;
                 Err(error)
             }
         }
@@ -3037,7 +3029,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
                 Ok(value)
             }
             Err(error) => {
-                Self::rollback(&mut connection).await;
+                Self::rollback(connection).await;
                 Err(error)
             }
         }
