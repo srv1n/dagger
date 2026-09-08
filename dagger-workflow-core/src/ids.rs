@@ -230,7 +230,10 @@ pub fn idempotency_key(
     _run_id: &Id,
     _node_instance_id: &NodeInstanceId,
 ) -> String {
-    finish_hash("dwf-idem-v1:", idem_prefix(_scope, _run_id, _node_instance_id))
+    finish_hash(
+        "dwf-idem-v1:",
+        idem_prefix(_scope, _run_id, _node_instance_id),
+    )
 }
 
 /// Derives a Map child's external idempotency key.

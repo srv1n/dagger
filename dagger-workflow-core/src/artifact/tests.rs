@@ -30,7 +30,10 @@ fn capability_clones_share_bytes_and_outlive_the_original() {
     let reference = capability(vec![42; 1024 * 1024]);
     let cloned = reference.clone();
     assert_eq!(cloned, reference);
-    assert!(Arc::ptr_eq(&reference.verified_bytes, &cloned.verified_bytes));
+    assert!(Arc::ptr_eq(
+        &reference.verified_bytes,
+        &cloned.verified_bytes
+    ));
     assert_eq!(
         reference.verified_bytes().as_ptr(),
         cloned.verified_bytes().as_ptr()

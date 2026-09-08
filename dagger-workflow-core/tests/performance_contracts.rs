@@ -119,7 +119,10 @@ fn artifacts_match_v1_for_every_kind_and_optional_field_combination() {
         (ArtifactKind::MapInput, "MapInput"),
         (ArtifactKind::MapAggregate, "MapAggregate"),
         (ArtifactKind::ApprovalRequest, "ApprovalRequest"),
-        (ArtifactKind::ApprovalDecisionPayload, "ApprovalDecisionPayload"),
+        (
+            ArtifactKind::ApprovalDecisionPayload,
+            "ApprovalDecisionPayload",
+        ),
     ];
     let run = Id::new("run\0雪").unwrap();
     let node = Id::new("node").unwrap();
@@ -209,5 +212,8 @@ fn map_expansion_matches_v1_for_empty_large_and_reordered_inputs() {
         map_expansion_digest(&reversed).as_str(),
         buffered_expansion(&reversed)
     );
-    assert_ne!(map_expansion_digest(&children), map_expansion_digest(&reversed));
+    assert_ne!(
+        map_expansion_digest(&children),
+        map_expansion_digest(&reversed)
+    );
 }
