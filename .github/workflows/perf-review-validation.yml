@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: never
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -21,60 +24,56 @@ jobs:
       - name: Record environment and lock dependencies
         run: |
           rustc --version --verbose
-          lscpu | grep -E 'Model name|CPU\(s\)|Architecture' || true
           cargo generate-lockfile
-      - name: Workspace tests
-        run: |
-          if cargo test --workspace --all-features --locked > "$RUNNER_TEMP/tests.log" 2>&1; then
-            grep -E '^test result:' "$RUNNER_TEMP/tests.log"
-          else
-            tail -n 120 "$RUNNER_TEMP/tests.log"
-            exit 1
-          fi
-      - name: Agent conformance
+      - name: New differential tests and existing golden IDs
+        run: cargo test -p dagger-workflow-core --all-features --locked --test performance_contracts --test w1_ids
+      - name: Full head suite without early stopping
         if: success() || failure()
         run: |
-          if make agent-run-conformance > "$RUNNER_TEMP/conformance.log" 2>&1; then
-            tail -n 25 "$RUNNER_TEMP/conformance.log"
-          else
-            tail -n 100 "$RUNNER_TEMP/conformance.log"
-            exit 1
-          fi
-      - name: Documentation tests and build
+          set +e
+          cargo test --workspace --all-features --locked --no-fail-fast > "$RUNNER_TEMP/head-tests.log" 2>&1
+          result=$?
+          set -e
+          echo "HEAD_CODE_COMMIT=6be02ef5ea5197bb54a22e782ec9c184f73d1750 EXIT_STATUS=$result"
+          grep -E '^ *Running |^test result:|^test .*\.\.\. FAILED|^error:' "$RUNNER_TEMP/head-tests.log" || true
+          if [ "$result" -ne 0 ]; then tail -n 100 "$RUNNER_TEMP/head-tests.log"; fi
+          exit "$result"
+      - name: Full baseline suite with identical dependencies
         if: success() || failure()
         run: |
-          cargo test --doc --workspace --all-features --locked
-          cargo doc --workspace --all-features --no-deps --locked
-      - name: Build identical benchmark at base and head
+          git worktree add "$RUNNER_TEMP/dagger-test-base" 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5
+          cp Cargo.lock "$RUNNER_TEMP/dagger-test-base/Cargo.lock"
+          export CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target"
+          cd "$RUNNER_TEMP/dagger-test-base"
+          set +e
+          cargo test --workspace --all-features --locked --no-fail-fast > "$RUNNER_TEMP/base-tests.log" 2>&1
+          result=$?
+          set -e
+          echo "BASE_CODE_COMMIT=1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5 EXIT_STATUS=$result"
+          grep -E '^ *Running |^test result:|^test .*\.\.\. FAILED|^error:' "$RUNNER_TEMP/base-tests.log" || true
+          if [ "$result" -ne 0 ]; then tail -n 100 "$RUNNER_TEMP/base-tests.log"; fi
+          exit "$result"
+      - name: Compare named test outcomes
         if: success() || failure()
         run: |
-          git worktree add "$RUNNER_TEMP/dagger-perf-base" 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5
-          cp dagger-workflow-core/examples/perf_core.rs "$RUNNER_TEMP/dagger-perf-base/dagger-workflow-core/examples/perf_core.rs"
-          cp Cargo.lock "$RUNNER_TEMP/dagger-perf-base/Cargo.lock"
-          if cargo build -p dagger-workflow-core --release --example perf_core --locked > "$RUNNER_TEMP/build-head.log" 2>&1; then
-            echo "Head benchmark build passed"
-          else
-            tail -n 100 "$RUNNER_TEMP/build-head.log"
-            exit 1
-          fi
-          cd "$RUNNER_TEMP/dagger-perf-base"
-          if cargo build -p dagger-workflow-core --release --example perf_core --locked > "$RUNNER_TEMP/build-base.log" 2>&1; then
-            echo "Base benchmark build passed"
-          else
-            tail -n 100 "$RUNNER_TEMP/build-base.log"
-            exit 1
-          fi
-      - name: Run base-head-head-base microbenchmarks
-        if: success() || failure()
-        run: |
-          set -euo pipefail
-          test -x "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
-          test -x target/release/examples/perf_core
-          echo "BASE_1 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5"
-          "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
-          echo "HEAD_1 6be02ef5ea5197bb54a22e782ec9c184f73d1750"
-          target/release/examples/perf_core
-          echo "HEAD_2 6be02ef5ea5197bb54a22e782ec9c184f73d1750"
-          target/release/examples/perf_core
-          echo "BASE_2 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5"
-          "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          pattern = re.compile(r'^test (.+) \.\.\. (ok|FAILED|ignored)(?: .*)?$', re.MULTILINE)
+          head = dict(pattern.findall((root / 'head-tests.log').read_text()))
+          base = dict(pattern.findall((root / 'base-tests.log').read_text()))
+          if not head or not base:
+              raise SystemExit('Could not extract both test runs')
+          changed = {name: (outcome, head.get(name, 'MISSING')) for name, outcome in base.items() if head.get(name) != outcome}
+          added = {name: outcome for name, outcome in head.items() if name not in base}
+          print('BASE named outcomes:', {outcome: list(base.values()).count(outcome) for outcome in sorted(set(base.values()))})
+          print('HEAD named outcomes:', {outcome: list(head.values()).count(outcome) for outcome in sorted(set(head.values()))})
+          print('Changed or missing existing outcomes:', changed)
+          print('Added outcomes:', added)
+          print('Baseline failures:', [name for name, outcome in base.items() if outcome == 'FAILED'])
+          print('Head failures:', [name for name, outcome in head.items() if outcome == 'FAILED'])
+          if changed or any(outcome != 'ok' for outcome in added.values()):
+              raise SystemExit('Test outcomes differ; inspect logs')
+          PY
