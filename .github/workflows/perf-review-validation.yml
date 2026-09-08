@@ -1,0 +1,80 @@
+name: perf-review-validation
+
+# Review-only workflow. This branch is not part of PR #2.
+on:
+  push:
+    branches: [perf/validate-share-payloads]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Record environment and lock dependencies
+        run: |
+          rustc --version --verbose
+          lscpu | grep -E 'Model name|CPU\(s\)|Architecture' || true
+          cargo generate-lockfile
+      - name: Workspace tests
+        run: |
+          if cargo test --workspace --all-features --locked > "$RUNNER_TEMP/tests.log" 2>&1; then
+            grep -E '^test result:' "$RUNNER_TEMP/tests.log"
+          else
+            tail -n 120 "$RUNNER_TEMP/tests.log"
+            exit 1
+          fi
+      - name: Agent conformance
+        if: success() || failure()
+        run: |
+          if make agent-run-conformance > "$RUNNER_TEMP/conformance.log" 2>&1; then
+            tail -n 25 "$RUNNER_TEMP/conformance.log"
+          else
+            tail -n 100 "$RUNNER_TEMP/conformance.log"
+            exit 1
+          fi
+      - name: Documentation tests and build
+        if: success() || failure()
+        run: |
+          cargo test --doc --workspace --all-features --locked
+          cargo doc --workspace --all-features --no-deps --locked
+      - name: Build identical benchmark at base and head
+        if: success() || failure()
+        run: |
+          git worktree add "$RUNNER_TEMP/dagger-perf-base" 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5
+          cp dagger-workflow-core/examples/perf_core.rs "$RUNNER_TEMP/dagger-perf-base/dagger-workflow-core/examples/perf_core.rs"
+          cp Cargo.lock "$RUNNER_TEMP/dagger-perf-base/Cargo.lock"
+          if cargo build -p dagger-workflow-core --release --example perf_core --locked > "$RUNNER_TEMP/build-head.log" 2>&1; then
+            echo "Head benchmark build passed"
+          else
+            tail -n 100 "$RUNNER_TEMP/build-head.log"
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/dagger-perf-base"
+          if cargo build -p dagger-workflow-core --release --example perf_core --locked > "$RUNNER_TEMP/build-base.log" 2>&1; then
+            echo "Base benchmark build passed"
+          else
+            tail -n 100 "$RUNNER_TEMP/build-base.log"
+            exit 1
+          fi
+      - name: Run base-head-head-base microbenchmarks
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          test -x "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
+          test -x target/release/examples/perf_core
+          echo "BASE_1 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5"
+          "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
+          echo "HEAD_1 6be02ef5ea5197bb54a22e782ec9c184f73d1750"
+          target/release/examples/perf_core
+          echo "HEAD_2 6be02ef5ea5197bb54a22e782ec9c184f73d1750"
+          target/release/examples/perf_core
+          echo "BASE_2 1beb395b6b2c6d0c4ee26870addf4339f6dbc1d5"
+          "$RUNNER_TEMP/dagger-perf-base/target/release/examples/perf_core"
