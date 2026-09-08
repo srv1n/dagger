@@ -4,6 +4,7 @@ use crate::ids::{Digest, Id, NodeInstanceId, Timestamp};
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 use std::future::Future;
+use std::sync::Arc;
 
 /// The closed typed-use vocabulary for artifact references.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -109,7 +110,9 @@ pub struct VerifiedObjectRef {
     media_type: String,
     object_key: String,
     store_instance_nonce: Vec<u8>,
-    verified_bytes: Vec<u8>,
+    // Keep the Vec allocation when constructing the capability. Arc<[u8]>
+    // would move the payload into a new allocation; clones only need ownership.
+    verified_bytes: Arc<Vec<u8>>,
 }
 
 impl VerifiedObjectRef {
@@ -130,7 +133,7 @@ impl VerifiedObjectRef {
             media_type,
             object_key,
             store_instance_nonce,
-            verified_bytes,
+            verified_bytes: Arc::new(verified_bytes),
         }
     }
 
@@ -366,3 +369,6 @@ pub trait ObjectStore: Send + Sync {
         media_type: &str,
     ) -> Result<VerifiedObjectRef, ObjectStoreError>;
 }
+
+#[cfg(test)]
+mod tests;
