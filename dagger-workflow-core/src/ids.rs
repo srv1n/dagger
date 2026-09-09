@@ -185,34 +185,43 @@ pub fn edge_id(
     _edge_label: &str,
     _to_node_id: &Id,
 ) -> Id {
-    let mut bytes = lp(b"dagger-edge-v1");
-    bytes.extend(lp(&digest_bytes(_revision_hash)));
-    bytes.extend(lp(_from_node_id.0.as_bytes()));
-    bytes.extend(lp(_edge_label.as_bytes()));
-    bytes.extend(lp(_to_node_id.0.as_bytes()));
-    Id::new(format!("edge_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
+    let mut hash = Sha256::new();
+    hash_lp(&mut hash, b"dagger-edge-v1");
+    hash_lp(&mut hash, &digest_bytes(_revision_hash));
+    hash_lp(&mut hash, _from_node_id.0.as_bytes());
+    hash_lp(&mut hash, _edge_label.as_bytes());
+    hash_lp(&mut hash, _to_node_id.0.as_bytes());
+    Id::new(finish_hash("edge_", hash)).expect("derived ID is valid")
 }
 
 /// Derives the typed content-use identifier.
 pub fn artifact_ref_id(_identity: ArtifactRefIdentity<'_>) -> Id {
-    let mut bytes = lp(b"dagger-artifact-ref-v1");
-    bytes.extend(lp(_identity.scope.tenant_id.as_str().as_bytes()));
-    bytes.extend(lp(_identity.scope.namespace.as_str().as_bytes()));
-    bytes.extend(lp(&digest_bytes(_identity.digest)));
-    bytes.extend(lp(artifact_kind_name(_identity.kind).as_bytes()));
-    bytes.extend(optional_lp(
-        _identity.producer_run_id.map(|value| value.0.as_bytes()),
-    ));
-    bytes.extend(optional_lp(
-        _identity.producer_node_id.map(|value| value.0.as_bytes()),
-    ));
-    bytes.extend(optional_lp(
+    let mut hash = Sha256::new();
+    hash_lp(&mut hash, b"dagger-artifact-ref-v1");
+    hash_lp(&mut hash, _identity.scope.tenant_id.as_str().as_bytes());
+    hash_lp(&mut hash, _identity.scope.namespace.as_str().as_bytes());
+    hash_lp(&mut hash, &digest_bytes(_identity.digest));
+    hash_lp(&mut hash, artifact_kind_name(_identity.kind).as_bytes());
+    hash_lp(
+        &mut hash,
+        _identity
+            .producer_run_id
+            .map_or(b"", |value| value.0.as_bytes()),
+    );
+    hash_lp(
+        &mut hash,
+        _identity
+            .producer_node_id
+            .map_or(b"", |value| value.0.as_bytes()),
+    );
+    hash_lp(
+        &mut hash,
         _identity
             .producer_attempt_id
-            .map(|value| value.0.as_bytes()),
-    ));
-    bytes.extend(lp(&_identity.ordinal.to_be_bytes()));
-    Id::new(format!("artifact_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
+            .map_or(b"", |value| value.0.as_bytes()),
+    );
+    hash_lp(&mut hash, &_identity.ordinal.to_be_bytes());
+    Id::new(finish_hash("artifact_", hash)).expect("derived ID is valid")
 }
 
 /// Derives a static logical node's external idempotency key.
@@ -221,8 +230,10 @@ pub fn idempotency_key(
     _run_id: &Id,
     _node_instance_id: &NodeInstanceId,
 ) -> String {
-    let bytes = idem_prefix(_scope, _run_id, _node_instance_id);
-    format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
+    finish_hash(
+        "dwf-idem-v1:",
+        idem_prefix(_scope, _run_id, _node_instance_id),
+    )
 }
 
 /// Derives a Map child's external idempotency key.
@@ -234,12 +245,12 @@ pub fn map_child_idempotency_key(
     _map_item_index: u32,
     _map_item_digest: &Digest,
 ) -> String {
-    let mut bytes = idem_prefix(_scope, _run_id, _child_node_instance_id);
-    bytes.extend(lp(b"map-child"));
-    bytes.extend(lp(_map_parent_node_instance_id.0.as_bytes()));
-    bytes.extend(lp(&_map_item_index.to_be_bytes()));
-    bytes.extend(lp(_map_item_digest.as_str().as_bytes()));
-    format!("dwf-idem-v1:{}", hex(&Sha256::digest(bytes)))
+    let mut hash = idem_prefix(_scope, _run_id, _child_node_instance_id);
+    hash_lp(&mut hash, b"map-child");
+    hash_lp(&mut hash, _map_parent_node_instance_id.0.as_bytes());
+    hash_lp(&mut hash, &_map_item_index.to_be_bytes());
+    hash_lp(&mut hash, _map_item_digest.as_str().as_bytes());
+    finish_hash("dwf-idem-v1:", hash)
 }
 
 /// Derives a synthetic Map child node identifier.
@@ -249,46 +260,44 @@ pub fn map_child_id(
     _item_index: u32,
     _item_digest: &Digest,
 ) -> NodeInstanceId {
-    let mut bytes = lp(b"dagger-map-child-v1");
-    bytes.extend(lp(_run_id.0.as_bytes()));
-    bytes.extend(lp(_map_node_instance_id.0.as_bytes()));
-    bytes.extend(&_item_index.to_be_bytes());
-    bytes.extend(digest_bytes(_item_digest));
-    Id::new(format!("mapchild_{}", hex(&Sha256::digest(bytes)))).expect("derived ID is valid")
+    let mut hash = Sha256::new();
+    hash_lp(&mut hash, b"dagger-map-child-v1");
+    hash_lp(&mut hash, _run_id.0.as_bytes());
+    hash_lp(&mut hash, _map_node_instance_id.0.as_bytes());
+    // These two fields are deliberately raw, not length-prefixed. They are
+    // part of the persisted v1 identity contract.
+    hash.update(_item_index.to_be_bytes());
+    hash.update(digest_bytes(_item_digest));
+    Id::new(finish_hash("mapchild_", hash)).expect("derived ID is valid")
 }
 
 /// Derives the ordered Map expansion digest.
 pub fn map_expansion_digest(_children: &[MapChildIdentity]) -> Digest {
-    let mut bytes = lp(b"dagger-map-expansion-v1");
+    let mut hash = Sha256::new();
+    hash_lp(&mut hash, b"dagger-map-expansion-v1");
     for child in _children {
-        bytes.extend(lp(&child.item_index.to_be_bytes()));
-        bytes.extend(lp(&digest_bytes(&child.item_digest)));
-        bytes.extend(lp(child.child_id.0.as_bytes()));
+        hash_lp(&mut hash, &child.item_index.to_be_bytes());
+        hash_lp(&mut hash, &digest_bytes(&child.item_digest));
+        hash_lp(&mut hash, child.child_id.0.as_bytes());
     }
-    Digest::new(format!("sha256:{}", hex(&Sha256::digest(bytes)))).expect("SHA-256 output is valid")
+    Digest::new(finish_hash("sha256:", hash)).expect("SHA-256 output is valid")
 }
 
-fn lp(value: &[u8]) -> Vec<u8> {
-    let mut encoded = Vec::with_capacity(8 + value.len());
-    encoded.extend((value.len() as u64).to_be_bytes());
-    encoded.extend(value);
-    encoded
+// Stream the same u64 big-endian length prefix and bytes as the v1 encoding.
+// In particular, an absent optional field is a zero-length field, not omitted.
+fn hash_lp(hash: &mut Sha256, value: &[u8]) {
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
-fn optional_lp(value: Option<&[u8]>) -> Vec<u8> {
-    match value {
-        Some(value) => lp(value),
-        None => lp(b""),
-    }
-}
-
-fn idem_prefix(scope: &ExecutionScope, run_id: &Id, node_instance_id: &NodeInstanceId) -> Vec<u8> {
-    let mut bytes = lp(b"dagger-idem-v1");
-    bytes.extend(lp(scope.tenant_id.as_str().as_bytes()));
-    bytes.extend(lp(scope.namespace.as_str().as_bytes()));
-    bytes.extend(lp(run_id.0.as_bytes()));
-    bytes.extend(lp(node_instance_id.0.as_bytes()));
-    bytes
+fn idem_prefix(scope: &ExecutionScope, run_id: &Id, node_instance_id: &NodeInstanceId) -> Sha256 {
+    let mut hash = Sha256::new();
+    hash_lp(&mut hash, b"dagger-idem-v1");
+    hash_lp(&mut hash, scope.tenant_id.as_str().as_bytes());
+    hash_lp(&mut hash, scope.namespace.as_str().as_bytes());
+    hash_lp(&mut hash, run_id.0.as_bytes());
+    hash_lp(&mut hash, node_instance_id.0.as_bytes());
+    hash
 }
 
 fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
@@ -309,8 +318,15 @@ fn artifact_kind_name(kind: ArtifactKind) -> &'static str {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn finish_hash(prefix: &str, hash: Sha256) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(prefix.len() + 64);
+    output.push_str(prefix);
+    for byte in hash.finalize() {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn digest_bytes(digest: &Digest) -> [u8; 32] {
