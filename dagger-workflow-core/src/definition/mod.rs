@@ -2096,33 +2096,6 @@ fn reachable_from(entries: &[Id], edges: &BTreeMap<Id, Vec<(String, Id)>>) -> BT
     }
     seen
 }
-fn graph_reaches(
-    edges: &BTreeMap<Id, Vec<(String, Id)>>,
-    start: &Id,
-    target: &Id,
-    blocked: Option<&Id>,
-) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::from([start.clone()]);
-    while let Some(id) = queue.pop_front() {
-        if blocked == Some(&id) {
-            continue;
-        }
-        if id == *target {
-            return true;
-        }
-        if seen.insert(id.clone()) {
-            queue.extend(
-                edges
-                    .get(&id)
-                    .into_iter()
-                    .flatten()
-                    .map(|(_, next)| next.clone()),
-            );
-        }
-    }
-    false
-}
 fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128

@@ -842,17 +842,17 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
             let mut result = cases
                 .iter()
                 .enumerate()
-                .filter_map(|(index, case)| {
+                .map(|(index, case)| {
                     let target = match case {
                         crate::definition::ChoiceCase::Equals { target, .. }
                         | crate::definition::ChoiceCase::In { target, .. } => target,
                     };
                     match target {
                         crate::definition::ChoiceTarget::Node { next } => {
-                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                            (format!("case/{index}"), next.clone(), Some(index as u32))
                         }
                         crate::definition::ChoiceTarget::Skip { next } => {
-                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                            (format!("case/{index}"), next.clone(), Some(index as u32))
                         }
                     }
                 })
