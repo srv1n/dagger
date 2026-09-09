@@ -622,7 +622,7 @@ pub fn validate_definition(
             ));
         }
     }
-    validate_bindings(&normalized, &mut errors);
+    validate_bindings(&normalized, &ids, &mut errors);
     if errors.is_empty() {
         Ok(UnresolvedDefinition {
             definition: normalized,
@@ -1804,7 +1804,11 @@ fn validate_pointer(id: &Id, pointer: &str, errors: &mut Vec<DefinitionValidatio
         ));
     }
 }
-fn validate_bindings(definition: &WorkflowDefinition, errors: &mut Vec<DefinitionValidationError>) {
+fn validate_bindings(
+    definition: &WorkflowDefinition,
+    ids: &BTreeMap<Id, usize>,
+    errors: &mut Vec<DefinitionValidationError>,
+) {
     for node in &definition.nodes {
         let consumer = node_id(node);
         let ordinary_sources = match node {
@@ -1851,7 +1855,19 @@ fn validate_bindings(definition: &WorkflowDefinition, errors: &mut Vec<Definitio
             | NodeDefinition::Succeed { output: input, .. } => source_nodes(input),
             NodeDefinition::Fail { .. } => vec![],
         };
-        let _ = sources;
+        for source_id in sources {
+            if source_id == consumer || !ids.contains_key(source_id) {
+                errors.push(error(
+                    ValidationErrorKind::BindingSourceInvalid,
+                    format!("/nodes/{}/bindings", consumer.0),
+                    format!(
+                        "node_output `{}` must name another authored node",
+                        source_id.0
+                    ),
+                    &["use another authored node id"],
+                ));
+            }
+        }
     }
 }
 
