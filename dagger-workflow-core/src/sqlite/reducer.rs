@@ -4997,6 +4997,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     let child_failure_kind = node.failure_kind.expect("permanent failure kind");
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
+                    let map_child_failed = parent_map_instance_id.is_some();
                     let failed_frontier =
                         if let Some(parent_map_instance_id) = parent_map_instance_id {
                             let parent_key = (
@@ -5030,17 +5031,40 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         } else {
                             command.node_id.clone()
                         };
-                    frontier_reduce(
-                        &mut state,
-                        scope,
-                        &command.run_id,
-                        &failed_frontier,
-                        false,
-                        false,
-                        None,
-                        now,
-                        &mut specs,
-                    )?;
+                    if map_child_failed {
+                        terminalize_run(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            RunState::Failed,
+                            Some(RunFailureKind::MapChildFailed),
+                            "MapChildFailed",
+                            now,
+                            &mut specs,
+                        )?;
+                        specs.push(event_spec(
+                            "R07",
+                            None,
+                            None,
+                            None,
+                            event_payload::run_failed(
+                                &(RunFailureKind::MapChildFailed),
+                                &(Option::<&Digest>::None),
+                            ),
+                        ));
+                    } else {
+                        frontier_reduce(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &failed_frontier,
+                            false,
+                            false,
+                            None,
+                            now,
+                            &mut specs,
+                        )?;
+                    }
                     let run = state
                         .runs
                         .get(&(scope.clone(), command.run_id.clone()))
