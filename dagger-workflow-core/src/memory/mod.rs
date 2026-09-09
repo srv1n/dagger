@@ -842,17 +842,17 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
             let mut result = cases
                 .iter()
                 .enumerate()
-                .filter_map(|(index, case)| {
+                .map(|(index, case)| {
                     let target = match case {
                         crate::definition::ChoiceCase::Equals { target, .. }
                         | crate::definition::ChoiceCase::In { target, .. } => target,
                     };
                     match target {
                         crate::definition::ChoiceTarget::Node { next } => {
-                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                            (format!("case/{index}"), next.clone(), Some(index as u32))
                         }
                         crate::definition::ChoiceTarget::Skip { next } => {
-                            Some((format!("case/{index}"), next.clone(), Some(index as u32)))
+                            (format!("case/{index}"), next.clone(), Some(index as u32))
                         }
                     }
                 })
@@ -5270,6 +5270,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     let child_failure_kind = node.failure_kind.expect("permanent failure kind");
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
+                    let map_child_failed = parent_map_instance_id.is_some();
                     let failed_frontier =
                         if let Some(parent_map_instance_id) = parent_map_instance_id {
                             let parent_key = (
@@ -5303,17 +5304,40 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         } else {
                             command.node_id.clone()
                         };
-                    frontier_reduce(
-                        &mut state,
-                        scope,
-                        &command.run_id,
-                        &failed_frontier,
-                        false,
-                        false,
-                        None,
-                        now,
-                        &mut specs,
-                    )?;
+                    if map_child_failed {
+                        terminalize_run(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            RunState::Failed,
+                            Some(RunFailureKind::MapChildFailed),
+                            "MapChildFailed",
+                            now,
+                            &mut specs,
+                        )?;
+                        specs.push(event_spec(
+                            "R07",
+                            None,
+                            None,
+                            None,
+                            event_payload::run_failed(
+                                &(RunFailureKind::MapChildFailed),
+                                &(Option::<&Digest>::None),
+                            ),
+                        ));
+                    } else {
+                        frontier_reduce(
+                            &mut state,
+                            scope,
+                            &command.run_id,
+                            &failed_frontier,
+                            false,
+                            false,
+                            None,
+                            now,
+                            &mut specs,
+                        )?;
+                    }
                     let run = state
                         .runs
                         .get(&(scope.clone(), command.run_id.clone()))

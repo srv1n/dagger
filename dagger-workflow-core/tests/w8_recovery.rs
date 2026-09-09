@@ -606,16 +606,18 @@ async fn multiple_root_ready_set_survives_reopen_and_executes_once() {
     );
     engine.acquire_scope(&deployment.scope).await.unwrap();
     engine.run_until_idle(&deployment.scope, 8).await.unwrap();
-    let invocations = log.0.lock().unwrap();
-    for node in ["alfa", "zulu", "join"] {
-        assert_eq!(
-            invocations
-                .iter()
-                .filter(|(invoked, _, _)| invoked == node)
-                .count(),
-            1,
-            "{node} must execute exactly once"
-        );
+    {
+        let invocations = log.0.lock().unwrap();
+        for node in ["alfa", "zulu", "join"] {
+            assert_eq!(
+                invocations
+                    .iter()
+                    .filter(|(invoked, _, _)| invoked == node)
+                    .count(),
+                1,
+                "{node} must execute exactly once"
+            );
+        }
     }
     assert_eq!(
         store
