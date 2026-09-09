@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 70;
+pub const CASE_COUNT: usize = 71;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -76,6 +76,7 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "blocked_run_host_command_fence",
     "expand_map_recomputes_identity",
     "map_concurrency_admission",
+    "map_child_failure_cancels_siblings",
     "exponential_backoff_cap",
     "corrupt_unreachable_ref_rejected",
     "corrupt_run_produced_ref_accepted",
@@ -1661,6 +1662,125 @@ async fn map_concurrency_admission<A: ConformanceAdapter>(
         {
             return Err(failure(39, "Map concurrency refusal mutated store state"));
         }
+    }
+    Ok(())
+}
+
+async fn map_child_failure_cancels_siblings<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _scope_b: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    let case = 71;
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        case,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    let run_id = id("map-run-71");
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map expansion failed"))?;
+    let failed_id = fixture.ordered_items[0].child_id.clone();
+    let sibling_id = fixture.ordered_items[1].child_id.clone();
+    let child = adapter
+        .store()
+        .get_node(scope, &run_id, &failed_id)
+        .await
+        .map_err(|_| failure(case, "Map child read failed"))?;
+    let attempt_id = id("map-failed-attempt");
+    let claimed = adapter
+        .store()
+        .claim_node_attempt(
+            scope,
+            ClaimNodeAttempt {
+                permit: fixture.permit,
+                run_id: run_id.clone(),
+                node_id: failed_id.clone(),
+                expected_node_version: child.version,
+                attempt_id: attempt_id.clone(),
+                worker_id: id("worker"),
+                binding_derivation_digest: fixture.input.digest().clone(),
+                bound_input: fixture.input,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map child claim failed"))?;
+    let completion_credential = match claimed {
+        ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } => completion_credential,
+        _ => return Err(failure(case, "Map child was not claimed")),
+    };
+    let completed = adapter
+        .store()
+        .complete_attempt(
+            scope,
+            CompleteAttempt {
+                completion_credential,
+                run_id: run_id.clone(),
+                node_id: failed_id,
+                attempt_id,
+                submitted_outcome: ActionOutcome::permanent(
+                    "fixture.failed".to_owned(),
+                    "requested failure".to_owned(),
+                    None,
+                    CostUnits(1),
+                )
+                .map_err(|_| failure(case, "Map failure outcome invalid"))?,
+                objects: CompletionObjects {
+                    output: None,
+                    artifacts: Vec::new(),
+                    diagnostics: None,
+                },
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "Map child completion failed"))?;
+    if !matches!(
+        completed,
+        CompleteAttemptResult::TerminalRun(ref run)
+            if run.status == RunState::Failed
+                && run.failure_kind == Some(RunFailureKind::MapChildFailed)
+    ) {
+        return Err(failure(case, "Map child failure did not fail the run"));
+    }
+    let parent = adapter
+        .store()
+        .get_node(scope, &run_id, &id("map"))
+        .await
+        .map_err(|_| failure(case, "Map parent read failed"))?;
+    let sibling = adapter
+        .store()
+        .get_node(scope, &run_id, &sibling_id)
+        .await
+        .map_err(|_| failure(case, "Map sibling read failed"))?;
+    if parent.status != NodeState::Failed
+        || parent.failure_kind != Some(NodeFailureKind::MapChildFailed)
+        || sibling.status != NodeState::Cancelled
+    {
+        return Err(failure(case, "Map failure did not cancel its sibling"));
     }
     Ok(())
 }
@@ -4940,6 +5060,10 @@ pub async fn run_conformance<A: ConformanceAdapter>(
         expand_map_recomputes_identity
     );
     run_fixture!("map_concurrency_admission", map_concurrency_admission);
+    run_fixture!(
+        "map_child_failure_cancels_siblings",
+        map_child_failure_cancels_siblings
+    );
     run_fixture!("exponential_backoff_cap", exponential_backoff_cap);
     run_fixture!(
         "corrupt_unreachable_ref_rejected",
