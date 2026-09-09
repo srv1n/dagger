@@ -152,7 +152,6 @@ async fn publish<S: WorkflowStore>(
     objects: &Arc<InMemoryObjectStore<TestClock>>,
     tenant: &str,
     nodes: Vec<NodeDefinition>,
-    entry: Id,
     action_schema_keys: &[&str],
 ) -> Fixture {
     let workflow_scope = scope(tenant);
@@ -290,7 +289,7 @@ async fn seed_action<S: WorkflowStore>(
             },
         },
     ];
-    publish(store, objects, tenant, nodes, id("action"), &["action"]).await
+    publish(store, objects, tenant, nodes, &["action"]).await
 }
 
 /// A Map whose children are concurrently claimable. Map children are the only
@@ -346,15 +345,7 @@ async fn seed_map<S: WorkflowStore>(
             },
         },
     ];
-    publish(
-        store,
-        objects,
-        tenant,
-        nodes,
-        id("map"),
-        &["map/map_action"],
-    )
-    .await
+    publish(store, objects, tenant, nodes, &["map/map_action"]).await
 }
 
 fn create_run_command(
