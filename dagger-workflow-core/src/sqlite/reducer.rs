@@ -162,6 +162,7 @@ pub(crate) struct StoredClaim {
 pub struct ReducerStore<C> {
     clock: Arc<C>,
     state: Mutex<ReducerState>,
+    engine_claim_lifetime_ms: u64,
 }
 
 impl<C: Clock> ReducerStore<C> {
@@ -169,7 +170,13 @@ impl<C: Clock> ReducerStore<C> {
         Self {
             clock,
             state: Mutex::new(state),
+            engine_claim_lifetime_ms: CLAIM_LIFETIME_MS as u64,
         }
+    }
+
+    pub(crate) fn with_engine_claim_lifetime_ms(mut self, milliseconds: u64) -> Self {
+        self.engine_claim_lifetime_ms = milliseconds;
+        self
     }
 
     pub(crate) fn snapshot(&self) -> ReducerState {
@@ -3028,7 +3035,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 generation,
                 claimed_at: now,
                 heartbeat_at: now,
-                expires_at: checked_add_time(now, CLAIM_LIFETIME_MS as u64)?,
+                expires_at: checked_add_time(now, self.engine_claim_lifetime_ms)?,
                 version: Version(version),
             };
             let permit = EnginePermit::mint(instance_id, generation, raw);
@@ -3054,8 +3061,18 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             if now < stored.claim.heartbeat_at {
                 return Err(StoreError::ClockNonMonotonic);
             }
+            // Renewal preserves the window accepted with this generation,
+            // even if another adapter opens the database with other defaults.
+            let lifetime_ms = stored
+                .claim
+                .expires_at
+                .0
+                .checked_sub(stored.claim.heartbeat_at.0)
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or(StoreError::CorruptControlPlane)?;
             stored.claim.heartbeat_at = now;
-            stored.claim.expires_at = checked_add_time(now, CLAIM_LIFETIME_MS as u64)?;
+            stored.claim.expires_at = checked_add_time(now, lifetime_ms)?;
             stored.claim.version.0 = stored
                 .claim
                 .version

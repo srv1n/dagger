@@ -814,6 +814,7 @@ fn encode_authority_rows(
 /// SQLite-backed workflow control plane with no process-local domain state.
 pub struct SqliteWorkflowStore<C, O> {
     pool: SqlitePool,
+    engine_claim_lifetime_ms: u64,
     /// The scoped durable object plane. SQLite retains only metadata and
     /// references. Proof validation is nonce-based, matching memory.
     objects: Arc<O>,
@@ -855,12 +856,31 @@ where
         schema::migrate(&pool).await?;
         Ok(Self {
             pool,
+            engine_claim_lifetime_ms: 20_000,
             objects,
             verified_bytes: Arc::new(Mutex::new(BTreeMap::new())),
             #[cfg(feature = "conformance")]
             commit_fault: Arc::new(Mutex::new(None)),
             marker: PhantomData,
         })
+    }
+
+    /// Sets the database-clock lease renewed by acquire/heartbeat commands.
+    ///
+    /// The default remains 20 seconds. Slow durable filesystems can select a
+    /// larger bounded window; expired owners remain fenced and takeover still
+    /// waits for the persisted expiry. This option applies to newly acquired
+    /// generations; renewal preserves the existing generation's persisted
+    /// window even through an adapter with different defaults. Heartbeats must
+    /// remain enabled.
+    pub fn with_engine_claim_lifetime(mut self, lifetime: Duration) -> Result<Self, StoreError> {
+        let milliseconds =
+            u64::try_from(lifetime.as_millis()).map_err(|_| StoreError::InvalidField)?;
+        if !(20_000..=3_600_000).contains(&milliseconds) {
+            return Err(StoreError::InvalidField);
+        }
+        self.engine_claim_lifetime_ms = milliseconds;
+        Ok(self)
     }
 
     /// Opens or creates a standalone WAL database and runs pending migrations.
@@ -965,24 +985,45 @@ where
         Ok(connection)
     }
 
+    fn begin_owned(
+        connection: PoolConnection<Sqlite>,
+        statement: &'static str,
+    ) -> tokio::task::JoinHandle<Result<Transaction<'static, Sqlite>, sqlx::Error>> {
+        // SQLx 0.8.6 custom BEGIN awaits lock_handle after acknowledging BEGIN,
+        // before constructing Transaction's rollback guard. Caller cancellation
+        // there can poison a pooled connection. An owned task finishes installing
+        // that guard; if its caller disappears, the unclaimed result rolls back.
+        tokio::spawn(Transaction::begin(connection, Some(statement.into())))
+    }
+
     async fn begin_immediate(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
         for attempt in 0..=SQLITE_BUSY_RETRY_ATTEMPTS {
             let connection = self.acquire_configured().await?;
-            match Transaction::begin(connection, Some("BEGIN IMMEDIATE".into())).await {
+            match Self::begin_owned(connection, "BEGIN IMMEDIATE")
+                .await
+                .map_err(|_| StoreError::TransactionFailed)?
+            {
                 Ok(transaction) => return Ok(transaction),
                 Err(error) if Self::is_busy(&error) && attempt < SQLITE_BUSY_RETRY_ATTEMPTS => {
                     tokio::time::sleep(Self::busy_retry_delay(attempt)).await;
                 }
-                Err(_) => return Err(StoreError::TransactionFailed),
+                Err(error) => {
+                    eprintln!("dagger sqlite BEGIN IMMEDIATE failed: {error:?}");
+                    return Err(StoreError::TransactionFailed);
+                }
             }
         }
         unreachable!("bounded retry loop returns on its final attempt")
     }
 
     async fn begin_read(&self) -> Result<Transaction<'static, Sqlite>, StoreError> {
-        Transaction::begin(self.acquire_configured().await?, Some("BEGIN".into()))
+        Self::begin_owned(self.acquire_configured().await?, "BEGIN")
             .await
-            .map_err(|_| StoreError::TransactionFailed)
+            .map_err(|_| StoreError::TransactionFailed)?
+            .map_err(|error| {
+                eprintln!("dagger sqlite BEGIN failed: {error:?}");
+                StoreError::TransactionFailed
+            })
     }
 
     async fn database_now(
@@ -2087,10 +2128,10 @@ where
     }
 
     async fn commit(connection: Transaction<'static, Sqlite>) -> Result<(), StoreError> {
-        connection
-            .commit()
-            .await
-            .map_err(|_| StoreError::TransactionFailed)
+        connection.commit().await.map_err(|error| {
+            eprintln!("dagger sqlite COMMIT failed: {error:?}");
+            StoreError::TransactionFailed
+        })
     }
 
     async fn rollback(connection: Transaction<'static, Sqlite>) {
@@ -2710,7 +2751,7 @@ macro_rules! sql_engine_command {
             let reducer = ReducerStore::from_state(
                 Arc::new(DatabaseTimestamp(now)),
                 loaded.state.clone(),
-            );
+            ).with_engine_claim_lifetime_ms(self.engine_claim_lifetime_ms);
             match reducer.$name(scope, $($arg),*).await {
                 Ok(value) => {
                     let state = reducer.snapshot();
@@ -3145,5 +3186,45 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
         self.scan_due_run_lifetimes_sql(scope, page).await
+    }
+}
+
+#[cfg(test)]
+mod transaction_cancellation_tests {
+    use super::*;
+    use crate::engine::TestClock;
+    use crate::memory::InMemoryObjectStore;
+
+    #[tokio::test]
+    async fn cancelled_custom_begin_returns_a_rolled_back_connection() {
+        type Store = SqliteWorkflowStore<TestClock, InMemoryObjectStore<TestClock>>;
+        let clock = Arc::new(TestClock::new(Timestamp(0)));
+        let store = Store::open_url(
+            "sqlite::memory:",
+            clock.clone(),
+            Arc::new(InMemoryObjectStore::new(clock)),
+        )
+        .await
+        .unwrap();
+        // The memory store has one connection, so the next BEGIN must reuse it.
+        // Cancel both before BEGIN can finish and after its transaction exists
+        // but before the waiting caller receives it. Neither may leak a lock.
+        for statement in ["BEGIN", "BEGIN IMMEDIATE"] {
+            for wait_for_completion in [false, true] {
+                let connection = store.acquire_configured().await.unwrap();
+                let opening = Store::begin_owned(connection, statement);
+                if wait_for_completion {
+                    while !opening.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                drop(opening);
+                let next = tokio::time::timeout(Duration::from_secs(5), store.begin_immediate())
+                    .await
+                    .expect("cancelled BEGIN must return the pool connection")
+                    .expect("cancelled BEGIN must not leave a nested transaction");
+                Store::rollback(next).await;
+            }
+        }
     }
 }

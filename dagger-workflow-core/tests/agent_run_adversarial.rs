@@ -1500,8 +1500,11 @@ async fn restart_retry_reuses_the_external_idempotency_marker() {
     )
     .unwrap();
     second.acquire_scope(&execution_scope).await.unwrap();
+    // This is a functional recovery assertion, not a storage-latency benchmark.
+    // SQLite FULL-sync recovery on slow disks can exceed the old ten-second
+    // watchdog; keep a finite bound without weakening any idempotency checks.
     tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         second.run_until_idle(&execution_scope, 16),
     )
     .await
