@@ -40,6 +40,33 @@ The object store publishes bytes first. The control store then commits a typed r
 
 A crash can leave an object with no durable reference. This is safe. A committed reference must not point to bytes that were not published.
 
+## Large binary files
+
+`FsObjectStore::import_file` copies and hashes a local binary file with a bounded
+buffer and retains the local publication sync barriers. It does not hardlink a
+mutable source. JSON uses canonical JSON publication. Binary capabilities retain
+metadata without retaining file contents in control state.
+Copying and binary verification run on blocking workers so they do not stall
+the scheduler runtime during a large read.
+
+`ObjectStore::verify` returns a verified capability. FsObjectStore streams binary
+verification. The default trait method uses an ordinary in-memory read; other
+backends need their own override for bounded memory.
+
+`FsObjectStore::get_file` returns a verified private file snapshot. Its temporary
+disk copy supports reading and seeking without trusting a mutable object path.
+`CommittedObjectReader::read_file` adds committed-reference and corruption checks.
+These APIs bound memory, not disk traffic. Byte-returning reads remain available
+for small objects.
+
+`ObjectStore::put_repairing` restores a regenerated candidate only after the
+backend proves that its existing same-digest bytes are missing or invalid.
+FsObjectStore checks its live store identity, candidate digest, metadata, and
+publication barriers before replacement. Healthy bytes and metadata conflicts
+remain immutable. Ordinary `put` stays strict. Memoizable binary actions using
+byte publication should use the repairing method; local `import_file` supports
+verified regeneration directly. A storage outage does not authorize repair.
+
 ## Read failures
 
 `CommittedObjectReader` has three important results:

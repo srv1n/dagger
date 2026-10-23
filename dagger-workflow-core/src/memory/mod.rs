@@ -148,6 +148,45 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
         self.publish_if_absent(scope, bytes, media_type).await
     }
 
+    async fn put_repairing(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        if media_type.is_empty() || media_type.len() > 255 {
+            return Err(ObjectStoreError::InvalidField);
+        }
+        let canonical;
+        let bytes = if media_type == "application/json" {
+            canonical = canonical_json(bytes)?;
+            canonical.as_slice()
+        } else {
+            bytes
+        };
+        let object_digest = digest(bytes);
+        {
+            let mut objects = self.objects.lock().expect("object lock poisoned");
+            if let Some(existing) = objects.get_mut(&(scope.clone(), object_digest.clone())) {
+                if existing.media_type != media_type {
+                    return Err(ArtifactMetadataConflict {
+                        digest: object_digest,
+                        existing_size_bytes: existing.bytes.len() as u64,
+                        candidate_size_bytes: bytes.len() as u64,
+                    }
+                    .into());
+                }
+                // A fresh completed verification proves wrong bytes. Replacing
+                // them with independently hashed same-digest bytes restores the
+                // immutable logical object; ordinary publish/get remain strict.
+                if digest(&existing.bytes) != object_digest {
+                    existing.bytes = bytes.to_vec();
+                }
+            }
+        }
+        self.publish_if_absent(scope, bytes, media_type).await
+    }
+
     async fn get(
         &self,
         scope: &ExecutionScope,
@@ -564,10 +603,12 @@ fn verified(
     } else {
         state.object_records.insert(key, record);
     }
-    state
-        .verified_object_bytes
-        .entry((scope.clone(), object.digest().clone()))
-        .or_insert_with(|| object.verified_bytes().to_vec());
+    if let Some(bytes) = object.inline_bytes() {
+        state
+            .verified_object_bytes
+            .entry((scope.clone(), object.digest().clone()))
+            .or_insert_with(|| bytes.to_vec());
+    }
     Ok(())
 }
 
@@ -805,6 +846,8 @@ struct CreateFingerprint<'a> {
     budget_limit: CostUnits,
     limits: &'a crate::run::RunLimits,
     principal: &'a str,
+    #[serde(skip_serializing_if = "crate::pinning::RunOptions::is_default")]
+    options: &'a crate::pinning::RunOptions,
 }
 
 fn node_id(node: &NodeDefinition) -> &Id {
@@ -866,6 +909,28 @@ fn outgoing(node: &NodeDefinition) -> Vec<(String, Id, Option<u32>)> {
         }
         NodeDefinition::Succeed { .. } | NodeDefinition::Fail { .. } => Vec::new(),
     }
+}
+
+fn map_child_continues(
+    state: &MemoryState,
+    scope: &ExecutionScope,
+    run_id: &Id,
+    node_id: &Id,
+) -> Result<bool, StoreError> {
+    let node = state
+        .nodes
+        .get(&(scope.clone(), run_id.clone(), node_id.clone()))
+        .ok_or(StoreError::CorruptControlPlane)?;
+    if node.parent_map_instance_id.is_none() {
+        return Ok(false);
+    }
+    let definition = state
+        .run_definitions
+        .get(&(scope.clone(), run_id.clone()))
+        .ok_or(StoreError::CorruptControlPlane)?;
+    Ok(definition.definition.nodes.iter().any(|candidate| matches!(candidate,
+        NodeDefinition::Map { id, on_child_failure: crate::definition::MapChildFailurePolicy::Continue, .. }
+        if id == &node.definition_node_id)))
 }
 
 fn action_config<'a>(
@@ -1011,7 +1076,7 @@ pub(crate) fn retry_at(
 /// creation. The oracle owns the semantics the durable adapter is certified
 /// against, so it must reject exactly what section 14.3 forbids rather than
 /// accepting any well-formed JSON object as a schema.
-fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
+pub(crate) fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
     if bytes.len() > 1024 * 1024 {
         return Err(StoreError::SchemaSubsetUnsupported);
     }
@@ -1019,6 +1084,10 @@ fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
         serde_json::from_slice(bytes).map_err(|_| StoreError::SchemaSubsetUnsupported)?;
     if serde_jcs::to_vec(&value).map_err(|_| StoreError::SchemaSubsetUnsupported)? != bytes {
         return Err(StoreError::SchemaSubsetUnsupported);
+    }
+    if value.get("schema_format").is_some() {
+        crate::action::schema::validate_opaque_bundle(&value)?;
+        return Ok(value);
     }
     let root = value
         .as_object()
@@ -1281,6 +1350,9 @@ fn finite_schema_number(value: Option<&Value>) -> Result<Option<f64>, StoreError
 }
 
 fn schema_accepts(root: &Value, schema: &Value, value: &Value) -> bool {
+    if crate::action::schema::is_opaque_bundle(schema) {
+        return true;
+    }
     if schema.as_object().is_some_and(serde_json::Map::is_empty) {
         return true;
     }
@@ -1463,6 +1535,7 @@ fn corrupt_ref_reachable_from_run(
             pinned(&revision.canonical_definition_ref)
                 || pinned(&revision.run_input_schema_ref)
                 || pinned(&revision.run_output_schema_ref)
+                || revision.approval_schema_refs.values().any(pinned)
                 || revision
                     .action_pins
                     .iter()
@@ -1556,7 +1629,7 @@ payload_constructors! {
     run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Option<Digest>, store_instance_nonce_digest: &Digest, prior_status: &RunState, owner_node_id: &Option<Id>);
     node_became_ready => NodeBecameReady(incoming_satisfied: &u32, incoming_skipped: &u32, incoming_total: &u32);
     node_retry_eligible => NodeRetryEligible(next_eligible_at: &Timestamp, database_now: &Timestamp);
-    node_attempt_claimed => NodeAttemptClaimed(attempt_id: &Id, invocation_id: &Id, attempt_number: &u32, worker_id: &Id);
+    node_attempt_claimed => NodeAttemptClaimed(attempt_id: &Id, invocation_id: &Id, attempt_number: &u32, worker_id: &Id, action_name: &str);
     attempt_started => AttemptStarted(attempt_number: &u32, worker_id: &Id, engine_generation: &u64, deadline_at: &Timestamp, declared_max_cost_units: &CostUnits, idempotency_key_digest: &Digest, bound_input_digest: &Digest, completion_credential_digest: &Digest);
     budget_reserved => BudgetReserved(ledger_seq: &u64, amount: &CostUnits, available_after: &str);
     map_child_created => MapChildCreated(parent_map_instance_id: &Id, item_index: &u32, item_digest: &Digest, topological_rank: &crate::ids::TopologicalRank);
@@ -1569,6 +1642,7 @@ payload_constructors! {
     approval_rejected => ApprovalRejected(gate_id: &Id, decision_payload_digest: &Option<&Digest>, resolution_source: &str);
     approval_expired_approved => ApprovalExpiredApproved(gate_id: &Id, expires_at: &Timestamp, approval_output_digest: &Digest);
     approval_expired_rejected => ApprovalExpiredRejected(gate_id: &Id, expires_at: &Timestamp);
+    approval_decision_resolved => ApprovalDecisionResolved(gate_id: &Id, decision: &ApprovalDecision, resolution_source: &str, approval_output_digest: &Digest, decision_payload_digest: &Option<&Digest>);
     succeed_node_reached => SucceedNodeReached(output_digest: &Digest);
     fail_node_reached => FailNodeReached(code: &str, message_digest: &Digest);
     node_succeeded => NodeSucceeded(attempt_id: &Id, output_digest: &Digest, artifact_digests: &Vec<Digest>);
@@ -1581,10 +1655,13 @@ payload_constructors! {
     node_skipped => NodeSkipped(incoming_skipped: &u32, incoming_total: &u32, reason: &SkipReason);
     node_cancelled => NodeCancelled(prior_status: &NodeState, terminal_run_status: &RunState, reason_code: &str);
     map_failed_fast => MapFailedFast(failed_child_id: &Id, child_failure_kind: &NodeFailureKind);
+    map_threshold_failed => MapThresholdFailed(child_count: &u32, successful_children: &u32, min_successful_children: &u32);
     map_contract_failed => MapContractFailed(failure_kind: &NodeFailureKind, failed_child_id: &Option<Id>);
     map_retries_exhausted => MapRetriesExhausted(failed_child_id: &Id, attempt_id: &Id, max_attempts: &u32);
     map_budget_exhausted => MapBudgetExhausted(failed_child_id: &Id, requested: &CostUnits, available: &str);
     node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Digest, prior_status: &NodeState);
+    cache_hit => CacheHit(source_run_id: &Id, source_node_id: &Id, source_attempt_id: &Id, cache_key: &Digest);
+    pinned_output_reused => PinnedOutputReused(source_run_id: &Id, source_node_id: &Id, source_attempt_id: &Id);
     attempt_succeeded => AttemptSucceeded(actual_cost_units: &CostUnits, output_digest: &Digest, artifact_digests: &Vec<Digest>);
     attempt_retryable_failed => AttemptRetryableFailed(actual_cost_units: &CostUnits, error_code: &str, diagnostics_digest: &Option<&Digest>);
     attempt_permanent_failed => AttemptPermanentFailed(actual_cost_units: &CostUnits, error_code: &str, diagnostics_digest: &Option<&Digest>);
@@ -1718,7 +1795,7 @@ fn event_payload_fields(
         NodeRetryEligible => (&["next_eligible_at", "database_now"], &[]),
         NodeAttemptClaimed => (
             &["attempt_id", "invocation_id", "attempt_number", "worker_id"],
-            &[],
+            &["action_name"],
         ),
         AttemptStarted => (
             &[
@@ -1786,6 +1863,15 @@ fn event_payload_fields(
         ),
         ApprovalExpiredApproved => (&["gate_id", "expires_at", "approval_output_digest"], &[]),
         ApprovalExpiredRejected => (&["gate_id", "expires_at"], &[]),
+        ApprovalDecisionResolved => (
+            &[
+                "gate_id",
+                "decision",
+                "resolution_source",
+                "approval_output_digest",
+            ],
+            &["decision_payload_digest"],
+        ),
         SucceedNodeReached => (&["output_digest"], &[]),
         FailNodeReached => (&["code", "message_digest"], &[]),
         NodeSucceeded => (&["attempt_id", "output_digest", "artifact_digests"], &[]),
@@ -1810,6 +1896,14 @@ fn event_payload_fields(
         NodeSkipped => (&["incoming_skipped", "incoming_total", "reason"], &[]),
         NodeCancelled => (&["prior_status", "terminal_run_status", "reason_code"], &[]),
         MapFailedFast => (&["failed_child_id", "child_failure_kind"], &[]),
+        MapThresholdFailed => (
+            &[
+                "child_count",
+                "successful_children",
+                "min_successful_children",
+            ],
+            &[],
+        ),
         MapContractFailed => (&["failure_kind"], &["failed_child_id"]),
         MapRetriesExhausted => (&["failed_child_id", "attempt_id", "max_attempts"], &[]),
         MapBudgetExhausted => (&["failed_child_id", "requested", "available"], &[]),
@@ -1821,6 +1915,19 @@ fn event_payload_fields(
                 "corrupt_proof_fingerprint",
                 "prior_status",
             ],
+            &[],
+        ),
+        CacheHit => (
+            &[
+                "source_run_id",
+                "source_node_id",
+                "source_attempt_id",
+                "cache_key",
+            ],
+            &[],
+        ),
+        PinnedOutputReused => (
+            &["source_run_id", "source_node_id", "source_attempt_id"],
             &[],
         ),
         AttemptSucceeded => (
@@ -1953,6 +2060,8 @@ fn event_payload_field_type_is_valid(field: &str, value: &Value) -> bool {
         | "ledger_seq"
         | "item_index"
         | "child_count"
+        | "successful_children"
+        | "min_successful_children"
         | "max_concurrency"
         | "case_index"
         | "expires_at"
@@ -2005,7 +2114,8 @@ fn event_order(
         | EventType::ApprovalApproved
         | EventType::ApprovalRejected
         | EventType::ApprovalExpiredApproved
-        | EventType::ApprovalExpiredRejected => 2,
+        | EventType::ApprovalExpiredRejected
+        | EventType::ApprovalDecisionResolved => 2,
         EventType::BudgetReserved
         | EventType::BudgetSettled
         | EventType::BudgetReservationRefused => 3,
@@ -3090,9 +3200,38 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         command: PublishRevision,
     ) -> Result<WorkflowRevision, StoreError> {
+        self.publish_revision_with_approval_schemas(scope, command, BTreeMap::new())
+            .await
+    }
+    async fn publish_revision_with_approval_schemas(
+        &self,
+        scope: &ExecutionScope,
+        command: PublishRevision,
+        approval_schemas: BTreeMap<String, VerifiedObjectRef>,
+    ) -> Result<WorkflowRevision, StoreError> {
         self.transaction(|mut state, now| {
             if command.principal.scope() != scope {
                 return Err(StoreError::InvalidField);
+            }
+            // Structured capabilities must retain canonical JSON bytes. Binary file
+            // capabilities are valid objects, but invalid definition/schema inputs.
+            for object in [
+                &command.canonical_definition,
+                &command.run_input_schema,
+                &command.run_output_schema,
+            ]
+            .into_iter()
+            .chain(
+                command
+                    .resolved_action_schema_objects
+                    .values()
+                    .flat_map(|schemas| [&schemas.input_schema, &schemas.output_schema]),
+            )
+            .chain(approval_schemas.values())
+            {
+                if object.media_type() != "application/json" || object.inline_bytes().is_none() {
+                    return Err(StoreError::InvalidField);
+                }
             }
             verified(&mut state, scope, &command.canonical_definition, now)?;
             verified(&mut state, scope, &command.run_input_schema, now)?;
@@ -3214,6 +3353,41 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     )?,
                 });
             }
+            let mut approval_schema_refs = BTreeMap::new();
+            for candidate in &canonical_revision.definition.nodes {
+                if let NodeDefinition::Approval { id, gate, .. } = candidate {
+                    if let Some(digest) = &gate.decision_schema_digest {
+                        let schema = approval_schemas
+                            .get(id.as_str())
+                            .ok_or(StoreError::NotFound)?;
+                        if schema.digest() != digest {
+                            return Err(StoreError::DigestMismatch);
+                        }
+                        verified(&mut state, scope, schema, now)?;
+                        validate_schema_document(schema.verified_bytes())?;
+                        approval_schema_refs.insert(
+                            id.as_str().to_owned(),
+                            json_ref(
+                                &mut state,
+                                scope,
+                                schema,
+                                ArtifactKind::SchemaDocument,
+                                None,
+                                None,
+                                None,
+                                0,
+                                now,
+                            )?,
+                        );
+                    }
+                }
+            }
+            if approval_schemas
+                .keys()
+                .any(|id| !approval_schema_refs.contains_key(id))
+            {
+                return Err(StoreError::InvalidField);
+            }
             let revision = WorkflowRevision {
                 scope: scope.clone(),
                 definition_id: command.definition_id.clone(),
@@ -3237,6 +3411,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
                 node_topological_ranks: canonical_revision.topological_ranks.clone(),
                 action_pins: pins,
+                approval_schema_refs,
                 published_at: now,
                 published_by: command.principal.principal_id().to_owned(),
             };
@@ -3376,6 +3551,21 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         command: CreateRun,
     ) -> Result<CommandReceipt, StoreError> {
+        self.create_run_with_options(
+            scope,
+            CreateRunWithOptions {
+                command,
+                options: crate::pinning::RunOptions::default(),
+            },
+        )
+        .await
+    }
+    async fn create_run_with_options(
+        &self,
+        scope: &ExecutionScope,
+        command: CreateRunWithOptions,
+    ) -> Result<CommandReceipt, StoreError> {
+        let CreateRunWithOptions { command, options } = command;
         self.transaction(|mut state, now| {
             if command.principal.scope() != scope || command.idempotency_token.len() < 16 {
                 return Err(StoreError::InvalidField);
@@ -3406,6 +3596,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     budget_limit: command.budget_limit,
                     limits: &command.limits,
                     principal: command.principal.principal_id(),
+                    options: &options,
                 },
             );
             let receipt_key = (
@@ -3435,6 +3626,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .get(&revision_key)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
+            options.validate(&command.run_id, &parsed.definition)?;
             let schema_bytes = state
                 .verified_object_bytes
                 .get(&(
@@ -3510,6 +3702,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 revision_hash: command.revision_hash.clone(),
                 input_ref,
                 create_request_fingerprint: request_fingerprint.clone(),
+                options,
                 status: RunState::Pending,
                 failure_kind: None,
                 failure_diagnostics_ref: None,
@@ -3622,6 +3815,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     parent_map_instance_id: None,
                     map_item_index: None,
                     map_item_digest: None,
+                    map_item_key: None,
                     topological_rank: *parsed
                         .topological_ranks
                         .get(&id)
@@ -4005,9 +4199,88 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         scope: &ExecutionScope,
         command: ClaimNodeAttempt,
     ) -> Result<ClaimNodeAttemptResult, StoreError> {
+        self.claim_reusable_node_attempt(
+            scope,
+            ClaimReusableNodeAttempt {
+                claim: command,
+                memoization_key: None,
+                memoization_artifact_refs: Vec::new(),
+                reuse_provenance: None,
+            },
+        )
+        .await
+    }
+
+    async fn get_action_invocation(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        invocation_id: &Id,
+    ) -> Result<ActionInvocation, StoreError> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .invocations
+            .get(&(scope.clone(), run_id.clone(), invocation_id.clone()))
+            .cloned()
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn lookup_artifact_ref(
+        &self,
+        scope: &ExecutionScope,
+        artifact_ref_id: &Id,
+    ) -> Result<ArtifactRef, StoreError> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .artifact_refs
+            .get(&(scope.clone(), artifact_ref_id.clone()))
+            .cloned()
+            .ok_or(StoreError::NotFound)
+    }
+
+    async fn lookup_memoized_attempt(
+        &self,
+        scope: &ExecutionScope,
+        key: &Digest,
+    ) -> Result<Option<NodeAttempt>, StoreError> {
+        let state = self.state.lock().expect("store lock poisoned");
+        Ok(state
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.scope == *scope
+                    && attempt.status == AttemptState::Succeeded
+                    && attempt.memoization_key.as_ref() == Some(key)
+            })
+            .max_by_key(|attempt| {
+                (
+                    attempt.memoization_sequence,
+                    attempt.finished_at,
+                    &attempt.run_id,
+                    &attempt.attempt_id,
+                )
+            })
+            .cloned())
+    }
+
+    async fn claim_reusable_node_attempt(
+        &self,
+        scope: &ExecutionScope,
+        reusable: ClaimReusableNodeAttempt,
+    ) -> Result<ClaimNodeAttemptResult, StoreError> {
+        let ClaimReusableNodeAttempt {
+            claim: command,
+            memoization_key,
+            memoization_artifact_refs,
+            reuse_provenance,
+        } = reusable;
         self.transaction(|mut state, now| {
             running_fence(&state, scope, &command.run_id, Some(&command.permit), now)?;
-            if command.bound_input.media_type() != "application/json" {
+            if command.bound_input.media_type() != "application/json"
+                || command.bound_input.inline_bytes().is_none()
+            {
                 return Err(StoreError::InvalidField);
             }
             let run_key = (scope.clone(), command.run_id.clone());
@@ -4122,6 +4395,108 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             }
             let (action, retry, timeout_ms, declared_max) =
                 action_config(&definition, &node).ok_or(StoreError::CorruptControlPlane)?;
+            if run_snapshot.options.cache_mode == crate::memoization::CacheMode::Off
+                && memoization_key.is_some()
+            {
+                return Err(StoreError::InvalidField);
+            }
+            if let Some(key) = &memoization_key {
+                for projection in &memoization_artifact_refs {
+                    let reference = state
+                        .artifact_refs
+                        .get(&(scope.clone(), projection.artifact_ref_id.clone()))
+                        .ok_or(StoreError::InvalidField)?;
+                    if reference.digest != projection.digest
+                        || reference.size_bytes.to_string() != projection.size_bytes
+                        || reference.media_type != projection.media_type
+                    {
+                        return Err(StoreError::InvalidField);
+                    }
+                }
+                let expected = crate::memoization::action_cache_key(
+                    scope,
+                    action,
+                    command.bound_input.verified_bytes(),
+                    &memoization_artifact_refs,
+                )
+                .map_err(|_| StoreError::InvalidField)?;
+                if key != &expected {
+                    return Err(StoreError::InvalidField);
+                }
+            }
+            if let Some(source) = &reuse_provenance {
+                let original = state
+                    .attempts
+                    .get(&(
+                        scope.clone(),
+                        source.source_run_id.clone(),
+                        source.source_attempt_id.clone(),
+                    ))
+                    .ok_or(StoreError::NotFound)?;
+                if original.status != AttemptState::Succeeded
+                    || original.node_instance_id != source.source_node_id
+                {
+                    return Err(StoreError::InvalidField);
+                }
+                match source.kind {
+                    crate::memoization::ReuseKind::CacheHit
+                        if run_snapshot.options.cache_mode
+                            != crate::memoization::CacheMode::Use
+                            || memoization_key.is_none()
+                            || original.memoization_key != memoization_key =>
+                    {
+                        return Err(StoreError::InvalidField)
+                    }
+                    crate::memoization::ReuseKind::Pinned => {
+                        if memoization_key.is_some() {
+                            return Err(StoreError::InvalidField);
+                        }
+                        let source_node = state
+                            .nodes
+                            .get(&(
+                                scope.clone(),
+                                source.source_run_id.clone(),
+                                source.source_node_id.clone(),
+                            ))
+                            .ok_or(StoreError::NotFound)?;
+                        let source_run = state
+                            .runs
+                            .get(&(scope.clone(), source.source_run_id.clone()))
+                            .ok_or(StoreError::NotFound)?;
+                        let source_revision = state
+                            .revisions
+                            .get(&(
+                                scope.clone(),
+                                source_run.definition_id.clone(),
+                                source_run.revision_hash.clone(),
+                            ))
+                            .ok_or(StoreError::NotFound)?;
+                        let target_revision = state
+                            .revisions
+                            .get(&(
+                                scope.clone(),
+                                run_snapshot.definition_id.clone(),
+                                run_snapshot.revision_hash.clone(),
+                            ))
+                            .ok_or(StoreError::CorruptControlPlane)?;
+                        crate::pinning::validate_pin_reuse(
+                            &run_snapshot,
+                            &node,
+                            source,
+                            original,
+                            source_node,
+                            source_revision,
+                            target_revision,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+            let declared_max = if reuse_provenance.is_some() {
+                CostUnits(0)
+            } else {
+                declared_max
+            };
             if node.attempt_count >= retry.max_attempts {
                 return Err(StoreError::IllegalTransition);
             }
@@ -4400,6 +4775,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 invocation_id: invocation.invocation_id.clone(),
                 idempotency_key: idempotency_key(scope, &command.run_id, &command.node_id),
                 status: AttemptState::Started,
+                memoization_key,
+                memoization_sequence: None,
+                reuse_provenance,
                 declared_max_cost: declared_max,
                 reserved_cost: declared_max,
                 settled_cost: None,
@@ -4518,6 +4896,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             &(invocation.invocation_id),
                             &(attempt_number),
                             &(attempt.worker_id),
+                            &invocation.action_name,
                         ),
                     ),
                     event_spec(
@@ -4808,7 +5187,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     exhausted,
                     node.next_eligible_at,
                 )?;
-                if exhausted {
+                if exhausted
+                    && !map_child_continues(&state, scope, &command.run_id, &command.node_id)?
+                {
                     terminalize_run(
                         &mut state,
                         scope,
@@ -5044,7 +5425,33 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         return Err(StoreError::TransactionFailed);
                     }
                     set_run_mutated(run, now)?;
+                    attempt.diagnostics_ref = command
+                        .objects
+                        .diagnostics
+                        .as_ref()
+                        .map(|diagnostics| {
+                            json_ref(
+                                &mut state,
+                                scope,
+                                diagnostics,
+                                ArtifactKind::Diagnostics,
+                                Some(&command.run_id),
+                                Some(&command.node_id),
+                                Some(&command.attempt_id),
+                                0,
+                                now,
+                            )
+                        })
+                        .transpose()?;
                     attempt.status = AttemptState::Succeeded;
+                    if attempt.memoization_key.is_some() {
+                        attempt.memoization_sequence = Some(
+                            state
+                                .batch_counter
+                                .checked_add(1)
+                                .ok_or(StoreError::ArithmeticOverflow)?,
+                        );
+                    }
                     attempt.output_ref = Some(output_ref.clone());
                     attempt.artifact_refs = refs.clone();
                     attempt.finished_at = Some(now);
@@ -5080,6 +5487,33 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                                 .collect::<Vec<_>>()),
                         ),
                     ));
+                    if let Some(source) = &attempt.reuse_provenance {
+                        let payload = match source.kind {
+                            crate::memoization::ReuseKind::CacheHit => event_payload::cache_hit(
+                                &source.source_run_id,
+                                &source.source_node_id,
+                                &source.source_attempt_id,
+                                attempt
+                                    .memoization_key
+                                    .as_ref()
+                                    .ok_or(StoreError::CorruptControlPlane)?,
+                            ),
+                            crate::memoization::ReuseKind::Pinned => {
+                                event_payload::pinned_output_reused(
+                                    &source.source_run_id,
+                                    &source.source_node_id,
+                                    &source.source_attempt_id,
+                                )
+                            }
+                        };
+                        specs.push(event_spec(
+                            "A02",
+                            Some(&command.node_id),
+                            Some(&command.attempt_id),
+                            None,
+                            payload,
+                        ));
+                    }
                     specs.push(budget_settled_spec(
                         &state,
                         scope,
@@ -5158,6 +5592,18 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         )?);
                         state.nodes.insert(node_key, node);
                         state.attempts.insert(attempt_key, attempt.clone());
+                        if map_child_continues(&state, scope, &command.run_id, &command.node_id)? {
+                            append_batch(
+                                &mut state,
+                                scope,
+                                &command.run_id,
+                                now,
+                                EventActorKind::ActionCompletion,
+                                "completion".to_owned(),
+                                specs,
+                            )?;
+                            return Ok(CompleteAttemptResult::Applied(attempt));
+                        }
                         let run = terminalize_run(
                             &mut state,
                             scope,
@@ -5266,7 +5712,12 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         &command.run_id,
                         &attempt,
                     )?);
-                    let parent_map_instance_id = node.parent_map_instance_id.clone();
+                    let continue_child =
+                        map_child_continues(&state, scope, &command.run_id, &command.node_id)?;
+                    let parent_map_instance_id = node
+                        .parent_map_instance_id
+                        .clone()
+                        .filter(|_| !continue_child);
                     let child_failure_kind = node.failure_kind.expect("permanent failure kind");
                     state.nodes.insert(node_key, node);
                     state.attempts.insert(attempt_key, attempt.clone());
@@ -5636,7 +6087,8 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             )?;
             state.attempts.insert(attempt_key, attempt.clone());
             state.nodes.insert(node_key, node);
-            if exhausted {
+            if exhausted && !map_child_continues(&state, scope, &command.run_id, &command.node_id)?
+            {
                 terminalize_run(
                     &mut state,
                     scope,
@@ -5782,7 +6234,20 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 recovered.push(attempt.clone());
                 rows.push((key, node_key, attempt, node, exhausted, retry.clone()));
             }
-            let exhausted_primary = rows.iter().position(|row| row.4);
+            let mut exhausted_primary = None;
+            for (index, row) in rows.iter().enumerate() {
+                if row.4
+                    && !map_child_continues(
+                        &state,
+                        scope,
+                        &command.run_id,
+                        &row.2.node_instance_id,
+                    )?
+                {
+                    exhausted_primary = Some(index);
+                    break;
+                }
+            }
             if let Some(primary_index) = exhausted_primary {
                 let primary = rows[primary_index].2.clone();
                 let primary_max_attempts = rows[primary_index].5.max_attempts;
@@ -5846,7 +6311,27 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     ),
                 ));
             } else {
-                for (_, node_key, attempt, mut node, _, retry) in rows {
+                for (_, node_key, attempt, mut node, exhausted, retry) in rows {
+                    if exhausted {
+                        node.status = NodeState::RetriesExhausted;
+                        node.active_attempt_id = None;
+                        node.next_eligible_at = None;
+                        set_node_mutated(&mut node, now)?;
+                        specs.push(event_spec(
+                            "N26",
+                            Some(&node.node_instance_id),
+                            Some(&attempt.attempt_id),
+                            None,
+                            event_payload::node_retries_exhausted(
+                                &attempt.attempt_id,
+                                &attempt.attempt_number,
+                                &retry.max_attempts,
+                                &"unknown",
+                            ),
+                        ));
+                        state.nodes.insert(node_key, node);
+                        continue;
+                    }
                     let next_eligible_at = retry_at(now, &retry, attempt.attempt_number)?;
                     node.status = NodeState::RetryWaiting;
                     node.active_attempt_id = None;
@@ -6284,7 +6769,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 });
             }
             let definition = state.run_definitions.get(&run_key).expect("definition");
-            let (max_items, max_concurrency) = definition
+            let (max_items, max_concurrency, minimum, item_key_pointer) = definition
                 .definition
                 .nodes
                 .iter()
@@ -6293,8 +6778,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         id,
                         max_items,
                         max_concurrency,
+                        min_successful_children,
+                        item_key_pointer,
                         ..
-                    } if id == &node.definition_node_id => Some((*max_items, *max_concurrency)),
+                    } if id == &node.definition_node_id => Some((
+                        *max_items,
+                        *max_concurrency,
+                        *min_successful_children,
+                        item_key_pointer.clone(),
+                    )),
                     _ => None,
                 })
                 .ok_or(StoreError::CorruptControlPlane)?;
@@ -6314,14 +6806,47 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     code: "MapBoundExceeded".to_owned(),
                 });
             }
+            let map_input: Value = serde_json::from_slice(command.input.verified_bytes())
+                .map_err(|_| StoreError::CorruptControlPlane)?;
+            let item_keys = crate::pinning::map_item_keys(item_key_pointer.as_deref(), &map_input);
+            let item_keys = match item_keys {
+                Ok(keys)
+                    if crate::pinning::validate_map_pins(
+                        &run.options,
+                        &command.map_node_id,
+                        item_key_pointer.as_deref(),
+                        &map_input,
+                    )
+                    .is_ok() =>
+                {
+                    keys
+                }
+                _ => {
+                    apply_node_contract_failure(
+                        &mut state,
+                        scope,
+                        &command.run_id,
+                        &command.map_node_id,
+                        "N46",
+                        NodeFailureKind::MapInputInvalid,
+                        now,
+                        EventActorKind::Engine,
+                        actor_id,
+                    )?;
+                    return Err(StoreError::ContractValidationApplied {
+                        code: "MapInputInvalid".to_owned(),
+                    });
+                }
+            };
             // Section 1.4 charges the Map input, plus the zero-item aggregate, against the
             // run ceiling. The check is hoisted ahead of every mutation so the applied
             // N46/R08 leaves no Map input ref, no children, and no charged counter.
-            let zero_aggregate_bytes = if command.ordered_items.is_empty() {
-                command.input.size_bytes()
-            } else {
-                0
-            };
+            let zero_aggregate_bytes =
+                if command.ordered_items.is_empty() && minimum.unwrap_or(0) == 0 {
+                    command.input.size_bytes()
+                } else {
+                    0
+                };
             let aggregate_after = run
                 .aggregate_object_bytes
                 .checked_add(command.input.size_bytes())
@@ -6360,7 +6885,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     .map_err(|_| StoreError::ArithmeticOverflow)?,
             );
             let mut specs = Vec::new();
-            if command.ordered_items.is_empty() {
+            if command.ordered_items.is_empty() && minimum.unwrap_or(0) == 0 {
                 node.status = NodeState::Succeeded;
                 node.result_ref = Some(json_ref(
                     &mut state,
@@ -6415,6 +6940,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         parent_map_instance_id: Some(command.map_node_id.clone()),
                         map_item_index: Some(item.index),
                         map_item_digest: Some(item.item_digest.clone()),
+                        map_item_key: item_keys.get(item.index as usize).cloned(),
                         topological_rank: node.topological_rank,
                         status: NodeState::Ready,
                         blocked_from_status: None,
@@ -6520,10 +7046,40 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            if children
+            let definition = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let (policy, minimum) = definition
+                .definition
+                .nodes
                 .iter()
-                .any(|child| child.status != NodeState::Succeeded)
-            {
+                .find_map(|candidate| match candidate {
+                    NodeDefinition::Map {
+                        id,
+                        on_child_failure,
+                        min_successful_children,
+                        ..
+                    } if id == &node.definition_node_id => {
+                        Some((*on_child_failure, *min_successful_children))
+                    }
+                    _ => None,
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
+            let continues = policy == crate::definition::MapChildFailurePolicy::Continue;
+            if children.iter().any(|child| {
+                if continues {
+                    !matches!(
+                        child.status,
+                        NodeState::Succeeded
+                            | NodeState::Failed
+                            | NodeState::RetriesExhausted
+                            | NodeState::Skipped
+                    )
+                } else {
+                    child.status != NodeState::Succeeded
+                }
+            }) {
                 return Err(StoreError::ChildrenIncomplete);
             }
             let expected_count = node
@@ -6550,6 +7106,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             }) {
                 return Err(StoreError::AggregateMismatch);
             }
+            if command.aggregate.media_type() != "application/json"
+                || command.aggregate.inline_bytes().is_none()
+            {
+                return Err(StoreError::AggregateMismatch);
+            }
             let aggregate_bytes = command.aggregate.verified_bytes();
             let aggregate_value: Value = serde_json::from_slice(aggregate_bytes)
                 .map_err(|_| StoreError::AggregateMismatch)?;
@@ -6563,18 +7124,101 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .as_array()
                 .filter(|values| values.len() == expected_count)
                 .ok_or(StoreError::AggregateMismatch)?;
+            let mut latest_attempts = BTreeMap::new();
+            if continues {
+                for attempt in state
+                    .attempts
+                    .values()
+                    .filter(|attempt| attempt.scope == *scope && attempt.run_id == command.run_id)
+                {
+                    let latest = latest_attempts
+                        .entry(&attempt.node_instance_id)
+                        .or_insert(attempt);
+                    if latest.attempt_number < attempt.attempt_number {
+                        *latest = attempt;
+                    }
+                }
+            }
             if aggregate_values
                 .iter()
                 .zip(&children)
                 .any(|(value, child)| {
+                    let output = if continues {
+                        let Some(output) = value.get("output") else {
+                            return true;
+                        };
+                        let attempt = latest_attempts.get(&child.node_instance_id).copied();
+                        if crate::run::map_child_envelope(child, attempt, output.clone()) != *value
+                        {
+                            return true;
+                        }
+                        output
+                    } else {
+                        value
+                    };
+                    if child.status != NodeState::Succeeded {
+                        return !output.is_null();
+                    }
                     child.result_ref.as_ref().is_none_or(|result| {
-                        serde_jcs::to_vec(value)
+                        serde_jcs::to_vec(output)
                             .map(|bytes| digest(&bytes) != result.0.digest)
                             .unwrap_or(true)
                     })
                 })
             {
                 return Err(StoreError::AggregateMismatch);
+            }
+            let successful = children
+                .iter()
+                .filter(|child| child.status == NodeState::Succeeded)
+                .count() as u32;
+            let minimum = minimum.unwrap_or(expected_count as u32);
+            if successful < minimum {
+                node.status = NodeState::Failed;
+                node.failure_kind = Some(NodeFailureKind::MapChildFailed);
+                set_node_mutated(&mut node, now)?;
+                state.nodes.insert(key, node.clone());
+                let mut specs = vec![event_spec(
+                    "N68",
+                    Some(&command.map_node_id),
+                    None,
+                    None,
+                    event_payload::map_threshold_failed(
+                        &(expected_count as u32),
+                        &successful,
+                        &minimum,
+                    ),
+                )];
+                terminalize_run(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    RunState::Failed,
+                    Some(RunFailureKind::MapChildFailed),
+                    "MapThresholdFailed",
+                    now,
+                    &mut specs,
+                )?;
+                specs.push(event_spec(
+                    "R07",
+                    None,
+                    None,
+                    None,
+                    event_payload::run_failed(
+                        &RunFailureKind::MapChildFailed,
+                        &Option::<&Digest>::None,
+                    ),
+                ));
+                append_batch(
+                    &mut state,
+                    scope,
+                    &command.run_id,
+                    now,
+                    EventActorKind::Engine,
+                    command.permit.instance_id().as_str().to_owned(),
+                    specs,
+                )?;
+                return Ok(node);
             }
             let run_key = (scope.clone(), command.run_id.clone());
             let run_snapshot = state
@@ -6635,7 +7279,15 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .map_err(|_| StoreError::CorruptControlPlane)?;
             if aggregate_values
                 .iter()
-                .any(|value| !schema_accepts(&schema, &schema, value))
+                .zip(&children)
+                .filter(|(_, child)| child.status == NodeState::Succeeded)
+                .any(|(value, _)| {
+                    !schema_accepts(
+                        &schema,
+                        &schema,
+                        if continues { &value["output"] } else { value },
+                    )
+                })
             {
                 return apply_map_contract_failure(
                     &mut state,
@@ -6857,6 +7509,32 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 return Err(StoreError::ApprovalUnauthorized);
             }
             running_fence(&state, scope, &command.run_id, None, now)?;
+            let config = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .and_then(|definition| {
+                    definition
+                        .definition
+                        .nodes
+                        .iter()
+                        .find_map(|candidate| match candidate {
+                            NodeDefinition::Approval {
+                                id, gate: config, ..
+                            } if state
+                                .nodes
+                                .get(&(
+                                    scope.clone(),
+                                    command.run_id.clone(),
+                                    gate.node_instance_id.clone(),
+                                ))
+                                .is_some_and(|node| id == &node.definition_node_id) =>
+                            {
+                                Some(config.clone())
+                            }
+                            _ => None,
+                        })
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
             if let Some(payload) = &command.decision_payload {
                 verified(&mut state, scope, payload, now)?;
                 if payload.media_type() != "application/json" {
@@ -6866,7 +7544,10 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             if let Some(output) = &command.approval_output {
                 verified(&mut state, scope, output, now)?;
             }
-            if command.decision == ApprovalDecision::Reject && command.approval_output.is_some() {
+            if command.decision == ApprovalDecision::Reject
+                && !config.decision_output
+                && command.approval_output.is_some()
+            {
                 return Err(StoreError::InvalidField);
             }
             let decision_fingerprint = approval_decision_fingerprint(
@@ -6895,6 +7576,43 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             {
                 return Err(StoreError::ApprovalRaceLost);
             }
+            let payload_json = if config.decision_output {
+                match &command.decision_payload {
+                    Some(payload) => {
+                        let limit = state
+                            .runs
+                            .get(&(scope.clone(), command.run_id.clone()))
+                            .ok_or(StoreError::CorruptControlPlane)?
+                            .limits
+                            .max_inline_json_bytes_per_value;
+                        if payload.size_bytes() > limit {
+                            return Err(StoreError::ApprovalDecisionPayloadInvalid);
+                        }
+                        let value: Value = serde_json::from_slice(payload.verified_bytes())
+                            .map_err(|_| StoreError::ApprovalDecisionPayloadInvalid)?;
+                        if serde_jcs::to_vec(&value)
+                            .map_err(|_| StoreError::ApprovalDecisionPayloadInvalid)?
+                            != payload.verified_bytes()
+                        {
+                            return Err(StoreError::ApprovalDecisionPayloadInvalid);
+                        }
+                        value
+                    }
+                    None => Value::Null,
+                }
+            } else {
+                Value::Null
+            };
+            if let Some(schema_digest) = &config.decision_schema_digest {
+                let schema_bytes = state
+                    .verified_object_bytes
+                    .get(&(scope.clone(), schema_digest.clone()))
+                    .ok_or(StoreError::CorruptControlPlane)?;
+                let schema = validate_schema_document(schema_bytes)?;
+                if !schema_accepts(&schema, &schema, &payload_json) {
+                    return Err(StoreError::ApprovalDecisionPayloadInvalid);
+                }
+            }
             let node_key = (
                 scope.clone(),
                 command.run_id.clone(),
@@ -6922,15 +7640,35 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     media_type: payload.media_type().to_owned(),
                 }
             });
-            if command.decision == ApprovalDecision::Approve {
+            if command.decision == ApprovalDecision::Approve || config.decision_output {
                 let output = command
                     .approval_output
                     .as_ref()
                     .ok_or(StoreError::ObjectNotVerified)?;
-                let expected = crate::approval::canonical_human_approval_result(
-                    payload_value,
-                    &command.principal,
-                );
+                let expected = if config.decision_output {
+                    crate::approval::canonical_human_decision_result(
+                        command.decision,
+                        payload_json,
+                        payload_value,
+                        &command.principal,
+                    )
+                } else {
+                    crate::approval::canonical_human_approval_result(
+                        payload_value,
+                        &command.principal,
+                    )
+                };
+                if config.decision_output
+                    && expected.len() as u64
+                        > state
+                            .runs
+                            .get(&(scope.clone(), command.run_id.clone()))
+                            .ok_or(StoreError::CorruptControlPlane)?
+                            .limits
+                            .max_inline_json_bytes_per_value
+                {
+                    return Err(StoreError::ApprovalDecisionPayloadInvalid);
+                }
                 if output.media_type() != "application/json"
                     || output.digest() != &digest(&expected)
                     || output.size_bytes() != expected.len() as u64
@@ -6972,12 +7710,16 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 })
                 .transpose()?;
             match command.decision {
-                ApprovalDecision::Approve => {
+                decision if decision == ApprovalDecision::Approve || config.decision_output => {
                     let output = command
                         .approval_output
                         .as_ref()
                         .ok_or(StoreError::ObjectNotVerified)?;
-                    gate.status = crate::run::GateState::Approved;
+                    gate.status = if command.decision == ApprovalDecision::Approve {
+                        crate::run::GateState::Approved
+                    } else {
+                        crate::run::GateState::Rejected
+                    };
                     node.status = NodeState::Succeeded;
                     node.result_ref = Some(json_ref(
                         &mut state,
@@ -6990,36 +7732,64 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         0,
                         now,
                     )?);
-                    specs.push(event_spec(
-                        "G02",
-                        Some(&node.node_instance_id),
-                        None,
-                        Some(&gate.gate_id),
-                        event_payload::approval_gate_approved(
-                            &(command.principal.principal_id()),
-                            &(command
-                                .decision_payload
-                                .as_ref()
-                                .map(VerifiedObjectRef::digest)),
-                            &(output.digest()),
-                            &(decision_fingerprint),
-                        ),
-                    ));
-                    specs.push(event_spec(
-                        "N12",
-                        Some(&node.node_instance_id),
-                        None,
-                        Some(&gate.gate_id),
-                        event_payload::approval_approved(
-                            &(gate.gate_id),
-                            &(command
-                                .decision_payload
-                                .as_ref()
-                                .map(VerifiedObjectRef::digest)),
-                            &(output.digest()),
-                            &("human"),
-                        ),
-                    ));
+                    let payload_digest = command
+                        .decision_payload
+                        .as_ref()
+                        .map(VerifiedObjectRef::digest);
+                    if command.decision == ApprovalDecision::Approve {
+                        specs.push(event_spec(
+                            "G02",
+                            Some(&node.node_instance_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_gate_approved(
+                                &command.principal.principal_id(),
+                                &payload_digest,
+                                &output.digest(),
+                                &decision_fingerprint,
+                            ),
+                        ));
+                    } else {
+                        specs.push(event_spec(
+                            "G03",
+                            Some(&node.node_instance_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_gate_rejected(
+                                &command.principal.principal_id(),
+                                &payload_digest,
+                                &decision_fingerprint,
+                            ),
+                        ));
+                    }
+                    if config.decision_output {
+                        specs.push(event_spec(
+                            "N69",
+                            Some(&node.node_instance_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_decision_resolved(
+                                &gate.gate_id,
+                                &command.decision,
+                                "human",
+                                &output.digest(),
+                                &payload_digest,
+                            ),
+                        ));
+                    } else {
+                        specs.push(event_spec(
+                            "N12",
+                            Some(&node.node_instance_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_approved(
+                                &gate.gate_id,
+                                &payload_digest,
+                                &output.digest(),
+                                "human",
+                            ),
+                        ));
+                    }
                     let node_id = node.node_instance_id.clone();
                     set_node_mutated(&mut node, now)?;
                     state.nodes.insert(node_key, node);
@@ -7090,6 +7860,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         ),
                     ));
                 }
+                ApprovalDecision::Approve => unreachable!("approve matched above"),
             }
             gate.deciding_principal = Some(command.principal.principal_id().to_owned());
             gate.decision_payload_ref = payload_reference.map(JsonRef);
@@ -7155,15 +7926,46 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 .get(&node_key)
                 .cloned()
                 .ok_or(StoreError::NotFound)?;
+            let config = state
+                .run_definitions
+                .get(&(scope.clone(), command.run_id.clone()))
+                .and_then(|definition| {
+                    definition
+                        .definition
+                        .nodes
+                        .iter()
+                        .find_map(|candidate| match candidate {
+                            NodeDefinition::Approval { id, gate, .. }
+                                if id == &node.definition_node_id =>
+                            {
+                                Some(gate.clone())
+                            }
+                            _ => None,
+                        })
+                })
+                .ok_or(StoreError::CorruptControlPlane)?;
             let mut specs = Vec::new();
             match gate.on_expiry {
-                crate::approval::ApprovalExpiryPolicy::Approve => {
+                policy
+                    if policy == crate::approval::ApprovalExpiryPolicy::Approve
+                        || config.decision_output =>
+                {
                     let output = command
                         .approval_output
                         .as_ref()
                         .ok_or(StoreError::ObjectNotVerified)?;
                     verified(&mut state, scope, output, now)?;
-                    let expected = crate::approval::canonical_expiry_approval_result();
+                    let decision =
+                        if gate.on_expiry == crate::approval::ApprovalExpiryPolicy::Approve {
+                            ApprovalDecision::Approve
+                        } else {
+                            ApprovalDecision::Reject
+                        };
+                    let expected = if config.decision_output {
+                        crate::approval::canonical_expiry_decision_result(decision)
+                    } else {
+                        crate::approval::canonical_expiry_approval_result()
+                    };
                     if output.media_type() != "application/json"
                         || output.digest() != &digest(&expected)
                         || output.size_bytes() != expected.len() as u64
@@ -7187,7 +7989,11 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             code: "ApprovalPayloadInvalid".to_owned(),
                         });
                     }
-                    gate.status = crate::run::GateState::ExpiredApproved;
+                    gate.status = if decision == ApprovalDecision::Approve {
+                        crate::run::GateState::ExpiredApproved
+                    } else {
+                        crate::run::GateState::ExpiredRejected
+                    };
                     gate.resolution_source = Some(ApprovalResolutionSource::Expiry);
                     node.status = NodeState::Succeeded;
                     node.result_ref = Some(json_ref(
@@ -7204,28 +8010,54 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     set_node_mutated(&mut node, now)?;
                     let node_id = node.node_instance_id.clone();
                     state.nodes.insert(node_key, node);
-                    specs.push(event_spec(
-                        "G04",
-                        Some(&node_id),
-                        None,
-                        Some(&gate.gate_id),
-                        event_payload::approval_gate_expired_approved(
-                            &(gate.expires_at),
-                            &(now),
-                            &(output.digest()),
-                        ),
-                    ));
-                    specs.push(event_spec(
-                        "N14",
-                        Some(&node_id),
-                        None,
-                        Some(&gate.gate_id),
-                        event_payload::approval_expired_approved(
-                            &(gate.gate_id),
-                            &(gate.expires_at),
-                            &(output.digest()),
-                        ),
-                    ));
+                    if decision == ApprovalDecision::Approve {
+                        specs.push(event_spec(
+                            "G04",
+                            Some(&node_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_gate_expired_approved(
+                                &gate.expires_at,
+                                &now,
+                                &output.digest(),
+                            ),
+                        ));
+                    } else {
+                        specs.push(event_spec(
+                            "G05",
+                            Some(&node_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_gate_expired_rejected(&gate.expires_at, &now),
+                        ));
+                    }
+                    if config.decision_output {
+                        specs.push(event_spec(
+                            "N69",
+                            Some(&node_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_decision_resolved(
+                                &gate.gate_id,
+                                &decision,
+                                "expiry",
+                                &output.digest(),
+                                &None,
+                            ),
+                        ));
+                    } else {
+                        specs.push(event_spec(
+                            "N14",
+                            Some(&node_id),
+                            None,
+                            Some(&gate.gate_id),
+                            event_payload::approval_expired_approved(
+                                &gate.gate_id,
+                                &gate.expires_at,
+                                &output.digest(),
+                            ),
+                        ));
+                    }
                     frontier_reduce(
                         &mut state,
                         scope,
@@ -7283,6 +8115,9 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             &(Option::<&Digest>::None),
                         ),
                     ));
+                }
+                crate::approval::ApprovalExpiryPolicy::Approve => {
+                    unreachable!("approve matched above")
                 }
             }
             gate.decided_at = Some(now);
@@ -8117,6 +8952,27 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .get(&(scope.clone(), run_id.clone(), attempt_id.clone()))
             .cloned()
             .ok_or(StoreError::NotFound)
+    }
+
+    async fn get_latest_attempt(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        node_id: &NodeInstanceId,
+    ) -> Result<Option<NodeAttempt>, StoreError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("store lock poisoned")
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.scope == *scope
+                    && attempt.run_id == *run_id
+                    && attempt.node_instance_id == *node_id
+            })
+            .max_by_key(|attempt| attempt.attempt_number)
+            .cloned())
     }
 
     async fn get_gate(

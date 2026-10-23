@@ -2,7 +2,11 @@
 //!
 //!.
 
-use crate::artifact::{ArtifactRef, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject};
+use crate::artifact::{
+    ArtifactRef, FailedReadProof, ObjectReadError, ObjectStore, VerifiedObject, VerifiedObjectFile,
+};
+use crate::engine::Clock;
+use crate::fs_object_store::FsObjectStore;
 use crate::ids::{Id, NodeInstanceId};
 use crate::scope::ExecutionScope;
 use crate::store::{MarkCorruptStorage, StoreError, WorkflowStore};
@@ -14,9 +18,9 @@ use std::sync::Arc;
 /// variants that both originate from `ObjectReadError::Corrupt` differ in
 /// whether the control plane has already been told.
 #[derive(Debug)]
-pub enum CommittedReadOutcome {
+pub enum CommittedReadOutcome<T = VerifiedObject> {
     /// Read completed and the bytes were verified against the committed digest.
-    Verified(VerifiedObject),
+    Verified(T),
     /// The store could not complete a verification. No proof, no durable change.
     ///
     /// Nothing was mutated, so a later operational retry may repeat the read.
@@ -43,6 +47,9 @@ pub enum CommittedReadOutcome {
         error: StoreError,
     },
 }
+
+/// The committed host-read outcomes for a bounded-memory file snapshot.
+pub type CommittedFileReadOutcome = CommittedReadOutcome<VerifiedObjectFile>;
 
 /// Reads committed objects on behalf of an existing run.
 ///
@@ -98,6 +105,18 @@ where
             }
             Err(ObjectReadError::Corrupt(proof)) => proof,
         };
+        self.apply_corruption(scope, run_id, committed, owner_node_id, proof)
+            .await
+    }
+
+    async fn apply_corruption<T>(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        committed: &ArtifactRef,
+        owner_node_id: Option<&NodeInstanceId>,
+        proof: FailedReadProof,
+    ) -> CommittedReadOutcome<T> {
         match self
             .store
             .mark_corrupt_storage(
@@ -116,5 +135,33 @@ where
             Ok(_) => CommittedReadOutcome::CorruptionApplied { proof },
             Err(error) => CommittedReadOutcome::CorruptionMarkFailed { proof, error },
         }
+    }
+}
+
+impl<S, C> CommittedObjectReader<S, FsObjectStore<C>>
+where
+    S: WorkflowStore,
+    C: Clock,
+{
+    /// Reads a committed binary artifact into a verified anonymous file snapshot.
+    ///
+    /// Verification uses bounded memory. Integrity failures are committed to the control
+    /// plane before they are reported, in the same order as `read`.
+    pub async fn read_file(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        committed: &ArtifactRef,
+        owner_node_id: Option<&NodeInstanceId>,
+    ) -> CommittedFileReadOutcome {
+        let proof = match self.object_store.get_file(scope, &committed.digest).await {
+            Ok(object) => return CommittedReadOutcome::Verified(object),
+            Err(ObjectReadError::StorageUnavailable) => {
+                return CommittedReadOutcome::StorageUnavailable
+            }
+            Err(ObjectReadError::Corrupt(proof)) => proof,
+        };
+        self.apply_corruption(scope, run_id, committed, owner_node_id, proof)
+            .await
     }
 }

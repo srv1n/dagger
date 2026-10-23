@@ -69,13 +69,13 @@ graph TD
   n_Testing_and_development["Testing and development"]
   n_Workflow_definitions["Workflow definitions"]
   n_Workflow_engine["Workflow engine"]
-  n_System_overview --> n_Getting_started
-  n_System_overview --> n_Glossary
-  n_Workflow_engine --> n_Operations_and_limits
-  n_System_overview --> n_Repository_structure
-  n_Workflow_engine --> n_Storage_and_durability
-  n_System_overview --> n_Testing_and_development
-  n_Workflow_engine --> n_Workflow_definitions
-  n_System_overview --> n_Workflow_engine
+  n_Getting_started -->|part of| n_System_overview
+  n_Glossary -->|part of| n_System_overview
+  n_Operations_and_limits -->|part of| n_Workflow_engine
+  n_Repository_structure -->|part of| n_System_overview
+  n_Storage_and_durability -->|part of| n_Workflow_engine
+  n_Testing_and_development -->|part of| n_System_overview
+  n_Workflow_definitions -->|part of| n_Workflow_engine
+  n_Workflow_engine -->|part of| n_System_overview
 ```
 <!-- tusker:docs-map:end -->

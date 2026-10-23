@@ -73,6 +73,52 @@ success output remains possible.
 Skipped edges and nodes record one reason: `condition_false` for an unselected Choice branch, or
 `skipped_upstream_failed` when no upstream output can exist.
 
+## Partial Maps
+
+Map defaults to `on_child_failure: cancel_siblings`. Set it to `continue` to
+finish independent children after a domain failure. `min_successful_children`
+defaults to the actual item count. The Map waits for every child to finish before
+checking the threshold. Continued Maps return ordered identity, status, output,
+and error reports. `map_aggregate` projects fields from successful child outputs.
+Keep part keys in those outputs so later stages can identify remaining parts.
+Contract and storage failures, run limits, and cancellation remain fatal.
+
+## Reusing action results
+
+Actions opt into caching with `WorkflowAction::memoize`; the default is false.
+Custom registries also expose this policy through `ActionRegistry::memoize`.
+The in-memory registry does this automatically. Policy lookup precedes a claim;
+executable resolution follows the durable claim so cancellation stays fenced.
+Run options select `use` (read and write), `refresh` (execute and write), or `off`
+(read and write neither). Ordinary run creation uses `use`.
+
+The scoped key includes all five pins and canonical bound input, including
+artifact digests. Declare every effective input: seeds, renderer and sample
+versions, knowledge snapshots, and relevant configuration. Do not memoize an
+external side effect such as publishing delivery.
+
+Memoized actions must depend on content and declared inputs. They must not
+change output based on a run, attempt, or typed-use identity. Verified typed
+artifact-use IDs are normalized for keys; ordinary JSON fields remain exact.
+Reused file bytes retain their digests. JSON outputs that contain artifact
+references receive the new run's IDs, so those JSON bytes can differ while
+the referenced content stays identical.
+
+The engine verifies cached output and artifact bytes. Missing or invalid cached
+objects cause execution. A storage outage remains an infrastructure error.
+Ordinary committed-read corruption rules remain unchanged. Reuse completes
+through ordinary credential and generation fences, costs zero execution units,
+records source provenance, and creates new-run artifact references. A dependent
+can hit cache when its input remains unchanged after an upstream execution.
+
+Run options can lock an Action or keyed Map item to a same-scope committed
+output. Pins verify schemas and bytes. Invalid pins fail instead of executing
+a replacement. Durable provenance distinguishes pins from cache hits.
+An invalid source discovered while scheduling returns a typed error before a
+claim. The host must cancel that run or create a corrected run; options are
+immutable. Pins currently select authored Actions and individual keyed Map
+children.
+
 ## Action contract
 
 An `ActionDescriptor` contains these exact pins:

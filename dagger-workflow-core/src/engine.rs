@@ -16,8 +16,8 @@ use crate::ids::{edge_id, map_child_id, map_expansion_digest, Digest, Id, MapChi
 use crate::run::{NodeKind, NodeRun};
 use crate::scope::ExecutionScope;
 use crate::store::{
-    CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CommandReceipt, CompleteAttempt,
-    CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
+    CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, ClaimReusableNodeAttempt, CommandReceipt,
+    CompleteAttempt, CompleteMap, CompletionObjects, ExpandMap, ExpireApproval, ExpireRunLifetime,
     MarkCorruptStorage, OrderedMapItem, PageRequest, RecordActionProgress, RecordChoice,
     RecoverAbandonedAttemptsForRun, RegisterExternalHandle, ReleaseRetry, RequestApproval,
     ResolveTerminalNode, ResumeCompatible, StartRun, StoreError, SuspendIncompatible,
@@ -145,6 +145,45 @@ struct AttemptSupervisor {
     activity: Notify,
 }
 
+/// Owns local cancellation registration until the spawned supervisor finishes.
+/// Dropping an unfinished claim must not leave a key that no task can remove.
+struct AttemptRegistration {
+    supervisor: Arc<AttemptSupervisor>,
+    key: AttemptKey,
+    cancellation: CancellationSource,
+    finished: bool,
+}
+
+impl AttemptRegistration {
+    fn new(
+        supervisor: Arc<AttemptSupervisor>,
+        key: AttemptKey,
+        cancellation: CancellationSource,
+    ) -> Self {
+        supervisor.register(key.clone(), cancellation.clone());
+        Self {
+            supervisor,
+            key,
+            cancellation,
+            finished: false,
+        }
+    }
+
+    fn finish(mut self, result: Result<(), EngineError>) {
+        self.supervisor.finish(&self.key, result);
+        self.finished = true;
+    }
+}
+
+impl Drop for AttemptRegistration {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancellation.cancel();
+            self.supervisor.unregister(&self.key);
+        }
+    }
+}
+
 impl AttemptSupervisor {
     fn new(max_concurrency: usize) -> Self {
         Self {
@@ -169,6 +208,12 @@ impl AttemptSupervisor {
             .lock()
             .expect("supervisor lock poisoned")
             .remove(key);
+        if !self.has_scope(&key.0) {
+            self.last_heartbeat
+                .lock()
+                .expect("heartbeat lock poisoned")
+                .remove(&key.0);
+        }
         self.activity.notify_waiters();
     }
 
@@ -350,6 +395,33 @@ where
             return Err(error);
         }
         let permit = self.permit(scope)?;
+        let mut scheduling = Box::pin(self.tick_with_permit(scope, &permit));
+        // Verification may stream many large files before any action task is
+        // spawned. Keep this lease alive for every kind of scheduler work.
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                result = &mut scheduling => return result,
+                _ = heartbeat.tick() => {
+                    let refreshing = self.store.heartbeat_engine_claim(scope, &permit);
+                    tokio::pin!(refreshing);
+                    // Scheduler commands may hold the same SQLite connection
+                    // or writer lock. Continue polling them while refreshing.
+                    tokio::select! {
+                        result = &mut scheduling => return result,
+                        result = &mut refreshing => { result?; }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn tick_with_permit(
+        &self,
+        scope: &ExecutionScope,
+        permit: &crate::store::EnginePermit,
+    ) -> Result<usize, EngineError> {
         let mut changed = self.run_maintenance_scans(scope).await?;
         let retries = self
             .store
@@ -416,30 +488,30 @@ where
                     action_nodes.push(node)
                 }
                 NodeKind::Choice => {
-                    self.execute_choice(scope, &permit, node).await?;
+                    self.execute_choice(scope, permit, node).await?;
                     changed += 1;
                 }
                 NodeKind::Map => {
-                    self.execute_map(scope, &permit, node).await?;
+                    self.execute_map(scope, permit, node).await?;
                     changed += 1;
                 }
                 NodeKind::Approval => {
-                    self.execute_approval(scope, &permit, node).await?;
+                    self.execute_approval(scope, permit, node).await?;
                     changed += 1;
                 }
                 NodeKind::Succeed | NodeKind::Fail => {
-                    self.execute_terminal(scope, &permit, node).await?;
+                    self.execute_terminal(scope, permit, node).await?;
                     changed += 1;
                 }
                 _ => {}
             }
         }
-        changed += self.complete_waiting_maps(scope, &permit).await?;
+        changed += self.complete_waiting_maps(scope, permit).await?;
         for node in action_nodes {
             let Ok(slot) = self.supervisor.semaphore.clone().try_acquire_owned() else {
                 break;
             };
-            match self.claim_action(scope, &permit, node).await {
+            match self.claim_action(scope, permit, node).await {
                 Ok(Some(invocation)) => {
                     self.spawn_attempt(scope.clone(), permit.clone(), invocation, slot);
                     changed += 1;
@@ -534,19 +606,18 @@ where
         &self,
         scope: ExecutionScope,
         permit: crate::store::EnginePermit,
-        claimed: ClaimedAction,
+        mut claimed: ClaimedAction,
         slot: OwnedSemaphorePermit,
     ) {
-        let key = (
-            scope.clone(),
-            claimed.context.run_id.clone(),
-            claimed.context.attempt_id.clone(),
-        );
         let source = claimed.cancellation.clone();
         let supervisor = self.supervisor.clone();
         let store = self.store.clone();
         let object_store = self.object_store.clone();
         let grace = self.config.cancellation_grace;
+        let registration = claimed
+            .registration
+            .take()
+            .expect("claimed action owns its local registration");
         tokio::spawn(async move {
             let task = tokio::spawn(supervise_attempt(
                 store,
@@ -563,7 +634,7 @@ where
                 Ok(result) => result,
                 Err(_) => Err(EngineError::ActionTaskFailed),
             };
-            supervisor.finish(&key, result);
+            registration.finish(result);
         });
     }
 
@@ -646,18 +717,36 @@ where
             }
         }
         for gate in self.store.scan_due_gates(scope, first_page()).await?.items {
-            let approval_output =
-                if gate.on_expiry == crate::approval::ApprovalExpiryPolicy::Approve {
-                    let bytes = crate::approval::canonical_expiry_approval_result();
-                    Some(
-                        self.object_store
-                            .put(scope, &bytes, "application/json")
-                            .await
-                            .map_err(|_| EngineError::ObjectWrite)?,
-                    )
+            let (_, definition) = self.definition_for(scope, &gate.run_id).await?;
+            let gate_node = self
+                .store
+                .get_node(scope, &gate.run_id, &gate.node_instance_id)
+                .await?;
+            let decision_output = matches!(find_node(&definition, &gate_node.definition_node_id)?,
+                NodeDefinition::Approval { gate: config, .. } if config.decision_output);
+            let approval_output = if gate.on_expiry
+                == crate::approval::ApprovalExpiryPolicy::Approve
+                || decision_output
+            {
+                let decision = if gate.on_expiry == crate::approval::ApprovalExpiryPolicy::Approve {
+                    crate::approval::ApprovalDecision::Approve
                 } else {
-                    None
+                    crate::approval::ApprovalDecision::Reject
                 };
+                let bytes = if decision_output {
+                    crate::approval::canonical_expiry_decision_result(decision)
+                } else {
+                    crate::approval::canonical_expiry_approval_result()
+                };
+                Some(
+                    self.object_store
+                        .put(scope, &bytes, "application/json")
+                        .await
+                        .map_err(|_| EngineError::ObjectWrite)?,
+                )
+            } else {
+                None
+            };
             match self
                 .store
                 .expire_approval(
@@ -765,14 +854,12 @@ where
     /// Artifact locators carry a digest, not an `ArtifactRef`, so no valid
     /// `mark_corrupt_storage` command can be formed for them; corruption surfaces
     /// as an integrity error only. The availability split is still preserved.
-    // ponytail: no artifact-ref lookup exists on WorkflowStore. If one is added,
-    // route these two reads through read_committed as well.
-    async fn read_by_digest(
+    async fn verify_by_digest(
         &self,
         scope: &ExecutionScope,
         digest: &Digest,
-    ) -> Result<VerifiedObject, EngineError> {
-        match self.object_store.get(scope, digest).await {
+    ) -> Result<crate::artifact::VerifiedObjectRef, EngineError> {
+        match self.object_store.verify(scope, digest).await {
             Ok(object) => Ok(object),
             Err(ObjectReadError::StorageUnavailable) => Err(EngineError::StorageUnavailable),
             Err(ObjectReadError::Corrupt(_)) => Err(EngineError::ObjectRead),
@@ -821,35 +908,131 @@ where
             }
             _ => return Err(EngineError::DefinitionDecode),
         };
-        let bound_object = self
-            .object_store
-            .put(scope, &bound, "application/json")
-            .await
-            .map_err(|_| EngineError::ObjectWrite)?;
+        let repair_cache_objects = self.registry.memoize(&action_ref.name);
+        let bound_object = if repair_cache_objects {
+            self.object_store
+                .put_repairing(scope, &bound, "application/json")
+                .await
+        } else {
+            self.object_store
+                .put(scope, &bound, "application/json")
+                .await
+        }
+        .map_err(|_| EngineError::ObjectWrite)?;
+        let memoization_artifact_refs = if repair_cache_objects
+            && run.options.cache_mode != crate::memoization::CacheMode::Off
+        {
+            crate::memoization::confirmed_artifact_uses(&*self.store, scope, &bound).await?
+        } else {
+            Vec::new()
+        };
+        let memoization_key = if repair_cache_objects
+            && run.options.cache_mode != crate::memoization::CacheMode::Off
+        {
+            Some(crate::memoization::action_cache_key(
+                scope,
+                action_ref,
+                &bound,
+                &memoization_artifact_refs,
+            )?)
+        } else {
+            None
+        };
         let attempt_id = self.next_attempt_id(permit.generation())?;
+        let pinned = crate::pinning::resolve_pin_attempt(
+            &*self.store,
+            &*self.object_store,
+            scope,
+            &run,
+            &node,
+            &definition,
+        )
+        .await?;
+        let (reused_outcome, reuse_provenance) = if let Some(source) = pinned {
+            let outcome = crate::memoization::reuse_attempt_outcome(
+                &*self.store,
+                &*self.object_store,
+                scope,
+                &source,
+                &run.run_id,
+                &node.node_instance_id,
+                &attempt_id,
+                &bound,
+            )
+            .await?
+            .ok_or(EngineError::ObjectRead)?;
+            (
+                Some(outcome),
+                Some(crate::memoization::ReuseProvenance::from_attempt(
+                    &source,
+                    crate::memoization::ReuseKind::Pinned,
+                )),
+            )
+        } else if run.options.cache_mode == crate::memoization::CacheMode::Use {
+            if let Some(key) = &memoization_key {
+                if let Some(source) = self.store.lookup_memoized_attempt(scope, key).await? {
+                    let outcome = crate::memoization::reuse_attempt_outcome(
+                        &*self.store,
+                        &*self.object_store,
+                        scope,
+                        &source,
+                        &run.run_id,
+                        &node.node_instance_id,
+                        &attempt_id,
+                        &bound,
+                    )
+                    .await?;
+                    let provenance = outcome.as_ref().map(|_| {
+                        crate::memoization::ReuseProvenance::from_attempt(
+                            &source,
+                            crate::memoization::ReuseKind::CacheHit,
+                        )
+                    });
+                    (outcome, provenance)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        let memoization_key = if reuse_provenance
+            .as_ref()
+            .is_some_and(|source| source.kind == crate::memoization::ReuseKind::Pinned)
+        {
+            None
+        } else {
+            memoization_key
+        };
         let source = CancellationSource::new();
         let key = (scope.clone(), node.run_id.clone(), attempt_id.clone());
-        self.supervisor.register(key.clone(), source.clone());
+        let registration = AttemptRegistration::new(self.supervisor.clone(), key, source.clone());
         let result = match self
             .store
-            .claim_node_attempt(
+            .claim_reusable_node_attempt(
                 scope,
-                ClaimNodeAttempt {
-                    permit: permit.clone(),
-                    run_id: node.run_id.clone(),
-                    node_id: node.node_instance_id.clone(),
-                    expected_node_version: node.version,
-                    attempt_id: attempt_id.clone(),
-                    worker_id: self.config.instance_id.clone(),
-                    bound_input: bound_object,
-                    binding_derivation_digest: sha(&bound),
+                ClaimReusableNodeAttempt {
+                    claim: ClaimNodeAttempt {
+                        permit: permit.clone(),
+                        run_id: node.run_id.clone(),
+                        node_id: node.node_instance_id.clone(),
+                        expected_node_version: node.version,
+                        attempt_id: attempt_id.clone(),
+                        worker_id: self.config.instance_id.clone(),
+                        bound_input: bound_object,
+                        binding_derivation_digest: sha(&bound),
+                    },
+                    memoization_key,
+                    memoization_artifact_refs,
+                    reuse_provenance,
                 },
             )
             .await
         {
             Ok(result) => result,
             Err(error) => {
-                self.supervisor.unregister(&key);
                 return Err(error.into());
             }
         };
@@ -858,7 +1041,6 @@ where
             completion_credential,
         } = result
         else {
-            self.supervisor.unregister(&key);
             return Ok(None);
         };
         let attempt = match self
@@ -868,7 +1050,6 @@ where
         {
             Ok(attempt) => attempt,
             Err(error) => {
-                self.supervisor.unregister(&key);
                 return Err(error.into());
             }
         };
@@ -962,15 +1143,20 @@ where
             progress_reporter,
             external_handles,
         );
-        let action = self
-            .registry
-            .resolve(&action_ref.name)
-            .ok_or(EngineError::ActionMissing)?;
+        let action = match self.registry.resolve(&action_ref.name) {
+            Some(action) => action,
+            None => {
+                return Err(EngineError::ActionMissing);
+            }
+        };
         Ok(Some(ClaimedAction {
             action,
+            reused_outcome,
+            repair_cache_objects,
             context,
             input_bytes: bound,
             cancellation: source,
+            registration: Some(registration),
             _invocation: invocation,
         }))
     }
@@ -1122,8 +1308,18 @@ where
                     .as_array()
                     .cloned()
                     .ok_or(EngineError::Binding)?;
+                let (_, definition) = self.definition_for(scope, &run.run_id).await?;
+                let continues = matches!(
+                    find_node(&definition, &node.definition_node_id)?,
+                    NodeDefinition::Map {
+                        on_child_failure: crate::definition::MapChildFailurePolicy::Continue,
+                        ..
+                    }
+                );
                 values
                     .iter()
+                    .filter(|value| !continues || value["status"] == "succeeded")
+                    .map(|value| if continues { &value["output"] } else { value })
                     .map(|value| value.pointer(pointer).cloned().ok_or(EngineError::Binding))
                     .collect::<Result<Vec<_>, _>>()
                     .map(Value::Array)
@@ -1163,14 +1359,14 @@ where
                 digest,
                 media_type,
             } => {
-                let object = self.read_by_digest(scope, digest).await?;
-                if object.reference.media_type() != media_type {
+                let object = self.verify_by_digest(scope, digest).await?;
+                if object.media_type() != media_type {
                     return Err(EngineError::Binding);
                 }
                 ArtifactRefValue {
                     artifact_ref_id: artifact_ref_id.clone(),
                     digest: digest.clone(),
-                    size_bytes: object.reference.size_bytes().to_string(),
+                    size_bytes: object.size_bytes().to_string(),
                     media_type: media_type.clone(),
                 }
             }
@@ -1191,9 +1387,9 @@ where
                     .map_err(|_| EngineError::Binding)?
             }
         };
-        let object = self.read_by_digest(scope, &value.digest).await?;
-        if object.reference.size_bytes().to_string() != value.size_bytes
-            || object.reference.media_type() != value.media_type
+        let object = self.verify_by_digest(scope, &value.digest).await?;
+        if object.size_bytes().to_string() != value.size_bytes
+            || object.media_type() != value.media_type
         {
             return Err(EngineError::Binding);
         }
@@ -1433,9 +1629,22 @@ where
                     break;
                 }
             }
+            if !nodes.iter().any(|node| {
+                node.kind == NodeKind::Map && node.status == crate::run::NodeState::WaitingChildren
+            }) {
+                continue;
+            }
+            let (_, definition) = self.definition_for(scope, &run.run_id).await?;
             for parent in nodes.iter().filter(|node| {
                 node.kind == NodeKind::Map && node.status == crate::run::NodeState::WaitingChildren
             }) {
+                let continues = matches!(
+                    find_node(&definition, &parent.definition_node_id)?,
+                    NodeDefinition::Map {
+                        on_child_failure: crate::definition::MapChildFailurePolicy::Continue,
+                        ..
+                    }
+                );
                 let mut children = nodes
                     .iter()
                     .filter(|node| {
@@ -1444,15 +1653,39 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
                 if children.len() != parent.map_child_count.unwrap_or(0) as usize
-                    || children
-                        .iter()
-                        .any(|child| child.status != crate::run::NodeState::Succeeded)
+                    || children.iter().any(|child| {
+                        if continues {
+                            !matches!(
+                                child.status,
+                                crate::run::NodeState::Succeeded
+                                    | crate::run::NodeState::Failed
+                                    | crate::run::NodeState::RetriesExhausted
+                                    | crate::run::NodeState::Skipped
+                            )
+                        } else {
+                            child.status != crate::run::NodeState::Succeeded
+                        }
+                    })
                 {
                     continue;
                 }
                 children.sort_by_key(|child| child.map_item_index);
+                // A zero-item Map with a positive minimum still comes here: the
+                // store evaluates its empty aggregate as an unmet threshold.
                 let mut values: Vec<Value> = Vec::with_capacity(children.len());
                 for child in &children {
+                    if child.status != crate::run::NodeState::Succeeded {
+                        let attempt = self
+                            .store
+                            .get_latest_attempt(scope, &run.run_id, &child.node_instance_id)
+                            .await?;
+                        values.push(crate::run::map_child_envelope(
+                            child,
+                            attempt.as_ref(),
+                            Value::Null,
+                        ));
+                        continue;
+                    }
                     let output = child.result_ref.clone().ok_or(EngineError::Binding)?;
                     let object = match self
                         .read_committed(
@@ -1473,9 +1706,13 @@ where
                         // Unavailability commits nothing and aborts the pass.
                         Err(error) => return Err(error),
                     };
-                    values.push(
-                        serde_json::from_slice(&object.bytes).map_err(|_| EngineError::Binding)?,
-                    );
+                    let output =
+                        serde_json::from_slice(&object.bytes).map_err(|_| EngineError::Binding)?;
+                    values.push(if continues {
+                        crate::run::map_child_envelope(child, None, output)
+                    } else {
+                        output
+                    });
                 }
                 if values.len() != children.len() {
                     continue;
@@ -1568,10 +1805,13 @@ where
 }
 
 struct ClaimedAction {
+    repair_cache_objects: bool,
+    reused_outcome: Option<ActionOutcome>,
     action: Arc<dyn crate::action::WorkflowAction>,
     context: ActionContext,
     input_bytes: Vec<u8>,
     cancellation: CancellationSource,
+    registration: Option<AttemptRegistration>,
     _invocation: crate::action::ActionInvocation,
 }
 
@@ -1632,6 +1872,7 @@ where
     O: ObjectStore + 'static,
 {
     let run_id = claimed.context.run_id.clone();
+    let attempt_id = claimed.context.attempt_id.clone();
     let execution = execute_attempt(
         store.clone(),
         object_store,
@@ -1645,6 +1886,7 @@ where
         supervisor,
         scope,
         run_id,
+        attempt_id,
         permit,
         cancellation.clone(),
     );
@@ -1669,6 +1911,7 @@ async fn monitor_attempt<S>(
     supervisor: Arc<AttemptSupervisor>,
     scope: ExecutionScope,
     run_id: Id,
+    attempt_id: Id,
     permit: crate::store::EnginePermit,
     cancellation: CancellationSource,
 ) -> Result<(), EngineError>
@@ -1685,6 +1928,13 @@ where
                 if supervisor.heartbeat_due(&scope) {
                     let _command = supervisor.commands.lock().await;
                     store.heartbeat_engine_claim(&scope, &permit).await?;
+                }
+                // A continuing Map can keep its run alive after this attempt
+                // times out or is recovered. Stop only the retired invocation.
+                if store.get_attempt(&scope, &run_id, &attempt_id).await?.status
+                    != crate::run::AttemptState::Started
+                {
+                    return Ok(());
                 }
                 if store.get_run(&scope, &run_id).await?.run.status
                     != crate::run::RunState::Running
@@ -1707,11 +1957,22 @@ where
     S: WorkflowStore + 'static,
     O: ObjectStore + 'static,
 {
-    let outcome = claimed
-        .action
-        .invoke(claimed.context.clone(), &claimed.input_bytes)
-        .await;
-    let objects = completion_objects(&*object_store, &scope, &outcome).await?;
+    let outcome = match claimed.reused_outcome {
+        Some(outcome) => outcome,
+        None => {
+            claimed
+                .action
+                .invoke(claimed.context.clone(), &claimed.input_bytes)
+                .await
+        }
+    };
+    let objects = completion_objects(
+        &*object_store,
+        &scope,
+        &outcome,
+        claimed.repair_cache_objects,
+    )
+    .await?;
     let _command = supervisor.commands.lock().await;
     store
         .complete_attempt(
@@ -1733,26 +1994,54 @@ async fn completion_objects<O: ObjectStore>(
     object_store: &O,
     scope: &ExecutionScope,
     outcome: &ActionOutcome,
+    repair_cache_objects: bool,
 ) -> Result<CompletionObjects, EngineError> {
     let output = match outcome {
         ActionOutcome::Success { output, .. } => {
             let bytes = serde_jcs::to_vec(output).map_err(|_| EngineError::ObjectWrite)?;
             Some(
-                object_store
-                    .put(scope, &bytes, "application/json")
-                    .await
-                    .map_err(|_| EngineError::ObjectWrite)?,
+                if repair_cache_objects {
+                    object_store
+                        .put_repairing(scope, &bytes, "application/json")
+                        .await
+                } else {
+                    object_store.put(scope, &bytes, "application/json").await
+                }
+                .map_err(|_| EngineError::ObjectWrite)?,
             )
         }
         _ => None,
     };
-    let artifacts = match outcome {
-        ActionOutcome::Success { artifacts, .. } => artifacts
-            .iter()
-            .map(|artifact| artifact.object.clone())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let mut artifacts = Vec::new();
+    if let ActionOutcome::Success {
+        artifacts: submitted,
+        ..
+    } = outcome
+    {
+        for artifact in submitted {
+            let verified = object_store
+                .verify(scope, artifact.object.digest())
+                .await
+                .map_err(|error| match error {
+                    ObjectReadError::Corrupt(_) => EngineError::ObjectRead,
+                    ObjectReadError::StorageUnavailable => EngineError::StorageUnavailable,
+                })?;
+            if verified != artifact.object {
+                // Capabilities can differ in retained binary bytes, but metadata
+                // and scope must still match the submitted verified publication.
+                if verified.scope() != artifact.object.scope()
+                    || verified.digest() != artifact.object.digest()
+                    || verified.size_bytes() != artifact.object.size_bytes()
+                    || verified.media_type() != artifact.object.media_type()
+                    || verified.store_instance_nonce() != artifact.object.store_instance_nonce()
+                    || verified.object_key() != artifact.object.object_key()
+                {
+                    return Err(EngineError::ObjectRead);
+                }
+            }
+            artifacts.push(verified);
+        }
+    }
     let diagnostics = match outcome {
         ActionOutcome::Success { diagnostics, .. }
         | ActionOutcome::Retryable { diagnostics, .. }
@@ -1760,10 +2049,14 @@ async fn completion_objects<O: ObjectStore>(
             Some(diagnostics) => {
                 let bytes = serde_jcs::to_vec(diagnostics).map_err(|_| EngineError::ObjectWrite)?;
                 Some(
-                    object_store
-                        .put(scope, &bytes, "application/json")
-                        .await
-                        .map_err(|_| EngineError::ObjectWrite)?,
+                    if repair_cache_objects {
+                        object_store
+                            .put_repairing(scope, &bytes, "application/json")
+                            .await
+                    } else {
+                        object_store.put(scope, &bytes, "application/json").await
+                    }
+                    .map_err(|_| EngineError::ObjectWrite)?,
                 )
             }
             None => None,
@@ -1854,4 +2147,44 @@ fn approval_gate_id(run_id: &Id, node_id: &Id) -> Id {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Id::new(format!("approval_{hex}")).expect("SHA-256 gate ID is valid")
+}
+
+#[cfg(test)]
+mod cancellation_registration_tests {
+    use super::*;
+    use crate::scope::ScopeAtom;
+
+    #[tokio::test]
+    async fn aborting_a_pending_claim_cancels_and_removes_its_local_registration() {
+        let supervisor = Arc::new(AttemptSupervisor::new(1));
+        let scope = ExecutionScope {
+            tenant_id: ScopeAtom::new("claim-drop-tenant").unwrap(),
+            namespace: ScopeAtom::new("claim-drop").unwrap(),
+        };
+        let cancellation = CancellationSource::new();
+        let (registered, wait_registered) = tokio::sync::oneshot::channel();
+        let task_supervisor = supervisor.clone();
+        let task_scope = scope.clone();
+        let task_cancellation = cancellation.clone();
+        let claiming = tokio::spawn(async move {
+            let _registration = AttemptRegistration::new(
+                task_supervisor,
+                (
+                    task_scope,
+                    Id::new("claim-drop-run").unwrap(),
+                    Id::new("claim-drop-attempt").unwrap(),
+                ),
+                task_cancellation,
+            );
+            registered.send(()).unwrap();
+            // The claim may be waiting for its SQL transaction or attempt read.
+            std::future::pending::<()>().await;
+        });
+        wait_registered.await.unwrap();
+        assert!(supervisor.has_scope(&scope));
+        claiming.abort();
+        assert!(claiming.await.unwrap_err().is_cancelled());
+        assert!(cancellation.is_cancelled());
+        assert!(!supervisor.has_scope(&scope));
+    }
 }

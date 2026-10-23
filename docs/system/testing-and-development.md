@@ -56,6 +56,11 @@ cargo test -p dagger-workflow-core --features sqlite,conformance --test w6_sqlit
 | `w10_budgets.rs` | Budgets, events, and run limits. |
 | `w11_integrity.rs` | Committed-object integrity. |
 | `w11d_crash_model.rs` | The stateful file-system crash model. |
+| `w12_manifest.rs` | Manifest pins, atomic registration, and consumer schema bundles. |
+| `w14_pinning.rs` | Authenticated output locks, item keys, and durable reuse fences. |
+| `w15_memoization.rs` | Cache modes, artifact retention, corruption fallback, and scope isolation. |
+| `structured_approval.rs` | Payload schemas, routed decisions, expiry, and legacy compatibility. |
+| `w7_large_artifacts.rs` | Streamed engine artifacts; the ignored 500 MiB test measures RSS separately. |
 
 ## Documentation checks
 
@@ -72,6 +77,6 @@ Use `rg` to check links and paths after a rename or deletion.
 
 ## Code bundle
 
-Run `make codebasezip` only when a reviewer needs a repository bundle. The command writes a ZIP file to the ignored `artifacts/` directory.
+Run `make codebasezip` only when a reviewer needs a repository bundle. The command creates the ignored artifacts directory and writes a ZIP file there.
 
 Do not commit a generated bundle.

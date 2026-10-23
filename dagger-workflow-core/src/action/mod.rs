@@ -1,5 +1,8 @@
 //! Action registry, invocation, context, and outcome contracts.
 
+pub mod manifest;
+pub mod schema;
+
 use crate::artifact::{ArtifactRefValue, JsonRef, VerifiedObjectRef};
 use crate::definition::ActionPin;
 use crate::ids::{CostUnits, Digest, Id, NodeInstanceId, Timestamp};
@@ -733,6 +736,20 @@ pub trait WorkflowAction: Send + Sync {
     /// Returns the implementation's exact descriptor.
     fn descriptor(&self) -> &ActionDescriptor;
 
+    /// Opts a deterministic action into scope-confined cross-run reuse.
+    ///
+    /// Every effective input must be present in the bound input or descriptor.
+    fn memoize(&self) -> bool {
+        false
+    }
+
+    /// Returns host-defined capability tags required by this implementation.
+    ///
+    /// These declarations are metadata; worker placement belongs to the host.
+    fn required_capabilities(&self) -> &[String] {
+        &[]
+    }
+
     /// Executes against exact canonical invocation bytes.
     fn invoke<'a>(
         &'a self,
@@ -745,6 +762,14 @@ pub trait WorkflowAction: Send + Sync {
 pub trait ActionRegistry: Send + Sync {
     /// Resolves a name-addressed action implementation.
     fn resolve(&self, name: &str) -> Option<Arc<dyn WorkflowAction>>;
+
+    /// Returns the host's memoization policy without resolving an executable.
+    ///
+    /// Registries must explicitly forward opt-in action policies. The default
+    /// preserves legacy registries' claim-before-resolution ordering.
+    fn memoize(&self, _name: &str) -> bool {
+        false
+    }
 
     /// Checks whether every exact revision pin is available.
     fn check_pins(&self, pins: &[ActionPin]) -> CompatibilityReport;
@@ -794,18 +819,38 @@ impl InMemoryActionRegistry {
 
     /// Registers an implementation without replacing an existing name.
     pub fn register(&self, action: Arc<dyn WorkflowAction>) -> Result<(), ActionRegistrationError> {
-        let name = action.descriptor().name.clone();
-        if name.is_empty() {
-            return Err(ActionRegistrationError::EmptyName);
+        self.register_many(std::iter::once(action))
+    }
+
+    /// Registers a batch atomically, rejecting empty or duplicate names.
+    ///
+    /// A rejected batch adds no implementation to the registry.
+    pub fn register_many(
+        &self,
+        actions: impl IntoIterator<Item = Arc<dyn WorkflowAction>>,
+    ) -> Result<(), ActionRegistrationError> {
+        let mut names = BTreeSet::new();
+        let mut batch = Vec::new();
+        for action in actions {
+            let name = action.descriptor().name.clone();
+            if name.is_empty() {
+                return Err(ActionRegistrationError::EmptyName);
+            }
+            if !names.insert(name.clone()) {
+                return Err(ActionRegistrationError::DuplicateName { name });
+            }
+            batch.push((name, action));
         }
-        let mut actions = self
+        let mut registered = self
             .actions
             .write()
             .expect("action registry lock is not poisoned");
-        if actions.contains_key(&name) {
-            return Err(ActionRegistrationError::DuplicateName { name });
+        for (name, _) in &batch {
+            if registered.contains_key(name) {
+                return Err(ActionRegistrationError::DuplicateName { name: name.clone() });
+            }
         }
-        actions.insert(name, action);
+        registered.extend(batch);
         Ok(())
     }
 }
@@ -817,6 +862,14 @@ impl ActionRegistry for InMemoryActionRegistry {
             .expect("action registry lock is not poisoned")
             .get(name)
             .cloned()
+    }
+
+    fn memoize(&self, name: &str) -> bool {
+        self.actions
+            .read()
+            .expect("action registry lock is not poisoned")
+            .get(name)
+            .is_some_and(|action| action.memoize())
     }
 
     fn check_pins(&self, pins: &[ActionPin]) -> CompatibilityReport {

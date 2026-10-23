@@ -20,9 +20,9 @@ use dagger_workflow_core::memory::InMemoryObjectStore;
 use dagger_workflow_core::run::{NodeState, RunLimits, RunState, SkipReason};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::{
-    SqliteWorkflowStore, SCHEDULER_COMPATIBILITY_SCAN_SQL, SCHEDULER_DEADLINES_SCAN_SQL,
-    SCHEDULER_GATES_SCAN_SQL, SCHEDULER_LIFETIMES_SCAN_SQL, SCHEDULER_NODES_SCAN_SQL,
-    SCHEDULER_RECOVERY_SCAN_SQL, SCHEMA_VERSION,
+    SqliteWorkflowStore, ATTEMPT_POINT_SQL, NODE_POINT_SQL, SCHEDULER_COMPATIBILITY_SCAN_SQL,
+    SCHEDULER_DEADLINES_SCAN_SQL, SCHEDULER_GATES_SCAN_SQL, SCHEDULER_LIFETIMES_SCAN_SQL,
+    SCHEDULER_NODES_SCAN_SQL, SCHEDULER_RECOVERY_SCAN_SQL, SCHEMA_VERSION,
 };
 use dagger_workflow_core::store::{
     CancelRun, ClaimNodeAttempt, ClaimNodeAttemptResult, CompleteAttempt, CompleteAttemptResult,
@@ -250,6 +250,156 @@ async fn seed_action_definition(
 }
 
 #[tokio::test]
+async fn point_reads_use_scoped_authority_without_loading_unrelated_rows() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+    let store = SqliteWorkflowStore::open_url("sqlite::memory:", clock, objects.clone())
+        .await
+        .unwrap();
+    let run_id = Id::new("shared-run").unwrap();
+    let node_id = Id::new("action").unwrap();
+    let attempt_id = Id::new("shared-attempt").unwrap();
+    for tenant in ["point-read-a", "point-read-b"] {
+        let fixture = seed_action_definition(&store, &objects, tenant).await;
+        let claim = store
+            .acquire_engine_claim(&fixture.scope, Id::new("shared-engine").unwrap())
+            .await
+            .unwrap();
+        start_and_claim_action(
+            &store,
+            &fixture,
+            &claim.permit,
+            run_id.as_str(),
+            attempt_id.as_str(),
+        )
+        .await;
+    }
+    // An unrelated malformed authority row must not expand a point read into a
+    // whole-run read. Projection rows are not the source of either result.
+    sqlx::query("UPDATE dagger_workflow_node_run_rows SET row_data = '{' WHERE sub_id = 'succeed'")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM dagger_workflow_nodes")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM dagger_workflow_attempts")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    for tenant in ["point-read-a", "point-read-b"] {
+        let workflow_scope = scope(tenant);
+        let node = store
+            .get_node(&workflow_scope, &run_id, &node_id)
+            .await
+            .unwrap();
+        let attempt = store
+            .get_attempt(&workflow_scope, &run_id, &attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(node.scope, workflow_scope);
+        assert_eq!(node.node_instance_id, node_id);
+        assert_eq!(node.status, NodeState::Running);
+        assert_eq!(attempt.scope, workflow_scope);
+        assert_eq!(attempt.node_instance_id, node_id);
+        assert_eq!(attempt.attempt_id, attempt_id);
+    }
+    for missing_scope in [
+        scope("point-read-missing"),
+        ExecutionScope {
+            tenant_id: ScopeAtom::new("point-read-a").unwrap(),
+            namespace: ScopeAtom::new("other").unwrap(),
+        },
+    ] {
+        assert!(matches!(
+            store.get_node(&missing_scope, &run_id, &node_id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store
+                .get_attempt(&missing_scope, &run_id, &attempt_id)
+                .await,
+            Err(StoreError::NotFound)
+        ));
+    }
+    // Row identities must also match the requested primary key, even when
+    // the encoded row's scope is valid.
+    let workflow_scope = scope("point-read-a");
+    let mut node = store
+        .get_node(&workflow_scope, &run_id, &node_id)
+        .await
+        .unwrap();
+    node.node_instance_id = Id::new("other-node").unwrap();
+    sqlx::query("UPDATE dagger_workflow_node_run_rows SET row_data = ? WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?")
+        .bind(serde_jcs::to_string(&node).unwrap())
+        .bind(workflow_scope.tenant_id.as_str())
+        .bind(workflow_scope.namespace.as_str())
+        .bind(run_id.as_str())
+        .bind(node_id.as_str())
+        .execute(store.pool()).await.unwrap();
+    assert!(matches!(
+        store.get_node(&workflow_scope, &run_id, &node_id).await,
+        Err(StoreError::CorruptControlPlane)
+    ));
+    let mut attempt = store
+        .get_attempt(&workflow_scope, &run_id, &attempt_id)
+        .await
+        .unwrap();
+    attempt.run_id = Id::new("other-run").unwrap();
+    sqlx::query("UPDATE dagger_workflow_attempt_rows SET row_data = ? WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?")
+        .bind(serde_jcs::to_string(&attempt).unwrap())
+        .bind(workflow_scope.tenant_id.as_str())
+        .bind(workflow_scope.namespace.as_str())
+        .bind(run_id.as_str())
+        .bind(attempt_id.as_str())
+        .execute(store.pool()).await.unwrap();
+    assert!(matches!(
+        store
+            .get_attempt(&workflow_scope, &run_id, &attempt_id)
+            .await,
+        Err(StoreError::CorruptControlPlane)
+    ));
+}
+
+#[tokio::test]
+async fn point_reads_search_all_four_primary_key_columns() {
+    let clock = Arc::new(TestClock::new(Timestamp(0)));
+    let store = SqliteWorkflowStore::open_url(
+        "sqlite::memory:",
+        clock.clone(),
+        Arc::new(InMemoryObjectStore::new(clock)),
+    )
+    .await
+    .unwrap();
+    for statement in [NODE_POINT_SQL, ATTEMPT_POINT_SQL] {
+        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {statement}"))
+            .bind("tenant")
+            .bind("workflow")
+            .bind("run")
+            .bind("item")
+            .fetch_all(store.pool())
+            .await
+            .unwrap();
+        let details: Vec<String> = rows.into_iter().map(|row| row.get("detail")).collect();
+        assert!(
+            details.iter().all(|detail| !detail.contains("SCAN ")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH ")
+                    && detail.contains("tenant_id=?")
+                    && detail.contains("namespace=?")
+                    && detail.contains("entity_id=?")
+                    && detail.contains("sub_id=?")
+            }),
+            "{details:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn publish_revision_reuses_existing_schema_artifact_refs() {
     let clock = Arc::new(TestClock::new(Timestamp(0)));
     let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
@@ -393,6 +543,8 @@ async fn seed_approval_definition(
                     pointer: String::new(),
                 },
                 gate: ApprovalGateConfig {
+                    decision_output: false,
+                    decision_schema_digest: None,
                     expires_after_ms: 100_000,
                     on_expiry: ApprovalExpiryPolicy::Reject,
                     authorization: DecisionAuthorizationPolicy {
@@ -805,7 +957,7 @@ async fn standalone_open_reopens_a_converged_migration() {
     .fetch_all(reopened.pool())
     .await
     .unwrap();
-    assert_eq!(versions, vec![1, 2, 3]);
+    assert_eq!(versions, vec![1, 2, 3, 4]);
     let error_message_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts')
          WHERE name = 'error_message'",
@@ -814,6 +966,10 @@ async fn standalone_open_reopens_a_converged_migration() {
     .await
     .unwrap();
     assert_eq!(error_message_columns, 1);
+    let cache_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts') WHERE name IN ('cache_key', 'cache_sequence')",
+    ).fetch_one(reopened.pool()).await.unwrap();
+    assert_eq!(cache_columns, 2);
 }
 
 #[tokio::test]
@@ -1340,6 +1496,10 @@ async fn complete_map_rehydrates_pinned_output_schema_after_restart() {
                     value: serde_json::json!([{"value": 1}]),
                 },
                 max_items: 1,
+                on_child_failure:
+                    dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+                min_successful_children: None,
+                item_key_pointer: None,
                 max_concurrency: 1,
                 action: ActionReference {
                     name: "map.action".to_owned(),

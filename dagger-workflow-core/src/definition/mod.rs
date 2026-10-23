@@ -60,6 +60,15 @@ pub enum NodeDefinition {
         max_items: u32,
         /// Maximum concurrent children.
         max_concurrency: u32,
+        /// Whether an ordinary failed child cancels its siblings or is recorded.
+        #[serde(default, skip_serializing_if = "MapChildFailurePolicy::is_default")]
+        on_child_failure: MapChildFailurePolicy,
+        /// Required successes; omission requires every child to succeed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_successful_children: Option<u32>,
+        /// Optional pointer selecting each item's unique nonempty string key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_key_pointer: Option<String>,
         /// Pinned child action contract.
         action: ActionReference,
         /// Explicit child input bindings.
@@ -113,6 +122,23 @@ pub enum NodeDefinition {
         /// Persistence-safe failure message.
         message: String,
     },
+}
+
+/// Treatment of ordinary terminal Map child failures.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapChildFailurePolicy {
+    /// Fail immediately and cancel sibling work.
+    #[default]
+    CancelSiblings,
+    /// Finish every child, then evaluate the success threshold.
+    Continue,
+}
+
+impl MapChildFailurePolicy {
+    fn is_default(&self) -> bool {
+        *self == Self::CancelSiblings
+    }
 }
 
 /// An executable action reference as represented in definition JSON.
@@ -401,6 +427,16 @@ pub struct ApprovalGateConfig {
     pub on_expiry: ApprovalExpiryPolicy,
     /// Immutable decision authorization policy.
     pub authorization: DecisionAuthorizationPolicy,
+    /// Resolve both human decisions as successful data for downstream routing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub decision_output: bool,
+    /// Optional pinned schema for human payloads. Expiry always emits null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_schema_digest: Option<Digest>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Structured, closed validation error categories.
@@ -735,6 +771,30 @@ pub fn resolve_publication(
         }
     }
     for node in &unresolved.definition.nodes {
+        if let NodeDefinition::Approval { id, gate, .. } = node {
+            if let Some(digest) = &gate.decision_schema_digest {
+                require_publication_schema(
+                    resolver,
+                    digest,
+                    format!("/nodes/{}/gate/decision_schema_digest", id.as_str()),
+                    &mut schemas,
+                    &mut errors,
+                );
+                if let Some(schema) = schemas.get(digest) {
+                    let supported = serde_jcs::to_vec(schema).ok().is_some_and(|bytes| {
+                        crate::memory::validate_schema_document(&bytes).is_ok()
+                    });
+                    if !supported {
+                        errors.push(error(
+                            ValidationErrorKind::SchemaSubsetUnsupported,
+                            format!("/nodes/{}/gate/decision_schema_digest", id.as_str()),
+                            "decision schema uses unsupported features",
+                            &["use the supported schema subset"],
+                        ));
+                    }
+                }
+            }
+        }
         validate_publication_artifacts(node, resolver, &mut errors);
     }
     if errors.is_empty() {
@@ -766,6 +826,15 @@ fn require_publication_schema(
                     path,
                     "schema document bytes do not match its pinned digest",
                     &["store the exact supported-subset schema document"],
+                ));
+            } else if document.value.get("schema_format").is_some()
+                && crate::action::schema::validate_opaque_bundle(&document.value).is_err()
+            {
+                errors.push(error(
+                    ValidationErrorKind::SchemaSubsetUnsupported,
+                    path,
+                    "opaque schema bundle is malformed or has unresolved references",
+                    &["supply an explicit host-validated bundle with every referenced document"],
                 ));
             } else {
                 schemas.insert(digest.clone(), document.value);
@@ -1013,14 +1082,71 @@ fn binding_source_schema(
                 // target failed as BindingTypeMismatch, and dropping `type` from
                 // the target to dodge the check was then rejected by the schema
                 // subset validator, which requires `type` on every node.
-                NodeDefinition::Map { action, .. } => {
+                NodeDefinition::Map {
+                    action,
+                    on_child_failure,
+                    ..
+                } => {
                     let mut aggregate = serde_json::Map::new();
                     aggregate.insert("type".to_string(), Value::String("array".to_string()));
-                    aggregate.insert(
-                        "items".to_string(),
-                        schemas.get(&action.output_schema_digest)?.clone(),
-                    );
+                    let mut item_schema = schemas.get(&action.output_schema_digest)?.clone();
+                    if *on_child_failure == MapChildFailurePolicy::Continue {
+                        if let Some(object) = item_schema.as_object_mut() {
+                            if let Some(kind) = object.get_mut("type") {
+                                let mut kinds = kind
+                                    .as_array()
+                                    .cloned()
+                                    .unwrap_or_else(|| vec![kind.clone()]);
+                                if !kinds.contains(&Value::String("null".to_owned())) {
+                                    kinds.push(Value::String("null".to_owned()));
+                                }
+                                *kind = Value::Array(kinds);
+                            }
+                        }
+                        item_schema = serde_json::json!({
+                            "type": "object", "additionalProperties": false,
+                            "required": ["index", "item_digest", "status", "output", "error_class", "message"],
+                            "properties": {
+                                "index": {"type":"integer"}, "item_digest":{"type":"string"},
+                                "status":{"type":"string"}, "output":item_schema,
+                                "error_class":{"type":["string","null"]}, "message":{"type":["string","null"]}
+                            }
+                        });
+                    }
+                    aggregate.insert("items".to_string(), item_schema);
                     Value::Object(aggregate)
+                }
+                NodeDefinition::Approval { gate, .. } if gate.decision_output => {
+                    let mut properties = serde_json::Map::new();
+                    properties.insert(
+                        "decision".to_owned(),
+                        serde_json::json!({"type":"string", "enum":["approve", "reject"]}),
+                    );
+                    properties.insert(
+                        "source".to_owned(),
+                        serde_json::json!({"type":"string", "enum":["human", "expiry"]}),
+                    );
+                    properties.insert(
+                        "principal".to_owned(),
+                        serde_json::json!({"type":["string", "null"]}),
+                    );
+                    let payload_schema = if let Some(digest) = &gate.decision_schema_digest {
+                        schemas.get(digest)?.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    properties.insert("payload".to_owned(), payload_schema);
+                    properties.insert(
+                        "payload_ref".to_owned(),
+                        serde_json::json!({
+                            "type":["object", "null"], "additionalProperties":false,
+                            "properties": {
+                                "artifact_ref_id":{"type":"string"}, "digest":{"type":"string"},
+                                "size_bytes":{"type":"string"}, "media_type":{"type":"string"}
+                            }
+                        }),
+                    );
+                    serde_json::json!({"type":"object", "properties":properties})
                 }
                 _ => return None,
             };
@@ -1087,13 +1213,16 @@ fn schemas_are_assignable(source: &Value, target: &Value) -> bool {
 }
 
 fn schema_at_pointer<'a>(schema: &'a Value, pointer: &str) -> Option<&'a Value> {
-    if pointer.is_empty() {
+    if pointer.is_empty() || crate::action::schema::is_opaque_bundle(schema) {
         return Some(schema);
     }
     pointer
         .strip_prefix('/')?
         .split('/')
         .try_fold(schema, |current, segment| {
+            if crate::action::schema::is_opaque_bundle(current) {
+                return Some(current);
+            }
             let segment = segment.replace("~1", "/").replace("~0", "~");
             current
                 .get("properties")?
@@ -1109,7 +1238,9 @@ fn schema_at_binding_target<'a>(
     let mut current = schema;
     let mut ancestor = String::new();
     for segment in pointer.strip_prefix('/').unwrap_or(pointer).split('/') {
-        if current.as_object().is_some_and(serde_json::Map::is_empty) {
+        if current.as_object().is_some_and(serde_json::Map::is_empty)
+            || crate::action::schema::is_opaque_bundle(current)
+        {
             return Ok(None);
         }
         let decoded = segment.replace("~1", "/").replace("~0", "~");
@@ -1124,7 +1255,9 @@ fn schema_at_binding_target<'a>(
         ancestor.push('/');
         ancestor.push_str(segment);
     }
-    if current.as_object().is_some_and(serde_json::Map::is_empty) {
+    if current.as_object().is_some_and(serde_json::Map::is_empty)
+        || crate::action::schema::is_opaque_bundle(current)
+    {
         Ok(None)
     } else {
         Ok(Some(current))
@@ -1418,6 +1551,8 @@ fn validate_node(
             items,
             max_items,
             max_concurrency,
+            min_successful_children,
+            item_key_pointer,
             action,
             bindings,
             retry,
@@ -1427,6 +1562,9 @@ fn validate_node(
             ..
         } => {
             validate_source(id, items, false, errors);
+            if let Some(pointer) = item_key_pointer {
+                validate_pointer(id, pointer, errors);
+            }
             if *max_items == 0
                 || *max_items > 10_000
                 || *max_concurrency == 0
@@ -1434,6 +1572,14 @@ fn validate_node(
                 || max_concurrency > max_items
             {
                 errors.push(error(ValidationErrorKind::MapBoundsInvalid, format!("/nodes/{}/max_concurrency", id.0), "Map requires 1 <= max_concurrency <= max_items <= 10000 and max_concurrency <= 1024", &["set positive bounded max_items and max_concurrency"]));
+            }
+            if min_successful_children.is_some_and(|minimum| minimum > *max_items) {
+                errors.push(error(
+                    ValidationErrorKind::MapBoundsInvalid,
+                    format!("/nodes/{}/min_successful_children", id.0),
+                    "Map minimum successes cannot exceed max_items",
+                    &["use a threshold within the item bound"],
+                ));
             }
             validate_action(
                 id,
@@ -1541,6 +1687,16 @@ fn validate_node(
             ..
         } => {
             validate_source(id, request, false, errors);
+            if let Some(digest) = &gate.decision_schema_digest {
+                if !gate.decision_output || Digest::new(digest.as_str()).is_err() {
+                    errors.push(error(
+                        ValidationErrorKind::InvalidField,
+                        format!("/nodes/{}/gate/decision_schema_digest", id.as_str()),
+                        "decision_schema_digest requires decision_output and a valid digest",
+                        &["enable decision_output and pin the human payload schema"],
+                    ));
+                }
+            }
             if gate.expires_after_ms == 0 || gate.expires_after_ms > 31_536_000_000 {
                 errors.push(error(
                     ValidationErrorKind::InvalidField,
@@ -1602,8 +1758,7 @@ fn validate_action(
     next: &[Id],
     errors: &mut Vec<DefinitionValidationError>,
 ) {
-    if action.name.is_empty()
-        || action.name.len() > 200
+    if !valid_action_name(&action.name)
         || action.contract_version.is_empty()
         || action.contract_version.len() > 64
         || [
@@ -2104,6 +2259,14 @@ fn valid_id(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
+fn valid_action_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 200
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'/' | b'@' | b'-')
+        })
+}
 fn valid_digest(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256:")
@@ -2141,7 +2304,7 @@ fn is_scalar(value: &Value) -> bool {
     !matches!(value, Value::Array(_) | Value::Object(_))
 }
 
-struct NoDuplicateJson(Value);
+pub(crate) struct NoDuplicateJson(pub(crate) Value);
 impl<'de> Deserialize<'de> for NoDuplicateJson {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -2272,6 +2435,36 @@ mod tests {
             run_input_schema_digest: digest(),
             run_output_schema_digest: digest(),
             nodes: roots,
+        }
+    }
+
+    #[test]
+    fn versioned_action_names_match_the_published_name_grammar() {
+        let schema: Value = serde_json::from_str(&definition_json_schema()).unwrap();
+        let pattern = schema["$defs"]["action_pin"]["properties"]["name"]["pattern"]
+            .as_str()
+            .unwrap();
+        let grammar = regex_lite::Regex::new(pattern).unwrap();
+        for (name, valid) in [
+            ("acme.tool:text.word-count@v1", true),
+            ("acme/tool@v2", true),
+            ("acme.tool", true),
+            ("@v1", false),
+            ("acme.tool bad", false),
+            ("acme.tool?alias", false),
+            ("", false),
+        ] {
+            assert_eq!(grammar.is_match(name), valid, "schema: {name:?}");
+            let mut definition = multiple_root_definition(["alfa", "zulu"]);
+            let NodeDefinition::Action { action, .. } = &mut definition.nodes[0] else {
+                unreachable!();
+            };
+            action.name = name.to_owned();
+            assert_eq!(
+                validate_definition(&definition).is_ok(),
+                valid,
+                "validator: {name:?}"
+            );
         }
     }
 

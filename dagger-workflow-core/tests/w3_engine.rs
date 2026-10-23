@@ -1349,6 +1349,10 @@ fn map_workflow(
                 id: id("map"),
                 items: BindingSource::Constant { value: items },
                 max_items,
+                on_child_failure:
+                    dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+                min_successful_children: None,
+                item_key_pointer: None,
                 max_concurrency,
                 action: ActionReference {
                     name: descriptor.name.clone(),
@@ -1395,6 +1399,9 @@ fn two_map_workflow(definition_id: &str, descriptor: &ActionDescriptor) -> Workf
             value: json!([value]),
         },
         max_items: 1,
+        on_child_failure: dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+        min_successful_children: None,
+        item_key_pointer: None,
         max_concurrency: 1,
         action: action.clone(),
         bindings: vec![MapBinding {
@@ -2141,6 +2148,8 @@ fn approval_expiry_advances_downstream_frontier_through_engine_ticks() {
                         pointer: String::new(),
                     },
                     gate: ApprovalGateConfig {
+                        decision_output: false,
+                        decision_schema_digest: None,
                         expires_after_ms: 50,
                         on_expiry: ApprovalExpiryPolicy::Approve,
                         authorization: DecisionAuthorizationPolicy {
@@ -2248,6 +2257,8 @@ fn approval_decision_winning_between_due_scan_and_expiry_is_benign() {
                         pointer: String::new(),
                     },
                     gate: ApprovalGateConfig {
+                        decision_output: false,
+                        decision_schema_digest: None,
                         expires_after_ms: 50,
                         on_expiry: ApprovalExpiryPolicy::Approve,
                         authorization: DecisionAuthorizationPolicy {
@@ -2387,6 +2398,10 @@ fn map_nodes_expand_schedule_children_and_complete_parent_through_ticks() {
                         value: json!([{"value": 2}, {"value": 1}]),
                     },
                     max_items: 2,
+                    on_child_failure:
+                        dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+                    min_successful_children: None,
+                    item_key_pointer: None,
                     max_concurrency: 2,
                     action: ActionReference {
                         name: descriptor.name.clone(),
@@ -3065,6 +3080,8 @@ fn run_lifetime_expiry_terminalizes_through_engine_ticks() {
                         pointer: String::new(),
                     },
                     gate: ApprovalGateConfig {
+                        decision_output: false,
+                        decision_schema_digest: None,
                         expires_after_ms: 10_000,
                         on_expiry: ApprovalExpiryPolicy::Reject,
                         authorization: DecisionAuthorizationPolicy {
@@ -3165,6 +3182,8 @@ fn blocked_run_fence_precedes_exact_approval_replay() {
                         pointer: String::new(),
                     },
                     gate: ApprovalGateConfig {
+                        decision_output: false,
+                        decision_schema_digest: None,
                         expires_after_ms: 10_000,
                         on_expiry: ApprovalExpiryPolicy::Reject,
                         authorization: DecisionAuthorizationPolicy {

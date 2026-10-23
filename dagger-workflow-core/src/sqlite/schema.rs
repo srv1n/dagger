@@ -7,7 +7,7 @@ use crate::store::StoreError;
 /// Current durable schema version.
 ///
 /// This adapter has one coherent baseline schema.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATIONS_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS dagger_workflow_schema_migrations (
     version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL,
@@ -188,7 +188,7 @@ const MIGRATION_1: &[&str] = &[
         engine_generation INTEGER NOT NULL, completion_credential_digest TEXT NOT NULL,
         reservation_units INTEGER NOT NULL, started_at_ms INTEGER NOT NULL, deadline_at_ms INTEGER NOT NULL,
         finished_at_ms INTEGER, output_digest TEXT, diagnostics_digest TEXT,
-        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0), error_message TEXT,
+        version INTEGER NOT NULL DEFAULT 1 CHECK(version > 0), error_message TEXT, cache_key TEXT, cache_sequence INTEGER,
         PRIMARY KEY (tenant_id, namespace, run_id, attempt_id),
         UNIQUE (tenant_id, namespace, run_id, node_id, attempt_number)
     ) STRICT"#,
@@ -286,6 +286,47 @@ const MIGRATION_2: &[&str] = &[
         ON dagger_workflow_external_handles(tenant_id, namespace, run_id, idempotency_key, kind)"#,
 ];
 
+const MIGRATION_4: &[&str] = &[
+    r#"CREATE INDEX IF NOT EXISTS dagger_workflow_attempts_cache_lookup
+        ON dagger_workflow_attempts(tenant_id, namespace, cache_key, status, cache_sequence DESC, run_id DESC, attempt_id DESC)"#,
+];
+
+async fn apply_action_cache_migration(pool: &SqlitePool) -> Result<(), StoreError> {
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+    let column_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts') WHERE name = 'cache_key'",
+    ).fetch_one(&mut *transaction).await.map_err(|_| StoreError::StorageUnavailable)?;
+    if column_exists == 0 {
+        sqlx::query("ALTER TABLE dagger_workflow_attempts ADD COLUMN cache_key TEXT")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
+    }
+    let sequence_exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('dagger_workflow_attempts') WHERE name = 'cache_sequence'",
+    ).fetch_one(&mut *transaction).await.map_err(|_| StoreError::StorageUnavailable)?;
+    if sequence_exists == 0 {
+        sqlx::query("ALTER TABLE dagger_workflow_attempts ADD COLUMN cache_sequence INTEGER")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
+    }
+    for statement in MIGRATION_4 {
+        sqlx::query(statement)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| StoreError::TransactionFailed)?;
+    }
+    record_version(&mut transaction, 4).await?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StoreError::TransactionFailed)
+}
+
 async fn apply_attempt_error_message_migration(pool: &SqlitePool) -> Result<(), StoreError> {
     let mut transaction = pool
         .begin()
@@ -318,22 +359,26 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         .await
         .map_err(|_| StoreError::StorageUnavailable)?;
 
-    let applied: Option<i64> =
-        sqlx::query_scalar("SELECT MAX(version) FROM dagger_workflow_schema_migrations")
-            .fetch_one(pool)
-            .await
-            .map_err(|_| StoreError::StorageUnavailable)?;
-    if applied.is_some_and(|version| version > SCHEMA_VERSION) {
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM dagger_workflow_schema_migrations ORDER BY version",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|_| StoreError::StorageUnavailable)?;
+    if applied.iter().any(|version| *version > SCHEMA_VERSION) {
         return Err(StoreError::TransactionFailed);
     }
-    if applied.unwrap_or(0) < 1 {
+    if !applied.contains(&1) {
         apply_version(pool, 1, MIGRATION_1).await?;
     }
-    if applied.unwrap_or(0) < 2 {
+    if !applied.contains(&2) {
         apply_version(pool, 2, MIGRATION_2).await?;
     }
-    if applied.unwrap_or(0) < 3 {
+    if !applied.contains(&3) {
         apply_attempt_error_message_migration(pool).await?;
+    }
+    if !applied.contains(&4) {
+        apply_action_cache_migration(pool).await?;
     }
     validate_coherent_schema(pool).await?;
     Ok(())
@@ -343,6 +388,7 @@ async fn validate_coherent_schema(pool: &SqlitePool) -> Result<(), StoreError> {
     for statement in std::iter::once(MIGRATIONS_TABLE_DDL)
         .chain(MIGRATION_1.iter().copied())
         .chain(MIGRATION_2.iter().copied())
+        .chain(MIGRATION_4.iter().copied())
     {
         let mut words = statement.split_whitespace();
         let object_type = match (words.next(), words.next()) {
@@ -362,9 +408,27 @@ async fn validate_coherent_schema(pool: &SqlitePool) -> Result<(), StoreError> {
                 .await
                 .map_err(|_| StoreError::StorageUnavailable)?;
         let expected = statement.replacen(" IF NOT EXISTS", "", 1);
-        if present.as_deref().map(normalize_schema_sql).as_deref()
-            != Some(normalize_schema_sql(&expected).as_str())
-        {
+        let normalize = |statement: &str| {
+            let mut normalized = normalize_schema_sql(statement);
+            if object_name == "dagger_workflow_attempts" {
+                // Restarted optional-column migrations can restore a missing
+                // column after newer columns. Named SQL fields make that order
+                // immaterial; every field's exact declaration remains checked.
+                for declaration in [
+                    "error_message text",
+                    "cache_key text",
+                    "cache_sequence integer",
+                ] {
+                    let present = normalized.contains(declaration);
+                    normalized = normalized
+                        .replace(&format!("{declaration} , "), "")
+                        .replace(&format!(", {declaration}"), "");
+                    normalized.push_str(&format!(" | {declaration}={present}"));
+                }
+            }
+            normalized
+        };
+        if present.as_deref().map(normalize).as_deref() != Some(normalize(&expected).as_str()) {
             return Err(StoreError::TransactionFailed);
         }
     }

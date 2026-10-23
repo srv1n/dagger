@@ -78,6 +78,11 @@ An ordinary binding can read from these sources:
 
 A Map child can also read the current item and its zero-based index.
 
+Maps accept optional `on_child_failure: continue`, `min_successful_children`,
+and `item_key_pointer`. The minimum defaults to the actual item count. The key
+pointer selects a unique string within each item for part locks. Omit these
+fields to keep legacy behavior.
+
 Bindings use RFC 6901 JSON pointers. The validator rejects overlapping target pointers.
 
 A Choice outcome names one guarded node. `kind: node` activates it; `kind: skip` marks it skipped.
@@ -102,6 +107,49 @@ The parser also limits YAML depth, aliases, anchors, scalar bytes, events, and e
 Each `Action` and Map action has five exact pin fields. The engine requires an exact registry match before it starts or resumes the run.
 
 The example YAML files use zero digests as authoring placeholders. Example code replaces these values before publication. Do not publish a definition with placeholder digests.
+
+## Action manifests
+
+The action manifest loader accepts JSON and YAML. Entries declare a name,
+contract version, input and output schema documents, implementation digest,
+optional `memoize`, and optional `required_capabilities`. Canonical JSON supplies
+schema digests. The loader checks the publication schema subset by default. A host factory
+supplies implementations whose descriptors match each entry's five pins.
+Multiple entries can share command code while keeping distinct descriptors.
+
+Bulk registration validates all entries before changing the registry. Schema
+publication supplies objects for the ordinary publication resolver. Capability
+tags are metadata in this local milestone. They do not dispatch remote workers.
+
+## Host-validated schema bundles
+
+The host can explicitly select `SchemaValidationMode::Opaque` for JSON Schema
+2020-12 documents outside Dagger's supported validation subset. The canonical
+`dagger.opaque-schema-bundle/v1` envelope retains the original documents and
+their complete reference closure. No schema text is rewritten and no network
+resolution is performed. An unresolved reference rejects publication. Changing
+a referenced document changes every consuming bundle digest. Unused documents
+are excluded.
+
+Dagger verifies the bundle structure, bytes, and digest. **The host action must
+validate input and output payloads.** Static binding checks treat opaque shapes
+as unknown. The same responsibility applies to host-validated run input/output
+and approval payload schemas if the host selects this mode for them. Unsupported
+unmarked schemas still reject; the existing default validation is unchanged.
+
+Bundle digests differ from raw-document digests. The loader checks any declared
+raw schema digests, then returns action references and run-schema digests for
+the canonical bundles. Use these returned pins when publishing.
+
+## Structured decisions
+
+An Approval gate can enable `decision_output` and declare a
+`decision_schema_digest` for its human JSON payload. Publish that schema through
+the approval-schema API. Both approve and reject produce a successful decision
+result in this mode. Bindings can read its payload directly; Choice can route on
+the verdict. Expiry produces its configured decision with a null payload and
+does not apply the human payload schema. Default rejection still fails the node.
+Identity, allowlists, first-valid resolution, and replay checks still apply.
 
 ## Opaque schema values
 

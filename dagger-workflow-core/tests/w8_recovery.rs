@@ -1273,6 +1273,10 @@ fn map_definition(schema: &Digest) -> WorkflowDefinition {
                     value: json!([{"value": 1}, {"value": 2}, {"value": 3}]),
                 },
                 max_items: 8,
+                on_child_failure:
+                    dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+                min_successful_children: None,
+                item_key_pointer: None,
                 max_concurrency: 3,
                 action: action_reference("w8.item", schema),
                 bindings: vec![MapBinding {

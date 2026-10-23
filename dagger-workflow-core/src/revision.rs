@@ -35,6 +35,8 @@ pub struct WorkflowRevision {
     pub node_topological_ranks: BTreeMap<Id, TopologicalRank>,
     /// Ordered executable action pins.
     pub action_pins: Vec<ActionPin>,
+    /// Pinned human decision schemas keyed by Approval node ID.
+    pub approval_schema_refs: BTreeMap<String, JsonRef>,
     /// Publication database timestamp.
     pub published_at: Timestamp,
     /// Persistence-safe publishing principal ID.

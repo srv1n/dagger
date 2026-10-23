@@ -22,13 +22,13 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
 macro_rules! serde_public_struct {
-    ($module:ident, $type:path, { $($field:ident : $field_type:ty),* $(,)? }) => {
+    ($module:ident, $type:path, { $($(#[$attr:meta])* $field:ident : $field_type:ty),* $(,)? }) => {
         mod $module {
             use super::*;
 
             #[derive(Deserialize, Serialize)]
             pub(super) struct Repr {
-                $(pub(super) $field: $field_type),*
+                $($(#[$attr])* pub(super) $field: $field_type),*
             }
         }
 
@@ -127,6 +127,8 @@ serde_public_struct!(workflow_revision, WorkflowRevision, {
     node_count: u32,
     node_topological_ranks: BTreeMap<Id, TopologicalRank>,
     action_pins: Vec<ActionPin>,
+    #[serde(default)]
+    approval_schema_refs: BTreeMap<String, JsonRef>,
     published_at: Timestamp,
     published_by: String,
 });
@@ -149,6 +151,8 @@ serde_public_struct!(workflow_run, WorkflowRun, {
     revision_hash: Digest,
     input_ref: JsonRef,
     create_request_fingerprint: Digest,
+    #[serde(default)]
+    options: crate::pinning::RunOptions,
     status: RunState,
     failure_kind: Option<RunFailureKind>,
     failure_diagnostics_ref: Option<JsonRef>,
@@ -185,6 +189,8 @@ serde_public_struct!(node_run, NodeRun, {
     parent_map_instance_id: Option<NodeInstanceId>,
     map_item_index: Option<u32>,
     map_item_digest: Option<Digest>,
+    #[serde(default)]
+    map_item_key: Option<String>,
     topological_rank: TopologicalRank,
     status: crate::run::NodeState,
     blocked_from_status: Option<BlockedFromState>,
@@ -243,6 +249,12 @@ serde_public_struct!(node_attempt, NodeAttempt, {
     deadline_at: Timestamp,
     started_at: Timestamp,
     finished_at: Option<Timestamp>,
+    #[serde(default)]
+    memoization_key: Option<Digest>,
+    #[serde(default)]
+    memoization_sequence: Option<u64>,
+    #[serde(default)]
+    reuse_provenance: Option<crate::memoization::ReuseProvenance>,
     output_ref: Option<JsonRef>,
     artifact_refs: Vec<ArtifactRef>,
     error_class: Option<AttemptErrorClass>,

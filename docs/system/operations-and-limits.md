@@ -48,6 +48,10 @@ The host authenticates the principal. Dagger checks the durable allowlist. The f
 
 Do not accept an unauthenticated name from workflow input as identity.
 
+The structured approval helper publishes and validates a human JSON payload.
+A schema-invalid payload leaves the gate pending. Expiry uses a null payload.
+Repair follows a forward branch or starts a new run; definitions remain acyclic.
+
 ## Secrets
 
 Dagger has no secret store and no secret scanner.

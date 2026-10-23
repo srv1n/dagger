@@ -76,7 +76,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 200,
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$"
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$"
         },
         "contract_version": {
           "type": "string",
@@ -442,6 +442,17 @@
           "minimum": 1,
           "maximum": 1024
         },
+        "on_child_failure": {
+          "type": "string",
+          "enum": ["cancel_siblings", "continue"],
+          "default": "cancel_siblings"
+        },
+        "min_successful_children": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "item_key_pointer": { "$ref": "#/$defs/source_pointer" },
         "action": { "$ref": "#/$defs/action_pin" },
         "bindings": {
           "type": "array",
@@ -479,7 +490,9 @@
             },
             "authorization": {
               "$ref": "#/$defs/decision_authorization_policy"
-            }
+            },
+            "decision_output": { "type": "boolean", "default": false },
+            "decision_schema_digest": { "$ref": "#/$defs/digest" }
           }
         },
         "next": { "$ref": "#/$defs/targets" }

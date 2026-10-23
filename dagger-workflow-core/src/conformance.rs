@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Number of independent adapter-neutral cases.
-pub const CASE_COUNT: usize = 71;
+pub const CASE_COUNT: usize = 78;
 
 /// Stable case names reported by every adapter.
 pub const CASE_NAMES: [&str; CASE_COUNT] = [
@@ -77,6 +77,13 @@ pub const CASE_NAMES: [&str; CASE_COUNT] = [
     "expand_map_recomputes_identity",
     "map_concurrency_admission",
     "map_child_failure_cancels_siblings",
+    "map_continue_records_failure",
+    "map_continue_threshold_failure",
+    "map_continue_retry_exhaustion",
+    "map_continue_timeout_exhaustion",
+    "map_continue_unknown_exhaustion",
+    "map_continue_minimum_exceeds_actual_count",
+    "map_continue_empty_positive_minimum",
     "exponential_backoff_cap",
     "corrupt_unreachable_ref_rejected",
     "corrupt_run_produced_ref_accepted",
@@ -948,6 +955,8 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                     pointer: String::new(),
                 },
                 gate: ApprovalGateConfig {
+                    decision_output: false,
+                    decision_schema_digest: None,
                     expires_after_ms: 10_000,
                     on_expiry: ApprovalExpiryPolicy::Reject,
                     authorization: DecisionAuthorizationPolicy {
@@ -1261,7 +1270,22 @@ async fn prepare_map_conformance_with_limits<A: ConformanceAdapter>(
                 items: BindingSource::Constant {
                     value: Value::Array(values.clone()),
                 },
-                max_items: item_count.max(1),
+                max_items: if matches!(case, 406 | 407) {
+                    3
+                } else {
+                    item_count.max(1)
+                },
+                on_child_failure: if (401..=407).contains(&case) {
+                    crate::definition::MapChildFailurePolicy::Continue
+                } else {
+                    crate::definition::MapChildFailurePolicy::CancelSiblings
+                },
+                min_successful_children: match case {
+                    401 | 403 | 404 | 405 | 407 => Some(1),
+                    406 => Some(2),
+                    _ => None,
+                },
+                item_key_pointer: None,
                 max_concurrency,
                 action: ActionReference {
                     name: format!("map.action.{case}"),
@@ -1783,6 +1807,485 @@ async fn map_child_failure_cancels_siblings<A: ConformanceAdapter>(
         return Err(failure(case, "Map failure did not cancel its sibling"));
     }
     Ok(())
+}
+
+async fn map_continue_case<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<(), ConformanceFailure> {
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        case,
+        2,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "continue Map expansion failed"))?;
+    let mut values = Vec::new();
+    let mut permit = fixture.permit.clone();
+    for (index, item) in fixture.ordered_items.iter().enumerate() {
+        let child = adapter
+            .store()
+            .get_node(scope, &run_id, &item.child_id)
+            .await
+            .map_err(|_| failure(case, "continue child read failed"))?;
+        if child.status != NodeState::Ready {
+            return Err(failure(case, "failure cancelled an unfinished sibling"));
+        }
+        let attempt_id = id(&format!("continue-attempt-{index}"));
+        let claimed = adapter
+            .store()
+            .claim_node_attempt(
+                scope,
+                ClaimNodeAttempt {
+                    permit: permit.clone(),
+                    run_id: run_id.clone(),
+                    node_id: item.child_id.clone(),
+                    expected_node_version: child.version,
+                    attempt_id: attempt_id.clone(),
+                    worker_id: id("worker"),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.input.digest().clone(),
+                },
+            )
+            .await
+            .map_err(|_| failure(case, "continue child claim failed"))?;
+        let ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } = claimed
+        else {
+            return Err(failure(case, "continue child was not claimed"));
+        };
+        let output = if index == 0 {
+            Value::Null
+        } else {
+            json!({"item": 1})
+        };
+        let verified_output = if index == 0 {
+            None
+        } else {
+            Some(
+                adapter
+                    .objects()
+                    .put(
+                        scope,
+                        &serde_jcs::to_vec(&output).unwrap(),
+                        "application/json",
+                    )
+                    .await
+                    .map_err(|_| failure(case, "continue output publication failed"))?,
+            )
+        };
+        let outcome = if index == 0 {
+            if case == 403 {
+                ActionOutcome::retryable(
+                    "fixture.failed".to_owned(),
+                    "requested retryable failure".to_owned(),
+                    None,
+                    CostUnits(1),
+                )
+            } else {
+                ActionOutcome::permanent(
+                    "fixture.failed".to_owned(),
+                    "requested failure".to_owned(),
+                    None,
+                    CostUnits(1),
+                )
+            }
+        } else {
+            ActionOutcome::success(output.clone(), Vec::new(), CostUnits(1), None)
+        }
+        .map_err(|_| failure(case, "continue outcome invalid"))?;
+        if index == 0 && case == 405 {
+            adapter.advance_clock_ms(20_001);
+            permit = adapter
+                .store()
+                .acquire_engine_claim(scope, id("continue-recovery-engine"))
+                .await
+                .map_err(|_| failure(case, "continue takeover failed"))?
+                .permit;
+            adapter
+                .store()
+                .recover_abandoned_attempts_for_run(
+                    scope,
+                    crate::store::RecoverAbandonedAttemptsForRun {
+                        permit: permit.clone(),
+                        run_id: run_id.clone(),
+                    },
+                )
+                .await
+                .map_err(|_| failure(case, "continue recovery failed"))?;
+        } else {
+            if index == 0 && case == 404 {
+                adapter.advance_clock_ms(1_000);
+            }
+            let result = adapter
+                .store()
+                .complete_attempt(
+                    scope,
+                    CompleteAttempt {
+                        completion_credential,
+                        run_id: run_id.clone(),
+                        node_id: item.child_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        submitted_outcome: outcome,
+                        objects: CompletionObjects {
+                            output: verified_output,
+                            artifacts: Vec::new(),
+                            diagnostics: None,
+                        },
+                    },
+                )
+                .await
+                .map_err(|_| failure(case, "continue completion failed"))?;
+            if !matches!(
+                result,
+                CompleteAttemptResult::Applied(_)
+                    | CompleteAttemptResult::TimedOutAndStaleRecorded(_)
+            ) {
+                return Err(failure(case, "continue child terminalized the run"));
+            }
+        }
+        let child = adapter
+            .store()
+            .get_node(scope, &run_id, &item.child_id)
+            .await
+            .map_err(|_| failure(case, "continue final child read failed"))?;
+        let attempt = adapter
+            .store()
+            .get_latest_attempt(scope, &run_id, &item.child_id)
+            .await
+            .map_err(|_| failure(case, "continue final attempt read failed"))?;
+        values.push(crate::run::map_child_envelope(
+            &child,
+            attempt.as_ref(),
+            output,
+        ));
+        if index == 0 {
+            let parent = adapter
+                .store()
+                .get_node(scope, &run_id, &id("map"))
+                .await
+                .map_err(|_| failure(case, "continue parent read failed"))?;
+            if parent.status != NodeState::WaitingChildren {
+                return Err(failure(case, "Map did not wait for every child"));
+            }
+        }
+    }
+    let parent = adapter
+        .store()
+        .get_node(scope, &run_id, &id("map"))
+        .await
+        .map_err(|_| failure(case, "continue parent read failed"))?;
+    // The store verifies error metadata as well as successful output bytes.
+    let mut forged = values.clone();
+    forged[0]["message"] = json!("forged");
+    let forged_ref = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&forged).unwrap(),
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "forged aggregate publication failed"))?;
+    if adapter
+        .store()
+        .complete_map(
+            scope,
+            CompleteMap {
+                permit: permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: parent.version,
+                aggregate: forged_ref,
+            },
+        )
+        .await
+        != Err(StoreError::AggregateMismatch)
+    {
+        return Err(failure(case, "forged failure envelope accepted"));
+    }
+    let aggregate = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&values).unwrap(),
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "continue aggregate publication failed"))?;
+    let completed = adapter
+        .store()
+        .complete_map(
+            scope,
+            CompleteMap {
+                permit,
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: parent.version,
+                aggregate,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "continue Map completion failed"))?;
+    let expected = if case == 402 {
+        NodeState::Failed
+    } else {
+        NodeState::Succeeded
+    };
+    if completed.status != expected {
+        return Err(failure(case, "continue threshold result mismatch"));
+    }
+    let run = adapter
+        .store()
+        .get_run(scope, &run_id)
+        .await
+        .map_err(|_| failure(case, "continue run read failed"))?
+        .run;
+    if case == 402
+        && (run.status != RunState::Failed
+            || run.failure_kind != Some(RunFailureKind::MapChildFailed))
+    {
+        return Err(failure(case, "unmet threshold did not fail run"));
+    }
+    Ok(())
+}
+
+async fn map_continue_records_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_case(adapter, scope, 401).await
+}
+async fn map_continue_threshold_failure<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_case(adapter, scope, 402).await
+}
+async fn map_continue_retry_exhaustion<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_case(adapter, scope, 403).await
+}
+
+async fn map_continue_timeout_exhaustion<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_case(adapter, scope, 404).await
+}
+async fn map_continue_unknown_exhaustion<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_case(adapter, scope, 405).await
+}
+
+async fn map_continue_underfull_case<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    case: usize,
+) -> Result<(), ConformanceFailure> {
+    let count = if case == 406 { 1 } else { 0 };
+    let fixture = prepare_map_conformance(
+        adapter,
+        scope,
+        case,
+        count,
+        1,
+        RetryPolicy {
+            max_attempts: 1,
+            backoff: BackoffPolicy::Fixed { delay_ms: 0 },
+        },
+    )
+    .await?;
+    let run_id = id(&format!("map-run-{case}"));
+    let expanded = adapter
+        .store()
+        .expand_map(
+            scope,
+            ExpandMap {
+                permit: fixture.permit.clone(),
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: Version(1),
+                input: fixture.input.clone(),
+                ordered_items: fixture.ordered_items.clone(),
+                expansion_digest: fixture.expansion_digest,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "underfull Map did not expand"))?;
+    if expanded.status != NodeState::WaitingChildren {
+        return Err(failure(case, "underfull Map prematurely terminalized"));
+    }
+    let mut values = Vec::new();
+    for item in &fixture.ordered_items {
+        let child = adapter
+            .store()
+            .get_node(scope, &run_id, &item.child_id)
+            .await
+            .map_err(|_| failure(case, "underfull child read failed"))?;
+        let attempt_id = id("underfull-success-attempt");
+        let claimed = adapter
+            .store()
+            .claim_node_attempt(
+                scope,
+                ClaimNodeAttempt {
+                    permit: fixture.permit.clone(),
+                    run_id: run_id.clone(),
+                    node_id: item.child_id.clone(),
+                    expected_node_version: child.version,
+                    attempt_id: attempt_id.clone(),
+                    worker_id: id("worker"),
+                    bound_input: fixture.input.clone(),
+                    binding_derivation_digest: fixture.input.digest().clone(),
+                },
+            )
+            .await
+            .map_err(|_| failure(case, "underfull child claim failed"))?;
+        let ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } = claimed
+        else {
+            return Err(failure(case, "underfull child not claimed"));
+        };
+        let output = json!({"item": 0});
+        let output_ref = adapter
+            .objects()
+            .put(
+                scope,
+                &serde_jcs::to_vec(&output).unwrap(),
+                "application/json",
+            )
+            .await
+            .map_err(|_| failure(case, "underfull output publication failed"))?;
+        adapter
+            .store()
+            .complete_attempt(
+                scope,
+                CompleteAttempt {
+                    completion_credential,
+                    run_id: run_id.clone(),
+                    node_id: item.child_id.clone(),
+                    attempt_id,
+                    submitted_outcome: ActionOutcome::success(
+                        output.clone(),
+                        Vec::new(),
+                        CostUnits(1),
+                        None,
+                    )
+                    .map_err(|_| failure(case, "underfull outcome invalid"))?,
+                    objects: CompletionObjects {
+                        output: Some(output_ref),
+                        artifacts: Vec::new(),
+                        diagnostics: None,
+                    },
+                },
+            )
+            .await
+            .map_err(|_| failure(case, "underfull child completion failed"))?;
+        let child = adapter
+            .store()
+            .get_node(scope, &run_id, &item.child_id)
+            .await
+            .map_err(|_| failure(case, "underfull completed child read failed"))?;
+        if child.status != NodeState::Succeeded {
+            return Err(failure(case, "existing underfull child did not execute"));
+        }
+        values.push(crate::run::map_child_envelope(&child, None, output));
+    }
+    let aggregate = adapter
+        .objects()
+        .put(
+            scope,
+            &serde_jcs::to_vec(&values).unwrap(),
+            "application/json",
+        )
+        .await
+        .map_err(|_| failure(case, "underfull aggregate publication failed"))?;
+    let parent = adapter
+        .store()
+        .get_node(scope, &run_id, &id("map"))
+        .await
+        .map_err(|_| failure(case, "underfull parent read failed"))?;
+    let completed = adapter
+        .store()
+        .complete_map(
+            scope,
+            CompleteMap {
+                permit: fixture.permit,
+                run_id: run_id.clone(),
+                map_node_id: id("map"),
+                expected_node_version: parent.version,
+                aggregate,
+            },
+        )
+        .await
+        .map_err(|_| failure(case, "underfull Map completion failed"))?;
+    let run = adapter
+        .store()
+        .get_run(scope, &run_id)
+        .await
+        .map_err(|_| failure(case, "underfull run read failed"))?
+        .run;
+    if completed.status != NodeState::Failed
+        || run.status != RunState::Failed
+        || run.failure_kind != Some(RunFailureKind::MapChildFailed)
+    {
+        return Err(failure(
+            case,
+            "unmet minimum was not an ordinary Map failure",
+        ));
+    }
+    Ok(())
+}
+
+async fn map_continue_minimum_exceeds_actual_count<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_underfull_case(adapter, scope, 406).await
+}
+async fn map_continue_empty_positive_minimum<A: ConformanceAdapter>(
+    adapter: &A,
+    scope: &ExecutionScope,
+    _: &ExecutionScope,
+) -> Result<(), ConformanceFailure> {
+    map_continue_underfull_case(adapter, scope, 407).await
 }
 
 async fn exponential_backoff_cap<A: ConformanceAdapter>(
@@ -4839,6 +5342,8 @@ async fn prepare_approval_conformance<A: ConformanceAdapter>(
                     pointer: String::new(),
                 },
                 gate: ApprovalGateConfig {
+                    decision_output: false,
+                    decision_schema_digest: None,
                     expires_after_ms: 10_000,
                     on_expiry: ApprovalExpiryPolicy::Reject,
                     authorization: DecisionAuthorizationPolicy {
@@ -5063,6 +5568,31 @@ pub async fn run_conformance<A: ConformanceAdapter>(
     run_fixture!(
         "map_child_failure_cancels_siblings",
         map_child_failure_cancels_siblings
+    );
+    run_fixture!("map_continue_records_failure", map_continue_records_failure);
+    run_fixture!(
+        "map_continue_threshold_failure",
+        map_continue_threshold_failure
+    );
+    run_fixture!(
+        "map_continue_retry_exhaustion",
+        map_continue_retry_exhaustion
+    );
+    run_fixture!(
+        "map_continue_timeout_exhaustion",
+        map_continue_timeout_exhaustion
+    );
+    run_fixture!(
+        "map_continue_unknown_exhaustion",
+        map_continue_unknown_exhaustion
+    );
+    run_fixture!(
+        "map_continue_minimum_exceeds_actual_count",
+        map_continue_minimum_exceeds_actual_count
+    );
+    run_fixture!(
+        "map_continue_empty_positive_minimum",
+        map_continue_empty_positive_minimum
     );
     run_fixture!("exponential_backoff_cap", exponential_backoff_cap);
     run_fixture!(

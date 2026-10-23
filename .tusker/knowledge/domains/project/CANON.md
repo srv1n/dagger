@@ -39,6 +39,16 @@ state_rev: "sha256:771bd3601378b0338821268604f72ca36ed7df2e5788e877c3cd612d03b51
 - `ObjectStore` owns immutable bytes.
 - `ExecutionScope` isolates every tenant and namespace.
 - The host owns identity, secrets, process startup, and deployment policy.
+- Runs support opt-in partial Maps, manifest registration,
+  action-result reuse, keyed output locks, structured approval decisions, and
+  streamed binary artifact import and verified file snapshots.
+- Memoized actions declare all effective inputs and depend on content rather
+  than runtime identities. Cache and pin provenance passes ordinary completion
+  fences. Default Map and approval behavior remains compatible.
+- Capability tags are metadata; the repository has no remote worker service.
+- Versioned action names preserve `@`. A manifest can explicitly pin closed
+  JSON Schema 2020-12 bundles with host-owned payload validation. The default
+  schema subset remains validated by Dagger.
 
 ## Storage boundary
 

@@ -809,7 +809,9 @@ async fn main() -> DemoResult<()> {
     )
     .await?;
     for tick in 1..=20 {
-        let changes = engine.tick(&scope).await?;
+        // A tick can report no changes while a spawned action is still running.
+        // Wait for those actions before judging the next scheduler pass idle.
+        let changes = engine.run_until_idle(&scope, 1).await?;
         println!("  tick {tick}: {changes} durable change(s)");
         nodes = all_nodes(&store, &scope, &run_id).await?;
         print_new_events(

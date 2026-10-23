@@ -202,6 +202,8 @@ async fn seed<S: WorkflowStore>(
                     pointer: String::new(),
                 },
                 gate: ApprovalGateConfig {
+                    decision_output: false,
+                    decision_schema_digest: None,
                     expires_after_ms: EXPIRES_AFTER_MS,
                     on_expiry,
                     authorization: DecisionAuthorizationPolicy {

@@ -39,8 +39,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 6;
+const OBJECT_METADATA_BATCH_SIZE: usize = 128;
 
 pub use schema::SCHEMA_VERSION;
+
+#[doc(hidden)]
+pub const NODE_POINT_SQL: &str = "SELECT row_data FROM dagger_workflow_node_run_rows
+     WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?";
+
+#[doc(hidden)]
+pub const ATTEMPT_POINT_SQL: &str = "SELECT row_data FROM dagger_workflow_attempt_rows
+     WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?";
 
 #[doc(hidden)]
 pub const SCHEDULER_NODES_SCAN_SQL: &str = "SELECT nr.row_data
@@ -275,6 +284,7 @@ struct AuthorityLoad {
     object_digests: Vec<Digest>,
     artifact_ref_ids: Vec<Id>,
     external_idempotency_key: Option<String>,
+    reuse_source: Option<crate::memoization::ReuseProvenance>,
 }
 
 impl AuthorityLoad {
@@ -316,6 +326,11 @@ impl AuthorityLoad {
 
     fn artifacts(mut self, ids: impl IntoIterator<Item = Id>) -> Self {
         self.artifact_ref_ids.extend(ids);
+        self
+    }
+
+    fn reuse_source(mut self, source: Option<&crate::memoization::ReuseProvenance>) -> Self {
+        self.reuse_source = source.cloned();
         self
     }
 
@@ -1227,16 +1242,76 @@ where
         }
         object_digests.sort();
         object_digests.dedup();
-        for digest in object_digests {
+        for digests in object_digests.chunks(OBJECT_METADATA_BATCH_SIZE) {
+            // Keep the complete scope predicate visible to the static SQL gate;
+            // only the bounded number of placeholders is constructed dynamically.
+            let statement = format!(
+                "SELECT entity_id, sub_id, row_data, version FROM dagger_workflow_object_rows
+                 WHERE tenant_id = ? AND namespace = ? AND sub_id = '' AND entity_id IN ({})",
+                vec!["?"; digests.len()].join(", "),
+            );
+            let mut query = sqlx::query_as::<_, (String, String, String, i64)>(&statement)
+                .bind(scope.tenant_id.as_str())
+                .bind(scope.namespace.as_str());
+            for digest in digests {
+                query = query.bind(digest.as_str());
+            }
+            let rows: Vec<(String, String, String, i64)> = query
+                .fetch_all(&mut **connection)
+                .await
+                .map_err(|_| StoreError::StorageUnavailable)?;
+            for (entity_id, sub_id, row_data, version) in rows {
+                let key = AuthorityKey::new(OBJECT_ROWS, entity_id, sub_id);
+                decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
+                loaded.rows.insert(key, (row_data, version));
+            }
+        }
+        if let Some(source) = &request.reuse_source {
             Self::load_authority_point(
                 connection,
                 scope,
                 &mut loaded,
-                OBJECT_ROWS,
-                digest.as_str(),
-                "",
+                ATTEMPT_ROWS,
+                source.source_run_id.as_str(),
+                source.source_attempt_id.as_str(),
             )
             .await?;
+            if source.kind == crate::memoization::ReuseKind::Pinned {
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    RUN_ROWS,
+                    source.source_run_id.as_str(),
+                    "",
+                )
+                .await?;
+                Self::load_authority_point(
+                    connection,
+                    scope,
+                    &mut loaded,
+                    NODE_ROWS,
+                    source.source_run_id.as_str(),
+                    source.source_node_id.as_str(),
+                )
+                .await?;
+                if let Some(run) = loaded
+                    .state
+                    .runs
+                    .get(&(scope.clone(), source.source_run_id.clone()))
+                    .cloned()
+                {
+                    Self::load_authority_point(
+                        connection,
+                        scope,
+                        &mut loaded,
+                        REVISION_ROWS,
+                        run.definition_id.as_str(),
+                        run.revision_hash.as_str(),
+                    )
+                    .await?;
+                }
+            }
         }
         if request.run_id.is_none()
             && request.definition_id.is_none()
@@ -1246,6 +1321,7 @@ where
             && request.object_digests.is_empty()
             && request.artifact_ref_ids.is_empty()
             && request.external_idempotency_key.is_none()
+            && request.reuse_source.is_none()
         {
             // Only object_records uses this diagnostic, tenant-wide snapshot.
             for table in AUTHORITY_TABLES {
@@ -1791,8 +1867,8 @@ where
                  (tenant_id, namespace, run_id, attempt_id, node_id, attempt_number,
                   status, engine_generation, completion_credential_digest,
                   reservation_units, started_at_ms, deadline_at_ms, finished_at_ms,
-                  output_digest, diagnostics_digest, error_message, version)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                  output_digest, diagnostics_digest, error_message, cache_key, cache_sequence, version)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
             )
             .bind(attempt.scope.tenant_id.as_str())
             .bind(attempt.scope.namespace.as_str())
@@ -1820,6 +1896,8 @@ where
                     .map(|reference| reference.0.digest.as_str()),
             )
             .bind(attempt.error_message.as_deref())
+            .bind(attempt.memoization_key.as_ref().map(Digest::as_str))
+            .bind(attempt.memoization_sequence.map(Self::sql_integer).transpose()?)
             .execute(&mut **connection)
             .await
             .map_err(|_| StoreError::TransactionFailed)?;
@@ -2169,6 +2247,13 @@ where
             authority.revision.run_input_schema_ref.0,
             authority.revision.run_output_schema_ref.0,
         ];
+        refs.extend(
+            authority
+                .revision
+                .approval_schema_refs
+                .values()
+                .map(|reference| reference.0.clone()),
+        );
         if include_action_schemas {
             refs.extend(
                 authority
@@ -2836,8 +2921,16 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             .definition(&command.definition_id)
             .scope_counter()
     );
+    async fn publish_revision(
+        &self,
+        scope: &ExecutionScope,
+        command: PublishRevision,
+    ) -> Result<WorkflowRevision, StoreError> {
+        self.publish_revision_with_approval_schemas(scope, command, BTreeMap::new())
+            .await
+    }
     sql_command!(
-        publish_revision(command: PublishRevision) -> WorkflowRevision;
+        publish_revision_with_approval_schemas(command: PublishRevision, approval_schemas: BTreeMap<String, VerifiedObjectRef>) -> WorkflowRevision;
         AuthorityLoad::default()
             .definition(&command.definition_id)
             .revision(&command.definition_id, command.canonical_definition.digest())
@@ -2850,6 +2943,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
                         schemas.input_schema.digest(),
                         schemas.output_schema.digest(),
                     ]))
+                    .chain(approval_schemas.values().map(VerifiedObjectRef::digest))
             )
             // The macro's `scope` binding is not hygienically reachable here.
             // The reducer rejects `principal.scope() != scope` with InvalidField
@@ -2857,6 +2951,10 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             // request scope's tenant and namespace, so a mismatch can only make
             // these point loads miss.
             .artifacts(publish_revision_artifact_ids(command.principal.scope(), &command))
+            .artifacts(approval_schemas.values().map(|schema| artifact_ref_id(ArtifactRefIdentity {
+                scope: command.principal.scope(), digest: schema.digest(), kind: ArtifactKind::SchemaDocument,
+                producer_run_id: None, producer_node_id: None, producer_attempt_id: None, ordinal: 0,
+            })))
     );
     sql_engine_command!(acquire_engine_claim(instance_id: Id) -> AcquiredEngineClaim);
     sql_engine_command!(heartbeat_engine_claim(permit: &EnginePermit) -> EngineClaim);
@@ -2874,6 +2972,19 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             false,
         ).await?
     );
+    sql_command!(
+        create_run_with_options(command: CreateRunWithOptions) -> CommandReceipt;
+        AuthorityLoad::run(&command.command.run_id)
+            .revision(&command.command.definition_id, &command.command.revision_hash)
+            .receipt(CommandKindKey::Create, &command.command.idempotency_token)
+            .objects([command.command.input.digest()]);
+        |store, workflow_scope| store.hydrate_revision_schemas(
+            workflow_scope,
+            &command.command.definition_id,
+            &command.command.revision_hash,
+            false,
+        ).await?
+    );
     sql_command!(start_run(command: StartRun) -> WorkflowRun; AuthorityLoad::run(&command.run_id));
     sql_command!(
         suspend_incompatible(command: SuspendIncompatible) -> WorkflowRun;
@@ -2887,6 +2998,75 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         claim_node_attempt(command: ClaimNodeAttempt) -> ClaimNodeAttemptResult;
         AuthorityLoad::run(&command.run_id).objects([command.bound_input.digest()])
     );
+    sql_command!(
+        claim_reusable_node_attempt(command: ClaimReusableNodeAttempt) -> ClaimNodeAttemptResult;
+        AuthorityLoad::run(&command.claim.run_id).objects([command.claim.bound_input.digest()])
+            .reuse_source(command.reuse_provenance.as_ref())
+            .artifacts(command.memoization_artifact_refs.iter().map(|reference| reference.artifact_ref_id.clone()))
+    );
+    async fn get_action_invocation(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        invocation_id: &Id,
+    ) -> Result<crate::action::ActionInvocation, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(
+            "SELECT row_data FROM dagger_workflow_invocation_rows WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?",
+        ).bind(scope.tenant_id.as_str()).bind(scope.namespace.as_str()).bind(run_id.as_str()).bind(invocation_id.as_str())
+            .fetch_optional(&mut *connection).await.map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let invocation: crate::action::ActionInvocation =
+            decode_row(&data.ok_or(StoreError::NotFound)?)?;
+        scoped(scope, &invocation.scope, ())?;
+        Ok(invocation)
+    }
+
+    async fn lookup_artifact_ref(
+        &self,
+        scope: &ExecutionScope,
+        artifact_ref_id: &Id,
+    ) -> Result<ArtifactRef, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(
+            "SELECT row_data FROM dagger_workflow_artifact_rows WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
+        ).bind(scope.tenant_id.as_str()).bind(scope.namespace.as_str()).bind(artifact_ref_id.as_str())
+            .fetch_optional(&mut *connection).await.map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let reference: ArtifactRef = decode_row(&data.ok_or(StoreError::NotFound)?)?;
+        scoped(scope, &reference.scope, ())?;
+        Ok(reference)
+    }
+
+    async fn lookup_memoized_attempt(
+        &self,
+        scope: &ExecutionScope,
+        key: &Digest,
+    ) -> Result<Option<NodeAttempt>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(
+            "SELECT authority.row_data FROM dagger_workflow_attempts AS attempt
+             JOIN dagger_workflow_attempt_rows AS authority
+               ON authority.tenant_id = attempt.tenant_id AND authority.namespace = attempt.namespace
+              AND authority.entity_id = attempt.run_id AND authority.sub_id = attempt.attempt_id
+             WHERE attempt.tenant_id = ? AND attempt.namespace = ? AND attempt.cache_key = ?
+               AND attempt.status = 'Succeeded'
+             ORDER BY attempt.cache_sequence DESC, attempt.run_id DESC, attempt.attempt_id DESC LIMIT 1",
+        ).bind(scope.tenant_id.as_str()).bind(scope.namespace.as_str()).bind(key.as_str())
+            .fetch_optional(&mut *connection).await.map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        data.map(|data| {
+            let attempt: NodeAttempt = decode_row(&data)?;
+            scoped(scope, &attempt.scope, ())?;
+            if attempt.status != crate::run::AttemptState::Succeeded
+                || attempt.memoization_key.as_ref() != Some(key)
+            {
+                return Err(StoreError::CorruptControlPlane);
+            }
+            Ok(attempt)
+        })
+        .transpose()
+    }
     sql_command!(
         complete_attempt(command: CompleteAttempt) -> CompleteAttemptResult;
         AuthorityLoad::run(&command.run_id).objects(
@@ -2971,7 +3151,8 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         AuthorityLoad::run(&command.run_id).objects(
             command.decision_payload.iter().map(VerifiedObjectRef::digest)
                 .chain(command.approval_output.iter().map(VerifiedObjectRef::digest))
-        )
+        );
+        |store, workflow_scope| store.hydrate_run_action_schemas(workflow_scope, &command.run_id).await?
     );
     sql_command!(
         expire_approval(command: ExpireApproval) -> ApprovalGate;
@@ -3076,8 +3257,79 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         }
     }
     sql_read!(get_run(run_id: &Id) -> WorkflowRunView; Some((*run_id).clone()));
-    sql_read!(get_node(run_id: &Id, node_id: &NodeInstanceId) -> NodeRun; Some((*run_id).clone()));
-    sql_read!(get_attempt(run_id: &Id, attempt_id: &Id) -> NodeAttempt; Some((*run_id).clone()));
+    async fn get_node(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        node_id: &NodeInstanceId,
+    ) -> Result<NodeRun, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(NODE_POINT_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(run_id.as_str())
+            .bind(node_id.as_str())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let node: NodeRun = decode_row(&data.ok_or(StoreError::NotFound)?)?;
+        scoped(scope, &node.scope, ())?;
+        if node.run_id != *run_id || node.node_instance_id != *node_id {
+            return Err(StoreError::CorruptControlPlane);
+        }
+        Ok(node)
+    }
+    async fn get_attempt(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        attempt_id: &Id,
+    ) -> Result<NodeAttempt, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(ATTEMPT_POINT_SQL)
+            .bind(scope.tenant_id.as_str())
+            .bind(scope.namespace.as_str())
+            .bind(run_id.as_str())
+            .bind(attempt_id.as_str())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let attempt: NodeAttempt = decode_row(&data.ok_or(StoreError::NotFound)?)?;
+        scoped(scope, &attempt.scope, ())?;
+        if attempt.run_id != *run_id || attempt.attempt_id != *attempt_id {
+            return Err(StoreError::CorruptControlPlane);
+        }
+        Ok(attempt)
+    }
+    async fn get_latest_attempt(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        node_id: &NodeInstanceId,
+    ) -> Result<Option<NodeAttempt>, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(
+            "SELECT authority.row_data FROM dagger_workflow_attempts AS attempt
+             JOIN dagger_workflow_attempt_rows AS authority
+               ON authority.tenant_id = attempt.tenant_id AND authority.namespace = attempt.namespace
+              AND authority.entity_id = attempt.run_id AND authority.sub_id = attempt.attempt_id
+             WHERE attempt.tenant_id = ? AND attempt.namespace = ? AND attempt.run_id = ? AND attempt.node_id = ?
+             ORDER BY attempt.attempt_number DESC LIMIT 1",
+        ).bind(scope.tenant_id.as_str()).bind(scope.namespace.as_str()).bind(run_id.as_str()).bind(node_id.as_str())
+            .fetch_optional(&mut *connection).await.map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        data.map(|data| {
+            let attempt: NodeAttempt = decode_row(&data)?;
+            scoped(scope, &attempt.scope, ())?;
+            if attempt.run_id != *run_id || attempt.node_instance_id != *node_id {
+                return Err(StoreError::CorruptControlPlane);
+            }
+            Ok(attempt)
+        })
+        .transpose()
+    }
     sql_read!(get_gate(run_id: &Id, gate_id: &Id) -> ApprovalGate; Some((*run_id).clone()));
     async fn list_runs(
         &self,
@@ -3186,6 +3438,74 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         page: PageRequest,
     ) -> Result<Page<WorkflowRun>, StoreError> {
         self.scan_due_run_lifetimes_sql(scope, page).await
+    }
+}
+
+#[cfg(test)]
+mod authority_load_tests {
+    use super::*;
+    use crate::engine::TestClock;
+    use crate::memory::InMemoryObjectStore;
+    use crate::scope::ScopeAtom;
+
+    #[tokio::test]
+    async fn object_metadata_batches_preserve_scoped_rows_and_cas_versions() {
+        let clock = Arc::new(TestClock::new(Timestamp(0)));
+        let store = SqliteWorkflowStore::open_url(
+            "sqlite::memory:",
+            clock.clone(),
+            Arc::new(InMemoryObjectStore::new(clock)),
+        )
+        .await
+        .unwrap();
+        let scope = ExecutionScope {
+            tenant_id: ScopeAtom::new("batch-objects").unwrap(),
+            namespace: ScopeAtom::new("workflow").unwrap(),
+        };
+        let mut expected_rows = BTreeMap::new();
+        let mut expected_objects = BTreeMap::new();
+        let mut digests = Vec::new();
+        for ordinal in 0..OBJECT_METADATA_BATCH_SIZE + 2 {
+            let digest = Digest::new(format!("sha256:{ordinal:064x}")).unwrap();
+            let record = ObjectRecord {
+                scope: scope.clone(),
+                digest: digest.clone(),
+                size_bytes: ordinal as u64,
+                object_key: format!("objects/{ordinal}"),
+                created_at: Timestamp(ordinal as i64),
+            };
+            let data = encode_row(&record).unwrap();
+            let version = ordinal as i64 + 3;
+            sqlx::query("INSERT INTO dagger_workflow_object_rows (tenant_id, namespace, entity_id, sub_id, row_data, version) VALUES (?, ?, ?, '', ?, ?)")
+                .bind(scope.tenant_id.as_str()).bind(scope.namespace.as_str())
+                .bind(digest.as_str()).bind(&data).bind(version)
+                .execute(store.pool()).await.unwrap();
+            expected_rows.insert(
+                AuthorityKey::new(OBJECT_ROWS, digest.as_str().to_owned(), String::new()),
+                (data, version),
+            );
+            expected_objects.insert((scope.clone(), digest.clone()), record);
+            digests.push(digest);
+        }
+        // A same-digest row in another scope must not be decoded or returned.
+        sqlx::query("INSERT INTO dagger_workflow_object_rows (tenant_id, namespace, entity_id, sub_id, row_data, version) VALUES ('other-tenant', 'workflow', ?, '', '{', 1), ('batch-objects', 'other-namespace', ?, '', '{', 1)")
+            .bind(digests[0].as_str()).bind(digests[0].as_str())
+            .execute(store.pool()).await.unwrap();
+        digests.push(digests[0].clone());
+        digests.push(Digest::new(format!("sha256:{:064x}", 999)).unwrap());
+        let mut connection = store.begin_read().await.unwrap();
+        let loaded = SqliteWorkflowStore::<TestClock, InMemoryObjectStore<TestClock>>::load_state(
+            &mut connection,
+            &scope,
+            &AuthorityLoad::default().objects(&digests),
+        )
+        .await
+        .unwrap();
+        SqliteWorkflowStore::<TestClock, InMemoryObjectStore<TestClock>>::commit(connection)
+            .await
+            .unwrap();
+        assert_eq!(loaded.rows, expected_rows);
+        assert_eq!(loaded.state.object_records, expected_objects);
     }
 }
 

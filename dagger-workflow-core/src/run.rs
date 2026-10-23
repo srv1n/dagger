@@ -267,6 +267,8 @@ pub struct WorkflowRun {
     pub input_ref: JsonRef,
     /// Scope-bound creation fingerprint.
     pub create_request_fingerprint: Digest,
+    /// Immutable cache policy and explicit output locks.
+    pub options: crate::pinning::RunOptions,
     /// Durable run state.
     pub status: RunState,
     /// Closed terminal failure kind.
@@ -338,6 +340,8 @@ pub struct NodeRun {
     pub map_item_index: Option<u32>,
     /// Optional Map item digest.
     pub map_item_digest: Option<Digest>,
+    /// Validated stable string key selected at Map expansion.
+    pub map_item_key: Option<String>,
     /// Persisted canonical recovery rank.
     pub topological_rank: TopologicalRank,
     /// Durable node state.
@@ -384,6 +388,58 @@ pub struct NodeRun {
     pub updated_at: Timestamp,
     /// Node CAS version.
     pub version: Version,
+}
+
+/// Closed aggregate envelope for a Map which continues after ordinary failures.
+pub(crate) fn map_child_envelope(
+    child: &NodeRun,
+    attempt: Option<&NodeAttempt>,
+    output: serde_json::Value,
+) -> serde_json::Value {
+    let status = match child.status {
+        NodeState::Succeeded => "succeeded",
+        NodeState::Skipped => "skipped",
+        _ => "failed",
+    };
+    let error_class = if child.status == NodeState::Succeeded {
+        None
+    } else if child.status == NodeState::Skipped {
+        Some("skipped")
+    } else {
+        attempt.and_then(|attempt| match attempt.status {
+            AttemptState::PermanentFailed => Some("permanent"),
+            AttemptState::RetryableFailed => Some("retryable"),
+            AttemptState::TimedOut => Some("timeout"),
+            AttemptState::UnknownOutcome => Some("unknown"),
+            _ => None,
+        })
+    };
+    let message = if child.status == NodeState::Skipped {
+        child.skip_reason.map(|reason| match reason {
+            SkipReason::ConditionFalse => "condition_false",
+            SkipReason::SkippedUpstreamFailed => "skipped_upstream_failed",
+        })
+    } else if child.status == NodeState::Succeeded {
+        None
+    } else {
+        attempt.and_then(|attempt| {
+            attempt.error_message.as_deref().or(match attempt.status {
+                AttemptState::TimedOut => Some("attempt deadline elapsed"),
+                AttemptState::UnknownOutcome => {
+                    Some("attempt outcome unknown after engine recovery")
+                }
+                _ => None,
+            })
+        })
+    };
+    serde_json::json!({
+        "index": child.map_item_index,
+        "item_digest": child.map_item_digest,
+        "status": status,
+        "output": output,
+        "error_class": error_class,
+        "message": message,
+    })
 }
 
 /// The closed committed Choice selection.
@@ -450,6 +506,12 @@ pub struct NodeAttempt {
     pub started_at: Timestamp,
     /// Terminal timestamp.
     pub finished_at: Option<Timestamp>,
+    /// Scoped effective-input key for opt-in successful action memoization.
+    pub memoization_key: Option<Digest>,
+    /// Scope-monotonic accepted cache publication sequence.
+    pub memoization_sequence: Option<u64>,
+    /// Durable source identity when this attempt reused a completion.
+    pub reuse_provenance: Option<crate::memoization::ReuseProvenance>,
     /// Successful output ref.
     pub output_ref: Option<JsonRef>,
     /// Ordered action artifacts.

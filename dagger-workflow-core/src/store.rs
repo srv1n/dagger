@@ -398,6 +398,12 @@ pub enum StoreError {
     /// A schema document uses unsupported features.
     #[error("schema subset unsupported")]
     SchemaSubsetUnsupported,
+    /// A human decision payload does not satisfy its immutable schema.
+    #[error("approval decision payload invalid")]
+    ApprovalDecisionPayloadInvalid,
+    /// This store does not support durable structured decision schemas.
+    #[error("approval schemas unsupported")]
+    ApprovalSchemasUnsupported,
     /// A complete event batch exceeds response capacity.
     #[error("event batch too large")]
     BatchTooLarge,
@@ -494,6 +500,14 @@ pub struct CreateRun {
     pub idempotency_token: String,
 }
 
+/// Parameters for run creation with immutable cache policy and output locks.
+pub struct CreateRunWithOptions {
+    /// Existing run creation parameters.
+    pub command: CreateRun,
+    /// Options persisted with the run and its idempotency fingerprint.
+    pub options: crate::pinning::RunOptions,
+}
+
 /// Parameters for starting a compatible run.
 pub struct StartRun {
     /// Live engine permit.
@@ -544,6 +558,18 @@ pub struct ClaimNodeAttempt {
     pub bound_input: VerifiedObjectRef,
     /// Ordered binding derivation digest.
     pub binding_derivation_digest: Digest,
+}
+
+/// Parameters for an opt-in memoized or explicitly pinned action claim.
+pub struct ClaimReusableNodeAttempt {
+    /// Ordinary fenced action claim.
+    pub claim: ClaimNodeAttempt,
+    /// Scoped key to publish only after accepted successful completion.
+    pub memoization_key: Option<Digest>,
+    /// Exact registered artifact projections eligible for content-based keying.
+    pub memoization_artifact_refs: Vec<crate::artifact::ArtifactRefValue>,
+    /// Verified source selected for zero-cost reuse.
+    pub reuse_provenance: Option<crate::memoization::ReuseProvenance>,
 }
 
 /// Closed atomic claim results.
@@ -788,7 +814,7 @@ pub struct DecideApproval {
     pub decision: ApprovalDecision,
     /// Optional verified human decision payload.
     pub decision_payload: Option<VerifiedObjectRef>,
-    /// Required exact ApprovalResult object for approval.
+    /// Exact result object for approval, or either decision in decision-output mode.
     pub approval_output: Option<VerifiedObjectRef>,
     /// Scope-bound authenticated principal.
     pub principal: AuthenticatedPrincipal,
@@ -802,7 +828,7 @@ pub struct ExpireApproval {
     pub run_id: Id,
     /// Gate ID.
     pub gate_id: Id,
-    /// Exact expiry ApprovalResult when policy approves.
+    /// Exact expiry result when policy approves or decision-output mode is enabled.
     pub approval_output: Option<VerifiedObjectRef>,
 }
 
@@ -945,6 +971,21 @@ pub trait WorkflowStore: Send + Sync {
         command: PublishRevision,
     ) -> Result<WorkflowRevision, StoreError>;
 
+    /// Publishes a revision with verified human payload schemas keyed by Approval node ID.
+    ///
+    /// Stores must pin these objects durably before accepting the revision.
+    async fn publish_revision_with_approval_schemas(
+        &self,
+        scope: &ExecutionScope,
+        command: PublishRevision,
+        approval_schemas: BTreeMap<String, VerifiedObjectRef>,
+    ) -> Result<WorkflowRevision, StoreError> {
+        if !approval_schemas.is_empty() {
+            return Err(StoreError::ApprovalSchemasUnsupported);
+        }
+        self.publish_revision(scope, command).await
+    }
+
     /// Acquires or takes over the scoped singleton engine claim.
     async fn acquire_engine_claim(
         &self,
@@ -973,6 +1014,19 @@ pub trait WorkflowStore: Send + Sync {
         command: CreateRun,
     ) -> Result<CommandReceipt, StoreError>;
 
+    /// Creates a Pending run with explicit immutable execution options.
+    /// Stores that do not support these options reject nondefault requests.
+    async fn create_run_with_options(
+        &self,
+        scope: &ExecutionScope,
+        command: CreateRunWithOptions,
+    ) -> Result<CommandReceipt, StoreError> {
+        if !command.options.is_default() {
+            return Err(StoreError::InvalidField);
+        }
+        self.create_run(scope, command.command).await
+    }
+
     /// Starts a pin-compatible Pending run.
     async fn start_run(
         &self,
@@ -1000,6 +1054,46 @@ pub trait WorkflowStore: Send + Sync {
         scope: &ExecutionScope,
         command: ClaimNodeAttempt,
     ) -> Result<ClaimNodeAttemptResult, StoreError>;
+
+    /// Claims a reused result with zero reservation, or an opt-in cache writer.
+    async fn claim_reusable_node_attempt(
+        &self,
+        scope: &ExecutionScope,
+        command: ClaimReusableNodeAttempt,
+    ) -> Result<ClaimNodeAttemptResult, StoreError> {
+        if command.memoization_key.is_some() || command.reuse_provenance.is_some() {
+            return Err(StoreError::InvalidField);
+        }
+        self.claim_node_attempt(scope, command.claim).await
+    }
+
+    /// Reads the durable bound-input invocation for a successful reuse source.
+    async fn get_action_invocation(
+        &self,
+        _scope: &ExecutionScope,
+        _run_id: &Id,
+        _invocation_id: &Id,
+    ) -> Result<ActionInvocation, StoreError> {
+        Err(StoreError::NotFound)
+    }
+
+    /// Reads one scoped durable typed artifact use.
+    async fn lookup_artifact_ref(
+        &self,
+        _scope: &ExecutionScope,
+        _artifact_ref_id: &Id,
+    ) -> Result<ArtifactRef, StoreError> {
+        Err(StoreError::NotFound)
+    }
+
+    /// Returns the newest accepted successful completion for a scoped cache key.
+    async fn lookup_memoized_attempt(
+        &self,
+        _scope: &ExecutionScope,
+        _key: &Digest,
+    ) -> Result<Option<NodeAttempt>, StoreError> {
+        Ok(None)
+    }
 
     /// Accepts or observes a credential-authenticated result.
     fn complete_attempt<'a>(
@@ -1150,20 +1244,28 @@ pub trait WorkflowStore: Send + Sync {
     ) -> impl Future<Output = Result<WorkflowRunView, StoreError>> + Send + 'a;
 
     /// Reads one node instance.
-    async fn get_node(
+    fn get_node<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        run_id: &'a Id,
+        node_id: &'a NodeInstanceId,
+    ) -> impl Future<Output = Result<NodeRun, StoreError>> + Send + 'a;
+
+    /// Reads one attempt.
+    fn get_attempt<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        run_id: &'a Id,
+        attempt_id: &'a Id,
+    ) -> impl Future<Output = Result<NodeAttempt, StoreError>> + Send + 'a;
+
+    /// Reads the last started attempt for one node, including its terminal error.
+    async fn get_latest_attempt(
         &self,
         scope: &ExecutionScope,
         run_id: &Id,
         node_id: &NodeInstanceId,
-    ) -> Result<NodeRun, StoreError>;
-
-    /// Reads one attempt.
-    async fn get_attempt(
-        &self,
-        scope: &ExecutionScope,
-        run_id: &Id,
-        attempt_id: &Id,
-    ) -> Result<NodeAttempt, StoreError>;
+    ) -> Result<Option<NodeAttempt>, StoreError>;
 
     /// Reads one approval gate.
     async fn get_gate(

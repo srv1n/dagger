@@ -2,7 +2,7 @@
 
 use crate::artifact::{
     ArtifactMetadataConflict, FailedReadClass, FailedReadProof, ObjectReadError, ObjectStore,
-    ObjectStoreError, VerifiedObject, VerifiedObjectRef,
+    ObjectStoreError, VerifiedObject, VerifiedObjectFile, VerifiedObjectRef,
 };
 use crate::engine::Clock;
 use crate::ids::Digest;
@@ -12,12 +12,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const NONCE_BYTES: usize = 32;
+// Binary copy and verification use one buffer, independent of object size.
+const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 
 /// The filesystem operations the durable publication protocol performs.
 ///
@@ -43,11 +45,22 @@ pub trait StoreFs: Send + Sync {
     /// Links `link` to the inode behind `source`, never replacing an existing entry.
     fn hard_link(&self, source: &Path, link: &Path) -> io::Result<()>;
 
+    /// Atomically replaces a directory entry, used only to restore proven-corrupt content.
+    fn rename(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Unlinks a file.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
 
     /// Reads a whole file. `NotFound` is the only authoritative absence; see `ReadFailure`.
     fn read(&self, path: &Path) -> io::Result<Vec<u8>>;
+
+    /// Opens a content stream. The model fallback retains bytes; `StdFs` opens a real file.
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        self.read(path)
+            .map(|bytes| Box::new(io::Cursor::new(bytes)) as Box<dyn Read + Send>)
+    }
 
     /// Whether `path` is a directory, without following a final symlink.
     fn symlink_is_dir(&self, path: &Path) -> io::Result<bool>;
@@ -87,12 +100,20 @@ impl StoreFs for StdFs {
         fs::hard_link(source, link)
     }
 
+    fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        fs::rename(source, destination)
+    }
+
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         fs::remove_file(path)
     }
 
     fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
         fs::read(path)
+    }
+
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read + Send>> {
+        File::open(path).map(|file| Box::new(file) as Box<dyn Read + Send>)
     }
 
     fn symlink_is_dir(&self, path: &Path) -> io::Result<bool> {
@@ -135,6 +156,183 @@ impl<C: Clock> FsObjectStore<C, StdFs> {
     /// Opens or initializes an object-store root using the supplied diagnostic clock.
     pub fn open(root: impl AsRef<Path>, clock: Arc<C>) -> Result<Self, ObjectStoreError> {
         Self::open_with(root, clock, StdFs)
+    }
+
+    /// Copies a binary local file into immutable storage with bounded memory.
+    ///
+    /// The source is never hardlinked: changes to it after import cannot mutate the object.
+    /// JSON must use `ObjectStore::put`, which applies canonical JSON validation. A fully
+    /// verified source can restore an existing wrong-digest object with matching media metadata.
+    pub async fn import_file(
+        &self,
+        scope: &ExecutionScope,
+        source: impl AsRef<Path>,
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        if media_type.is_empty() || media_type.len() > 255 || media_type == "application/json" {
+            return Err(ObjectStoreError::InvalidField);
+        }
+        let mut source = File::open(source).map_err(storage_error)?;
+        if !source.metadata().map_err(storage_error)?.is_file() {
+            return Err(ObjectStoreError::InvalidField);
+        }
+        let temporary = self.temporary_path()?;
+        let _temporary_guard = TemporaryGuard {
+            fs: &self.fs,
+            path: temporary.clone(),
+        };
+        let result = async {
+            let mut destination = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(storage_error)?;
+            let (candidate_digest, size_bytes) = tokio::task::spawn_blocking(move || {
+                let result = copy_and_digest(&mut source, &mut destination)?;
+                destination.sync_all()?;
+                Ok::<_, io::Error>(result)
+            })
+            .await
+            .map_err(|_| ObjectStoreError::StorageUnavailable)?
+            .map_err(storage_error)?;
+            let media_temporary = self.media_temporary_path()?;
+            let _media_guard = TemporaryGuard {
+                fs: &self.fs,
+                path: media_temporary.clone(),
+            };
+            let result = async {
+                write_and_sync(&self.fs, &media_temporary, media_type.as_bytes())
+                    .map_err(storage_error)?;
+                match self
+                    .fs
+                    .symlink_is_dir(&self.object_path(scope, &candidate_digest))
+                {
+                    Ok(_) => {
+                        self.restore_missing_media(scope, &candidate_digest, media_type)
+                            .await?
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => return Err(ObjectStoreError::StorageUnavailable),
+                }
+                let created = self.publish_prepared(
+                    scope,
+                    &candidate_digest,
+                    &temporary,
+                    &media_temporary,
+                    media_type,
+                    size_bytes,
+                )?;
+                if !created {
+                    self.restore_corrupt_candidate(
+                        scope,
+                        &candidate_digest,
+                        size_bytes,
+                        &temporary,
+                        media_type,
+                    )
+                    .await?;
+                }
+                self.sync_publication_barrier(scope, &candidate_digest)
+                    .map_err(storage_error)?;
+                let (observed_digest, observed_size) = self
+                    .read_verified_stream(&self.object_path(scope, &candidate_digest))
+                    .await
+                    .map_err(unavailable)?;
+                if observed_digest != candidate_digest || observed_size != size_bytes {
+                    return if created {
+                        Err(ObjectStoreError::StorageUnavailable)
+                    } else {
+                        Err(ArtifactMetadataConflict {
+                            digest: candidate_digest,
+                            existing_size_bytes: observed_size,
+                            candidate_size_bytes: size_bytes,
+                        }
+                        .into())
+                    };
+                }
+                if read_media_type(&self.fs, &self.media_path(scope, &candidate_digest))
+                    .map_err(unavailable)?
+                    != media_type
+                {
+                    return Err(ObjectStoreError::StorageUnavailable);
+                }
+                Ok(self.file_reference(scope, candidate_digest, size_bytes, media_type))
+            }
+            .await;
+            remove_temp(&self.fs, &media_temporary);
+            result
+        }
+        .await;
+        remove_temp(&self.fs, &temporary);
+        result
+    }
+
+    /// Verifies binary content before returning a private read-only snapshot.
+    ///
+    /// This copies to an anonymous temporary file with a fixed 64 KiB buffer. Callers can read
+    /// or seek the result without holding the whole object in memory or trusting a mutable path.
+    pub async fn get_file(
+        &self,
+        scope: &ExecutionScope,
+        requested: &Digest,
+    ) -> Result<VerifiedObjectFile, ObjectReadError> {
+        let mut source = File::open(self.object_path(scope, requested)).map_err(|error| {
+            self.missing_or_unavailable(scope, requested, ReadFailure::classify(error))
+        })?;
+        let temporary = self
+            .temporary_path()
+            .map_err(|_| ObjectReadError::StorageUnavailable)?;
+        let _temporary_guard = TemporaryGuard {
+            fs: &self.fs,
+            path: temporary.clone(),
+        };
+        let result = async {
+            let mut destination = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|_| ObjectReadError::StorageUnavailable)?;
+            let (observed, size_bytes) =
+                tokio::task::spawn_blocking(move || copy_and_digest(&mut source, &mut destination))
+                    .await
+                    .map_err(|_| ObjectReadError::StorageUnavailable)?
+                    .map_err(|_| ObjectReadError::StorageUnavailable)?;
+            if &observed != requested {
+                return Err(self.corrupt(
+                    scope,
+                    requested,
+                    FailedReadClass::DigestInvalid,
+                    Some(observed),
+                ));
+            }
+            let media_type = read_media_type(&self.fs, &self.media_path(scope, requested))
+                .map_err(|failure| self.missing_or_unavailable(scope, requested, failure))?;
+            self.sync_publication_barrier(scope, requested)
+                .map_err(|_| ObjectReadError::StorageUnavailable)?;
+            let mut snapshot =
+                File::open(&temporary).map_err(|_| ObjectReadError::StorageUnavailable)?;
+            self.fs
+                .remove_file(&temporary)
+                .map_err(|_| ObjectReadError::StorageUnavailable)?;
+            // Structured capabilities are used by reducers for validation. Keep their bytes;
+            // binary artifacts retain only metadata, irrespective of payload size.
+            let reference = if media_type == "application/json" {
+                let mut bytes = Vec::new();
+                snapshot
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| ObjectReadError::StorageUnavailable)?;
+                snapshot
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|_| ObjectReadError::StorageUnavailable)?;
+                self.verified_reference(scope, requested.clone(), bytes, &media_type)
+            } else {
+                self.file_reference(scope, requested.clone(), size_bytes, &media_type)
+            };
+            Ok(VerifiedObjectFile::new(reference, snapshot))
+        }
+        .await;
+        remove_temp(&self.fs, &temporary);
+        result
     }
 }
 
@@ -311,6 +509,177 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         )
     }
 
+    fn file_reference(
+        &self,
+        scope: &ExecutionScope,
+        digest: Digest,
+        size_bytes: u64,
+        media_type: &str,
+    ) -> VerifiedObjectRef {
+        VerifiedObjectRef::without_inline_bytes(
+            scope.clone(),
+            digest.clone(),
+            size_bytes,
+            media_type.to_owned(),
+            self.object_key(scope, &digest),
+            self.store_instance_nonce.clone(),
+        )
+    }
+
+    async fn read_verified_stream(&self, path: &Path) -> Result<(Digest, u64), ReadFailure> {
+        let mut source = self.fs.open_read(path).map_err(ReadFailure::classify)?;
+        // Once open, every I/O failure is unavailability, including a mid-stream NotFound.
+        tokio::task::spawn_blocking(move || copy_and_digest(&mut source, &mut io::sink()))
+            .await
+            .map_err(|_| ReadFailure::Unavailable)?
+            .map_err(|_| ReadFailure::Unavailable)
+    }
+
+    /// Restores only wrong-digest bytes from a verified, synced prepared candidate. Metadata
+    /// conflicts and incomplete reads are never repairable. Replacement is atomic: concurrent
+    /// readers observe either the old inode or the complete replacement, never a partial write.
+    async fn restore_corrupt_candidate(
+        &self,
+        scope: &ExecutionScope,
+        candidate_digest: &Digest,
+        size_bytes: u64,
+        temporary: &Path,
+        media_type: &str,
+    ) -> Result<(), ObjectStoreError> {
+        let existing_media = read_media_type(&self.fs, &self.media_path(scope, candidate_digest))
+            .map_err(unavailable)?;
+        if existing_media != media_type {
+            return Err(ArtifactMetadataConflict {
+                digest: candidate_digest.clone(),
+                existing_size_bytes: size_bytes,
+                candidate_size_bytes: size_bytes,
+            }
+            .into());
+        }
+        let path = self.object_path(scope, candidate_digest);
+        let (observed, existing_size) = self
+            .read_verified_stream(&path)
+            .await
+            .map_err(unavailable)?;
+        if &observed == candidate_digest {
+            return if existing_size == size_bytes {
+                Ok(())
+            } else {
+                Err(ArtifactMetadataConflict {
+                    digest: candidate_digest.clone(),
+                    existing_size_bytes: existing_size,
+                    candidate_size_bytes: size_bytes,
+                }
+                .into())
+            };
+        }
+        if !matches!(
+            self.corrupt(
+                scope,
+                candidate_digest,
+                FailedReadClass::DigestInvalid,
+                Some(observed)
+            ),
+            ObjectReadError::Corrupt(_)
+        ) {
+            return Err(ObjectStoreError::StorageUnavailable);
+        }
+        let (replacement_digest, replacement_size) = self
+            .read_verified_stream(temporary)
+            .await
+            .map_err(unavailable)?;
+        if &replacement_digest != candidate_digest || replacement_size != size_bytes {
+            return Err(ObjectStoreError::StorageUnavailable);
+        }
+        self.fs.sync_file(temporary).map_err(storage_error)?;
+        self.fs.rename(temporary, &path).map_err(storage_error)?;
+        self.sync_publication_barrier(scope, candidate_digest)
+            .map_err(storage_error)
+    }
+
+    async fn publish_repairing(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        match self.publish(scope, bytes, media_type) {
+            Err(ObjectStoreError::ArtifactMetadataConflict(_))
+            | Err(ObjectStoreError::StorageUnavailable) => {}
+            result => return result,
+        }
+        let canonical;
+        let bytes = if media_type == "application/json" {
+            canonical = canonical_json(bytes)?;
+            canonical.as_slice()
+        } else {
+            bytes
+        };
+        let candidate_digest = digest(bytes);
+        let temporary = self.temporary_path()?;
+        let _temporary_guard = TemporaryGuard {
+            fs: &self.fs,
+            path: temporary.clone(),
+        };
+        let result = async {
+            write_and_sync(&self.fs, &temporary, bytes).map_err(storage_error)?;
+            self.restore_missing_media(scope, &candidate_digest, media_type)
+                .await?;
+            self.restore_corrupt_candidate(
+                scope,
+                &candidate_digest,
+                bytes.len() as u64,
+                &temporary,
+                media_type,
+            )
+            .await?;
+            self.finalize_candidate(scope, &candidate_digest, bytes, media_type, false)
+        }
+        .await;
+        remove_temp(&self.fs, &temporary);
+        result
+    }
+
+    async fn restore_missing_media(
+        &self,
+        scope: &ExecutionScope,
+        candidate_digest: &Digest,
+        media_type: &str,
+    ) -> Result<(), ObjectStoreError> {
+        let path = self.media_path(scope, candidate_digest);
+        match read_media_type(&self.fs, &path) {
+            Ok(_) => return Ok(()),
+            Err(ReadFailure::Unavailable) => return Err(ObjectStoreError::StorageUnavailable),
+            Err(ReadFailure::Absent) => {}
+        }
+        // Locate and fully read the content before restoring its absent metadata. Operational
+        // errors cannot authorize a repair, even when a component lookup reports NotFound.
+        self.read_verified_stream(&self.object_path(scope, candidate_digest))
+            .await
+            .map_err(unavailable)?;
+        if !matches!(
+            self.corrupt(scope, candidate_digest, FailedReadClass::Missing, None),
+            ObjectReadError::Corrupt(_)
+        ) {
+            return Err(ObjectStoreError::StorageUnavailable);
+        }
+        let temporary = self.media_temporary_path()?;
+        let result = (|| {
+            write_and_sync(&self.fs, &temporary, media_type.as_bytes()).map_err(storage_error)?;
+            let parent = path.parent().expect("media paths have a parent");
+            create_dir_all_synced(&self.fs, &self.root.join("meta"), parent)
+                .map_err(storage_error)?;
+            match self.fs.hard_link(&temporary, &path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(ObjectStoreError::StorageUnavailable),
+            }
+            self.fs.sync_dir(parent).map_err(storage_error)
+        })();
+        remove_temp(&self.fs, &temporary);
+        result
+    }
+
     /// Reads a whole object and digests it.
     ///
     /// Only a `NotFound` is authoritative absence. Every other failure is a failure of this
@@ -355,19 +724,44 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         let media_temporary = self.media_temporary_path()?;
         write_and_sync(&self.fs, &temporary, bytes).map_err(storage_error)?;
         write_and_sync(&self.fs, &media_temporary, media_type.as_bytes()).map_err(storage_error)?;
+        let created = self.publish_prepared(
+            scope,
+            &candidate_digest,
+            &temporary,
+            &media_temporary,
+            media_type,
+            bytes.len() as u64,
+        )?;
+        let finalized =
+            self.finalize_candidate(scope, &candidate_digest, bytes, media_type, created);
+        remove_temp(&self.fs, &temporary);
+        remove_temp(&self.fs, &media_temporary);
+        finalized
+    }
+
+    fn publish_prepared(
+        &self,
+        scope: &ExecutionScope,
+        candidate_digest: &Digest,
+        temporary: &Path,
+        media_temporary: &Path,
+        media_type: &str,
+        size_bytes: u64,
+    ) -> Result<bool, ObjectStoreError> {
+        let final_path = self.object_path(scope, candidate_digest);
         let parent = final_path
             .parent()
             .expect("object paths always have a parent");
         create_dir_all_synced(&self.fs, &self.objects_root(), parent).map_err(storage_error)?;
 
-        let media_path = self.media_path(scope, &candidate_digest);
+        let media_path = self.media_path(scope, candidate_digest);
         let media_parent = media_path
             .parent()
             .expect("media paths always have a parent");
         create_dir_all_synced(&self.fs, &self.root.join("meta"), media_parent)
             .map_err(storage_error)?;
 
-        match self.fs.hard_link(&media_temporary, &media_path) {
+        match self.fs.hard_link(media_temporary, &media_path) {
             Ok(()) => {
                 self.fs.sync_dir(media_parent).map_err(storage_error)?;
             }
@@ -378,26 +772,21 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         }
         let existing_media = read_media_type(&self.fs, &media_path).map_err(unavailable)?;
         if existing_media != media_type {
-            remove_temp(&self.fs, &temporary);
-            remove_temp(&self.fs, &media_temporary);
+            remove_temp(&self.fs, temporary);
+            remove_temp(&self.fs, media_temporary);
             return Err(ArtifactMetadataConflict {
-                digest: candidate_digest,
-                existing_size_bytes: bytes.len() as u64,
-                candidate_size_bytes: bytes.len() as u64,
+                digest: candidate_digest.clone(),
+                existing_size_bytes: size_bytes,
+                candidate_size_bytes: size_bytes,
             }
             .into());
         }
 
-        let created = match self.fs.hard_link(&temporary, &final_path) {
-            Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+        match self.fs.hard_link(temporary, &final_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(_) => return Err(ObjectStoreError::StorageUnavailable),
-        };
-        let finalized =
-            self.finalize_candidate(scope, &candidate_digest, bytes, media_type, created);
-        remove_temp(&self.fs, &temporary);
-        remove_temp(&self.fs, &media_temporary);
-        finalized
+        }
     }
 
     fn verify_existing_candidate(
@@ -530,11 +919,74 @@ impl<C: Clock, F: StoreFs> ObjectStore for FsObjectStore<C, F> {
     ) -> Result<VerifiedObjectRef, ObjectStoreError> {
         self.publish(scope, bytes, media_type)
     }
+
+    async fn put_repairing(
+        &self,
+        scope: &ExecutionScope,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<VerifiedObjectRef, ObjectStoreError> {
+        self.publish_repairing(scope, bytes, media_type).await
+    }
+
+    async fn verify(
+        &self,
+        scope: &ExecutionScope,
+        requested: &Digest,
+    ) -> Result<VerifiedObjectRef, ObjectReadError> {
+        let media_type = read_media_type(&self.fs, &self.media_path(scope, requested))
+            .map_err(|failure| self.missing_or_unavailable(scope, requested, failure))?;
+        if media_type == "application/json" {
+            return self
+                .get(scope, requested)
+                .await
+                .map(|object| object.reference);
+        }
+        let (observed, size_bytes) = self
+            .read_verified_stream(&self.object_path(scope, requested))
+            .await
+            .map_err(|failure| self.missing_or_unavailable(scope, requested, failure))?;
+        if &observed != requested {
+            return Err(self.corrupt(
+                scope,
+                requested,
+                FailedReadClass::DigestInvalid,
+                Some(observed),
+            ));
+        }
+        self.sync_publication_barrier(scope, requested)
+            .map_err(|_| ObjectReadError::StorageUnavailable)?;
+        Ok(self.file_reference(scope, requested.clone(), size_bytes, &media_type))
+    }
 }
 
 struct ReadVerified {
     digest: Digest,
     bytes: Vec<u8>,
+}
+
+fn copy_and_digest(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+) -> io::Result<(Digest, u64)> {
+    let mut hash = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = [0_u8; STREAM_BUFFER_BYTES];
+    loop {
+        let count = match source.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 {
+            break;
+        }
+        destination.write_all(&buffer[..count])?;
+        hash.update(&buffer[..count]);
+        size_bytes = size_bytes
+            .checked_add(count as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object size exceeds u64"))?;
+    }
+    Ok((digest_from_hash(hash.finalize()), size_bytes))
 }
 
 /// Why a component read failed, in terms of what it is entitled to assert about the object.
@@ -753,7 +1205,12 @@ fn create_directory_component(
 /// no class for it, so it is reported as an incomplete read rather than squeezed into
 /// `Missing`.
 fn read_media_type(fs: &impl StoreFs, path: &Path) -> Result<String, ReadFailure> {
-    let bytes = fs.read(path).map_err(ReadFailure::classify)?;
+    let source = fs.open_read(path).map_err(ReadFailure::classify)?;
+    let mut bytes = Vec::with_capacity(256);
+    source
+        .take(256)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReadFailure::Unavailable)?;
     let Ok(media_type) = String::from_utf8(bytes) else {
         return Err(ReadFailure::Unavailable);
     };
@@ -768,6 +1225,19 @@ fn remove_temp(fs: &impl StoreFs, path: &Path) {
         if let Some(parent) = path.parent() {
             let _ = fs.sync_dir(parent);
         }
+    }
+}
+
+// Cancellation may drop an async importer while its blocking copy still runs. Unlink its
+// private candidate then; the worker's owned file remains valid and frees the inode on close.
+struct TemporaryGuard<'a, F: StoreFs> {
+    fs: &'a F,
+    path: PathBuf,
+}
+
+impl<F: StoreFs> Drop for TemporaryGuard<'_, F> {
+    fn drop(&mut self) {
+        remove_temp(self.fs, &self.path);
     }
 }
 
@@ -850,7 +1320,7 @@ fn unavailable(_: ReadFailure) -> ObjectStoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_dir_all_synced, create_root_all_synced, StdFs};
+    use super::{copy_and_digest, create_dir_all_synced, create_root_all_synced, digest, StdFs};
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -865,6 +1335,43 @@ mod tests {
             process::id(),
             NEXT_ROOT.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    #[test]
+    fn stream_digest_does_not_accuse_a_partial_or_interrupted_read() {
+        struct FaultStream {
+            reads: usize,
+            midstream_kind: io::ErrorKind,
+        }
+        impl io::Read for FaultStream {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    1 => Err(io::ErrorKind::Interrupted.into()),
+                    2 => {
+                        buffer[..3].copy_from_slice(b"abc");
+                        Ok(3)
+                    }
+                    3 => Err(self.midstream_kind.into()),
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut source = FaultStream {
+            reads: 0,
+            midstream_kind: io::ErrorKind::NotFound,
+        };
+        assert_eq!(
+            copy_and_digest(&mut source, &mut io::sink())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound,
+            "no digest is returned for an incomplete stream"
+        );
+        assert_eq!(
+            copy_and_digest(&mut io::Cursor::new(b"abc"), &mut io::sink()).unwrap(),
+            (digest(b"abc"), 3)
+        );
     }
 
     #[test]

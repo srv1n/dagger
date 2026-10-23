@@ -85,6 +85,8 @@ pub enum EventType {
     ApprovalExpiredApproved,
     /// N15 approval expiry rejection.
     ApprovalExpiredRejected,
+    /// N69 successful structured decision output, including rejection.
+    ApprovalDecisionResolved,
     /// N16 Succeed terminal.
     SucceedNodeReached,
     /// N17 Fail terminal.
@@ -109,6 +111,8 @@ pub enum EventType {
     NodeCancelled,
     /// N42 child permanent failure.
     MapFailedFast,
+    /// N68 all children finished but the success threshold was not met.
+    MapThresholdFailed,
     /// N43/N65 Map contract failure.
     MapContractFailed,
     /// N44 Map retry exhaustion.
@@ -117,6 +121,11 @@ pub enum EventType {
     MapBudgetExhausted,
     /// N47-N57 node object corruption.
     NodeCorruptStorage,
+    /// Verified native memoization reuse, committed with accepted completion.
+    #[serde(rename = "cache_hit")]
+    CacheHit,
+    /// Explicit output pin reuse, committed with accepted completion.
+    PinnedOutputReused,
     /// A02 attempt success.
     AttemptSucceeded,
     /// A03 retryable attempt failure.

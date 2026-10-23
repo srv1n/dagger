@@ -22,6 +22,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -75,6 +76,9 @@ impl WorkflowAction for MapAction {
                     CostUnits(1),
                 )
                 .unwrap()
+            } else if value.pointer("/item") == Some(&Value::String("invalid-output".to_owned())) {
+                ActionOutcome::success(json!({"invalid": true}), Vec::new(), CostUnits(1), None)
+                    .unwrap()
             } else {
                 ActionOutcome::success(value, Vec::new(), CostUnits(1), None).unwrap()
             }
@@ -121,6 +125,10 @@ fn definition(definition_id: &str, items: Value, max_items: u32) -> WorkflowDefi
                 id: id("map"),
                 items: BindingSource::Constant { value: items },
                 max_items,
+                on_child_failure:
+                    dagger_workflow_core::definition::MapChildFailurePolicy::CancelSiblings,
+                min_successful_children: None,
+                item_key_pointer: None,
                 max_concurrency: 1,
                 action: ActionReference {
                     name: descriptor.name,
@@ -170,8 +178,13 @@ async fn publish_and_create(
         .put(execution_scope, RUN_INPUT_SCHEMA, "application/json")
         .await
         .unwrap();
+    let root_schema: &[u8] = if workflow.run_output_schema_digest == hash(b"{}") {
+        b"{}"
+    } else {
+        ROOT_OUTPUT_SCHEMA
+    };
     let root_output_schema = objects
-        .put(execution_scope, ROOT_OUTPUT_SCHEMA, "application/json")
+        .put(execution_scope, root_schema, "application/json")
         .await
         .unwrap();
     let canonical = objects
@@ -632,5 +645,467 @@ fn fail_fast_child_failure_fails_parent_and_cancels_siblings() {
         assert!(events
             .iter()
             .any(|event| event.event_type == EventType::NodeCancelled));
+    });
+}
+
+fn continue_definition(name: &str, items: Value, minimum: Option<u32>) -> WorkflowDefinition {
+    let mut workflow = definition(name, items, 3);
+    workflow.run_output_schema_digest = hash(b"{}");
+    if let NodeDefinition::Map {
+        on_child_failure,
+        min_successful_children,
+        ..
+    } = &mut workflow.nodes[0]
+    {
+        *on_child_failure = dagger_workflow_core::definition::MapChildFailurePolicy::Continue;
+        *min_successful_children = minimum;
+    }
+    workflow
+}
+
+#[test]
+fn continue_records_every_child_and_successful_projection() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(6_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        let mut workflow = continue_definition("w4-continue", json!(["fail", "later"]), Some(1));
+        if let NodeDefinition::Succeed { output, .. } = &mut workflow.nodes[1] {
+            *output = BindingSource::MapAggregate {
+                node_id: id("map"),
+                pointer: "/item".to_owned(),
+            };
+        }
+        publish_and_create(&store, &objects, &execution_scope, workflow, "continue").await;
+        let engine = engine(store.clone(), objects.clone(), "w4-continue-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("continue"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        let parent = store
+            .get_node(&execution_scope, &id("continue"), &id("map"))
+            .await
+            .unwrap();
+        assert_eq!(parent.status, NodeState::Succeeded);
+        let bytes = objects
+            .get(&execution_scope, &parent.result_ref.unwrap().0.digest)
+            .await
+            .unwrap()
+            .bytes;
+        let result: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(result[0]["index"], 0);
+        assert_eq!(result[0]["status"], "failed");
+        assert_eq!(result[0]["error_class"], "permanent");
+        assert!(result[0]["message"].as_str().is_some());
+        assert!(result[0]["output"].is_null());
+        assert_eq!(result[1]["status"], "succeeded");
+        assert_eq!(result[1]["output"], json!({"item":"later"}));
+        assert!(result[1]["error_class"].is_null());
+        let run = store
+            .get_run(&execution_scope, &id("continue"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Succeeded);
+        let output = objects
+            .get(&execution_scope, &run.output_ref.unwrap().0.digest)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.bytes).unwrap(),
+            json!(["later"])
+        );
+    });
+}
+
+#[test]
+fn continue_default_threshold_fails_after_siblings_finish() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(7_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-threshold", json!(["fail", "later"]), None),
+            "threshold",
+        )
+        .await;
+        let engine = engine(store.clone(), objects, "w4-threshold-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("threshold"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        let children = children(&store, &execution_scope, "threshold").await;
+        assert!(children
+            .iter()
+            .any(|child| child.status == NodeState::Succeeded));
+        assert!(children
+            .iter()
+            .all(|child| child.status != NodeState::Cancelled));
+        let parent = store
+            .get_node(&execution_scope, &id("threshold"), &id("map"))
+            .await
+            .unwrap();
+        assert_eq!(parent.status, NodeState::Failed);
+        let events = store
+            .list_events_after(
+                &execution_scope,
+                &id("threshold"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == EventType::MapThresholdFailed)
+            .unwrap();
+        assert_eq!(event.payload["successful_children"], 1);
+        assert_eq!(event.payload["min_successful_children"], 2);
+    });
+}
+
+#[test]
+fn threshold_above_actual_count_finishes_children_then_fails_map() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(8_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-bad-threshold", json!(["later"]), Some(2)),
+            "bad-threshold",
+        )
+        .await;
+        let engine = engine(store.clone(), objects, "w4-bad-threshold-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("bad-threshold"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        let run = store
+            .get_run(&execution_scope, &id("bad-threshold"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Failed);
+        assert_eq!(run.failure_kind, Some(RunFailureKind::MapChildFailed));
+        let children = children(&store, &execution_scope, "bad-threshold").await;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, NodeState::Succeeded);
+    });
+}
+
+#[test]
+fn continue_zero_items_defaults_to_zero_successes() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(9_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-continue-empty", json!([]), None),
+            "continue-empty",
+        )
+        .await;
+        let engine = engine(store.clone(), objects, "w4-continue-empty-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("continue-empty"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("continue-empty"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Succeeded
+        );
+    });
+}
+
+#[test]
+fn continue_does_not_tolerate_action_output_contract_failure() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(10_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-contract", json!(["invalid-output", "later"]), Some(0)),
+            "contract",
+        )
+        .await;
+        let engine = engine(store.clone(), objects, "w4-contract-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("contract"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 8).await.unwrap();
+        let run = store
+            .get_run(&execution_scope, &id("contract"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::ContractFailed);
+        assert_eq!(
+            run.failure_kind,
+            Some(RunFailureKind::ActionOutputSchemaMismatch)
+        );
+        assert!(children(&store, &execution_scope, "contract")
+            .await
+            .iter()
+            .any(|child| child.status == NodeState::Cancelled));
+    });
+}
+
+#[test]
+fn empty_map_with_positive_threshold_fails_normally() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(11_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-empty-threshold", json!([]), Some(1)),
+            "empty-threshold",
+        )
+        .await;
+        let engine = engine(store.clone(), objects, "w4-empty-threshold-engine");
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("empty-threshold"))
+            .await
+            .unwrap();
+        engine.run_until_idle(&execution_scope, 4).await.unwrap();
+        let run = store
+            .get_run(&execution_scope, &id("empty-threshold"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Failed);
+        assert_eq!(run.failure_kind, Some(RunFailureKind::MapChildFailed));
+        assert!(children(&store, &execution_scope, "empty-threshold")
+            .await
+            .is_empty());
+        let events = store
+            .list_events_after(
+                &execution_scope,
+                &id("empty-threshold"),
+                EventPageRequest {
+                    after_event_seq: 0,
+                    page_size: 1000,
+                    hard_response_byte_limit: 1_000_000,
+                },
+            )
+            .await
+            .unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == EventType::MapThresholdFailed)
+            .unwrap();
+        assert_eq!(event.payload["successful_children"], 0);
+        assert_eq!(event.payload["min_successful_children"], 1);
+    });
+}
+
+struct PendingMapAction {
+    descriptor: ActionDescriptor,
+    started: Arc<tokio::sync::Notify>,
+    invocations: Arc<AtomicUsize>,
+    dropped: Arc<AtomicBool>,
+    cancelled_at_drop: Arc<AtomicBool>,
+    sibling_cancelled: Arc<AtomicBool>,
+}
+
+struct PendingInvocationGuard {
+    context: ActionContext,
+    dropped: Arc<AtomicBool>,
+    cancelled_at_drop: Arc<AtomicBool>,
+}
+
+impl Drop for PendingInvocationGuard {
+    fn drop(&mut self) {
+        self.cancelled_at_drop.store(
+            self.context.cancellation_token.is_cancelled(),
+            Ordering::SeqCst,
+        );
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+impl WorkflowAction for PendingMapAction {
+    fn descriptor(&self) -> &ActionDescriptor {
+        &self.descriptor
+    }
+
+    fn invoke<'a>(
+        &'a self,
+        context: ActionContext,
+        input: &'a [u8],
+    ) -> Pin<Box<dyn Future<Output = ActionOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            if self.invocations.fetch_add(1, Ordering::SeqCst) == 0 {
+                let _resource = PendingInvocationGuard {
+                    context,
+                    dropped: self.dropped.clone(),
+                    cancelled_at_drop: self.cancelled_at_drop.clone(),
+                };
+                self.started.notify_one();
+                // Models a non-cooperative renderer which releases resources only
+                // when its invocation future is dropped after cancellation grace.
+                std::future::pending::<ActionOutcome>().await
+            } else {
+                self.sibling_cancelled
+                    .store(context.cancellation_token.is_cancelled(), Ordering::SeqCst);
+                ActionOutcome::success(
+                    serde_json::from_slice(input).unwrap(),
+                    Vec::new(),
+                    CostUnits(1),
+                    None,
+                )
+                .unwrap()
+            }
+        })
+    }
+}
+
+#[test]
+fn continue_timeout_cancels_only_its_attempt_and_releases_slot_for_sibling() {
+    block_on(async {
+        let execution_scope = scope();
+        let clock = Arc::new(TestClock::new(Timestamp(12_000)));
+        let store = Arc::new(InMemoryStore::new(clock.clone()));
+        let objects = Arc::new(InMemoryObjectStore::new(clock.clone()));
+        publish_and_create(
+            &store,
+            &objects,
+            &execution_scope,
+            continue_definition("w4-timeout-slot", json!(["first", "second"]), Some(1)),
+            "timeout-slot",
+        )
+        .await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled_at_drop = Arc::new(AtomicBool::new(false));
+        let sibling_cancelled = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(InMemoryActionRegistry::new());
+        registry
+            .register(Arc::new(PendingMapAction {
+                descriptor: descriptor(),
+                started: started.clone(),
+                invocations: invocations.clone(),
+                dropped: dropped.clone(),
+                cancelled_at_drop: cancelled_at_drop.clone(),
+                sibling_cancelled: sibling_cancelled.clone(),
+            }))
+            .unwrap();
+        let engine = WorkflowEngine::new(
+            store.clone(),
+            objects.clone(),
+            registry,
+            EngineConfig {
+                instance_id: id("w4-timeout-slot-engine"),
+                max_concurrency: 1,
+                cancellation_grace: std::time::Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        engine.acquire_scope(&execution_scope).await.unwrap();
+        engine
+            .start(&execution_scope, &id("timeout-slot"))
+            .await
+            .unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        clock.advance_ms(1_000).unwrap();
+        engine.tick(&execution_scope).await.unwrap();
+        assert_eq!(
+            store
+                .get_run(&execution_scope, &id("timeout-slot"))
+                .await
+                .unwrap()
+                .run
+                .status,
+            RunState::Running
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            engine.run_until_idle(&execution_scope, 8),
+        )
+        .await
+        .expect("timed-out invocation held the sole execution slot")
+        .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(cancelled_at_drop.load(Ordering::SeqCst));
+        assert!(!sibling_cancelled.load(Ordering::SeqCst));
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        let run = store
+            .get_run(&execution_scope, &id("timeout-slot"))
+            .await
+            .unwrap()
+            .run;
+        assert_eq!(run.status, RunState::Succeeded);
+        let child_nodes = children(&store, &execution_scope, "timeout-slot").await;
+        assert_eq!(
+            child_nodes
+                .iter()
+                .filter(|child| child.status == NodeState::Succeeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            child_nodes
+                .iter()
+                .filter(|child| child.status == NodeState::RetriesExhausted)
+                .count(),
+            1
+        );
+        let parent = store
+            .get_node(&execution_scope, &id("timeout-slot"), &id("map"))
+            .await
+            .unwrap();
+        let result = objects
+            .get(&execution_scope, &parent.result_ref.unwrap().0.digest)
+            .await
+            .unwrap();
+        let envelopes: Value = serde_json::from_slice(&result.bytes).unwrap();
+        assert!(envelopes
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["error_class"] == "timeout"));
     });
 }

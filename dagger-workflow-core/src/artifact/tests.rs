@@ -31,8 +31,8 @@ fn capability_clones_share_bytes_and_outlive_the_original() {
     let cloned = reference.clone();
     assert_eq!(cloned, reference);
     assert!(Arc::ptr_eq(
-        &reference.verified_bytes,
-        &cloned.verified_bytes
+        reference.verified_bytes.as_ref().unwrap(),
+        cloned.verified_bytes.as_ref().unwrap()
     ));
     assert_eq!(
         reference.verified_bytes().as_ptr(),
@@ -46,7 +46,10 @@ fn capability_clones_share_bytes_and_outlive_the_original() {
 fn capability_equality_remains_content_based_and_scope_bound() {
     let first = capability(vec![1, 2, 3]);
     let second = capability(vec![1, 2, 3]);
-    assert!(!Arc::ptr_eq(&first.verified_bytes, &second.verified_bytes));
+    assert!(!Arc::ptr_eq(
+        first.verified_bytes.as_ref().unwrap(),
+        second.verified_bytes.as_ref().unwrap()
+    ));
     assert_eq!(first, second);
     assert_ne!(first, capability(vec![1, 2, 4]));
 
@@ -93,4 +96,20 @@ fn shared_capabilities_remain_send_and_sync() {
         cloned
     });
     assert_eq!(worker.join().unwrap(), reference);
+}
+
+#[test]
+fn file_capability_clones_retain_no_payload() {
+    let inline = capability(vec![1, 2, 3]);
+    let reference = VerifiedObjectRef::without_inline_bytes(
+        inline.scope().clone(),
+        inline.digest().clone(),
+        inline.size_bytes(),
+        inline.media_type().to_owned(),
+        inline.object_key().to_owned(),
+        inline.store_instance_nonce().to_vec(),
+    );
+    assert_eq!(reference.inline_bytes(), None);
+    assert_eq!(reference.clone(), reference);
+    assert_eq!(reference.size_bytes(), 3);
 }

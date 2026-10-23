@@ -1,4 +1,4 @@
-<!-- tusker:generated:file; do not edit manually; run `tusker dashboard build` -->
+<!-- tusker:generated:file; do not edit manually; run `tusker reindex` -->
 
 # Review Queue
 
