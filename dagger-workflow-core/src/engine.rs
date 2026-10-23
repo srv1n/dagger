@@ -63,6 +63,8 @@ impl TestClock {
     }
 
     /// Advances the clock using checked arithmetic.
+    // Rust 1.99 renamed `fetch_update` to `try_update`; keep the old name for the 1.82 MSRV.
+    #[allow(deprecated)]
     pub fn advance_ms(&self, milliseconds: i64) -> Result<Timestamp, ClockError> {
         let result = self
             .now_ms
