@@ -11,11 +11,12 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const NONCE_BYTES: usize = 32;
 // Binary copy and verification use one buffer, independent of object size.
@@ -145,6 +146,10 @@ pub struct FsObjectStore<C, F = StdFs> {
     store_instance_nonce: Vec<u8>,
     proof_seed: [u8; NONCE_BYTES],
     next_proof_nonce: AtomicU64,
+    /// Objects whose directory entries this process has already synced. A
+    /// synced entry stays durable until a write path replaces it, and every
+    /// write path syncs again, so reads can skip the barrier for these.
+    durable: Mutex<BTreeSet<(ExecutionScope, Digest)>>,
 }
 
 impl<C: Clock> FsObjectStore<C, StdFs> {
@@ -307,7 +312,7 @@ impl<C: Clock> FsObjectStore<C, StdFs> {
             }
             let media_type = read_media_type(&self.fs, &self.media_path(scope, requested))
                 .map_err(|failure| self.missing_or_unavailable(scope, requested, failure))?;
-            self.sync_publication_barrier(scope, requested)
+            self.ensure_durable(scope, requested)
                 .map_err(|_| ObjectReadError::StorageUnavailable)?;
             let mut snapshot =
                 File::open(&temporary).map_err(|_| ObjectReadError::StorageUnavailable)?;
@@ -360,6 +365,7 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
             store_instance_nonce: load_or_create_nonce(&fs, &metadata, &temporary)?,
             proof_seed: random_bytes()?,
             next_proof_nonce: AtomicU64::new(0),
+            durable: Mutex::new(BTreeSet::new()),
             root,
             clock,
             fs,
@@ -824,7 +830,28 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
             self.media_path(scope, digest)
                 .parent()
                 .expect("media paths always have a parent"),
-        )
+        )?;
+        let mut durable = self.durable.lock().expect("durable set lock poisoned");
+        // ponytail: drop-all bound; a reader then re-syncs once per object.
+        if durable.len() >= 100_000 {
+            durable.clear();
+        }
+        durable.insert((scope.clone(), digest.clone()));
+        Ok(())
+    }
+
+    /// The read-side barrier: an object read must be durable before a caller
+    /// commits a reference to it. Skips objects already synced by this process.
+    fn ensure_durable(&self, scope: &ExecutionScope, digest: &Digest) -> Result<(), io::Error> {
+        if self
+            .durable
+            .lock()
+            .expect("durable set lock poisoned")
+            .contains(&(scope.clone(), digest.clone()))
+        {
+            return Ok(());
+        }
+        self.sync_publication_barrier(scope, digest)
     }
 
     /// Establishes the publication barrier before returning a verified ref.
@@ -899,7 +926,7 @@ impl<C: Clock, F: StoreFs> ObjectStore for FsObjectStore<C, F> {
         // escape ahead of the publication barrier. Splitting this return into a non-committable
         // verified-read capability, distinct from the durable put capability, would remove the
         // cost; that is a type-level change to the artifact contract, not to this store.
-        self.sync_publication_barrier(scope, requested)
+        self.ensure_durable(scope, requested)
             .map_err(|_| ObjectReadError::StorageUnavailable)?;
         let reference = self.verified_reference(
             scope,
@@ -956,7 +983,7 @@ impl<C: Clock, F: StoreFs> ObjectStore for FsObjectStore<C, F> {
                 Some(observed),
             ));
         }
-        self.sync_publication_barrier(scope, requested)
+        self.ensure_durable(scope, requested)
             .map_err(|_| ObjectReadError::StorageUnavailable)?;
         Ok(self.file_reference(scope, requested.clone(), size_bytes, &media_type))
     }
