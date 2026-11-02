@@ -884,6 +884,10 @@ pub struct SqliteWorkflowStore<C, O> {
     /// Ephemeral reducer input only. It is neither serialized nor read after
     /// restart; object verification belongs exclusively to the engine.
     verified_bytes: Arc<Mutex<BTreeMap<(ExecutionScope, Digest), Vec<u8>>>>,
+    /// Write transactions in this process queue here instead of polling
+    /// SQLite's write lock through the busy handler. Other processes still
+    /// rely on `busy_timeout`.
+    writer: tokio::sync::Mutex<()>,
     #[cfg(feature = "conformance")]
     commit_fault: Arc<Mutex<Option<SqliteCommitFault>>>,
     marker: PhantomData<fn() -> C>,
@@ -922,6 +926,7 @@ where
             engine_claim_lifetime_ms: 20_000,
             objects,
             verified_bytes: Arc::new(Mutex::new(BTreeMap::new())),
+            writer: tokio::sync::Mutex::new(()),
             #[cfg(feature = "conformance")]
             commit_fault: Arc::new(Mutex::new(None)),
             marker: PhantomData,
@@ -2798,6 +2803,7 @@ macro_rules! sql_command {
                 let $workflow_scope = scope;
                 $hydrate;
             )?
+            let _writer = self.writer.lock().await;
             let mut connection = self.begin_immediate().await?;
             let now = match Self::database_now(&mut connection).await {
                 Ok(value) => value,
@@ -2883,6 +2889,7 @@ macro_rules! sql_engine_command {
             scope: &ExecutionScope,
             $($arg: $arg_type),*
         ) -> Result<$output, StoreError> {
+            let _writer = self.writer.lock().await;
             let mut connection = self.begin_immediate().await?;
             let now = match Self::database_now(&mut connection).await {
                 Ok(value) => value,

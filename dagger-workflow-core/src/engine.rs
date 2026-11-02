@@ -133,6 +133,9 @@ where
     max_progress_events_per_attempt: u16,
     permits: Mutex<BTreeMap<ExecutionScope, crate::store::EnginePermit>>,
     supervisor: Arc<AttemptSupervisor>,
+    /// Parsed definitions by revision. A revision is immutable and addressed
+    /// by the hash of its canonical bytes, so one verified read is enough.
+    definitions: Mutex<BTreeMap<(ExecutionScope, Digest), Arc<WorkflowDefinition>>>,
 }
 
 type AttemptKey = (ExecutionScope, Id, Id);
@@ -310,6 +313,7 @@ where
             max_progress_events_per_attempt: 64,
             permits: Mutex::new(BTreeMap::new()),
             supervisor,
+            definitions: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -882,8 +886,17 @@ where
         &self,
         scope: &ExecutionScope,
         run_id: &Id,
-    ) -> Result<(crate::run::WorkflowRun, WorkflowDefinition), EngineError> {
+    ) -> Result<(crate::run::WorkflowRun, Arc<WorkflowDefinition>), EngineError> {
         let run = self.store.get_run_record(scope, run_id).await?;
+        let key = (scope.clone(), run.revision_hash.clone());
+        if let Some(definition) = self
+            .definitions
+            .lock()
+            .expect("definition cache lock poisoned")
+            .get(&key)
+        {
+            return Ok((run, definition.clone()));
+        }
         let revision = self
             .store
             .get_revision(scope, &run.definition_id, &run.revision_hash)
@@ -895,6 +908,17 @@ where
             std::str::from_utf8(&object.bytes).map_err(|_| EngineError::DefinitionDecode)?,
         )
         .map_err(|_| EngineError::DefinitionDecode)?;
+        let definition = Arc::new(definition);
+        let mut definitions = self
+            .definitions
+            .lock()
+            .expect("definition cache lock poisoned");
+        // ponytail: drop-all bound; switch to LRU if a host cycles through
+        // more than this many live revisions.
+        if definitions.len() >= 1024 {
+            definitions.clear();
+        }
+        definitions.insert(key, definition.clone());
         Ok((run, definition))
     }
 
