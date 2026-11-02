@@ -2,7 +2,7 @@
 subject: Operations and limits
 keywords: [limits, budgets, approvals, deployment]
 part_of: Workflow engine
-describes: [dagger-workflow-core/src/run.rs, dagger-workflow-core/src/engine.rs, dagger-workflow-core/src/approval.rs, dagger-workflow-core/src/sqlite/reducer.rs]
+describes: [dagger-workflow-core/src/run.rs, dagger-workflow-core/src/engine.rs, dagger-workflow-core/src/approval.rs, dagger-workflow-core/src/reducer.rs]
 status: canonical
 created: 2026-08-23
 last_verified: 2026-08-23 @ 94e8bc4543ccf2c8f57c30715071e7c0b9352b57

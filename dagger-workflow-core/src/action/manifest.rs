@@ -540,7 +540,7 @@ fn register_schema(
             .map_err(|error| invalid(&path, error.to_string()))?,
     };
     let bytes = serde_jcs::to_vec(&schema).map_err(|error| invalid(&path, error.to_string()))?;
-    crate::memory::validate_schema_document(&bytes)
+    crate::reducer::validate_schema_document(&bytes)
         .map_err(|error| invalid(&path, error.to_string()))?;
     let digest = revision_hash(&bytes);
     schemas.insert(digest.clone(), schema);

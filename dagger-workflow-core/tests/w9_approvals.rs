@@ -8,11 +8,8 @@
 //! Two deliberate choices, both mirroring `tests/w10_budgets.rs`.
 //!
 //! First, every fixture runs against both store implementations through the
-//! `WorkflowStore` trait. `src/memory/mod.rs` and `src/sqlite/reducer.rs` are
-//! textually near-identical for the approval commands, which means agreement
-//! between them is worth nothing as evidence of correctness -- it only proves
-//! the copy is faithful. The value of running both is catching the case where
-//! one copy is later edited and the other is not.
+//! `WorkflowStore` trait. Both stores run the same reducer, so running both
+//! checks that SQLite persists and reloads approval state without changing it.
 //!
 //! Second, the negative fixtures assert on the *state that did not change*,
 //! not merely on the returned error. Unauthorized input cannot win or perturb

@@ -5,7 +5,6 @@
 //! verified object metadata and typed references belong to the control plane.
 
 mod codec;
-mod reducer;
 mod schema;
 
 use crate::action::ActionInvocation;
@@ -18,14 +17,14 @@ use crate::definition::PublishableDefinition;
 use crate::engine::Clock;
 use crate::event::WorkflowEvent;
 use crate::ids::{artifact_ref_id, ArtifactRefIdentity, Digest, Id, NodeInstanceId, Timestamp};
+use crate::reducer::{
+    finish_scan_page, scan_page_context, timestamp_cursor_key, CommandKindKey, ReducerState,
+    ReducerStore, StoredClaim,
+};
 use crate::revision::WorkflowRevision;
 use crate::run::{EdgeFact, NodeAttempt, NodeRun, WorkflowRun, WorkflowRunView};
 use crate::scope::ExecutionScope;
 use crate::store::*;
-use reducer::{
-    finish_scan_page, scan_page_context, timestamp_cursor_key, CommandKindKey, ReducerState,
-    ReducerStore, StoredClaim,
-};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -2848,7 +2847,7 @@ macro_rules! sql_command {
                 // for both before returning them. Rolling the SQL transaction back here
                 // would discard exactly the transition the closed code claims was
                 // applied, leaving the durable row set disagreeing with the in-memory
-                // oracle. The reducer owns the decision about what is staged; this arm
+                // store. The reducer owns the decision about what is staged; this arm
                 // only has to persist whatever it committed.
                 Err(error)
                     if matches!(

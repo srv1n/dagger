@@ -781,7 +781,7 @@ pub fn resolve_publication(
                 );
                 if let Some(schema) = schemas.get(digest) {
                     let supported = serde_jcs::to_vec(schema).ok().is_some_and(|bytes| {
-                        crate::memory::validate_schema_document(&bytes).is_ok()
+                        crate::reducer::validate_schema_document(&bytes).is_ok()
                     });
                     if !supported {
                         errors.push(error(

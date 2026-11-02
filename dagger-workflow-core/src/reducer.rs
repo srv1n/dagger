@@ -66,74 +66,32 @@ fn valid_external_handle(command: &RegisterExternalHandle) -> bool {
             .unwrap_or(false)
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Default)]
 pub(crate) struct ReducerState {
     pub(crate) object_store_nonce: Option<Vec<u8>>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) object_records: BTreeMap<(ExecutionScope, Digest), crate::artifact::ObjectRecord>,
     /// Verified bytes belong to the object store. They may be cached while a
     /// process is alive, but serializing them into SQLite would turn the
     /// control-plane database into an object store.
-    #[serde(skip)]
     pub(crate) verified_object_bytes: BTreeMap<(ExecutionScope, Digest), Vec<u8>>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) artifact_refs: BTreeMap<(ExecutionScope, Id), ArtifactRef>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) definitions: BTreeMap<(ExecutionScope, Id), DefinitionRecord>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) revisions: BTreeMap<(ExecutionScope, Id, Digest), WorkflowRevision>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) parsed_revisions: BTreeMap<(ExecutionScope, Id, Digest), PublishableDefinition>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) claims: BTreeMap<ExecutionScope, StoredClaim>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) runs: BTreeMap<(ExecutionScope, Id), WorkflowRun>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) run_definitions: BTreeMap<(ExecutionScope, Id), PublishableDefinition>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) nodes: BTreeMap<(ExecutionScope, Id, NodeInstanceId), NodeRun>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) edges: BTreeMap<(ExecutionScope, Id, Id), EdgeFact>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) attempts: BTreeMap<(ExecutionScope, Id, Id), NodeAttempt>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) invocations: BTreeMap<(ExecutionScope, Id, Id), ActionInvocation>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) gates: BTreeMap<(ExecutionScope, Id, Id), ApprovalGate>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) receipts: BTreeMap<(ExecutionScope, CommandKindKey, String), CommandReceipt>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) events: BTreeMap<(ExecutionScope, Id), Vec<WorkflowEvent>>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) ledger: BTreeMap<(ExecutionScope, Id), Vec<BudgetLedgerEntry>>,
-    #[serde(with = "map_as_sequence")]
     pub(crate) external_handles: BTreeMap<(ExecutionScope, String, String), ExternalHandle>,
     pub(crate) stale_observed: BTreeSet<(ExecutionScope, Id, Id)>,
     pub(crate) batch_counter: u64,
-}
-
-mod map_as_sequence {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::collections::BTreeMap;
-
-    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
-        map: &BTreeMap<K, V>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        map.iter().collect::<Vec<_>>().serialize(serializer)
-    }
-
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
-    where
-        K: Deserialize<'de> + Ord,
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        Vec::<(K, V)>::deserialize(deserializer)
-            .map(Vec::into_iter)
-            .map(Iterator::collect)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -142,7 +100,8 @@ pub(crate) enum CommandKindKey {
     Cancel,
 }
 
-#[derive(Clone, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, PartialEq)]
+#[cfg_attr(feature = "sqlite", derive(Deserialize, Serialize))]
 pub(crate) struct StoredClaim {
     pub(crate) claim: EngineClaim,
     pub(crate) token_digest: Digest,
@@ -157,6 +116,38 @@ pub struct ReducerStore<C> {
 }
 
 impl<C: Clock> ReducerStore<C> {
+    /// Creates an empty in-memory control-plane store.
+    pub fn new(clock: Arc<C>) -> Self {
+        Self::from_state(clock, ReducerState::default())
+    }
+
+    /// Returns the immutable budget ledger for conformance and diagnostics.
+    pub fn budget_ledger(&self, scope: &ExecutionScope, run_id: &Id) -> Vec<BudgetLedgerEntry> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .ledger
+            .get(&(scope.clone(), run_id.clone()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns one immutable invocation.
+    pub fn get_invocation(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+        invocation_id: &Id,
+    ) -> Result<ActionInvocation, StoreError> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .invocations
+            .get(&(scope.clone(), run_id.clone(), invocation_id.clone()))
+            .cloned()
+            .ok_or(StoreError::NotFound)
+    }
+
     pub(crate) fn from_state(clock: Arc<C>, state: ReducerState) -> Self {
         Self {
             clock,
@@ -165,11 +156,13 @@ impl<C: Clock> ReducerStore<C> {
         }
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn with_engine_claim_lifetime_ms(mut self, milliseconds: u64) -> Self {
         self.engine_claim_lifetime_ms = milliseconds;
         self
     }
 
+    #[cfg(feature = "sqlite")]
     pub(crate) fn snapshot(&self) -> ReducerState {
         self.state.lock().expect("store lock poisoned").clone()
     }
@@ -465,7 +458,7 @@ fn parse_canonical_revision(
     })
 }
 
-fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
+pub(crate) fn validate_schema_document(bytes: &[u8]) -> Result<Value, StoreError> {
     if bytes.len() > 1024 * 1024 {
         return Err(StoreError::SchemaSubsetUnsupported);
     }

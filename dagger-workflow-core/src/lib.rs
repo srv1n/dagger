@@ -20,6 +20,7 @@ pub mod ids;
 pub mod memoization;
 pub mod memory;
 pub mod pinning;
+mod reducer;
 pub mod revision;
 pub mod run;
 pub mod scope;
