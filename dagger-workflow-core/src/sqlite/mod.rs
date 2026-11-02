@@ -3083,6 +3083,26 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
             .reuse_source(command.reuse_provenance.as_ref())
             .artifacts(command.memoization_artifact_refs.iter().map(|reference| reference.artifact_ref_id.clone()))
     );
+    // Claim and completion run in one transaction: one run load, one commit.
+    sql_command!(
+        claim_and_complete_reused(
+            claim: ClaimReusableNodeAttempt,
+            outcome: crate::action::ActionOutcome,
+            objects: CompletionObjects,
+        ) -> Option<CompleteAttemptResult>;
+        AuthorityLoad::run(&claim.claim.run_id).objects([claim.claim.bound_input.digest()])
+            .reuse_source(claim.reuse_provenance.as_ref())
+            .artifacts(claim.memoization_artifact_refs.iter().map(|reference| reference.artifact_ref_id.clone()))
+            .objects(
+                objects.output.iter().map(VerifiedObjectRef::digest)
+                    .chain(objects.artifacts.iter().map(VerifiedObjectRef::digest))
+                    .chain(objects.diagnostics.iter().map(VerifiedObjectRef::digest))
+            );
+        |store, workflow_scope| store.hydrate_run_action_schemas(
+            workflow_scope,
+            &claim.claim.run_id,
+        ).await?
+    );
     async fn get_action_invocation(
         &self,
         scope: &ExecutionScope,

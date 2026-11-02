@@ -1065,6 +1065,42 @@ pub trait WorkflowStore: Send + Sync {
         self.claim_node_attempt(scope, command.claim).await
     }
 
+    /// Claims a reused (cache hit or pinned) result and accepts its outcome as
+    /// one command. `None` means the claim did not produce an attempt, as for
+    /// any non-`Claimed` claim result. Stores that can run both reducer steps
+    /// in one transaction should override this.
+    async fn claim_and_complete_reused(
+        &self,
+        scope: &ExecutionScope,
+        claim: ClaimReusableNodeAttempt,
+        outcome: ActionOutcome,
+        objects: CompletionObjects,
+    ) -> Result<Option<CompleteAttemptResult>, StoreError> {
+        let run_id = claim.claim.run_id.clone();
+        let node_id = claim.claim.node_id.clone();
+        let attempt_id = claim.claim.attempt_id.clone();
+        let ClaimNodeAttemptResult::Claimed {
+            completion_credential,
+            ..
+        } = self.claim_reusable_node_attempt(scope, claim).await?
+        else {
+            return Ok(None);
+        };
+        self.complete_attempt(
+            scope,
+            CompleteAttempt {
+                completion_credential,
+                run_id,
+                node_id,
+                attempt_id,
+                submitted_outcome: outcome,
+                objects,
+            },
+        )
+        .await
+        .map(Some)
+    }
+
     /// Reads the durable bound-input invocation for a successful reuse source.
     async fn get_action_invocation(
         &self,

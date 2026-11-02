@@ -538,33 +538,17 @@ where
         changed += self.complete_waiting_maps(scope, permit).await?;
         for node in action_nodes {
             // ponytail: a reused node still needs a free slot to be looked
-            // up, though it releases the slot at once. When every slot runs
-            // a long action, ready cache hits wait for one to free.
+            // up, though it holds it only for this iteration. When every slot
+            // runs a long action, ready cache hits wait for one to free.
             let Ok(slot) = self.supervisor.semaphore.clone().try_acquire_owned() else {
                 break;
             };
             match self.claim_action(scope, permit, node).await {
-                Ok(Some(mut claimed)) if claimed.reused_outcome.is_some() => {
-                    let registration = claimed
-                        .registration
-                        .take()
-                        .expect("claimed action owns its local registration");
-                    let result = execute_attempt(
-                        self.store.clone(),
-                        self.object_store.clone(),
-                        self.supervisor.clone(),
-                        scope.clone(),
-                        claimed,
-                    )
-                    .await;
-                    drop(slot);
-                    resolved_inline |= result.is_ok();
-                    // Same outcome path as a spawned attempt: errors surface
-                    // on the next tick.
-                    registration.finish(result);
+                Ok(Some(Claim::Reused)) => {
                     changed += 1;
+                    resolved_inline = true;
                 }
-                Ok(Some(claimed)) => {
+                Ok(Some(Claim::Spawn(claimed))) => {
                     self.spawn_attempt(scope.clone(), permit.clone(), claimed, slot);
                     changed += 1;
                 }
@@ -967,7 +951,7 @@ where
         scope: &ExecutionScope,
         permit: &crate::store::EnginePermit,
         node: NodeRun,
-    ) -> Result<Option<ClaimedAction>, EngineError> {
+    ) -> Result<Option<Claim>, EngineError> {
         let (run, definition) = self.definition_for(scope, &node.run_id).await?;
         let definition_node = find_node(&definition, &node.definition_node_id)?;
         let action_ref = match definition_node {
@@ -1082,39 +1066,39 @@ where
         } else {
             memoization_key
         };
+        let claim = ClaimReusableNodeAttempt {
+            claim: ClaimNodeAttempt {
+                permit: permit.clone(),
+                run_id: node.run_id.clone(),
+                node_id: node.node_instance_id.clone(),
+                expected_node_version: node.version,
+                attempt_id: attempt_id.clone(),
+                worker_id: self.config.instance_id.clone(),
+                bound_input: bound_object,
+            },
+            memoization_key,
+            memoization_artifact_refs,
+            reuse_provenance,
+        };
+        // A reused outcome needs no task: claim and accept it in one command,
+        // so dependents are ready for this same scheduler pass.
+        if let Some(outcome) = reused_outcome {
+            let objects =
+                completion_objects(&*self.object_store, scope, &outcome, repair_cache_objects)
+                    .await?;
+            return Ok(self
+                .store
+                .claim_and_complete_reused(scope, claim, outcome, objects)
+                .await?
+                .map(|_| Claim::Reused));
+        }
         let source = CancellationSource::new();
         let key = (scope.clone(), node.run_id.clone(), attempt_id.clone());
         let registration = AttemptRegistration::new(self.supervisor.clone(), key, source.clone());
-        let result = match self
-            .store
-            .claim_reusable_node_attempt(
-                scope,
-                ClaimReusableNodeAttempt {
-                    claim: ClaimNodeAttempt {
-                        permit: permit.clone(),
-                        run_id: node.run_id.clone(),
-                        node_id: node.node_instance_id.clone(),
-                        expected_node_version: node.version,
-                        attempt_id: attempt_id.clone(),
-                        worker_id: self.config.instance_id.clone(),
-                        bound_input: bound_object,
-                    },
-                    memoization_key,
-                    memoization_artifact_refs,
-                    reuse_provenance,
-                },
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                return Err(error.into());
-            }
-        };
         let ClaimNodeAttemptResult::Claimed {
             invocation,
             completion_credential,
-        } = result
+        } = self.store.claim_reusable_node_attempt(scope, claim).await?
         else {
             return Ok(None);
         };
@@ -1224,16 +1208,15 @@ where
                 return Err(EngineError::ActionMissing);
             }
         };
-        Ok(Some(ClaimedAction {
+        Ok(Some(Claim::Spawn(ClaimedAction {
             action,
-            reused_outcome,
             repair_cache_objects,
             context,
             input_bytes: bound,
             cancellation: source,
             registration: Some(registration),
             _invocation: invocation,
-        }))
+        })))
     }
 
     async fn bind_object(
@@ -1882,9 +1865,16 @@ where
     }
 }
 
+/// What a successful claim produced.
+enum Claim {
+    /// An attempt to run in a spawned task.
+    Spawn(ClaimedAction),
+    /// A reused outcome, already claimed and accepted.
+    Reused,
+}
+
 struct ClaimedAction {
     repair_cache_objects: bool,
-    reused_outcome: Option<ActionOutcome>,
     action: Arc<dyn crate::action::WorkflowAction>,
     context: ActionContext,
     input_bytes: Vec<u8>,
@@ -2035,15 +2025,10 @@ where
     S: WorkflowStore + 'static,
     O: ObjectStore + 'static,
 {
-    let outcome = match claimed.reused_outcome {
-        Some(outcome) => outcome,
-        None => {
-            claimed
-                .action
-                .invoke(claimed.context.clone(), &claimed.input_bytes)
-                .await
-        }
-    };
+    let outcome = claimed
+        .action
+        .invoke(claimed.context.clone(), &claimed.input_bytes)
+        .await;
     let objects = completion_objects(
         &*object_store,
         &scope,

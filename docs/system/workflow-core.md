@@ -115,6 +115,12 @@ through ordinary credential and generation fences, costs zero execution units,
 records source provenance, and creates new-run artifact references. A dependent
 can hit cache when its input remains unchanged after an upstream execution.
 
+A reused outcome (cache hit or pin) runs no task. The scheduler claims and
+accepts it with one store command, `claim_and_complete_reused`, which SQLite
+runs as one transaction. It then rescans the frontier in the same `tick`, so
+a fully cached run finishes in one pass. Lookup still needs a free
+concurrency slot for that moment.
+
 Run options can lock an Action or keyed Map item to a same-scope committed
 output. Pins verify schemas and bytes. Invalid pins fail instead of executing
 a replacement. Durable provenance distinguishes pins from cache hits.
