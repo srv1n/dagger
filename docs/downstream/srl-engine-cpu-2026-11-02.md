@@ -2,23 +2,26 @@
 
 For: the Song Rendition Lab (SRL) team. From: Dagger. Date: 2026-11-02.
 Your report: `docs/upstream/dagger-engine-cpu-2026-11-02.md` in the SRL repo (Dagger `4b7f768`).
-Dagger branch: `perf/engine-sqlite-overhead`, 7 commits on top of `4b7f768`. Not merged yet.
+Dagger branch: `perf/engine-sqlite-overhead`, 11 commits on top of `4b7f768`. Not merged yet.
 
 ## Summary
 
 All five problems in your report are fixed or reduced inside Dagger. On your v7b song
-(86 nodes, Mac, one run each, all runs `delivery_candidate_ready`):
+(86 nodes, Mac, release builds of `srl_host`, one run each, all runs
+`delivery_candidate_ready`), measured at the branch head:
 
 | | Dagger `4b7f768` | Branch | Change |
 |---|---|---|---|
-| Cold song, `srl_host` CPU | 82.4 s | 25.8 s | -69% |
-| Cold song, wall | 181.3 s | 177.2 s | about the same |
-| Fully cached rerun, wall | 56.7 s | 16.4 s | -71% |
-| Fully cached rerun, `srl_host` CPU | 45.0 s | 10.5 s | -77% |
+| Cold song, `srl_host` CPU | 142.9 s | 22.1 s | -85% |
+| Cold song, wall | 203.7 s | 131.3 s | -36% |
+| Fully cached rerun, wall | 29.7 s | 15.3 s | -48% |
+| Fully cached rerun, `srl_host` CPU | 21.9 s | 7.8 s | -64% |
 
-These numbers are from commit `df43e5b`. The three later commits cut engine CPU further.
-Cold-song wall time barely moves because your actions' own work dominates it. The engine
-overhead that competed with that work is what dropped.
+The Mac was shared and loaded (load average 7 to 80 during the day), so treat single runs
+as rough. An earlier run on this branch at `df43e5b` measured 82.4 s vs 25.8 s cold host CPU
+and 56.7 s vs 16.4 s cached wall. Each pair ran back to back under the same load. On
+both days the branch cut host CPU by more than two thirds. The cold wall-time gain
+comes from the engine no longer competing with your actions for CPU.
 
 ## Your five points
 
@@ -38,9 +41,11 @@ overhead that competed with that work is what dropped.
      real disk this saves milliseconds per read; under `eatmydata` you will not see it.
 4. **No public way to wait for engine activity.** Added `WorkflowEngine::activity()`, a
    `tokio::sync::watch::Receiver<u64>` that changes after each local attempt finishes.
-5. **Cache hits resolved serially at about 1 s each.** The cost per cache hit was the
-   per-command overhead in point 3. Your cached rerun went from 57 s to 16 s. Cache hits
-   still take one concurrency slot each; see "Not done yet".
+5. **Cache hits resolved serially at about 1 s each.** Fixed. A cache hit (or pinned
+   output) no longer spawns an attempt task. The scheduler claims it and accepts its outcome
+   in one store command (`claim_and_complete_reused`, one SQLite transaction), then rescans
+   in the same `tick`. A fully cached run now finishes in one `tick` call. Re-publishing an
+   object that already exists also no longer fsyncs its directories.
 
 ## What SRL should change
 
@@ -84,13 +89,13 @@ These are your calls. Dagger does not depend on any of them.
 ## Not done yet
 
 - **Per-run state cache.** Every SQLite command still loads and decodes the run's working
-  rows. That is about 39% of the engine's remaining CPU. The design is in Dagger's
+  rows. After the cache-hit changes it is about half of the scheduler's remaining CPU on a
+  cached rerun. The design is in Dagger's
   `docs/system/proposals/sqlite-run-state-cache.md`. It needs a schema migration, so it is
   waiting on a decision.
-- **Cache hits use a concurrency slot.** A fully cached node still claims, spawns an attempt
-  task and commits a completion. Resolving cache hits inline in the scheduler would make a
-  cached rerun close to one pass. This changes scheduling behavior, so it is not in this
-  branch.
+- **Cache hits wait for a free slot to be looked up.** A cache hit holds a concurrency slot
+  only while the scheduler resolves it. When every slot runs a long action, ready cache hits
+  wait until one frees.
 
 ## How we measured
 
