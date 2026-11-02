@@ -8,7 +8,6 @@ use crate::run::NodeAttempt;
 use crate::scope::ExecutionScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 /// Immutable cache policy selected when a run is created.
@@ -86,11 +85,7 @@ pub(crate) fn action_cache_key(
         input,
     ))
     .map_err(|_| crate::engine::EngineError::Binding)?;
-    let hash = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Digest::new(format!("sha256:{hash}")).map_err(|_| crate::engine::EngineError::Binding)
+    Ok(Digest::of(&bytes))
 }
 
 fn normalize_artifact_uses(value: &mut Value, confirmed: &BTreeMap<Id, &ArtifactRefValue>) {
@@ -421,7 +416,7 @@ mod tests {
     use super::*;
     use crate::scope::ScopeAtom;
     fn digest(value: &str) -> Digest {
-        Digest::new(format!("sha256:{:x}", Sha256::digest(value.as_bytes()))).unwrap()
+        Digest::of(value)
     }
     #[test]
     fn every_pin_and_input_and_scope_dimension_enters_the_key() {

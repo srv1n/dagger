@@ -10,7 +10,6 @@ use crate::scope::ExecutionScope;
 use crate::store::{ExternalHandle, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
@@ -44,7 +43,7 @@ impl CompletionCredential {
 
     /// Returns the only persistence-safe representation of this credential.
     pub fn digest(&self) -> Digest {
-        digest_bytes(&self.0)
+        Digest::of(&self.0)
     }
 }
 
@@ -973,7 +972,7 @@ impl CanonicalBoundInput {
     pub fn from_canonical_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         let bytes = Arc::<[u8]>::from(bytes.into());
         Self {
-            digest: digest_bytes(&bytes),
+            digest: Digest::of(&bytes),
             bytes,
         }
     }
@@ -981,7 +980,7 @@ impl CanonicalBoundInput {
     /// Accepts resolved bytes only when their supplied digest is exact.
     pub fn with_digest(bytes: impl Into<Vec<u8>>, digest: Digest) -> Result<Self, InvocationError> {
         let bytes = Arc::<[u8]>::from(bytes.into());
-        let actual = digest_bytes(&bytes);
+        let actual = Digest::of(&bytes);
         if actual != digest {
             return Err(InvocationError::BoundInputDigestMismatch {
                 expected: digest,
@@ -1127,15 +1126,10 @@ pub async fn invoke_registered_at(
     Ok(outcome)
 }
 
-fn digest_bytes(bytes: &[u8]) -> Digest {
-    let hash = Sha256::digest(bytes);
-    Digest::new(format!("sha256:{hash:x}")).expect("SHA-256 output is valid")
-}
-
 /// Hashes compatibility evidence over RFC 8785 canonical JSON bytes.
 pub fn compatibility_evidence_digest<T: Serialize>(value: &T) -> Digest {
     let bytes = serde_jcs::to_vec(value).expect("compatibility evidence is serializable");
-    digest_bytes(&bytes)
+    Digest::of(&bytes)
 }
 
 fn invalid_diagnostics(path: &str, code: &'static str) -> DiagnosticsValidationError {

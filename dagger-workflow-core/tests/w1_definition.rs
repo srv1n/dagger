@@ -367,76 +367,29 @@ fn dependency_edges_make_reconverged_node_outputs_ready_without_duplicate_contro
     validate_definition(&parse_json_definition(&same_guarded_target).unwrap()).unwrap();
 }
 
-fn rejected_extension(document: String, field: &str) {
-    let error = parse_json_definition(&document)
-        .expect_err("closed format must reject this authoring construct");
-    assert_eq!(error.kind, ValidationErrorKind::UnknownField, "{field}");
-}
-
 #[test]
-fn friction_2_virtual_start_is_not_a_definition_node() {
-    rejected_extension(
-        valid().replace("\"nodes\"", "\"start\":{\"kind\":\"Start\"},\"nodes\""),
-        "start",
-    );
-}
-#[test]
-fn friction_3_composite_value_source_is_not_bindings() {
-    rejected_extension(
-        valid().replace(
-            "\"bindings\":[]",
-            "\"inputs\":[{\"target\":\"/x\"}],\"bindings\":[]",
+fn closed_format_rejects_unauthorable_extensions() {
+    let nodes = |extra: &str| valid().replace("\"nodes\"", &format!("{extra},\"nodes\""));
+    let bindings =
+        |extra: &str| valid().replace("\"bindings\":[]", &format!("{extra},\"bindings\":[]"));
+    let map = valid().replace("\"kind\":\"Action\"", "\"kind\":\"Map\",\"items\":{\"kind\":\"constant\",\"value\":[]},\"max_items\":1,\"max_concurrency\":1,\"subworkflow\":{}");
+    for (field, document) in [
+        ("start", nodes("\"start\":{\"kind\":\"Start\"}")),
+        ("inputs", bindings("\"inputs\":[{\"target\":\"/x\"}]")),
+        ("subworkflow", map),
+        ("trigger", nodes("\"trigger\":{\"cron\":\"* * * * *\"}")),
+        (
+            "approval_output",
+            bindings("\"approval_output\":{\"report\":true}"),
         ),
-        "inputs",
-    );
-}
-#[test]
-fn friction_4_map_cannot_embed_a_subworkflow() {
-    rejected_extension(valid().replace("\"kind\":\"Action\"", "\"kind\":\"Map\",\"items\":{\"kind\":\"constant\",\"value\":[]},\"max_items\":1,\"max_concurrency\":1,\"subworkflow\":{}"), "subworkflow");
-}
-#[test]
-fn friction_6_schedule_trigger_is_host_owned() {
-    rejected_extension(
-        valid().replace(
-            "\"nodes\"",
-            "\"trigger\":{\"cron\":\"* * * * *\"},\"nodes\"",
-        ),
-        "trigger",
-    );
-}
-#[test]
-fn friction_7_approval_output_cannot_be_author_defined() {
-    rejected_extension(
-        valid().replace(
-            "\"bindings\":[]",
-            "\"approval_output\":{\"report\":true},\"bindings\":[]",
-        ),
-        "approval_output",
-    );
-}
-#[test]
-fn friction_8_approval_rejection_has_no_graph_edge() {
-    rejected_extension(
-        valid().replace(
-            "\"bindings\":[]",
-            "\"on_reject\":[\"failed\"],\"bindings\":[]",
-        ),
-        "on_reject",
-    );
-}
-#[test]
-fn friction_9_action_catch_edges_are_not_authorable() {
-    rejected_extension(
-        valid().replace("\"bindings\":[]", "\"catch\":[\"cleanup\"],\"bindings\":[]"),
-        "catch",
-    );
-}
-#[test]
-fn friction_10_execution_traits_are_registry_metadata() {
-    rejected_extension(
-        valid().replace("\"bindings\":[]", "\"llm_backed\":true,\"bindings\":[]"),
-        "llm_backed",
-    );
+        ("on_reject", bindings("\"on_reject\":[\"failed\"]")),
+        ("catch", bindings("\"catch\":[\"cleanup\"]")),
+        ("llm_backed", bindings("\"llm_backed\":true")),
+    ] {
+        let error = parse_json_definition(&document)
+            .expect_err("closed format must reject this authoring construct");
+        assert_eq!(error.kind, ValidationErrorKind::UnknownField, "{field}");
+    }
 }
 
 #[test]

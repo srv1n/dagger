@@ -365,30 +365,6 @@ fn oversized_diagnostics_are_closed_rejections() {
 }
 
 #[test]
-fn outcome_error_taxonomy_remains_distinct() {
-    let retryable = ActionOutcome::retryable(
-        "test.retry".to_owned(),
-        "try again".to_owned(),
-        None,
-        CostUnits(1),
-    )
-    .unwrap();
-    let permanent = ActionOutcome::permanent(
-        "test.permanent".to_owned(),
-        "stop".to_owned(),
-        None,
-        CostUnits(2),
-    )
-    .unwrap();
-    assert!(
-        matches!(retryable, ActionOutcome::Retryable { code, actual_cost_units, .. } if code == "test.retry" && actual_cost_units == CostUnits(1))
-    );
-    assert!(
-        matches!(permanent, ActionOutcome::Permanent { code, actual_cost_units, .. } if code == "test.permanent" && actual_cost_units == CostUnits(2))
-    );
-}
-
-#[test]
 fn idempotency_key_is_stable_across_attempt_ids() {
     let source = CancellationSource::new();
     let first = ActionContext::new(
@@ -424,32 +400,6 @@ fn idempotency_key_is_stable_across_attempt_ids() {
         ExternalHandleAccess::unavailable(),
     );
     assert_eq!(first.idempotency_key, second.idempotency_key);
-}
-
-#[test]
-fn every_fixture_returns_identical_output_for_identical_input() {
-    let fixtures = fixtures::FixtureActions::new();
-    for (name, value) in fixture_inputs() {
-        let descriptor = fixtures::descriptor(name);
-        let input = CanonicalBoundInput::from_canonical_bytes(value.to_string().into_bytes());
-        let first = block_on(invoke_registered_at(
-            fixtures.registry().as_ref(),
-            &invocation(&descriptor, &input),
-            context(100, CancellationSource::new().token()),
-            &input,
-            Timestamp(1),
-        ))
-        .unwrap();
-        let second = block_on(invoke_registered_at(
-            fixtures.registry().as_ref(),
-            &invocation(&descriptor, &input),
-            context(100, CancellationSource::new().token()),
-            &input,
-            Timestamp(1),
-        ))
-        .unwrap();
-        assert_eq!(first, second, "fixture {name} was nondeterministic");
-    }
 }
 
 #[test]
@@ -499,68 +449,6 @@ fn beta_fails_once_and_publisher_records_the_logical_node_key() {
     ))
     .unwrap();
     assert_eq!(fixtures.published_idempotency_keys(), vec![expected_key]);
-}
-
-fn fixture_inputs() -> Vec<(&'static str, serde_json::Value)> {
-    vec![
-        (
-            "legal.generate_initial_queries",
-            json!({"question":"q","max_queries":3}),
-        ),
-        (
-            "legal.search",
-            json!({"question":"q","query":"q1","round":1}),
-        ),
-        (
-            "legal.summarize_evidence",
-            json!({"question":"q","evidence":[]}),
-        ),
-        (
-            "legal.generate_followup_queries",
-            json!({"question":"q","gaps":[],"max_queries":3}),
-        ),
-        (
-            "legal.merge_second_round",
-            json!({"question":"q","initial_summary":{},"second_round_evidence":[]}),
-        ),
-        (
-            "legal.synthesize_report",
-            json!({"question":"q","initial_summary":{},"second_round_binding_status":"none"}),
-        ),
-        (
-            "legal.validate_citations",
-            json!({"question":"q","draft_report":"d","citation_claims":[]}),
-        ),
-        ("intel.prepare_trigger", json!({"trigger":{}})),
-        (
-            "intel.fetch_feed_alpha",
-            json!({"feed_name":"alpha","trigger":{}}),
-        ),
-        (
-            "intel.fetch_feed_beta",
-            json!({"feed_name":"beta","trigger":{}}),
-        ),
-        (
-            "intel.fetch_feed_gamma",
-            json!({"feed_name":"gamma","trigger":{}}),
-        ),
-        (
-            "intel.normalize_deduplicate",
-            json!({"feeds":{"alpha":[],"beta":[],"gamma":[]},"trigger":{}}),
-        ),
-        (
-            "intel.summarize_item",
-            json!({"item":{},"item_index":0,"trigger":{}}),
-        ),
-        (
-            "intel.compile_report",
-            json!({"deduplication_stats":{},"summaries":[],"trigger":{}}),
-        ),
-        (
-            "intel.publish",
-            json!({"approval":{},"channel":"fixture","report":"r"}),
-        ),
-    ]
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {

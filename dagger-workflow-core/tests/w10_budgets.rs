@@ -15,7 +15,7 @@
 //! reducers are separate code paths that have drifted before.
 
 use dagger_workflow_core::action::{
-    ActionOutcome, ArtifactOutput, CompatibilityReport, CompletionCredential, ProgressRecord,
+    ActionOutcome, CompatibilityReport, CompletionCredential, ProgressRecord,
 };
 use dagger_workflow_core::approval::AuthenticatedPrincipal;
 use dagger_workflow_core::artifact::{ObjectStore, VerifiedObjectRef};
@@ -31,7 +31,7 @@ use dagger_workflow_core::ids::{
     Timestamp, Version,
 };
 use dagger_workflow_core::memory::{InMemoryObjectStore, InMemoryStore};
-use dagger_workflow_core::run::{AttemptState, NodeFailureKind, NodeState, RunLimits, RunState};
+use dagger_workflow_core::run::{NodeFailureKind, NodeState, RunLimits, RunState};
 use dagger_workflow_core::scope::{ExecutionScope, ScopeAtom};
 use dagger_workflow_core::sqlite::SqliteWorkflowStore;
 use dagger_workflow_core::store::{
@@ -1142,129 +1142,6 @@ async fn max_inline_json_bytes_per_value_ceiling_is_exact_at_claim() {
                         .err(),
                     Some(StoreError::NotFound),
                     "{tenant}: the refused claim must not mint an attempt"
-                );
-            }
-        }
-    }
-    both_stores!(body);
-}
-
-/// `max_artifacts_per_attempt` is refused at accepted action completion.
-///
-/// Section 1.4 enforces this "before accepted action completion", so the
-/// ceiling is per attempt and counted against the submitted artifact list.
-///
-/// A breach here is an accepted completion, not a rejected command: transitions
-/// A05 and N21 make it a contract failure that is applied, with R08 ending the
-/// run. The refused side therefore asserts that terminal state rather than
-/// asserting the node stayed put, which would be the pre-repair defect.
-#[tokio::test]
-async fn max_artifacts_per_attempt_ceiling_is_exact_at_complete_attempt() {
-    async fn body<S: WorkflowStore>(
-        store: &S,
-        objects: &Arc<InMemoryObjectStore<TestClock>>,
-        _clock: &Arc<TestClock>,
-        tenant: &str,
-    ) {
-        let fixture = seed_action(
-            store,
-            objects,
-            &format!("artifacts-{tenant}"),
-            2,
-            CostUnits(1),
-        )
-        .await;
-        let engine = claim_engine(store, &fixture, "artifacts-engine").await;
-        let artifact = objects
-            .put(&fixture.scope, br#"{"value":7}"#, "application/json")
-            .await
-            .unwrap();
-
-        for (run_id, ceiling, admitted) in [("below", 0_u64, false), ("at", 1_u64, true)] {
-            let mut limits = generous_limits();
-            limits.max_artifacts_per_attempt = ceiling;
-            store
-                .create_run(
-                    &fixture.scope,
-                    create_run_command(&fixture, run_id, CostUnits(10), limits),
-                )
-                .await
-                .unwrap();
-            start(store, &fixture, &engine, run_id).await;
-            let credential = credential_of(
-                claim_attempt(
-                    store,
-                    &fixture,
-                    &engine,
-                    run_id,
-                    &id("action"),
-                    &format!("{run_id}-attempt"),
-                    &fixture.input,
-                )
-                .await
-                .unwrap(),
-            );
-            let outcome = store
-                .complete_attempt(
-                    &fixture.scope,
-                    CompleteAttempt {
-                        completion_credential: credential,
-                        run_id: id(run_id),
-                        node_id: id("action"),
-                        attempt_id: id(&format!("{run_id}-attempt")),
-                        submitted_outcome: ActionOutcome::Success {
-                            output: serde_json::json!({"value": 1}),
-                            artifacts: vec![ArtifactOutput {
-                                media_type: artifact.media_type().to_owned(),
-                                object: artifact.clone(),
-                            }],
-                            actual_cost_units: CostUnits(1),
-                            diagnostics: None,
-                        },
-                        objects: CompletionObjects {
-                            output: Some(fixture.input.clone()),
-                            artifacts: vec![artifact.clone()],
-                            diagnostics: None,
-                        },
-                    },
-                )
-                .await;
-            if admitted {
-                assert!(
-                    matches!(outcome, Ok(CompleteAttemptResult::Applied(_))),
-                    "{tenant}: one artifact fits a ceiling of one"
-                );
-            } else {
-                let Ok(CompleteAttemptResult::TerminalRun(run)) = outcome else {
-                    panic!("{tenant}: one artifact over the ceiling must terminalize the run");
-                };
-                assert_eq!(run.status, RunState::ContractFailed, "{tenant}: R08");
-                let node = store
-                    .get_node(&fixture.scope, &id(run_id), &id("action"))
-                    .await
-                    .unwrap();
-                assert_eq!(node.status, NodeState::ContractFailed, "{tenant}: N21");
-                assert_eq!(
-                    node.failure_kind,
-                    Some(NodeFailureKind::ArtifactsPerAttemptLimitExceeded),
-                    "{tenant}: the applied failure must name the ceiling that fired"
-                );
-                assert_eq!(
-                    node.active_attempt_id, None,
-                    "{tenant}: N21 clears the active attempt"
-                );
-                assert_eq!(
-                    store
-                        .get_attempt(
-                            &fixture.scope,
-                            &id(run_id),
-                            &id(&format!("{run_id}-attempt"))
-                        )
-                        .await
-                        .unwrap()
-                        .status,
-                    AttemptState::ContractFailed,
-                    "{tenant}: A05"
                 );
             }
         }

@@ -83,6 +83,18 @@ impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// SHA-256 of `bytes` as `sha256:<lowercase hex>`.
+    pub fn of(bytes: impl AsRef<[u8]>) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(bytes);
+        Self::from_hasher(hash)
+    }
+
+    /// Finishes a streaming SHA-256 hash as a digest.
+    pub(crate) fn from_hasher(hash: Sha256) -> Self {
+        Self(finish_hash("sha256:", hash))
+    }
 }
 
 impl TryFrom<String> for Digest {

@@ -615,7 +615,7 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         } else {
             bytes
         };
-        let candidate_digest = digest(bytes);
+        let candidate_digest = Digest::of(bytes);
         let temporary = self.temporary_path()?;
         let _temporary_guard = TemporaryGuard {
             fs: &self.fs,
@@ -688,7 +688,7 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
     fn read_verified(&self, path: &Path) -> Result<ReadVerified, ReadFailure> {
         let bytes = self.fs.read(path).map_err(ReadFailure::classify)?;
         Ok(ReadVerified {
-            digest: digest(&bytes),
+            digest: Digest::of(&bytes),
             bytes,
         })
     }
@@ -710,7 +710,7 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         } else {
             bytes
         };
-        let candidate_digest = digest(bytes);
+        let candidate_digest = Digest::of(bytes);
         let final_path = self.object_path(scope, &candidate_digest);
         match self.fs.symlink_is_dir(&final_path) {
             Ok(_) => {
@@ -839,26 +839,28 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         let final_path = self.object_path(scope, candidate_digest);
         self.sync_publication_barrier(scope, candidate_digest)
             .map_err(storage_error)?;
-        let verified = self.read_verified(&final_path).map_err(unavailable)?;
+        // `candidate_digest` is the hash of `bytes`, so equal bytes read back
+        // prove the stored object matches it without hashing again.
+        let stored = self
+            .fs
+            .read(&final_path)
+            .map_err(ReadFailure::classify)
+            .map_err(unavailable)?;
         let existing_media = read_media_type(&self.fs, &self.media_path(scope, candidate_digest))
             .map_err(unavailable)?;
-        if verified.digest != *candidate_digest
-            || verified.bytes.len() != bytes.len()
-            || verified.bytes != bytes
-            || existing_media != media_type
-        {
+        if stored != bytes || existing_media != media_type {
             return if created {
                 Err(ObjectStoreError::StorageUnavailable)
             } else {
                 Err(ArtifactMetadataConflict {
                     digest: candidate_digest.clone(),
-                    existing_size_bytes: verified.bytes.len() as u64,
+                    existing_size_bytes: stored.len() as u64,
                     candidate_size_bytes: bytes.len() as u64,
                 }
                 .into())
             };
         }
-        Ok(self.verified_reference(scope, candidate_digest.clone(), verified.bytes, media_type))
+        Ok(self.verified_reference(scope, candidate_digest.clone(), stored, media_type))
     }
 }
 
@@ -986,7 +988,7 @@ fn copy_and_digest(
             .checked_add(count as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object size exceeds u64"))?;
     }
-    Ok((digest_from_hash(hash.finalize()), size_bytes))
+    Ok((Digest::from_hasher(hash), size_bytes))
 }
 
 /// Why a component read failed, in terms of what it is entitled to assert about the object.
@@ -1293,14 +1295,6 @@ fn random_bytes() -> Result<[u8; NONCE_BYTES], ObjectStoreError> {
     Ok(nonce)
 }
 
-fn digest(bytes: &[u8]) -> Digest {
-    digest_from_hash(Sha256::digest(bytes))
-}
-
-fn digest_from_hash(hash: impl AsRef<[u8]>) -> Digest {
-    Digest::new(format!("sha256:{}", hex(hash.as_ref()))).expect("SHA-256 is a valid digest")
-}
-
 fn encode_scope_atom(atom: &str) -> String {
     hex(atom.as_bytes())
 }
@@ -1320,7 +1314,8 @@ fn unavailable(_: ReadFailure) -> ObjectStoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_and_digest, create_dir_all_synced, create_root_all_synced, digest, StdFs};
+    use super::{copy_and_digest, create_dir_all_synced, create_root_all_synced, StdFs};
+    use crate::ids::Digest;
     use std::fs;
     use std::io;
     use std::path::PathBuf;
@@ -1370,7 +1365,7 @@ mod tests {
         );
         assert_eq!(
             copy_and_digest(&mut io::Cursor::new(b"abc"), &mut io::sink()).unwrap(),
-            (digest(b"abc"), 3)
+            (Digest::of(b"abc"), 3)
         );
     }
 

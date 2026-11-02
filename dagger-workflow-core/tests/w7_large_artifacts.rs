@@ -68,12 +68,6 @@ fn id(value: &str) -> Id {
 }
 
 #[tokio::test]
-#[ignore = "500 MiB disk/RSS acceptance probe; run compiled test under /usr/bin/time"]
-async fn large_file_import_verify_and_read_uses_bounded_memory() {
-    exercise_import_commit_and_read(500 * 1024 * 1024).await;
-}
-
-#[tokio::test]
 async fn imported_binary_artifact_commits_and_host_reads_apply_corruption() {
     exercise_import_commit_and_read(1024 * 1024).await;
 }

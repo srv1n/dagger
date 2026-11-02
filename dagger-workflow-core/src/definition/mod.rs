@@ -5,7 +5,6 @@ use crate::ids::{CostUnits, Digest, Id, TopologicalRank};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The strict, normalized workflow definition document.
@@ -1332,11 +1331,7 @@ pub fn canonical_definition_json(
 
 /// Computes the revision digest from canonical definition bytes.
 pub fn revision_hash(canonical_definition: &[u8]) -> Digest {
-    Digest::new(format!(
-        "sha256:{}",
-        hex(&Sha256::digest(canonical_definition))
-    ))
-    .expect("SHA-256 output is valid")
+    Digest::of(canonical_definition)
 }
 
 /// Computes lexical Kahn topological ranks.
@@ -1411,10 +1406,6 @@ fn parse_error(path: impl Into<String>, message: String) -> DefinitionValidation
         &["use the closed definition schema"],
     )
 }
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 fn node_id(node: &NodeDefinition) -> &Id {
     match node {
         NodeDefinition::Action { id, .. }

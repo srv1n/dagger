@@ -48,7 +48,6 @@ cargo test -p dagger-workflow-core --features sqlite,conformance --test w6_sqlit
 | `w2_action_contract.rs` | Action pins, inputs, outputs, and diagnostics. |
 | `w3_engine.rs`, `w3_memory.rs` | Engine and in-memory store behavior. |
 | `w4_map.rs` | Bounded Map behavior. |
-| `w5_legal_research.rs` | Reference workflow execution. |
 | `w6_sqlite.rs` | SQLite authority, scope, races, and query plans. |
 | `w7_fs_object_store.rs` | Local file-system object storage. |
 | `w8_recovery.rs` | Restart, takeover, fencing, and idempotency. |

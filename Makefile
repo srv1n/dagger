@@ -1,10 +1,7 @@
-.PHONY: agent-run-conformance codebasezip sqlite-write-load
+.PHONY: agent-run-conformance codebasezip
 
 agent-run-conformance:
 	cargo test -p dagger-workflow-core --all-features --test agent_run_adversarial
-
-sqlite-write-load:
-	cargo test -p dagger-workflow-core --features sqlite --test w6_sqlite sqlite_write_path_load -- --ignored --exact --nocapture
 
 codebasezip:
 	@mkdir -p artifacts

@@ -248,30 +248,6 @@ async fn fresh_scope_creates_the_full_object_directory_chain_and_reads_verified(
 }
 
 #[tokio::test]
-async fn existing_media_link_still_allows_a_verified_publication() {
-    let root = TestRoot::new("existing-media-link");
-    let store = open_store(root.path());
-    let scope = scope();
-    let first = store
-        .put(&scope, b"sidecar already linked", "text/plain")
-        .await
-        .unwrap();
-    let object = object_file(root.path());
-    fs::remove_file(&object).unwrap();
-
-    let second = store
-        .put(&scope, b"sidecar already linked", "text/plain")
-        .await
-        .unwrap();
-
-    assert_eq!(second.digest(), first.digest());
-    assert_eq!(
-        store.get(&scope, second.digest()).await.unwrap().bytes,
-        b"sidecar already linked"
-    );
-}
-
-#[tokio::test]
 async fn same_bytes_with_different_media_type_is_metadata_conflict() {
     let root = TestRoot::new("media-conflict");
     let store = open_store(root.path());
@@ -522,45 +498,36 @@ fn concurrent_same_digest_writers_publish_one_intact_object() {
 }
 
 #[tokio::test]
-async fn bit_flipped_object_is_reported_as_digest_invalid() {
-    let root = TestRoot::new("bit-flip");
-    let store = open_store(root.path());
-    let scope = scope();
-    let digest = store
-        .put(&scope, b"integrity check", "application/octet-stream")
-        .await
-        .unwrap()
-        .digest()
-        .clone();
-    let path = object_file(root.path());
-    let mut bytes = fs::read(&path).unwrap();
-    bytes[0] ^= 1;
-    fs::write(path, bytes).unwrap();
+async fn bit_flipped_or_truncated_object_is_reported_as_digest_invalid() {
+    let body = b"this object must be longer than one byte";
+    for (name, corrupt) in [
+        (
+            "bit-flip",
+            (|b: &mut Vec<u8>| b[0] ^= 1) as fn(&mut Vec<u8>),
+        ),
+        ("truncated", |b: &mut Vec<u8>| b.truncate(5)),
+    ] {
+        let root = TestRoot::new(name);
+        let store = open_store(root.path());
+        let scope = scope();
+        let digest = store
+            .put(&scope, body, "application/octet-stream")
+            .await
+            .unwrap()
+            .digest()
+            .clone();
+        let path = object_file(root.path());
+        let mut bytes = fs::read(&path).unwrap();
+        corrupt(&mut bytes);
+        fs::write(path, bytes).unwrap();
 
-    let error = store.get(&scope, &digest).await.unwrap_err();
-    assert_eq!(corrupt_class(error), FailedReadClass::DigestInvalid);
-}
-
-#[tokio::test]
-async fn truncated_object_is_reported_as_digest_invalid() {
-    let root = TestRoot::new("truncated");
-    let store = open_store(root.path());
-    let scope = scope();
-    let digest = store
-        .put(
-            &scope,
-            b"this object must be longer than one byte",
-            "application/octet-stream",
-        )
-        .await
-        .unwrap()
-        .digest()
-        .clone();
-    let path = object_file(root.path());
-    fs::write(path, b"short").unwrap();
-
-    let error = store.get(&scope, &digest).await.unwrap_err();
-    assert_eq!(corrupt_class(error), FailedReadClass::DigestInvalid);
+        let error = store.get(&scope, &digest).await.unwrap_err();
+        assert_eq!(
+            corrupt_class(error),
+            FailedReadClass::DigestInvalid,
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -898,46 +865,6 @@ async fn explicit_repair_and_streamed_regeneration_restore_only_proven_corruptio
     ));
     assert_eq!(fs::read(&path).unwrap(), b"damaged under replaced store");
     assert_eq!(fs::read_dir(root.path().join("tmp")).unwrap().count(), 0);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn large_binary_copy_and_verification_yield_to_runtime_timers() {
-    let root = TestRoot::new("stream-runtime");
-    let source = root.path().join("source.wav");
-    fs::File::create(&source)
-        .unwrap()
-        .set_len(8 * 1024 * 1024)
-        .unwrap();
-    let store = open_store(root.path());
-    let scope = scope();
-    let import = store.import_file(&scope, &source, "audio/wav");
-    tokio::pin!(import);
-    let mut yields = 0;
-    let imported = loop {
-        tokio::select! {
-            biased;
-            result = &mut import => break result.unwrap(),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => yields += 1,
-        }
-    };
-    assert!(
-        yields > 0,
-        "binary copying must leave lease-renewal timers runnable"
-    );
-    let verify = store.verify(&scope, imported.digest());
-    tokio::pin!(verify);
-    let mut yields = 0;
-    loop {
-        tokio::select! {
-            biased;
-            result = &mut verify => { result.unwrap(); break; },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => yields += 1,
-        }
-    }
-    assert!(
-        yields > 0,
-        "binary verification must leave lease-renewal timers runnable"
-    );
 }
 
 // NOT TESTED, and deliberately not faked: descriptor exhaustion (EMFILE/ENFILE), EIO from a

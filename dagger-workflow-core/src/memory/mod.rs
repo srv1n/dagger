@@ -30,21 +30,12 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 const CLAIM_LIFETIME_MS: i64 = 20_000;
 const PROGRESS_MIN_INTERVAL_MS: i64 = 1_000;
-
-fn digest(bytes: &[u8]) -> Digest {
-    let value = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Digest::new(format!("sha256:{value}")).expect("SHA-256 is a valid digest")
-}
 
 fn entropy() -> Result<[u8; 32], StoreError> {
     let mut bytes = [0_u8; 32];
@@ -164,7 +155,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
         } else {
             bytes
         };
-        let object_digest = digest(bytes);
+        let object_digest = Digest::of(bytes);
         {
             let mut objects = self.objects.lock().expect("object lock poisoned");
             if let Some(existing) = objects.get_mut(&(scope.clone(), object_digest.clone())) {
@@ -179,7 +170,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                 // A fresh completed verification proves wrong bytes. Replacing
                 // them with independently hashed same-digest bytes restores the
                 // immutable logical object; ordinary publish/get remain strict.
-                if digest(&existing.bytes) != object_digest {
+                if Digest::of(&existing.bytes) != object_digest {
                     existing.bytes = bytes.to_vec();
                 }
             }
@@ -208,7 +199,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
                     None,
                 ))
             })?;
-        let observed = digest(&object.bytes);
+        let observed = Digest::of(&object.bytes);
         if &observed != requested {
             // Verification completed and failed. Parity with FsObjectStore.
             return Err(ObjectReadError::Corrupt(self.proof(
@@ -248,7 +239,7 @@ impl<C: Clock> ObjectStore for InMemoryObjectStore<C> {
         } else {
             bytes
         };
-        let object_digest = digest(bytes);
+        let object_digest = Digest::of(bytes);
         let key = (scope.clone(), object_digest.clone());
         let mut objects = self.objects.lock().expect("object lock poisoned");
         if let Some(existing) = objects.get(&key) {
@@ -764,7 +755,7 @@ fn parse_canonical_revision(
 
 fn fingerprint<T: Serialize>(domain: &str, scope: &ExecutionScope, value: &T) -> Digest {
     let bytes = serde_jcs::to_vec(&(domain, scope, value)).expect("fingerprint input serializes");
-    digest(&bytes)
+    Digest::of(&bytes)
 }
 
 fn approval_decision_fingerprint(
@@ -798,7 +789,7 @@ fn approval_decision_fingerprint(
     ] {
         extend_lp(&mut bytes, value.as_bytes());
     }
-    digest(&bytes)
+    Digest::of(&bytes)
 }
 
 fn suspension_fingerprint(
@@ -834,7 +825,7 @@ fn suspension_fingerprint(
     ] {
         extend_lp(&mut bytes, value);
     }
-    digest(&bytes)
+    Digest::of(&bytes)
 }
 
 #[derive(Serialize)]
@@ -2379,7 +2370,7 @@ fn permit_check(
     let stored = state.claims.get(scope).ok_or(StoreError::EngineClaimLost)?;
     if stored.claim.instance_id != *permit.instance_id()
         || stored.claim.generation != permit.generation()
-        || stored.token_digest != digest(permit.session_token())
+        || stored.token_digest != Digest::of(permit.session_token())
     {
         return Err(StoreError::EngineClaimLost);
     }
@@ -3481,7 +3472,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 scope.clone(),
                 StoredClaim {
                     claim: claim.clone(),
-                    token_digest: digest(permit.session_token()),
+                    token_digest: Digest::of(permit.session_token()),
                     released_token_digest: None,
                 },
             );
@@ -3516,7 +3507,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
         permit: &EnginePermit,
     ) -> Result<(), StoreError> {
         self.transaction(|state, now| {
-            let candidate_digest = digest(permit.session_token());
+            let candidate_digest = Digest::of(permit.session_token());
             let stored = state
                 .claims
                 .get_mut(scope)
@@ -4881,7 +4872,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                             &(command.permit.generation()),
                             &(deadline_at),
                             &(declared_max),
-                            &(digest(attempt.idempotency_key.as_bytes())),
+                            &(Digest::of(attempt.idempotency_key.as_bytes())),
                             &(invocation.bound_input_digest),
                             &(credential.digest()),
                         ),
@@ -6486,7 +6477,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                 };
                 if values.iter().any(|value| {
                     serde_jcs::to_vec(value)
-                        .map(|bytes| digest(&bytes) == command.evaluated_selector_digest)
+                        .map(|bytes| Digest::of(&bytes) == command.evaluated_selector_digest)
                         .unwrap_or(false)
                 }) {
                     expected = Some(match target {
@@ -6702,7 +6693,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     // An index past u32 is unreachable under `max_items`, and it is still a
                     // property of the supplied array, so it stays a Map input failure.
                     let index = u32::try_from(index).ok()?;
-                    let item_digest = digest(&serde_jcs::to_vec(item).ok()?);
+                    let item_digest = Digest::of(&serde_jcs::to_vec(item).ok()?);
                     let child_id =
                         map_child_id(&command.run_id, &command.map_node_id, index, &item_digest);
                     identities.push(MapChildIdentity {
@@ -7161,7 +7152,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     }
                     child.result_ref.as_ref().is_none_or(|result| {
                         serde_jcs::to_vec(output)
-                            .map(|bytes| digest(&bytes) != result.0.digest)
+                            .map(|bytes| Digest::of(&bytes) != result.0.digest)
                             .unwrap_or(true)
                     })
                 })
@@ -7429,7 +7420,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             state.nodes.insert(node_key, node);
             state.gates.insert(gate_key, gate.clone());
             bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-            let authorization_policy_digest = digest(
+            let authorization_policy_digest = Digest::of(
                 &serde_jcs::to_vec(&gate.authorization_policy)
                     .map_err(|_| StoreError::TransactionFailed)?,
             );
@@ -7670,7 +7661,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                     return Err(StoreError::ApprovalDecisionPayloadInvalid);
                 }
                 if output.media_type() != "application/json"
-                    || output.digest() != &digest(&expected)
+                    || output.digest() != &Digest::of(&expected)
                     || output.size_bytes() != expected.len() as u64
                 {
                     // N67: `WaitingApproval` -> `ContractFailed` with
@@ -7967,7 +7958,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         crate::approval::canonical_expiry_approval_result()
                     };
                     if output.media_type() != "application/json"
-                        || output.digest() != &digest(&expected)
+                        || output.digest() != &Digest::of(&expected)
                         || output.size_bytes() != expected.len() as u64
                     {
                         // N67: `WaitingApproval` -> `ContractFailed` with
@@ -8314,7 +8305,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
                         None,
                         event_payload::fail_node_reached(
                             &("explicit_fail"),
-                            &(digest(b"explicit fail")),
+                            &(Digest::of(b"explicit fail")),
                         ),
                     ));
                     let run = terminalize_run(
@@ -8686,7 +8677,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             if !corrupt_ref_reachable_from_run(&state, scope, &prior, &command.bad_ref) {
                 return Err(StoreError::InvalidFailedReadProof);
             }
-            let proof_fingerprint = digest(&command.proof.fingerprint_material());
+            let proof_fingerprint = Digest::of(command.proof.fingerprint_material());
             let mut specs = Vec::new();
             if let Some(owner_node_id) = &command.owner_node_id {
                 let node_key = (scope.clone(), command.run_id.clone(), owner_node_id.clone());
@@ -8776,7 +8767,7 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             run.finished_at = Some(now);
             set_run_mutated(run, now)?;
             let returned = run.clone();
-            let store_instance_nonce_digest = digest(command.proof.store_instance_nonce());
+            let store_instance_nonce_digest = Digest::of(command.proof.store_instance_nonce());
             let run_transition =
                 corruption_run_transition(prior.status).expect("CorruptStorage handled above");
             specs.push(event_spec(
@@ -9435,7 +9426,7 @@ fn outcome_digest(outcome: &ActionOutcome) -> Digest {
             ("cost", payload_value(actual_cost_units)),
         ]),
     };
-    digest(&serde_jcs::to_vec(&value).expect("outcome projection serializes"))
+    Digest::of(serde_jcs::to_vec(&value).expect("outcome projection serializes"))
 }
 
 fn outcome_cost_reason(outcome: &ActionOutcome) -> (CostUnits, BudgetLedgerReason) {

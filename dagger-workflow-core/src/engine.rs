@@ -1036,7 +1036,7 @@ where
                         attempt_id: attempt_id.clone(),
                         worker_id: self.config.instance_id.clone(),
                         bound_input: bound_object,
-                        binding_derivation_digest: sha(&bound),
+                        binding_derivation_digest: Digest::of(&bound),
                     },
                     memoization_key,
                     memoization_artifact_refs,
@@ -1367,7 +1367,7 @@ where
         run: &crate::run::WorkflowRun,
         source: &ArtifactLocator,
     ) -> Result<Value, EngineError> {
-        let value = match source {
+        let value: ArtifactRefValue = match source {
             ArtifactLocator::Literal {
                 artifact_ref_id,
                 digest,
@@ -1377,12 +1377,14 @@ where
                 if object.media_type() != media_type {
                     return Err(EngineError::Binding);
                 }
-                ArtifactRefValue {
+                // Built from the verified object, so it needs no second check.
+                let value = ArtifactRefValue {
                     artifact_ref_id: artifact_ref_id.clone(),
                     digest: digest.clone(),
                     size_bytes: object.size_bytes().to_string(),
                     media_type: media_type.clone(),
-                }
+                };
+                return serde_json::to_value(value).map_err(|_| EngineError::Binding);
             }
             ArtifactLocator::RunInput { pointer } => {
                 let object = self
@@ -1495,8 +1497,8 @@ where
                     node_id: node.node_instance_id,
                     expected_node_version: node.version,
                     input: object,
-                    evaluated_selector_digest: sha(
-                        &serde_jcs::to_vec(selector_value).map_err(|_| EngineError::Binding)?
+                    evaluated_selector_digest: Digest::of(
+                        &serde_jcs::to_vec(selector_value).map_err(|_| EngineError::Binding)?,
                     ),
                     selection,
                 },
@@ -1528,7 +1530,8 @@ where
         let mut ordered_items = Vec::with_capacity(values.len());
         for (index, item) in values.iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| EngineError::Binding)?;
-            let item_digest = sha(&serde_jcs::to_vec(item).map_err(|_| EngineError::Binding)?);
+            let item_digest =
+                Digest::of(&serde_jcs::to_vec(item).map_err(|_| EngineError::Binding)?);
             let child_id = map_child_id(&node.run_id, &node.node_instance_id, index, &item_digest);
             identities.push(MapChildIdentity {
                 item_index: index,
@@ -2138,14 +2141,6 @@ fn set_pointer(target: &mut Value, pointer: &str, value: Value) -> Result<(), En
     Ok(())
 }
 
-fn sha(bytes: &[u8]) -> Digest {
-    let hex = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Digest::new(format!("sha256:{hex}")).expect("SHA-256 output is valid")
-}
-
 fn approval_gate_id(run_id: &Id, node_id: &Id) -> Id {
     fn length_prefixed(value: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(8 + value.len());
@@ -2156,11 +2151,7 @@ fn approval_gate_id(run_id: &Id, node_id: &Id) -> Id {
     let mut bytes = length_prefixed(b"dagger-approval-v1");
     bytes.extend(length_prefixed(run_id.as_str().as_bytes()));
     bytes.extend(length_prefixed(node_id.as_str().as_bytes()));
-    let hex = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Id::new(format!("approval_{hex}")).expect("SHA-256 gate ID is valid")
+    Id::new(format!("approval_{:x}", Sha256::digest(bytes))).expect("SHA-256 gate ID is valid")
 }
 
 #[cfg(test)]

@@ -1,8 +1,7 @@
 //! Deterministic, no-network actions for the reference workflow fixtures.
 
 use super::{
-    digest_bytes, ActionContext, ActionDescriptor, ActionOutcome, InMemoryActionRegistry,
-    WorkflowAction,
+    ActionContext, ActionDescriptor, ActionOutcome, InMemoryActionRegistry, WorkflowAction,
 };
 use crate::ids::CostUnits;
 use serde_json::{json, Value};
@@ -144,7 +143,9 @@ pub fn fixture_schema() -> Value {
 
 /// Returns the digest of [`fixture_schema`]'s canonical bytes.
 pub fn fixture_schema_digest() -> crate::ids::Digest {
-    digest_bytes(&serde_jcs::to_vec(&fixture_schema()).expect("fixture schema is canonical JSON"))
+    crate::ids::Digest::of(
+        serde_jcs::to_vec(&fixture_schema()).expect("fixture schema is canonical JSON"),
+    )
 }
 
 fn fixture_outcome(
@@ -162,7 +163,7 @@ fn fixture_outcome(
         );
     }
 
-    let input_digest = digest_bytes(bytes);
+    let input_digest = crate::ids::Digest::of(bytes);
     let marker = &input_digest.0[7..19];
     let output = match name {
         "legal.generate_initial_queries" | "legal.generate_followup_queries" => {
@@ -227,7 +228,7 @@ fn fixture_outcome(
                 keys.push(idempotency_key.to_owned());
             }
             json!({
-                "published_artifact_ref": artifact_ref("fixture-intel-publication", &digest_bytes(idempotency_key.as_bytes()))
+                "published_artifact_ref": artifact_ref("fixture-intel-publication", &crate::ids::Digest::of(idempotency_key.as_bytes()))
             })
         }
         _ => return permanent("fixture.unknown_action", "unknown fixture action"),
@@ -269,7 +270,7 @@ fn artifact_ref(kind: &str, digest: &crate::ids::Digest) -> Value {
 }
 
 fn fixture_digest(name: &str, dimension: &str) -> crate::ids::Digest {
-    digest_bytes(format!("dagger-workflow-fixture-v1:{name}:{dimension}").as_bytes())
+    crate::ids::Digest::of(format!("dagger-workflow-fixture-v1:{name}:{dimension}").as_bytes())
 }
 
 fn retryable(code: &str, message: &str) -> ActionOutcome {
