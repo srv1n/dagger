@@ -864,8 +864,14 @@ impl<C: Clock, F: StoreFs> FsObjectStore<C, F> {
         created: bool,
     ) -> Result<VerifiedObjectRef, ObjectStoreError> {
         let final_path = self.object_path(scope, candidate_digest);
-        self.sync_publication_barrier(scope, candidate_digest)
-            .map_err(storage_error)?;
+        // A new link must be synced now. An existing object needs only the
+        // reader's barrier, which is skipped once this process synced it.
+        if created {
+            self.sync_publication_barrier(scope, candidate_digest)
+        } else {
+            self.ensure_durable(scope, candidate_digest)
+        }
+        .map_err(storage_error)?;
         // `candidate_digest` is the hash of `bytes`, so equal bytes read back
         // prove the stored object matches it without hashing again.
         let stored = self
