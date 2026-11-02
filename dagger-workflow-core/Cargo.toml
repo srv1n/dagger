@@ -36,3 +36,7 @@ tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "test-util"
 [[example]]
 name = "durable_demo"
 required-features = ["sqlite"]
+
+[[example]]
+name = "engine_cpu"
+required-features = ["sqlite"]

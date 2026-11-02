@@ -42,6 +42,10 @@ claimed action as a Tokio task on the host runtime and returns without waiting f
 Each task publishes and commits its own result as soon as it finishes. `run_until_idle` waits for
 supervisor activity before it decides that the current frontier is idle.
 
+A host that drives its own loop subscribes with `WorkflowEngine::activity` before its first
+`tick`. The receiver changes after each local attempt finishes. The host loop is `tick`, then
+`activity.changed()` with a timeout for retries and deadlines. It does not sleep-poll.
+
 The supervisor heartbeats a scope while that scope has an action in flight. Attempt IDs contain
 the durable engine generation and random bytes. A completion is valid only while its attempt's
 engine generation still owns the live scope claim. A takeover therefore rejects an old

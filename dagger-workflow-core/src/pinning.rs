@@ -298,7 +298,7 @@ pub(crate) async fn resolve_pin_attempt<S: WorkflowStore, O: ObjectStore>(
     else {
         return Ok(None);
     };
-    let source_run = store.get_run(scope, &pin.source_run_id).await?.run;
+    let source_run = store.get_run_record(scope, &pin.source_run_id).await?;
     let source_node = store
         .get_node(scope, &pin.source_run_id, &pin.source_node_id)
         .await?;

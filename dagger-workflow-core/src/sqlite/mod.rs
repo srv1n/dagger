@@ -30,6 +30,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -605,44 +606,62 @@ fn decode_authority_row(
     Ok(())
 }
 
-fn encode_authority_rows(
+type AuthorityRows<'a> = BTreeMap<AuthorityKey, Cow<'a, str>>;
+
+/// Encodes the post-command authority rows for one scope. A row equal to the
+/// row it was decoded from reuses the stored text, so a command pays to encode
+/// only what it changed instead of the whole loaded run.
+fn encode_authority_rows<'a>(
     state: &ReducerState,
     scope: &ExecutionScope,
-) -> Result<BTreeMap<AuthorityKey, String>, StoreError> {
-    let mut rows = BTreeMap::new();
-    let mut put = |table, entity_id: String, sub_id: String, data| {
-        rows.insert(AuthorityKey::new(table, entity_id, sub_id), data);
+    before: &'a LoadedAuthority,
+) -> Result<AuthorityRows<'a>, StoreError> {
+    let mut rows = AuthorityRows::new();
+    let old = &before.state;
+    let mut put = |table,
+                   entity_id: String,
+                   sub_id: String,
+                   unchanged: bool,
+                   encode: &dyn Fn() -> Result<String, StoreError>|
+     -> Result<(), StoreError> {
+        let key = AuthorityKey::new(table, entity_id, sub_id);
+        let data = match before.rows.get(&key) {
+            Some((stored, _)) if unchanged => Cow::Borrowed(stored.as_str()),
+            _ => Cow::Owned(encode()?),
+        };
+        rows.insert(key, data);
+        Ok(())
     };
-    for ((row_scope, id), row) in &state.definitions {
+    for (key @ (row_scope, id), row) in &state.definitions {
         if row_scope == scope {
             put(
                 DEFINITION_ROWS,
                 id.as_str().to_owned(),
                 String::new(),
-                encode_row(row)?,
-            );
+                old.definitions.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, definition_id, revision_hash), revision) in &state.revisions {
+    for (key @ (row_scope, definition_id, revision_hash), revision) in &state.revisions {
         if row_scope == scope {
             let canonical_revision = state
                 .parsed_revisions
-                .get(&(
-                    row_scope.clone(),
-                    definition_id.clone(),
-                    revision_hash.clone(),
-                ))
-                .ok_or(StoreError::CorruptControlPlane)?
-                .clone();
+                .get(key)
+                .ok_or(StoreError::CorruptControlPlane)?;
             put(
                 REVISION_ROWS,
                 definition_id.as_str().to_owned(),
                 revision_hash.as_str().to_owned(),
-                encode_row(&RevisionAuthority {
-                    revision: revision.clone(),
-                    canonical_revision,
-                })?,
-            );
+                old.revisions.get(key) == Some(revision)
+                    && old.parsed_revisions.get(key) == Some(canonical_revision),
+                &|| {
+                    encode_row(&RevisionAuthority {
+                        revision: revision.clone(),
+                        canonical_revision: canonical_revision.clone(),
+                    })
+                },
+            )?;
         }
     }
     if let Some(row) = state.claims.get(scope) {
@@ -650,70 +669,77 @@ fn encode_authority_rows(
             ENGINE_CLAIM_ROWS,
             "scheduler".to_owned(),
             String::new(),
-            encode_row(row)?,
-        );
+            old.claims.get(scope) == Some(row),
+            &|| encode_row(row),
+        )?;
     }
-    for ((row_scope, run_id), row) in &state.runs {
+    for (key @ (row_scope, run_id), row) in &state.runs {
         if row_scope == scope {
             put(
                 RUN_ROWS,
                 run_id.as_str().to_owned(),
                 String::new(),
-                encode_row(row)?,
-            );
+                old.runs.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, run_id, node_id), row) in &state.nodes {
+    for (key @ (row_scope, run_id, node_id), row) in &state.nodes {
         if row_scope == scope {
             put(
                 NODE_ROWS,
                 run_id.as_str().to_owned(),
                 node_id.as_str().to_owned(),
-                encode_row(row)?,
-            );
+                old.nodes.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, run_id, edge_id), row) in &state.edges {
+    for (key @ (row_scope, run_id, edge_id), row) in &state.edges {
         if row_scope == scope {
             put(
                 EDGE_ROWS,
                 run_id.as_str().to_owned(),
                 edge_id.as_str().to_owned(),
-                encode_row(row)?,
-            );
+                old.edges.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, run_id, attempt_id), row) in &state.attempts {
+    for (key @ (row_scope, run_id, attempt_id), row) in &state.attempts {
         if row_scope == scope {
             put(
                 ATTEMPT_ROWS,
                 run_id.as_str().to_owned(),
                 attempt_id.as_str().to_owned(),
-                encode_row(row)?,
-            );
+                old.attempts.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, run_id, gate_id), row) in &state.gates {
+    for (key @ (row_scope, run_id, gate_id), row) in &state.gates {
         if row_scope == scope {
             put(
                 APPROVAL_ROWS,
                 run_id.as_str().to_owned(),
                 gate_id.as_str().to_owned(),
-                encode_row(row)?,
-            );
+                old.gates.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, run_id, invocation_id), row) in &state.invocations {
+    for (key @ (row_scope, run_id, invocation_id), row) in &state.invocations {
         if row_scope == scope {
             put(
                 INVOCATION_ROWS,
                 run_id.as_str().to_owned(),
                 invocation_id.as_str().to_owned(),
-                encode_row(row)?,
-            );
+                old.invocations.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, kind, token), row) in &state.receipts {
+    for (key @ (row_scope, kind, token), row) in &state.receipts {
         if row_scope == scope {
             put(
                 IDEMPOTENCY_ROWS,
@@ -723,42 +749,47 @@ fn encode_authority_rows(
                 }
                 .to_owned(),
                 token.clone(),
-                encode_row(row)?,
-            );
+                old.receipts.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, id), row) in &state.artifact_refs {
+    for (key @ (row_scope, id), row) in &state.artifact_refs {
         if row_scope == scope {
             put(
                 ARTIFACT_ROWS,
                 id.as_str().to_owned(),
                 String::new(),
-                encode_row(row)?,
-            );
+                old.artifact_refs.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
-    for ((row_scope, digest), row) in &state.object_records {
+    for (key @ (row_scope, digest), row) in &state.object_records {
         if row_scope == scope {
             put(
                 OBJECT_ROWS,
                 digest.as_str().to_owned(),
                 String::new(),
-                encode_row(row)?,
-            );
+                old.object_records.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
     let mut batches = BTreeMap::<(Id, Id), EventBatchAuthority>::new();
-    for ((row_scope, run_id), events) in &state.events {
+    for (key @ (row_scope, run_id), events) in &state.events {
         if row_scope != scope {
             continue;
         }
-        for event in events {
+        let old_events = old.events.get(key);
+        for (index, event) in events.iter().enumerate() {
             put(
                 EVENT_ROWS,
                 run_id.as_str().to_owned(),
                 format!("{:020}", event.event_seq),
-                encode_row(event)?,
-            );
+                old_events.and_then(|old| old.get(index)) == Some(event),
+                &|| encode_row(event),
+            )?;
             batches
                 .entry((run_id.clone(), event.batch_id.clone()))
                 .and_modify(|batch| {
@@ -779,29 +810,33 @@ fn encode_authority_rows(
             EVENT_BATCH_ROWS,
             run_id.as_str().to_owned(),
             batch_id.as_str().to_owned(),
-            encode_row(&batch)?,
-        );
+            false,
+            &|| encode_row(&batch),
+        )?;
     }
-    for ((row_scope, run_id), entries) in &state.ledger {
+    for (key @ (row_scope, run_id), entries) in &state.ledger {
         if row_scope == scope {
-            for entry in entries {
+            let old_entries = old.ledger.get(key);
+            for (index, entry) in entries.iter().enumerate() {
                 put(
                     BUDGET_ROWS,
                     run_id.as_str().to_owned(),
                     format!("{:020}", entry.ledger_seq),
-                    encode_row(entry)?,
-                );
+                    old_entries.and_then(|old| old.get(index)) == Some(entry),
+                    &|| encode_row(entry),
+                )?;
             }
         }
     }
-    for ((row_scope, idempotency_key, kind), row) in &state.external_handles {
+    for (key @ (row_scope, idempotency_key, kind), row) in &state.external_handles {
         if row_scope == scope {
             put(
                 EXTERNAL_HANDLE_ROWS,
                 row.run_id.as_str().to_owned(),
                 external_handle_sub_id(idempotency_key, kind),
-                encode_row(row)?,
-            );
+                old.external_handles.get(key) == Some(row),
+                &|| encode_row(row),
+            )?;
         }
     }
     for (row_scope, run_id, attempt_id) in &state.stale_observed {
@@ -810,19 +845,23 @@ fn encode_authority_rows(
                 STALE_ROWS,
                 run_id.as_str().to_owned(),
                 attempt_id.as_str().to_owned(),
-                "true".to_owned(),
-            );
+                false,
+                &|| Ok("true".to_owned()),
+            )?;
         }
     }
     put(
         COUNTER_ROWS,
         "event-batch".to_owned(),
         String::new(),
-        encode_row(&ScopeAuthority {
-            batch_counter: state.batch_counter,
-            object_store_nonce: state.object_store_nonce.clone(),
-        })?,
-    );
+        false,
+        &|| {
+            encode_row(&ScopeAuthority {
+                batch_counter: state.batch_counter,
+                object_store_nonce: state.object_store_nonce.clone(),
+            })
+        },
+    )?;
     Ok(rows)
 }
 
@@ -1406,13 +1445,24 @@ where
         Ok(loaded)
     }
 
-    async fn persist_authority(
+    /// Encodes the post-command rows once, then writes projections and authority.
+    async fn persist_all(
         connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
         before: &LoadedAuthority,
         state: &ReducerState,
     ) -> Result<(), StoreError> {
-        let after = encode_authority_rows(state, scope)?;
+        let after = encode_authority_rows(state, scope, before)?;
+        Self::persist_projections(connection, scope, before, state, &after).await?;
+        Self::persist_authority(connection, scope, before, &after).await
+    }
+
+    async fn persist_authority(
+        connection: &mut Transaction<'_, Sqlite>,
+        scope: &ExecutionScope,
+        before: &LoadedAuthority,
+        after: &AuthorityRows<'_>,
+    ) -> Result<(), StoreError> {
         let mut keys = before
             .rows
             .keys()
@@ -1434,12 +1484,12 @@ where
                         .bind(scope.namespace.as_str())
                         .bind(&key.entity_id)
                         .bind(&key.sub_id)
-                        .bind(data)
+                        .bind(data.as_ref())
                         .execute(&mut **connection)
                         .await
                         .map_err(|_| StoreError::CasConflict)?;
                 }
-                (Some((old_data, version)), Some(data)) if old_data != data => {
+                (Some((old_data, version)), Some(data)) if old_data.as_str() != data.as_ref() => {
                     let statement = format!(
                         "UPDATE {} SET row_data = ?, version = version + 1
                          WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ?
@@ -1447,7 +1497,7 @@ where
                         key.table
                     );
                     let changed = sqlx::query(&statement)
-                        .bind(data)
+                        .bind(data.as_ref())
                         .bind(scope.tenant_id.as_str())
                         .bind(scope.namespace.as_str())
                         .bind(&key.entity_id)
@@ -1494,13 +1544,16 @@ where
         scope: &ExecutionScope,
         before: &LoadedAuthority,
         state: &ReducerState,
+        after: &AuthorityRows<'_>,
     ) -> Result<(), StoreError> {
-        let after = encode_authority_rows(state, scope)?;
         let changed = before
             .rows
             .keys()
             .chain(after.keys())
-            .filter(|key| before.rows.get(*key).map(|(data, _)| data) != after.get(*key))
+            .filter(|key| {
+                before.rows.get(*key).map(|(data, _)| data.as_str())
+                    != after.get(*key).map(AsRef::as_ref)
+            })
             .cloned()
             .collect::<BTreeSet<_>>();
         let touched = |table: &'static str, entity_id: &str, sub_id: &str| {
@@ -2736,24 +2789,8 @@ macro_rules! sql_command {
                     let state = reducer.snapshot();
                     self.remember_verified_bytes(&state);
                     if let Err(error) =
-                        Self::persist_projections(
-                            &mut connection,
-                            scope,
-                            &loaded,
-                            &state,
-                        )
-                        .await
+                        Self::persist_all(&mut connection, scope, &loaded, &state).await
                     {
-                        Self::rollback(connection).await;
-                        return Err(error);
-                    }
-                    if let Err(error) = Self::persist_authority(
-                        &mut connection,
-                        scope,
-                        &loaded,
-                        &state,
-                    )
-                    .await {
                         Self::rollback(connection).await;
                         return Err(error);
                     }
@@ -2788,13 +2825,7 @@ macro_rules! sql_command {
                     let state = reducer.snapshot();
                     self.remember_verified_bytes(&state);
                     if let Err(persist_error) =
-                        Self::persist_projections(&mut connection, scope, &loaded, &state).await
-                    {
-                        Self::rollback(connection).await;
-                        return Err(persist_error);
-                    }
-                    if let Err(persist_error) =
-                        Self::persist_authority(&mut connection, scope, &loaded, &state).await
+                        Self::persist_all(&mut connection, scope, &loaded, &state).await
                     {
                         Self::rollback(connection).await;
                         return Err(persist_error);
@@ -2846,8 +2877,15 @@ macro_rules! sql_engine_command {
                         Self::rollback(connection).await;
                         return Err(error);
                     }
+                    let after = match encode_authority_rows(&state, scope, &loaded) {
+                        Ok(after) => after,
+                        Err(error) => {
+                            Self::rollback(connection).await;
+                            return Err(error);
+                        }
+                    };
                     if let Err(error) =
-                        Self::persist_authority(&mut connection, scope, &loaded, &state).await
+                        Self::persist_authority(&mut connection, scope, &loaded, &after).await
                     {
                         Self::rollback(connection).await;
                         return Err(error);
@@ -3257,6 +3295,30 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
         }
     }
     sql_read!(get_run(run_id: &Id) -> WorkflowRunView; Some((*run_id).clone()));
+    async fn get_run_record(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+    ) -> Result<WorkflowRun, StoreError> {
+        let mut connection = self.begin_read().await?;
+        let data: Option<String> = sqlx::query_scalar(
+            "SELECT row_data FROM dagger_workflow_run_rows
+             WHERE tenant_id = ? AND namespace = ? AND entity_id = ? AND sub_id = ''",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(run_id.as_str())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)?;
+        Self::commit(connection).await?;
+        let run: WorkflowRun = decode_row(&data.ok_or(StoreError::NotFound)?)?;
+        scoped(scope, &run.scope, ())?;
+        if run.run_id != *run_id {
+            return Err(StoreError::CorruptControlPlane);
+        }
+        Ok(run)
+    }
     async fn get_node(
         &self,
         scope: &ExecutionScope,

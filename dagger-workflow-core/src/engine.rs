@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{watch, Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::ids::Timestamp;
@@ -144,7 +144,7 @@ struct AttemptSupervisor {
     errors: Mutex<Vec<(ExecutionScope, EngineError)>>,
     last_heartbeat: Mutex<BTreeMap<ExecutionScope, Instant>>,
     commands: TokioMutex<()>,
-    activity: Notify,
+    activity: watch::Sender<u64>,
 }
 
 /// Owns local cancellation registration until the spawned supervisor finishes.
@@ -194,7 +194,7 @@ impl AttemptSupervisor {
             errors: Mutex::new(Vec::new()),
             last_heartbeat: Mutex::new(BTreeMap::new()),
             commands: TokioMutex::new(()),
-            activity: Notify::new(),
+            activity: watch::Sender::new(0),
         }
     }
 
@@ -216,7 +216,8 @@ impl AttemptSupervisor {
                 .expect("heartbeat lock poisoned")
                 .remove(&key.0);
         }
-        self.activity.notify_waiters();
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     fn finish(&self, key: &AttemptKey, result: Result<(), EngineError>) {
@@ -236,7 +237,8 @@ impl AttemptSupervisor {
                 .expect("heartbeat lock poisoned")
                 .remove(&key.0);
         }
-        self.activity.notify_waiters();
+        self.activity
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     fn signal_run(&self, scope: &ExecutionScope, run_id: &Id) {
@@ -363,10 +365,10 @@ where
 
     /// Starts one Pending run after checking every exact action pin.
     pub async fn start(&self, scope: &ExecutionScope, run_id: &Id) -> Result<(), EngineError> {
-        let view = self.store.get_run(scope, run_id).await?;
+        let run = self.store.get_run_record(scope, run_id).await?;
         let revision = self
             .store
-            .get_revision(scope, &view.run.definition_id, &view.run.revision_hash)
+            .get_revision(scope, &run.definition_id, &run.revision_hash)
             .await?;
         let evidence = self.registry.check_pins(&revision.action_pins);
         match self
@@ -405,7 +407,12 @@ where
         loop {
             tokio::select! {
                 result = &mut scheduling => return result,
+                // The first interval tick fires at once; skip the write when
+                // the claim was refreshed recently by this or another path.
                 _ = heartbeat.tick() => {
+                    if !self.supervisor.heartbeat_due(scope) {
+                        continue;
+                    }
                     let refreshing = self.store.heartbeat_engine_claim(scope, &permit);
                     tokio::pin!(refreshing);
                     // Scheduler commands may hold the same SQLite connection
@@ -550,19 +557,24 @@ where
     }
 
     async fn wait_for_in_flight(&self, scope: &ExecutionScope) -> Result<(), EngineError> {
+        let mut activity = self.supervisor.activity.subscribe();
         while self.supervisor.has_scope(scope) {
-            let activity = self.supervisor.activity.notified();
-            tokio::pin!(activity);
-            activity.as_mut().enable();
-            if !self.supervisor.has_scope(scope) {
-                break;
-            }
-            activity.await;
+            // The sender lives as long as the engine, so this cannot fail.
+            let _ = activity.changed().await;
             if let Some(error) = self.supervisor.take_error(scope) {
                 return Err(error);
             }
         }
         Ok(())
+    }
+
+    /// Subscribes to attempt completions across all scopes. The receiver
+    /// changes after each local attempt's outcome commits or its task exits,
+    /// so a host can loop `tick(); activity.changed()` (with a timeout for
+    /// retries and deadlines) instead of sleep-polling. Subscribe before the
+    /// first `tick` so no completion is missed between them.
+    pub fn activity(&self) -> watch::Receiver<u64> {
+        self.supervisor.activity.subscribe()
     }
 
     /// Signals all locally running attempts for an already-terminalizing run.
@@ -873,7 +885,7 @@ where
         scope: &ExecutionScope,
         run_id: &Id,
     ) -> Result<(crate::run::WorkflowRun, WorkflowDefinition), EngineError> {
-        let run = self.store.get_run(scope, run_id).await?.run;
+        let run = self.store.get_run_record(scope, run_id).await?;
         let revision = self
             .store
             .get_revision(scope, &run.definition_id, &run.revision_hash)
@@ -1938,7 +1950,7 @@ where
                 {
                     return Ok(());
                 }
-                if store.get_run(&scope, &run_id).await?.run.status
+                if store.get_run_record(&scope, &run_id).await?.status
                     != crate::run::RunState::Running
                 {
                     return Ok(());

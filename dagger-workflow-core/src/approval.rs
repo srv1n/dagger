@@ -276,7 +276,7 @@ pub async fn decide_approval_json<
         return Err(StoreError::ApprovalUnauthorized);
     }
     let gate = store.get_gate(scope, &run_id, &gate_id).await?;
-    let run = store.get_run(scope, &run_id).await?.run;
+    let run = store.get_run_record(scope, &run_id).await?;
     let revision = store
         .get_revision(scope, &run.definition_id, &run.revision_hash)
         .await?;

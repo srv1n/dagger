@@ -1243,6 +1243,16 @@ pub trait WorkflowStore: Send + Sync {
         run_id: &'a Id,
     ) -> impl Future<Output = Result<WorkflowRunView, StoreError>> + Send + 'a;
 
+    /// Reads only the durable run entity, without the derived operational view.
+    /// Stores should override this with a point read; the engine polls it.
+    fn get_run_record<'a>(
+        &'a self,
+        scope: &'a ExecutionScope,
+        run_id: &'a Id,
+    ) -> impl Future<Output = Result<WorkflowRun, StoreError>> + Send + 'a {
+        async move { Ok(self.get_run(scope, run_id).await?.run) }
+    }
+
     /// Reads one node instance.
     fn get_node<'a>(
         &'a self,

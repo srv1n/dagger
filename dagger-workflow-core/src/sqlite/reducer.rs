@@ -151,7 +151,7 @@ pub(crate) enum CommandKindKey {
     Cancel,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub(crate) struct StoredClaim {
     pub(crate) claim: EngineClaim,
     pub(crate) token_digest: Digest,

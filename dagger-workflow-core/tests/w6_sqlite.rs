@@ -2659,6 +2659,14 @@ async fn gate_6_real_command_fault_windows_are_atomic_and_replay_safe() {
         .await
         .unwrap();
     assert_eq!(committed.run.run_id.as_str(), "post-commit-run");
+    // The engine's cheap status poll must agree with the full run view.
+    assert_eq!(
+        replayed
+            .get_run_record(&fixture.scope, &committed.run.run_id)
+            .await
+            .unwrap(),
+        committed.run
+    );
     let first_replay = replayed
         .create_run(
             &fixture.scope,

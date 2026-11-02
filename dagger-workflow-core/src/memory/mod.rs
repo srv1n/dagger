@@ -8835,6 +8835,20 @@ impl<C: Clock> WorkflowStore for InMemoryStore<C> {
             .ok_or(StoreError::NotFound)
     }
 
+    async fn get_run_record(
+        &self,
+        scope: &ExecutionScope,
+        run_id: &Id,
+    ) -> Result<WorkflowRun, StoreError> {
+        self.state
+            .lock()
+            .expect("store lock poisoned")
+            .runs
+            .get(&(scope.clone(), run_id.clone()))
+            .cloned()
+            .ok_or(StoreError::NotFound)
+    }
+
     async fn get_run(
         &self,
         scope: &ExecutionScope,
