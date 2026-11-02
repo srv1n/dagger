@@ -279,24 +279,6 @@ impl FailedReadProof {
     pub(crate) fn store_instance_nonce(&self) -> &[u8] {
         &self.store_instance_nonce
     }
-
-    /// Returns a stable persistence-safe proof fingerprint.
-    pub(crate) fn fingerprint_material(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(self.scope.tenant_id.as_str().as_bytes());
-        bytes.push(0);
-        bytes.extend(self.scope.namespace.as_str().as_bytes());
-        bytes.push(0);
-        bytes.extend(self.requested_digest.as_str().as_bytes());
-        bytes.push(self.error_class as u8);
-        if let Some(observed) = &self.observed_digest {
-            bytes.extend(observed.as_str().as_bytes());
-        }
-        bytes.extend(&self.store_instance_nonce);
-        bytes.extend(&self.proof_nonce);
-        bytes.extend(self.checked_at.0.to_be_bytes());
-        bytes
-    }
 }
 
 impl std::fmt::Debug for FailedReadProof {

@@ -556,8 +556,6 @@ pub struct ClaimNodeAttempt {
     pub worker_id: Id,
     /// Verified exact canonical bound input.
     pub bound_input: VerifiedObjectRef,
-    /// Ordered binding derivation digest.
-    pub binding_derivation_digest: Digest,
 }
 
 /// Parameters for an opt-in memoized or explicitly pinned action claim.

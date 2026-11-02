@@ -315,8 +315,6 @@ pub struct WorkflowRun {
     pub corrupt_owner_node_id: Option<NodeInstanceId>,
     /// Closed corruption class.
     pub corrupt_error_class: Option<FailedReadClass>,
-    /// Opaque proof fingerprint.
-    pub corrupt_proof_fingerprint: Option<Digest>,
     /// Run CAS version.
     pub version: Version,
 }

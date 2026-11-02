@@ -1823,7 +1823,6 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
                         attempt_id: id("must-rollback"),
                         worker_id: id("worker-1"),
                         bound_input: input.clone(),
-                        binding_derivation_digest: hash(b"capacity-binding"),
                     },
                 )
                 .await,
@@ -1874,7 +1873,6 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
                         attempt_id: id("foreign-capability"),
                         worker_id: id("worker-1"),
                         bound_input: foreign_input,
-                        binding_derivation_digest: hash(b"foreign-binding"),
                     },
                 )
                 .await,
@@ -1895,7 +1893,6 @@ fn retry_delay_survives_engine_recreation_and_then_succeeds() {
                     attempt_id: id("abandoned-attempt"),
                     worker_id: id("worker-1"),
                     bound_input: input,
-                    binding_derivation_digest: hash(b"binding"),
                 },
             )
             .await
@@ -2970,7 +2967,6 @@ fn blocked_run_fence_precedes_exact_approval_replay() {
                     permit: claim.permit.clone(),
                     run_id: id("blocked-approval-run"),
                     compatibility_evidence: CompatibilityReport {
-                        evidence_digest: hash(b"compatible"),
                         incompatible_reference_locations: Vec::new(),
                         evidence: Vec::new(),
                     },
@@ -3054,7 +3050,6 @@ fn blocked_run_fence_precedes_exact_approval_replay() {
                     run_id: id("blocked-approval-run"),
                     incompatibilities,
                     evidence: CompatibilityReport {
-                        evidence_digest: hash(b"incompatible"),
                         incompatible_reference_locations: vec!["synthetic".to_owned()],
                         evidence: Vec::new(),
                     },

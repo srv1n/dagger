@@ -91,7 +91,6 @@ struct Fixture {
     /// The principal named in the gate's `allowed_principal_ids`.
     principal: AuthenticatedPrincipal,
     revision_hash: Digest,
-    evidence_digest: Digest,
     input: VerifiedObjectRef,
     /// One claim per scope: `acquire_engine_claim` is exclusive, so fixtures
     /// that open several gates must share the permit rather than re-acquire.
@@ -262,7 +261,6 @@ async fn seed<S: WorkflowStore>(
         scope: workflow_scope,
         principal,
         revision_hash: canonical.digest().clone(),
-        evidence_digest: schema.digest().clone(),
         input,
         permit: claim.permit,
     }
@@ -314,7 +312,6 @@ async fn open_gate<S: WorkflowStore>(
                 permit: fixture.permit.clone(),
                 run_id: run_id.clone(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },

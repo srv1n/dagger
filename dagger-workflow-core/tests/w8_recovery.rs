@@ -285,7 +285,6 @@ impl Deployment {
 
     fn evidence(&self) -> CompatibilityReport {
         CompatibilityReport {
-            evidence_digest: self.schema.clone(),
             incompatible_reference_locations: Vec::new(),
             evidence: Vec::new(),
         }
@@ -835,7 +834,6 @@ async fn claim(
                 attempt_id: id(attempt_id),
                 worker_id: id("w8-worker"),
                 bound_input,
-                binding_derivation_digest: deployment.schema.clone(),
             },
         )
         .await

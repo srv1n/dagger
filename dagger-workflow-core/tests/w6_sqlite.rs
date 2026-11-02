@@ -85,7 +85,6 @@ async fn start_and_claim_action(
                 permit: permit.clone(),
                 run_id: run_id.clone(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -109,7 +108,6 @@ async fn start_and_claim_action(
                 attempt_id: Id::new(attempt_id).unwrap(),
                 worker_id: Id::new("failure-message-worker").unwrap(),
                 bound_input: fixture.input.clone(),
-                binding_derivation_digest: fixture.evidence_digest.clone(),
             },
         )
         .await
@@ -653,7 +651,6 @@ async fn permanent_action_failure_skips_missing_output_dependent_in_sqlite() {
                 permit: engine_claim.permit.clone(),
                 run_id: run_id.clone(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -677,7 +674,6 @@ async fn permanent_action_failure_skips_missing_output_dependent_in_sqlite() {
                 attempt_id: Id::new("permanent-skip-attempt").unwrap(),
                 worker_id: Id::new("permanent-skip-worker").unwrap(),
                 bound_input: fixture.input.clone(),
-                binding_derivation_digest: fixture.evidence_digest.clone(),
             },
         )
         .await
@@ -1220,7 +1216,6 @@ async fn gate_4_tenant_command_changes_only_expected_rows_in_its_own_slice() {
                 permit: claim_a.permit,
                 run_id: Id::new("run-a").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture_a.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -1494,7 +1489,6 @@ async fn complete_map_rehydrates_pinned_output_schema_after_restart() {
                 permit: claim.permit.clone(),
                 run_id: Id::new("map-run").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -1556,7 +1550,6 @@ async fn complete_map_rehydrates_pinned_output_schema_after_restart() {
                 attempt_id: Id::new("map-attempt").unwrap(),
                 worker_id: Id::new("map-worker").unwrap(),
                 bound_input: item.clone(),
-                binding_derivation_digest: schema.digest().clone(),
             },
         )
         .await
@@ -1874,7 +1867,6 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
                 permit: acquired.permit.clone(),
                 run_id: Id::new("recovery-run").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -1902,7 +1894,6 @@ async fn reopen_recovers_a_started_attempt_from_sql_state_only() {
                     attempt_id: Id::new("started-at-crash").unwrap(),
                     worker_id: Id::new("worker").unwrap(),
                     bound_input: input,
-                    binding_derivation_digest: schema.digest().clone(),
                 },
             )
             .await
@@ -2285,7 +2276,6 @@ async fn gate_7_two_connection_races_preserve_all_domain_fences() {
                 permit: claim.permit.clone(),
                 run_id: Id::new("race-run").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -2309,7 +2299,6 @@ async fn gate_7_two_connection_races_preserve_all_domain_fences() {
         attempt_id: Id::new(attempt_id).unwrap(),
         worker_id: Id::new("worker").unwrap(),
         bound_input: fixture.input.clone(),
-        binding_derivation_digest: fixture.evidence_digest.clone(),
     };
     let (left, right) = tokio::join!(
         first.claim_node_attempt(&fixture.scope, claim_command("attempt-left")),
@@ -2436,7 +2425,6 @@ async fn gate_7_two_connection_races_preserve_all_domain_fences() {
                 permit: approval_claim.permit.clone(),
                 run_id: Id::new("approval-race-run").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: approval.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -2580,7 +2568,6 @@ async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_determin
                 permit: first_engine.permit.clone(),
                 run_id: Id::new("recovery-batch-run").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -2608,7 +2595,6 @@ async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_determin
                     attempt_id: Id::new("attempt-1").unwrap(),
                     worker_id: Id::new("worker").unwrap(),
                     bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.evidence_digest.clone(),
                 },
             )
             .await
@@ -2629,7 +2615,6 @@ async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_determin
                 permit: first_engine.permit.clone(),
                 run_id: Id::new("recovery-batch-run-2").unwrap(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.evidence_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -2657,7 +2642,6 @@ async fn gate_8_restart_replay_and_abandoned_attempt_recovery_bytes_are_determin
                     attempt_id: Id::new("attempt-2").unwrap(),
                     worker_id: Id::new("worker").unwrap(),
                     bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.evidence_digest.clone(),
                 },
             )
             .await
@@ -3195,7 +3179,6 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
                         permit: claim.permit.clone(),
                         run_id: Id::new(&run_id).unwrap(),
                         compatibility_evidence: CompatibilityReport {
-                            evidence_digest: fixture.evidence_digest.clone(),
                             incompatible_reference_locations: Vec::new(),
                             evidence: Vec::new(),
                         },
@@ -3222,7 +3205,6 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
                         attempt_id: Id::new(&attempt_id).unwrap(),
                         worker_id: Id::new("history-worker").unwrap(),
                         bound_input: fixture.input.clone(),
-                        binding_derivation_digest: fixture.evidence_digest.clone(),
                     },
                 )
                 .await
@@ -3341,7 +3323,6 @@ async fn gate_10_identical_command_cost_is_non_linear_in_historical_runs() {
                     permit: claim.permit.clone(),
                     run_id: Id::new("measured-run").unwrap(),
                     compatibility_evidence: CompatibilityReport {
-                        evidence_digest: fixture.evidence_digest.clone(),
                         incompatible_reference_locations: Vec::new(),
                         evidence: Vec::new(),
                     },

@@ -78,7 +78,6 @@ struct Fixture {
     scope: ExecutionScope,
     principal: AuthenticatedPrincipal,
     revision_hash: Digest,
-    schema_digest: Digest,
     input: VerifiedObjectRef,
 }
 
@@ -236,7 +235,6 @@ async fn publish<S: WorkflowStore>(
         scope: workflow_scope,
         principal,
         revision_hash: canonical.digest().clone(),
-        schema_digest: schema.digest().clone(),
         input,
     }
 }
@@ -394,7 +392,6 @@ async fn start<S: WorkflowStore>(
                 permit: claim.permit.clone(),
                 run_id: id(run_id),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: fixture.schema_digest.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -428,7 +425,6 @@ async fn claim_attempt<S: WorkflowStore>(
                 attempt_id: id(attempt_id),
                 worker_id: id("w10-worker"),
                 bound_input: bound_input.clone(),
-                binding_derivation_digest: fixture.schema_digest.clone(),
             },
         )
         .await

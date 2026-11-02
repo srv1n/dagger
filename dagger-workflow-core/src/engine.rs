@@ -38,7 +38,6 @@ use crate::ids::Timestamp;
 
 #[derive(serde::Serialize)]
 struct IncompatibilityEvidenceDocument<'a> {
-    evidence_digest: &'a Digest,
     incompatible_reference_locations: &'a [String],
 }
 
@@ -704,7 +703,6 @@ where
                     if !evidence.incompatible_reference_locations.is_empty() =>
                 {
                     let bytes = serde_jcs::to_vec(&IncompatibilityEvidenceDocument {
-                        evidence_digest: &evidence.evidence_digest,
                         incompatible_reference_locations: &evidence
                             .incompatible_reference_locations,
                     })
@@ -1036,7 +1034,6 @@ where
                         attempt_id: attempt_id.clone(),
                         worker_id: self.config.instance_id.clone(),
                         bound_input: bound_object,
-                        binding_derivation_digest: Digest::of(&bound),
                     },
                     memoization_key,
                     memoization_artifact_refs,

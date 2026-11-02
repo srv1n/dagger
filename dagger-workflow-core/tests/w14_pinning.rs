@@ -1006,7 +1006,6 @@ async fn reject_forged_claims<S: WorkflowStore + 'static, O: ObjectStore + 'stat
                         attempt_id: id("forged-pin-attempt"),
                         worker_id: id("worker"),
                         bound_input: bound_object,
-                        binding_derivation_digest: hash(&bound),
                     },
                     memoization_key: None,
                     memoization_artifact_refs: Vec::new(),

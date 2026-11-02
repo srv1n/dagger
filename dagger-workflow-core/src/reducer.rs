@@ -771,32 +771,18 @@ fn suspension_fingerprint(
     scope: &ExecutionScope,
     run_id: &Id,
     incompatibilities: &VerifiedObjectRef,
-    evidence_digest: &Digest,
 ) -> Digest {
     fn extend_lp(bytes: &mut Vec<u8>, value: &[u8]) {
         bytes.extend((value.len() as u64).to_be_bytes());
         bytes.extend(value);
     }
-    let artifact_id = artifact_ref_id(ArtifactRefIdentity {
-        scope,
-        digest: incompatibilities.digest(),
-        kind: ArtifactKind::CompatibilityEvidence,
-        producer_run_id: Some(run_id),
-        producer_node_id: None,
-        producer_attempt_id: None,
-        ordinal: 0,
-    });
     let mut bytes = Vec::new();
-    let size_bytes = incompatibilities.size_bytes().to_be_bytes();
     for value in [
         b"dagger-suspend-request-v1".as_slice(),
         scope.tenant_id.as_str().as_bytes(),
         scope.namespace.as_str().as_bytes(),
         run_id.as_str().as_bytes(),
-        artifact_id.as_str().as_bytes(),
         incompatibilities.digest().as_str().as_bytes(),
-        size_bytes.as_slice(),
-        evidence_digest.as_str().as_bytes(),
     ] {
         extend_lp(&mut bytes, value);
     }
@@ -1253,15 +1239,6 @@ fn payload_value(value: impl Serialize) -> Value {
     serde_json::to_value(value).expect("closed event payload field serializes")
 }
 
-fn value_object(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
-    Value::Object(
-        fields
-            .into_iter()
-            .map(|(name, value)| (name.to_owned(), value))
-            .collect(),
-    )
-}
-
 fn typed_event_payload(
     event_type: EventType,
     fields: impl IntoIterator<Item = (&'static str, Value)>,
@@ -1281,15 +1258,15 @@ fn typed_event_payload(
 }
 
 macro_rules! payload_constructors {
-    ($( $function:ident => $variant:ident ( $( $field:ident : $field_type:ty ),+ ) );+ $(;)?) => {
+    ($( $function:ident => $variant:ident ( $( $field:ident : $field_type:ty ),* ) );+ $(;)?) => {
         mod event_payload {
             use super::*;
             $(
                 #[allow(dead_code)]
-                pub(super) fn $function($( $field: $field_type ),+) -> TypedEventPayload {
+                pub(super) fn $function($( $field: $field_type ),*) -> TypedEventPayload {
                     typed_event_payload(
                         EventType::$variant,
-                        [$( (stringify!($field), payload_value($field)) ),+],
+                        [$( (stringify!($field), payload_value($field)) ),*],
                     )
                 }
             )+
@@ -1301,18 +1278,18 @@ payload_constructors! {
     run_created => RunCreated(definition_id: &Id, revision_hash: &Digest, input_digest: &Digest, budget_limit: &CostUnits, limits: &crate::run::RunLimits, create_request_fingerprint: &Digest);
     node_created_pending => NodeCreatedPending(definition_node_id: &Id, kind: &NodeKind, incoming_total: &u32, topological_rank: &crate::ids::TopologicalRank);
     node_created_ready => NodeCreatedReady(definition_node_id: &Id, kind: &NodeKind, topological_rank: &crate::ids::TopologicalRank);
-    run_started => RunStarted(revision_hash: &Digest, compatibility_evidence_digest: &Digest);
+    run_started => RunStarted(revision_hash: &Digest);
     run_blocked_incompatible => RunBlockedIncompatible(incompatibilities_digest: &Digest, incompatible_reference_locations: &Vec<String>, suspension_fingerprint: &Digest);
-    node_blocked_incompatible => NodeBlockedIncompatible(blocked_from_status: &NodeState, action_reference_location: &Id, required_semantic_digest: &Digest);
-    run_resumed_compatible => RunResumedCompatible(compatibility_evidence_digest: &Digest);
-    node_resumed_compatible => NodeResumedCompatible(restored_status: &NodeState, available_semantic_digest: &Digest);
+    node_blocked_incompatible => NodeBlockedIncompatible(blocked_from_status: &NodeState, action_reference_location: &Id);
+    run_resumed_compatible => RunResumedCompatible();
+    node_resumed_compatible => NodeResumedCompatible(restored_status: &NodeState);
     run_succeeded => RunSucceeded(output_digest: &Digest, consumed_cost_units: &CostUnits);
     run_failed => RunFailed(failure_kind: &RunFailureKind, diagnostics_digest: &Option<&Digest>);
     run_contract_failed => RunContractFailed(failure_kind: &RunFailureKind, diagnostics_digest: &Option<&Digest>);
     run_retries_exhausted => RunRetriesExhausted(node_instance_id: &Id, attempt_id: &Id, max_attempts: &u32);
     run_budget_exhausted => RunBudgetExhausted(node_instance_id: &Id, requested: &CostUnits, available: &str, limit_minus_consumed: &str, permanently_infeasible: &bool);
     run_cancelled => RunCancelled(principal: &Option<&str>, reason_code: &str, prior_status: &RunState);
-    run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Option<Digest>, store_instance_nonce_digest: &Digest, prior_status: &RunState, owner_node_id: &Option<Id>);
+    run_corrupt_storage => RunCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, prior_status: &RunState, owner_node_id: &Option<Id>);
     node_became_ready => NodeBecameReady(incoming_satisfied: &u32, incoming_skipped: &u32, incoming_total: &u32);
     node_retry_eligible => NodeRetryEligible(next_eligible_at: &Timestamp, database_now: &Timestamp);
     node_attempt_claimed => NodeAttemptClaimed(attempt_id: &Id, invocation_id: &Id, attempt_number: &u32, worker_id: &Id, action_name: &str);
@@ -1323,7 +1300,7 @@ payload_constructors! {
     map_zero_items_succeeded => MapZeroItemsSucceeded(map_input_digest: &Digest, expansion_digest: &Digest, aggregate_digest: &Digest);
     map_succeeded => MapSucceeded(child_count: &Option<u32>, aggregate_digest: &Digest);
     choice_selected => ChoiceSelected(choice_input_digest: &Digest, selector_value_digest: &Digest, selection_kind: &str, case_index: &Option<u32>, edge_id: &Option<&Id>);
-    approval_requested => ApprovalRequested(gate_id: &Id, request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
+    approval_requested => ApprovalRequested(gate_id: &Id, request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy);
     approval_approved => ApprovalApproved(gate_id: &Id, decision_payload_digest: &Option<&Digest>, approval_output_digest: &Digest, resolution_source: &str);
     approval_rejected => ApprovalRejected(gate_id: &Id, decision_payload_digest: &Option<&Digest>, resolution_source: &str);
     approval_expired_approved => ApprovalExpiredApproved(gate_id: &Id, expires_at: &Timestamp, approval_output_digest: &Digest);
@@ -1345,7 +1322,7 @@ payload_constructors! {
     map_contract_failed => MapContractFailed(failure_kind: &NodeFailureKind, failed_child_id: &Option<Id>);
     map_retries_exhausted => MapRetriesExhausted(failed_child_id: &Id, attempt_id: &Id, max_attempts: &u32);
     map_budget_exhausted => MapBudgetExhausted(failed_child_id: &Id, requested: &CostUnits, available: &str);
-    node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, corrupt_proof_fingerprint: &Digest, prior_status: &NodeState);
+    node_corrupt_storage => NodeCorruptStorage(bad_artifact_ref_id: &Id, bad_digest: &Digest, error_class: &FailedReadClass, prior_status: &NodeState);
     cache_hit => CacheHit(source_run_id: &Id, source_node_id: &Id, source_attempt_id: &Id, cache_key: &Digest);
     pinned_output_reused => PinnedOutputReused(source_run_id: &Id, source_node_id: &Id, source_attempt_id: &Id);
     attempt_succeeded => AttemptSucceeded(actual_cost_units: &CostUnits, output_digest: &Digest, artifact_digests: &Vec<Digest>);
@@ -1355,14 +1332,14 @@ payload_constructors! {
     attempt_timed_out => AttemptTimedOut(deadline_at: &Timestamp, database_now: &Timestamp, charged_cost_units: &CostUnits);
     attempt_outcome_unknown => AttemptOutcomeUnknown(dead_engine_generation: &u64, recovery_generation: &u64, charged_cost_units: &CostUnits);
     attempt_cancelled => AttemptCancelled(reason_code: &str, charged_cost_units: &CostUnits);
-    attempt_marked_stale => AttemptMarkedStale(active_attempt_id: &Option<Id>, submitted_outcome_category: &str, submitted_payload_digest: &Digest, charged_cost_units: &CostUnits);
-    stale_completion_observed => StaleCompletionObserved(immutable_terminal_state: &AttemptState, submitted_outcome_category: &str, submitted_payload_digest: &Digest, database_arrival_at: &Timestamp);
+    attempt_marked_stale => AttemptMarkedStale(active_attempt_id: &Option<Id>, submitted_outcome_category: &str, charged_cost_units: &CostUnits);
+    stale_completion_observed => StaleCompletionObserved(immutable_terminal_state: &AttemptState, submitted_outcome_category: &str, database_arrival_at: &Timestamp);
     action_checkpoint_reported => ActionCheckpointReported(object_ref: &str);
     action_phase_reported => ActionPhaseReported(label: &str);
     action_external_handle_reported => ActionExternalHandleReported(kind: &str, id: &str);
     budget_settled => BudgetSettled(ledger_seq: &u64, reservation_amount: &CostUnits, consumed_amount: &CostUnits, released_amount: &str, reason: &BudgetLedgerReason, available_after: &str);
     budget_reservation_refused => BudgetReservationRefused(requested: &CostUnits, consumed: &CostUnits, reserved: &CostUnits, limit: &CostUnits, available: &str, permanently_infeasible: &bool);
-    approval_gate_created => ApprovalGateCreated(request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy, authorization_policy_digest: &Digest);
+    approval_gate_created => ApprovalGateCreated(request_digest: &Digest, expires_at: &Timestamp, on_expiry: &crate::approval::ApprovalExpiryPolicy);
     approval_gate_approved => ApprovalGateApproved(principal: &str, decision_payload_digest: &Option<&Digest>, approval_output_digest: &Digest, decision_fingerprint: &Digest);
     approval_gate_rejected => ApprovalGateRejected(principal: &str, decision_payload_digest: &Option<&Digest>, decision_fingerprint: &Digest);
     approval_gate_expired_approved => ApprovalGateExpiredApproved(expires_at: &Timestamp, database_now: &Timestamp, approval_output_digest: &Digest);
@@ -1430,7 +1407,7 @@ fn event_payload_fields(
             &[],
         ),
         NodeCreatedReady => (&["definition_node_id", "kind", "topological_rank"], &[]),
-        RunStarted => (&["revision_hash", "compatibility_evidence_digest"], &[]),
+        RunStarted => (&["revision_hash"], &[]),
         RunBlockedIncompatible => (
             &[
                 "incompatibilities_digest",
@@ -1439,16 +1416,9 @@ fn event_payload_fields(
             ],
             &[],
         ),
-        NodeBlockedIncompatible => (
-            &[
-                "blocked_from_status",
-                "action_reference_location",
-                "required_semantic_digest",
-            ],
-            &[],
-        ),
-        RunResumedCompatible => (&["compatibility_evidence_digest"], &[]),
-        NodeResumedCompatible => (&["restored_status", "available_semantic_digest"], &[]),
+        NodeBlockedIncompatible => (&["blocked_from_status", "action_reference_location"], &[]),
+        RunResumedCompatible => (&[], &[]),
+        NodeResumedCompatible => (&["restored_status"], &[]),
         RunSucceeded => (&["output_digest", "consumed_cost_units"], &[]),
         RunFailed | RunContractFailed => (&["failure_kind"], &["diagnostics_digest"]),
         RunRetriesExhausted => (&["node_instance_id", "attempt_id", "max_attempts"], &[]),
@@ -1468,8 +1438,6 @@ fn event_payload_fields(
                 "bad_artifact_ref_id",
                 "bad_digest",
                 "error_class",
-                "corrupt_proof_fingerprint",
-                "store_instance_nonce_digest",
                 "prior_status",
             ],
             &["owner_node_id"],
@@ -1530,13 +1498,7 @@ fn event_payload_fields(
             &["case_index"],
         ),
         ApprovalRequested => (
-            &[
-                "gate_id",
-                "request_digest",
-                "expires_at",
-                "on_expiry",
-                "authorization_policy_digest",
-            ],
+            &["gate_id", "request_digest", "expires_at", "on_expiry"],
             &[],
         ),
         ApprovalApproved => (
@@ -1598,7 +1560,6 @@ fn event_payload_fields(
                 "bad_artifact_ref_id",
                 "bad_digest",
                 "error_class",
-                "corrupt_proof_fingerprint",
                 "prior_status",
             ],
             &[],
@@ -1639,18 +1600,13 @@ fn event_payload_fields(
         ),
         AttemptCancelled => (&["reason_code", "charged_cost_units"], &[]),
         AttemptMarkedStale => (
-            &[
-                "submitted_outcome_category",
-                "submitted_payload_digest",
-                "charged_cost_units",
-            ],
+            &["submitted_outcome_category", "charged_cost_units"],
             &["active_attempt_id"],
         ),
         StaleCompletionObserved => (
             &[
                 "immutable_terminal_state",
                 "submitted_outcome_category",
-                "submitted_payload_digest",
                 "database_arrival_at",
             ],
             &[],
@@ -1680,15 +1636,7 @@ fn event_payload_fields(
             ],
             &[],
         ),
-        ApprovalGateCreated => (
-            &[
-                "request_digest",
-                "expires_at",
-                "on_expiry",
-                "authorization_policy_digest",
-            ],
-            &[],
-        ),
+        ApprovalGateCreated => (&["request_digest", "expires_at", "on_expiry"], &[]),
         ApprovalGateApproved => (
             &[
                 "principal",
@@ -3412,7 +3360,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 corrupt_bad_artifact_ref_id: None,
                 corrupt_owner_node_id: None,
                 corrupt_error_class: None,
-                corrupt_proof_fingerprint: None,
                 version: Version(1),
             };
             state.runs.insert(run_key.clone(), run);
@@ -3635,10 +3582,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     None,
                     None,
                     None,
-                    event_payload::run_started(
-                        &(revision_hash),
-                        &(command.compatibility_evidence.evidence_digest),
-                    ),
+                    event_payload::run_started(&(revision_hash)),
                 )],
             )?;
             Ok(state.runs.get(&key).expect("run").clone())
@@ -3656,12 +3600,8 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 return Err(StoreError::EvidenceInvalid);
             }
             let key = (scope.clone(), command.run_id.clone());
-            let suspension_fingerprint = suspension_fingerprint(
-                scope,
-                &command.run_id,
-                &command.incompatibilities,
-                &command.evidence.evidence_digest,
-            );
+            let suspension_fingerprint =
+                suspension_fingerprint(scope, &command.run_id, &command.incompatibilities);
             let current = state.runs.get(&key).cloned().ok_or(StoreError::NotFound)?;
             if current.status == RunState::BlockedIncompatible
                 && current.blocked_incompatibility_fingerprint.as_ref()
@@ -3744,11 +3684,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     Some(&node.node_instance_id),
                     None,
                     None,
-                    event_payload::node_blocked_incompatible(
-                        &(prior),
-                        &(node.definition_node_id),
-                        &(command.evidence.evidence_digest),
-                    ),
+                    event_payload::node_blocked_incompatible(&(prior), &(node.definition_node_id)),
                 ));
             }
             if frontier_changed {
@@ -3845,10 +3781,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     Some(&node.node_instance_id),
                     None,
                     None,
-                    event_payload::node_resumed_compatible(
-                        &(restored),
-                        &(command.availability_evidence.evidence_digest),
-                    ),
+                    event_payload::node_resumed_compatible(&(restored)),
                 ));
             }
             if frontier_changed {
@@ -3864,9 +3797,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                 None,
                 None,
                 None,
-                event_payload::run_resumed_compatible(
-                    &(command.availability_evidence.evidence_digest),
-                ),
+                event_payload::run_resumed_compatible(),
             ));
             append_batch(
                 &mut state,
@@ -4439,9 +4370,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     .compatible_implementation_requirement
                     .clone(),
                 bound_input_ref,
-                bound_input_digest: command.bound_input.digest().clone(),
-                bound_input_size_bytes: command.bound_input.size_bytes(),
-                binding_derivation_digest: command.binding_derivation_digest,
                 created_at: now,
             };
             let attempt_number = node
@@ -4565,7 +4493,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                             &(deadline_at),
                             &(declared_max),
                             &(Digest::of(attempt.idempotency_key.as_bytes())),
-                            &(invocation.bound_input_digest),
+                            &(invocation.bound_input_ref.0.digest),
                             &(credential.digest()),
                         ),
                     ),
@@ -4662,7 +4590,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                             event_payload::stale_completion_observed(
                                 &(immutable),
                                 &(outcome_category(&command.submitted_outcome)),
-                                &(outcome_digest(&command.submitted_outcome)),
                                 &(now),
                             ),
                         )],
@@ -4716,7 +4643,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                             event_payload::attempt_marked_stale(
                                 &(node.active_attempt_id),
                                 &(outcome_category(&command.submitted_outcome)),
-                                &(outcome_digest(&command.submitted_outcome)),
                                 &(reservation),
                             ),
                         ),
@@ -4903,7 +4829,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     event_payload::stale_completion_observed(
                         &(AttemptState::TimedOut),
                         &(outcome_category(&command.submitted_outcome)),
-                        &(outcome_digest(&command.submitted_outcome)),
                         &(now),
                     ),
                 ));
@@ -7112,10 +7037,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             state.nodes.insert(node_key, node);
             state.gates.insert(gate_key, gate.clone());
             bump_frontier_epoch(&mut state, scope, &command.run_id)?;
-            let authorization_policy_digest = Digest::of(
-                &serde_jcs::to_vec(&gate.authorization_policy)
-                    .map_err(|_| StoreError::TransactionFailed)?,
-            );
             let run = state
                 .runs
                 .get_mut(&(scope.clone(), command.run_id.clone()))
@@ -7139,7 +7060,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                             &(command.request.digest()),
                             &(gate.expires_at),
                             &(gate.on_expiry),
-                            &(authorization_policy_digest),
                         ),
                     ),
                     event_spec(
@@ -7151,7 +7071,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                             &(command.request.digest()),
                             &(gate.expires_at),
                             &(gate.on_expiry),
-                            &(authorization_policy_digest),
                         ),
                     ),
                 ],
@@ -8369,7 +8288,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             if !corrupt_ref_reachable_from_run(&state, scope, &prior, &command.bad_ref) {
                 return Err(StoreError::InvalidFailedReadProof);
             }
-            let proof_fingerprint = Digest::of(command.proof.fingerprint_material());
             let mut specs = Vec::new();
             if let Some(owner_node_id) = &command.owner_node_id {
                 let node_key = (scope.clone(), command.run_id.clone(), owner_node_id.clone());
@@ -8432,7 +8350,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                         &(command.bad_ref.artifact_ref_id),
                         &(command.bad_ref.digest),
                         &(command.proof.error_class()),
-                        &(proof_fingerprint),
                         &(prior_status),
                     ),
                 ));
@@ -8455,11 +8372,9 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             run.corrupt_bad_artifact_ref_id = Some(command.bad_ref.artifact_ref_id.clone());
             run.corrupt_owner_node_id = command.owner_node_id;
             run.corrupt_error_class = Some(command.proof.error_class());
-            run.corrupt_proof_fingerprint = Some(proof_fingerprint);
             run.finished_at = Some(now);
             set_run_mutated(run, now)?;
             let returned = run.clone();
-            let store_instance_nonce_digest = Digest::of(command.proof.store_instance_nonce());
             let run_transition =
                 corruption_run_transition(prior.status).expect("CorruptStorage handled above");
             specs.push(event_spec(
@@ -8471,8 +8386,6 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
                     &(command.bad_ref.artifact_ref_id),
                     &(command.bad_ref.digest),
                     &(command.proof.error_class()),
-                    &(returned.corrupt_proof_fingerprint),
-                    &(store_instance_nonce_digest),
                     &(prior.status),
                     &(returned.corrupt_owner_node_id),
                 ),
@@ -9068,43 +8981,6 @@ fn outcome_category(outcome: &ActionOutcome) -> &'static str {
         ActionOutcome::Retryable { .. } => "retryable",
         ActionOutcome::Permanent { .. } => "permanent",
     }
-}
-
-fn outcome_digest(outcome: &ActionOutcome) -> Digest {
-    let value = match outcome {
-        ActionOutcome::Success {
-            output,
-            actual_cost_units,
-            ..
-        } => value_object([
-            ("kind", payload_value("success")),
-            ("output", payload_value(output)),
-            ("cost", payload_value(actual_cost_units)),
-        ]),
-        ActionOutcome::Retryable {
-            code,
-            message,
-            actual_cost_units,
-            ..
-        } => value_object([
-            ("kind", payload_value("retryable")),
-            ("code", payload_value(code)),
-            ("message", payload_value(message)),
-            ("cost", payload_value(actual_cost_units)),
-        ]),
-        ActionOutcome::Permanent {
-            code,
-            message,
-            actual_cost_units,
-            ..
-        } => value_object([
-            ("kind", payload_value("permanent")),
-            ("code", payload_value(code)),
-            ("message", payload_value(message)),
-            ("cost", payload_value(actual_cost_units)),
-        ]),
-    };
-    Digest::of(serde_jcs::to_vec(&value).expect("outcome projection serializes"))
 }
 
 fn outcome_cost_reason(outcome: &ActionOutcome) -> (CostUnits, BudgetLedgerReason) {

@@ -374,12 +374,6 @@ pub struct ActionInvocation {
     pub compatible_implementation_requirement: Digest,
     /// Exact canonical bound input ref.
     pub bound_input_ref: JsonRef,
-    /// Digest of exact delivered bytes.
-    pub bound_input_digest: Digest,
-    /// Exact delivered byte length.
-    pub bound_input_size_bytes: u64,
-    /// Ordered binding derivation digest.
-    pub binding_derivation_digest: Digest,
     /// Creation database timestamp.
     pub created_at: Timestamp,
 }
@@ -900,7 +894,6 @@ impl ActionRegistry for InMemoryActionRegistry {
             .map(|entry| entry.reference_location.clone())
             .collect();
         CompatibilityReport {
-            evidence_digest: compatibility_evidence_digest(&evidence),
             incompatible_reference_locations,
             evidence,
         }
@@ -952,8 +945,6 @@ pub struct PinCompatibilityEvidence {
 /// Exact compatibility evidence produced from one registry snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompatibilityReport {
-    /// Digest of the complete canonical evidence.
-    pub evidence_digest: Digest,
     /// Reference locations whose exact pin is unavailable.
     pub incompatible_reference_locations: Vec<String>,
     /// Complete deterministic observation supporting suspension or resume.
@@ -1063,28 +1054,18 @@ pub async fn invoke_registered_at(
             database_now,
         });
     }
-    if invocation.bound_input_ref.0.digest != invocation.bound_input_digest {
+    let bound_digest = &invocation.bound_input_ref.0.digest;
+    let bound_size = invocation.bound_input_ref.0.size_bytes;
+    if canonical_bound_input.digest != *bound_digest {
         return Err(InvocationError::BoundInputDigestMismatch {
-            expected: invocation.bound_input_ref.0.digest.clone(),
-            actual: invocation.bound_input_digest.clone(),
-        });
-    }
-    if invocation.bound_input_ref.0.size_bytes != invocation.bound_input_size_bytes {
-        return Err(InvocationError::BoundInputSizeMismatch {
-            expected: invocation.bound_input_ref.0.size_bytes,
-            actual: invocation.bound_input_size_bytes,
-        });
-    }
-    if canonical_bound_input.digest != invocation.bound_input_digest {
-        return Err(InvocationError::BoundInputDigestMismatch {
-            expected: invocation.bound_input_digest.clone(),
+            expected: bound_digest.clone(),
             actual: canonical_bound_input.digest.clone(),
         });
     }
     let actual_size = canonical_bound_input.bytes.len() as u64;
-    if actual_size != invocation.bound_input_size_bytes {
+    if actual_size != bound_size {
         return Err(InvocationError::BoundInputSizeMismatch {
-            expected: invocation.bound_input_size_bytes,
+            expected: bound_size,
             actual: actual_size,
         });
     }
@@ -1124,12 +1105,6 @@ pub async fn invoke_registered_at(
     let outcome = action.invoke(context, canonical_bound_input.bytes()).await;
     outcome.validate()?;
     Ok(outcome)
-}
-
-/// Hashes compatibility evidence over RFC 8785 canonical JSON bytes.
-pub fn compatibility_evidence_digest<T: Serialize>(value: &T) -> Digest {
-    let bytes = serde_jcs::to_vec(value).expect("compatibility evidence is serializable");
-    Digest::of(&bytes)
 }
 
 fn invalid_diagnostics(path: &str, code: &'static str) -> DiagnosticsValidationError {

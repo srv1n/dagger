@@ -1,9 +1,9 @@
 use dagger_workflow_core::action::{
-    check_compatibility, compatibility_evidence_digest, fixtures, invoke_registered_at,
-    ActionContext, ActionDescriptor, ActionInvocation, ActionOutcome, ActionRegistry, BudgetHandle,
-    CancellationSource, CanonicalBoundInput, CompatibilityMismatch, CompletionCredential,
-    DiagnosticFact, DiagnosticScalar, DiagnosticsEnvelope, DiagnosticsValidationError,
-    ExternalHandleAccess, InMemoryActionRegistry, InvocationError, WorkflowAction,
+    check_compatibility, fixtures, invoke_registered_at, ActionContext, ActionDescriptor,
+    ActionInvocation, ActionOutcome, ActionRegistry, BudgetHandle, CancellationSource,
+    CanonicalBoundInput, CompatibilityMismatch, CompletionCredential, DiagnosticFact,
+    DiagnosticScalar, DiagnosticsEnvelope, DiagnosticsValidationError, ExternalHandleAccess,
+    InMemoryActionRegistry, InvocationError, WorkflowAction,
 };
 use dagger_workflow_core::artifact::{ArtifactKind, ArtifactRef, JsonRef};
 use dagger_workflow_core::definition::ActionPin;
@@ -127,9 +127,6 @@ fn invocation(descriptor: &ActionDescriptor, input: &CanonicalBoundInput) -> Act
             ordinal: 0,
             created_at: Timestamp(0),
         }),
-        bound_input_digest: input.digest().clone(),
-        bound_input_size_bytes: input.bytes().len() as u64,
-        binding_derivation_digest: digest("bindings"),
         created_at: Timestamp(0),
     }
 }
@@ -223,17 +220,6 @@ fn registration_lookup_and_every_pin_dimension_are_exact() {
     let report = registry.check_pins(&[pin(&descriptor)]);
     assert!(report.incompatible_reference_locations.is_empty());
     assert_eq!(report.evidence.len(), 1);
-}
-
-#[test]
-fn compatibility_evidence_uses_known_rfc8785_bytes() {
-    let value = serde_json::json!({"z": [3, 2], "a": {"b": true, "a": null}});
-    let canonical = serde_jcs::to_vec(&value).unwrap();
-    assert_eq!(canonical, br#"{"a":{"a":null,"b":true},"z":[3,2]}"#);
-    assert_eq!(
-        compatibility_evidence_digest(&value).as_str(),
-        "sha256:d570148de3398d16b58b6267438ad1656f50352cfd66da2432a3c5f3a4b7a8c7"
-    );
 }
 
 #[test]

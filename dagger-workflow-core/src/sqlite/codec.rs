@@ -176,7 +176,6 @@ serde_public_struct!(workflow_run, WorkflowRun, {
     corrupt_bad_artifact_ref_id: Option<Id>,
     corrupt_owner_node_id: Option<NodeInstanceId>,
     corrupt_error_class: Option<crate::artifact::FailedReadClass>,
-    corrupt_proof_fingerprint: Option<Digest>,
     version: Version,
 });
 
@@ -277,9 +276,6 @@ serde_public_struct!(action_invocation, ActionInvocation, {
     output_schema_digest: Digest,
     compatible_implementation_requirement: Digest,
     bound_input_ref: JsonRef,
-    bound_input_digest: Digest,
-    bound_input_size_bytes: u64,
-    binding_derivation_digest: Digest,
     created_at: Timestamp,
 });
 

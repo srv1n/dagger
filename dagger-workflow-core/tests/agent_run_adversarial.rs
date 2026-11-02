@@ -792,7 +792,6 @@ async fn stale_completion_is_fenced_after_takeover() {
                 permit: first.permit.clone(),
                 run_id: id("run-fence"),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -819,7 +818,6 @@ async fn stale_completion_is_fenced_after_takeover() {
                 attempt_id: id("attempt-one"),
                 worker_id: id("fence-one"),
                 bound_input: input.clone(),
-                binding_derivation_digest: schema.clone(),
             },
         )
         .await
@@ -928,7 +926,6 @@ async fn stale_completion_is_fenced_after_takeover() {
                 attempt_id: id("attempt-two"),
                 worker_id: id("fence-two"),
                 bound_input: input.clone(),
-                binding_derivation_digest: schema,
             },
         )
         .await

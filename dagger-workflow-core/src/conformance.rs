@@ -479,7 +479,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                 permit: takeover.permit.clone(),
                 run_id: id("conformance-run"),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -509,7 +508,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                         attempt_id: id("cas-rejected"),
                         worker_id: id("worker"),
                         bound_input: input.clone(),
-                        binding_derivation_digest: schema.digest().clone(),
                     },
                 )
                 .await,
@@ -531,7 +529,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                 attempt_id: id("attempt"),
                 worker_id: id("worker"),
                 bound_input: input.clone(),
-                binding_derivation_digest: schema.digest().clone(),
             },
         )
         .await
@@ -568,7 +565,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                         attempt_id: id("active-fenced"),
                         worker_id: id("worker"),
                         bound_input: input.clone(),
-                        binding_derivation_digest: schema.digest().clone(),
                     },
                 )
                 .await,
@@ -749,7 +745,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                 permit: takeover.permit.clone(),
                 run_id: id("due-run"),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -774,7 +769,6 @@ async fn run_original_case<A: ConformanceAdapter>(
                 attempt_id: id("due-attempt"),
                 worker_id: id("worker"),
                 bound_input: input,
-                binding_derivation_digest: schema.digest().clone(),
             },
         )
         .await
@@ -1080,7 +1074,6 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                 permit: claim.permit.clone(),
                 run_id: id("approval-run"),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -1159,7 +1152,6 @@ async fn blocked_run_host_command_fence<A: ConformanceAdapter>(
                 run_id: id("approval-run"),
                 incompatibilities,
                 evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: vec!["action".to_owned()],
                     evidence: Vec::new(),
                 },
@@ -1388,7 +1380,6 @@ async fn prepare_map_conformance_with_limits<A: ConformanceAdapter>(
                 permit: claim.permit.clone(),
                 run_id: run_id.clone(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -1565,7 +1556,6 @@ async fn map_concurrency_admission<A: ConformanceAdapter>(
                             attempt_id: id(&format!("map-attempt-admitted-{index}")),
                             worker_id: id("worker"),
                             bound_input: fixture.input.clone(),
-                            binding_derivation_digest: fixture.input.digest().clone(),
                         },
                     )
                     .await,
@@ -1634,7 +1624,6 @@ async fn map_concurrency_admission<A: ConformanceAdapter>(
                         expected_node_version: refused.version,
                         attempt_id: id("map-attempt-refused"),
                         worker_id: id("worker"),
-                        binding_derivation_digest: refused_input.digest().clone(),
                         bound_input: refused_input,
                     },
                 )
@@ -1744,7 +1733,6 @@ async fn map_child_failure_cancels_siblings<A: ConformanceAdapter>(
                 expected_node_version: child.version,
                 attempt_id: attempt_id.clone(),
                 worker_id: id("worker"),
-                binding_derivation_digest: fixture.input.digest().clone(),
                 bound_input: fixture.input,
             },
         )
@@ -1867,7 +1855,6 @@ async fn map_continue_case<A: ConformanceAdapter>(
                     attempt_id: attempt_id.clone(),
                     worker_id: id("worker"),
                     bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.input.digest().clone(),
                 },
             )
             .await
@@ -2170,7 +2157,6 @@ async fn map_continue_underfull_case<A: ConformanceAdapter>(
                     attempt_id: attempt_id.clone(),
                     worker_id: id("worker"),
                     bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.input.digest().clone(),
                 },
             )
             .await
@@ -2364,7 +2350,6 @@ async fn exponential_backoff_cap<A: ConformanceAdapter>(
                     attempt_id: attempt_id.clone(),
                     worker_id: id("worker"),
                     bound_input: fixture.input.clone(),
-                    binding_derivation_digest: fixture.input.digest().clone(),
                 },
             )
             .await
@@ -3438,7 +3423,6 @@ async fn prepare_action_attempt_conformance<A: ConformanceAdapter>(
                 permit: claim.permit.clone(),
                 run_id: id("conformance-run"),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },
@@ -3463,7 +3447,6 @@ async fn prepare_action_attempt_conformance<A: ConformanceAdapter>(
                 attempt_id: id("attempt"),
                 worker_id: id("worker"),
                 bound_input: input.clone(),
-                binding_derivation_digest: schema.digest().clone(),
             },
         )
         .await
@@ -4526,7 +4509,6 @@ async fn prepare_map_aggregate_conformance<A: ConformanceAdapter>(
                 attempt_id: id("map-aggregate-attempt"),
                 worker_id: id("worker"),
                 bound_input: fixture.input.clone(),
-                binding_derivation_digest: fixture.input.digest().clone(),
             },
         )
         .await
@@ -5174,7 +5156,6 @@ async fn claim_inline_json_limit_applied<A: ConformanceAdapter>(
                 attempt_id: id("oversized-attempt"),
                 worker_id: id("worker"),
                 bound_input,
-                binding_derivation_digest: fixture.expansion_digest.clone(),
             },
         )
         .await
@@ -5435,7 +5416,6 @@ async fn prepare_approval_conformance<A: ConformanceAdapter>(
                 permit: claim.permit.clone(),
                 run_id: run_id.clone(),
                 compatibility_evidence: CompatibilityReport {
-                    evidence_digest: schema.digest().clone(),
                     incompatible_reference_locations: Vec::new(),
                     evidence: Vec::new(),
                 },

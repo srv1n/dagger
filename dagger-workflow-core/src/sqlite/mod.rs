@@ -2008,7 +2008,7 @@ where
             .bind(invocation.invocation_id.as_str())
             .bind(invocation.attempt_id.as_str())
             .bind(invocation.node_instance_id.as_str())
-            .bind(invocation.bound_input_digest.as_str())
+            .bind(invocation.bound_input_ref.0.digest.as_str())
             .bind(invocation.compatible_implementation_requirement.as_str())
             .bind(
                 state
