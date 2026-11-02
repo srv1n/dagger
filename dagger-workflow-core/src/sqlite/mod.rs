@@ -286,6 +286,11 @@ struct AuthorityLoad {
     artifact_ref_ids: Vec<Id>,
     external_idempotency_key: Option<String>,
     reuse_source: Option<crate::memoization::ReuseProvenance>,
+    /// Commands append to events and the budget ledger but never read their
+    /// history, so they load only the last ledger row. Reads load everything.
+    history_tail: bool,
+    /// Keeps full history for the one command that reads it.
+    full_history: bool,
 }
 
 impl AuthorityLoad {
@@ -332,6 +337,11 @@ impl AuthorityLoad {
 
     fn reuse_source(mut self, source: Option<&crate::memoization::ReuseProvenance>) -> Self {
         self.reuse_source = source.cloned();
+        self
+    }
+
+    fn full_history(mut self) -> Self {
+        self.full_history = true;
         self
     }
 
@@ -1131,6 +1141,25 @@ where
             .map_err(|_| StoreError::StorageUnavailable)
     }
 
+    /// Ledger sub IDs are zero-padded sequence numbers, so text order is numeric.
+    async fn load_last_ledger_row(
+        connection: &mut Transaction<'_, Sqlite>,
+        scope: &ExecutionScope,
+        run_id: &Id,
+    ) -> Result<Vec<(String, String, String, i64)>, StoreError> {
+        sqlx::query_as(
+            "SELECT entity_id, sub_id, row_data, version FROM dagger_workflow_budget_rows
+             WHERE tenant_id = ? AND namespace = ? AND entity_id = ?
+             ORDER BY sub_id DESC LIMIT 1",
+        )
+        .bind(scope.tenant_id.as_str())
+        .bind(scope.namespace.as_str())
+        .bind(run_id.as_str())
+        .fetch_all(&mut **connection)
+        .await
+        .map_err(|_| StoreError::StorageUnavailable)
+    }
+
     async fn load_state(
         connection: &mut Transaction<'_, Sqlite>,
         scope: &ExecutionScope,
@@ -1145,9 +1174,14 @@ where
 
         if let Some(run_id) = request.run_id.as_ref() {
             for table in RUN_SCOPED_AUTHORITY_TABLES {
-                for (entity_id, sub_id, row_data, version) in
-                    Self::load_authority_table(connection, scope, table, Some(run_id)).await?
-                {
+                let rows = match *table {
+                    EVENT_ROWS | EVENT_BATCH_ROWS if request.history_tail => continue,
+                    BUDGET_ROWS if request.history_tail => {
+                        Self::load_last_ledger_row(connection, scope, run_id).await?
+                    }
+                    _ => Self::load_authority_table(connection, scope, table, Some(run_id)).await?,
+                };
+                for (entity_id, sub_id, row_data, version) in rows {
                     let key = AuthorityKey::new(table, entity_id, sub_id);
                     decode_authority_row(&mut loaded.state, scope, &key, &row_data)?;
                     loaded.rows.insert(key, (row_data, version));
@@ -2773,7 +2807,8 @@ macro_rules! sql_command {
                     return Err(error);
                 }
             };
-            let authority_load: AuthorityLoad = $authority_load;
+            let mut authority_load: AuthorityLoad = $authority_load;
+            authority_load.history_tail = !authority_load.full_history;
             let loaded = match Self::load_state(&mut connection, scope, &authority_load).await {
                 Ok(value) => value,
                 Err(error) => {
@@ -3119,7 +3154,7 @@ impl<C: Send + Sync, O: ObjectStore> WorkflowStore for SqliteWorkflowStore<C, O>
     );
     sql_command!(
         record_action_progress(command: RecordActionProgress) -> ();
-        AuthorityLoad::run(&command.run_id)
+        AuthorityLoad::run(&command.run_id).full_history()
     );
     sql_command!(
         register_external_handle(command: RegisterExternalHandle) -> ExternalHandle;

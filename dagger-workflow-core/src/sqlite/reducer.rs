@@ -2468,10 +2468,7 @@ fn settle(
     if allocated_after > run_snapshot.budget_limit.0 {
         return Err(StoreError::ArithmeticOverflow);
     }
-    let ledger_seq = u64::try_from(state.ledger.get(&run_key).map_or(0, Vec::len))
-        .map_err(|_| StoreError::ArithmeticOverflow)?
-        .checked_add(1)
-        .ok_or(StoreError::ArithmeticOverflow)?;
+    let ledger_seq = next_ledger_seq(state, &run_key)?;
     let run = state.runs.get_mut(&run_key).expect("run remains present");
     run.budget_reserved.0 = reserved_after;
     run.budget_consumed.0 = consumed_after;
@@ -4543,10 +4540,7 @@ impl<C: Clock> WorkflowStore for ReducerStore<C> {
             }
             set_run_mutated(run, now)?;
             let ledger_key = (scope.clone(), command.run_id.clone());
-            let ledger_seq = u64::try_from(state.ledger.get(&ledger_key).map_or(0, Vec::len))
-                .map_err(|_| StoreError::ArithmeticOverflow)?
-                .checked_add(1)
-                .ok_or(StoreError::ArithmeticOverflow)?;
+            let ledger_seq = next_ledger_seq(&state, &ledger_key)?;
             state
                 .ledger
                 .entry(ledger_key.clone())
@@ -9312,6 +9306,21 @@ fn run_failure(kind: NodeFailureKind) -> RunFailureKind {
         NodeFailureKind::ActionCostProtocolViolation => RunFailureKind::ActionCostProtocolViolation,
         NodeFailureKind::SuccessOutputUnavailable => RunFailureKind::SuccessOutputUnavailable,
     }
+}
+
+/// Ledger sequence numbers start at 1 and grow by one, so the next one follows
+/// the last entry. SQLite commands load only that last entry, not the history.
+fn next_ledger_seq(
+    state: &ReducerState,
+    run_key: &(ExecutionScope, Id),
+) -> Result<u64, StoreError> {
+    state
+        .ledger
+        .get(run_key)
+        .and_then(|entries| entries.last())
+        .map_or(0, |entry| entry.ledger_seq)
+        .checked_add(1)
+        .ok_or(StoreError::ArithmeticOverflow)
 }
 
 #[cfg(test)]
