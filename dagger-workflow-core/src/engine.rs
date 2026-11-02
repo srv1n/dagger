@@ -482,6 +482,26 @@ where
             }
         }
 
+        // Cache hits and pinned reuse complete inline, so their dependents
+        // can become ready in this same pass. Rescan until a pass resolves
+        // nothing inline; each rescan follows at least one completed node.
+        loop {
+            let (scheduled, resolved_inline) = self.schedule_ready(scope, permit).await?;
+            changed += scheduled;
+            if !resolved_inline {
+                break;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn schedule_ready(
+        &self,
+        scope: &ExecutionScope,
+        permit: &crate::store::EnginePermit,
+    ) -> Result<(usize, bool), EngineError> {
+        let mut changed = 0;
+        let mut resolved_inline = false;
         let mut ready = self
             .store
             .scan_ready_nodes(scope, first_page())
@@ -496,9 +516,7 @@ where
         let mut action_nodes = Vec::new();
         for node in ready {
             match node.kind {
-                NodeKind::Action if action_nodes.len() < self.config.max_concurrency => {
-                    action_nodes.push(node)
-                }
+                NodeKind::Action => action_nodes.push(node),
                 NodeKind::Choice => {
                     self.execute_choice(scope, permit, node).await?;
                     changed += 1;
@@ -515,24 +533,46 @@ where
                     self.execute_terminal(scope, permit, node).await?;
                     changed += 1;
                 }
-                _ => {}
             }
         }
         changed += self.complete_waiting_maps(scope, permit).await?;
         for node in action_nodes {
+            // ponytail: a reused node still needs a free slot to be looked
+            // up, though it releases the slot at once. When every slot runs
+            // a long action, ready cache hits wait for one to free.
             let Ok(slot) = self.supervisor.semaphore.clone().try_acquire_owned() else {
                 break;
             };
             match self.claim_action(scope, permit, node).await {
-                Ok(Some(invocation)) => {
-                    self.spawn_attempt(scope.clone(), permit.clone(), invocation, slot);
+                Ok(Some(mut claimed)) if claimed.reused_outcome.is_some() => {
+                    let registration = claimed
+                        .registration
+                        .take()
+                        .expect("claimed action owns its local registration");
+                    let result = execute_attempt(
+                        self.store.clone(),
+                        self.object_store.clone(),
+                        self.supervisor.clone(),
+                        scope.clone(),
+                        claimed,
+                    )
+                    .await;
+                    drop(slot);
+                    resolved_inline |= result.is_ok();
+                    // Same outcome path as a spawned attempt: errors surface
+                    // on the next tick.
+                    registration.finish(result);
+                    changed += 1;
+                }
+                Ok(Some(claimed)) => {
+                    self.spawn_attempt(scope.clone(), permit.clone(), claimed, slot);
                     changed += 1;
                 }
                 Ok(None) | Err(EngineError::Store(StoreError::CasConflict)) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(changed)
+        Ok((changed, resolved_inline))
     }
 
     /// Drives passes until the scoped frontier is quiescent at the current clock.

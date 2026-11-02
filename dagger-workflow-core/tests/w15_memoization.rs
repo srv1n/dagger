@@ -452,6 +452,30 @@ async fn identical_inputs_zero_budget_changed_inputs_identical_dependents_and_mo
             "{run}"
         );
     }
+    // Cache hits resolve inline, so a fully cached run finishes in one pass.
+    create(
+        &*store,
+        &*objects,
+        &scope,
+        "pipeline",
+        &revision,
+        "one_pass",
+        1,
+        CacheMode::Use,
+        0,
+    )
+    .await;
+    engine.start(&scope, &id("one_pass")).await.unwrap();
+    engine.tick(&scope).await.unwrap();
+    assert_eq!(
+        store
+            .get_run(&scope, &id("one_pass"))
+            .await
+            .unwrap()
+            .run
+            .status,
+        RunState::Succeeded
+    );
     let run = store.get_run(&scope, &id("same")).await.unwrap().run;
     assert_eq!(run.budget_consumed, CostUnits(0));
     assert_eq!(run.budget_reserved, CostUnits(0));
