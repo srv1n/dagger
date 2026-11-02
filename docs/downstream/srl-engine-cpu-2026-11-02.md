@@ -2,7 +2,7 @@
 
 For: the Song Rendition Lab (SRL) team. From: Dagger. Date: 2026-11-02.
 Your report: `docs/upstream/dagger-engine-cpu-2026-11-02.md` in the SRL repo (Dagger `4b7f768`).
-Dagger branch: `perf/engine-sqlite-overhead`, 11 commits on top of `4b7f768`. Not merged yet.
+Dagger branch: `perf/engine-sqlite-overhead`, on top of `4b7f768`. Not merged yet.
 
 ## Summary
 
