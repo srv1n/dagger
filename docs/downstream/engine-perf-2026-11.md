@@ -1,13 +1,13 @@
 # Dagger engine performance changes, November 2026
 
 For: every team that embeds `dagger-workflow-core`. From: Dagger. Date: 2026-11-03.
-Branch: `perf/engine-sqlite-overhead`, on top of `4b7f768`. Not merged yet.
+Merged to `main` from `perf/engine-sqlite-overhead` (base `4b7f768`).
 
 ## Summary
 
 The engine now uses much less CPU per run, mostly in the SQLite store and the scheduler.
 Cache hits finish in the scheduler pass instead of each spawning a task. You do not have
-to change any code to get this. Bump your pin once the branch is merged.
+to change any code to get this. Bump your pin to `main`.
 
 One real workload (an 86-node DAG on a Mac, release builds, one run each):
 
@@ -100,7 +100,7 @@ Two new trait methods have defaults, so your store still compiles and behaves th
 - `cargo run -p dagger-workflow-core --release --features sqlite --example engine_cpu`
   runs an 85-node fan-in DAG whose actions only sleep, so it measures engine overhead.
 - `scripts/ab_engine_cpu.sh OLD NEW` alternates two builds of that example for a fair A/B.
-- To try the branch in your project before it merges, build with a path patch instead of
+- To try a Dagger checkout in your project, build with a path patch instead of
   editing your manifest:
   `cargo build --config "patch.'https://github.com/srv1n/dagger'.dagger-workflow-core.path='<dagger>/dagger-workflow-core'"`.
   This rewrites your `Cargo.lock`; restore it afterwards.

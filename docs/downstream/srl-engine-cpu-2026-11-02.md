@@ -2,7 +2,7 @@
 
 For: the Song Rendition Lab (SRL) team. From: Dagger. Date: 2026-11-02.
 Your report: `docs/upstream/dagger-engine-cpu-2026-11-02.md` in the SRL repo (Dagger `4b7f768`).
-Dagger branch: `perf/engine-sqlite-overhead`, on top of `4b7f768`. Not merged yet.
+Dagger: merged to `main` from `perf/engine-sqlite-overhead` (base `4b7f768`).
 
 ## Summary
 
@@ -51,8 +51,8 @@ comes from the engine no longer competing with your actions for CPU.
 
 These are your calls. Dagger does not depend on any of them.
 
-- **Bump the pin** in `native/srl_host/Cargo.toml` to the merge commit once the branch
-  lands. No Dagger API you use was removed.
+- **Bump the pin** in `native/srl_host/Cargo.toml` to the current `main` commit.
+  No Dagger API you use was removed.
 - **Replace the host loop's sleep and polling with `activity()`.** Your loop waits 150 ms
   after a subprocess exit for the outcome to commit. `activity()` changes only after the
   commit, so the wait and the guess go away:
